@@ -345,4 +345,3 @@ M0 阶段只有在 J00–J09 对应交付、适用验证、真实目标身份与
 - [仓库开发计划与 M0 基线](https://github.com/Reidddddd/etcd-hbase/blob/56bef2b1248d970cd2fe41f36249d96610913ae4/DEVELOPMENT_PLAN.md)
 - [etcd v3.5 API](https://etcd.io/docs/v3.5/learning/api/)
 - [Apache HBase 基础前置条件与 Java 支持](https://hbase.apache.org/docs/configuration/basic-prerequisites/)
-- [Dino 设计规格示例：portal-v2 在线导入](https://github.com/Reidddddd/dino/blob/internal/docs/superpowers/specs/2026-10-01-portal-v2-online-import-design.md)
