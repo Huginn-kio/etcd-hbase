@@ -1,0 +1,11 @@
+.idea/
+**/target/
+.artifacts/
+config/local/
+.mvn/local-toolchains.xml
+**/toolchains.local.xml
+**/.env
+**/.env.*
+**/*.keytab
+**/*credentials.local.*
+**/*secrets.local.*
