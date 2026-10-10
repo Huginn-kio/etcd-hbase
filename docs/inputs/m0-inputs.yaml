@@ -1,5 +1,5 @@
 schema_version: 1
-updated_at: 2026-10-10T07:00:04Z
+updated_at: 2026-10-10T07:12:46Z
 baseline_commit: 56bef2b1248d970cd2fe41f36249d96610913ae4
 inputs:
   - id: B01
@@ -66,3 +66,22 @@ inputs:
     responsible_role: Project maintainers
     affected_steps: [WP04, WP22, WP23]
     resolution: Record the approved coordinates and destination before freezing public artifact rules; do not publish during M0.
+input_request_summary:
+  - ids: [B01]
+    responsible_role: Storage and project maintainers
+    request: Provide the target salt algorithm, byte encoding, bucket count, pre-split boundaries, and sample input-to-bucket vectors.
+  - ids: [B02]
+    responsible_role: HBase platform maintainer
+    request: Provide target HBase/client/Hadoop versions, supported JDK 21 combination, and a test address.
+  - ids: [B03]
+    responsible_role: HBase identity platform maintainer
+    request: Explain how username/password map to an authorized identity, the dedicated test permissions, cross-replica/background/rotation constraints, and a secure credential reference.
+  - ids: [B04, B05]
+    responsible_role: Service owner
+    request: Provide submission/read-barrier/renewal acceptance profile and KV/value/version/request/new-cluster scale; production numbers may be frozen in later stages.
+  - ids: [B06]
+    responsible_role: Security and platform maintainers
+    request: Provide TLS, credential handoff, deployment/monitoring, backup/GC-window, and RPO/RTO requirements.
+  - ids: [I07, I08]
+    responsible_role: Project maintainers
+    request: Decide license/source-notice policy and artifact coordinates/publication location.

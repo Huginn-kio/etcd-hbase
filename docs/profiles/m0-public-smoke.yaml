@@ -1,0 +1,23 @@
+profile_id: m0-public-smoke-v1
+scope: engineering-only
+protocol_version: 3.5.23
+kv_count: 1000
+value_bytes: 256
+request_concurrency: 4
+request_timeout_ms: 5000
+lease_count: 10
+lease_ttl_seconds: 15
+watch_count: 4
+salt_profile:
+  id: crc32-be16-b16-v1
+  algorithm: crc32-ieee
+  buckets: 16
+  salt_width_bytes: 2
+native_etcd:
+  listen_host: 127.0.0.1
+  persistence: disposable-test-directory
+  ports: allocated-by-runner
+hbase:
+  environment: disposable-public-dev
+  authentication: explicit-dev-no-auth
+  namespace_prefix: etcd_hbase_m0_

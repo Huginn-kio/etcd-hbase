@@ -7,9 +7,9 @@ Goal ID：01a123e5-d309-7540-b6c2-2f33a3b0a731（active；未设置 token budget
 开发分支与基线 commit：codex/m0-engineering；56bef2b1248d970cd2fe41f36249d96610913ae4
 计划 SHA-256：5746e412718dd8a6f81f6f0b0fe1e0bd97b929c1469f140e47a9b29a21018929
 本轮 run-id：20261010T070004Z-56bef2b
-当前 WP 及 checkbox：WP00 完成；WP01/WP02/WP04/WP05 待执行
-下一条可执行命令：读取 DEVELOPMENT_PLAN.md 第 13.1 节调用清单，按 WP01 固定 Milvus v2.6.18 源码并完成调用审计
-已验证 WP 与证据：WP00，docs/reports/m0/20261010T070004Z-56bef2b/WP00.md
+当前 WP 及 checkbox：WP00、WP01、WP05 完成；WP02/WP03/WP04 待执行
+下一条可执行命令：执行 WP02，锁定公开 Java 21/Maven/protobuf 与最小工程依赖；目标 HBase 组合继续等待 B02
+已验证 WP 与证据：WP00、WP01、WP05，见 docs/reports/m0/20261010T070004Z-56bef2b/WP00.md、WP01.md、WP05.md
 等待输入：B01/B02/B03/B04/B05/B06/I07/I08，详见 docs/inputs/m0-inputs.yaml；不阻塞无依赖 public 工作
 跨阶段残留：按 M0 计划记录 J18/J19/J27/J50/J51/J52/J55/J56/J58/J59/J84/J85 等衔接项
 最近失败：none
@@ -23,6 +23,8 @@ Goal ID：01a123e5-d309-7540-b6c2-2f33a3b0a731（active；未设置 token budget
 - 每个可评审 PR 请求 GitHub reviewer reidchan。评审意见在所属 PR 层修复并复验；未经授权不合并。
 - public HBase 证据不能替代目标 HBase 身份与操作证据；transport fixture 不能替代真实后端失败验证。
 - 仅在实现、适用验证和输入事实有证据后更新 DEVELOPMENT_PLAN.md；没有目标身份输入时不得勾选 J04 或 M0 阶段验收。
+- 已锁定公开 Milvus 基线 `pkg/v2.6.18` / `5aee61bff0de2c9650af81f2e9b0bef44efe13fe`，并完成 WP01 静态调用审计；不存在等价/互通运行结果。
+- WP05 的 11 项生产目标都维持 `missing-input`，工程 profile 独立为 `m0-public-smoke-v1`；目标数值不由 smoke 或本机容量推定。
 
 ## 当前环境快照
 
