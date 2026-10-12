@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible defect in etcd-hbase.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        请提供可复现信息。提交前请删除密码、token、密钥、完整业务 key 和未脱敏的目标环境数据。
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题描述
+      description: 描述观察到的行为及影响范围。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 提供最小复现步骤、输入和必要配置；不要附带凭据。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为与脱敏日志
+      description: 删除凭据、token、密钥、业务 key 和目标环境标识后再粘贴。
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 项目版本或 commit
+  - type: input
+    id: java
+    attributes:
+      label: Java 发行版与版本
+  - type: input
+    id: hbase
+    attributes:
+      label: HBase/Hadoop 版本（如适用）
+  - type: textarea
+    id: environment
+    attributes:
+      label: 可公开说明的运行环境
+      description: 只写与复现相关且可公开的信息，不要填写地址、账号或集群标识。
