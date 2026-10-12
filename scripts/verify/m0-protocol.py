@@ -131,6 +131,39 @@ def verify() -> list[str]:
         raise ValueError("protocol module does not activate the grpc-java generator")
     if configuration.findtext("m:pluginArtifact", namespaces=namespace) != expected_grpc_plugin:
         raise ValueError("protocol module grpc plugin artifact does not match the locked configuration")
+    descriptor_execution = next(
+        (execution for execution in protobuf_plugin.findall("m:executions/m:execution", namespace)
+         if execution.findtext("m:id", namespaces=namespace) == "generate-java-descriptor"),
+        None,
+    )
+    if descriptor_execution is None:
+        raise ValueError("protocol module is missing the descriptor generation execution")
+    descriptor_configuration = descriptor_execution.find("m:configuration", namespace)
+    if descriptor_configuration is None:
+        raise ValueError("protocol descriptor generation is missing its configuration")
+    descriptor_options = {
+        "writeDescriptorSet": "true",
+        "descriptorSetFileName": "etcd-v3.5.23.protobin",
+        "includeDependenciesInDescriptorSet": "true",
+        "includeSourceInfoInDescriptorSet": "false",
+        "attachDescriptorSet": "false",
+    }
+    for option, expected in descriptor_options.items():
+        actual = descriptor_configuration.findtext(f"m:{option}", namespaces=namespace)
+        if actual != expected:
+            raise ValueError(
+                f"protocol module descriptor option {option} must be {expected!r}, got {actual!r}"
+            )
+    grpc_execution = next(
+        (execution for execution in protobuf_plugin.findall("m:executions/m:execution", namespace)
+         if execution.findtext("m:id", namespaces=namespace) == "generate-grpc-java"),
+        None,
+    )
+    grpc_configuration = None if grpc_execution is None else grpc_execution.find("m:configuration", namespace)
+    if grpc_configuration is None or grpc_configuration.findtext(
+        "m:writeDescriptorSet", namespaces=namespace
+    ) != "false":
+        raise ValueError("gRPC code generation must not emit a duplicate descriptor artifact")
     extensions = protocol_pom.findall("m:build/m:extensions/m:extension", namespace)
     os_extension = next((extension for extension in extensions if extension.findtext("m:artifactId", namespaces=namespace) == "os-maven-plugin"), None)
     if os_extension is None or os_extension.findtext("m:version", namespaces=namespace) != generation.get("osMavenPlugin"):
