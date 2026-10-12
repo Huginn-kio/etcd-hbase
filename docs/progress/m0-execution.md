@@ -22,13 +22,13 @@
 | 9/10 | WP21–WP22 | `codex/m0-09-interop-ci` | 未开始 |
 | 10/10 | WP23 | `codex/m0-10-delivery-evidence` | 未开始 |
 
-PR 栈的第一层以 `main` 为基线；后续层逐层基于前一层。每层记录 WP 范围、验证结果和前置 PR 链接。外部评审状态以 GitHub 实际结果为准。
+每个 PR 都以原仓库 `main` 为目标分支，并且只包含对应层的变更；层与层之间通过 PR 描述中的依赖链接串联，不依赖分支继承或累计 diff。每层记录 WP 范围和验证结果，外部评审状态以 GitHub 实际结果为准。
 
 ## 当前进度
 
 - 当前层：1/10。WP00、WP01、WP05 已完成本地交付和验证；PR #4 已向 `main` 提交，并已请求维护者评审。
 - 已验证报告：`docs/reports/m0/20261012T061144Z-f0b05ae/WP00.md`、`WP01.md`、`WP05.md`。
-- 下一工作包：在 PR #4 基础上进入 WP02–WP04，固定公开 Java 21、Maven Wrapper、Protobuf/gRPC 和构建依赖；目标 HBase 组合继续等待 B02。评审意见到达后在本层处理并更新验证记录。
+- 下一工作包：进入 WP02–WP04；对应 PR 独立以 `main` 为 base，并在描述中注明依赖 PR #4。固定公开 Java 21、Maven Wrapper、Protobuf/gRPC 和构建依赖；目标 HBase 组合继续等待 B02。评审意见到达后在本层处理并更新验证记录。
 - 未决输入：B01–B06、I07、I08；具体事实、责任角色和解除动作见 `docs/inputs/m0-inputs.yaml`。
 - 最近失败：none。
 
