@@ -168,7 +168,7 @@ gRPC 边界负责将内部失败分类映射为客户端可识别的状态和 et
 
 优先使用官方 HBase AsyncConnection/AsyncTable。连接由服务生命周期管理并按后端身份和授权边界复用，不按 RPC 创建；scanner、buffer、重试和队列均须受资源预算约束。
 
-M0 的真实后端探针验证连接、Get、Put、CAS、Scan、认证/权限失败、超时、取消和关闭行为。探针数据使用明确的专用表组或前缀，独立连接读回用于验证持久化。任何本地 mock 或 fixture 都只能验证调用封装和错误路径，不能替代真实 HBase 证据。
+M0 的真实后端探针验证连接、Get、Put、CAS、Scan、认证/权限失败、超时、取消和关闭行为。探针数据使用明确的专用表组或前缀；独立连接读回用于验证后端读写和跨连接可见性，并记录实际表级及 mutation 级 WAL/durability 配置。跨连接读回本身不证明 RegionServer 故障后的持久性；故障耐久性验证留在后续阶段，不纳入 M0 验收。任何本地 mock 或 fixture 都只能验证调用封装和错误路径，不能替代真实 HBase 证据。
 
 目标 HBase、Hadoop 与 client 版本组合仍待 B02 输入和兼容性验证。公开开发环境采用的版本只能作为公开候选组合记录。
 
@@ -180,7 +180,7 @@ M0 的真实后端探针验证连接、Get、Put、CAS、Scan、认证/权限失
 
 该候选不等于目标规则。目标算法、桶数、编码、分区键及样例需由 B01 确认。算法或桶数不能在已有表组上静默变更；变更需要独立的数据重编码/迁移设计。
 
-加盐后的范围查询需要覆盖相关桶中的逻辑 key 区间并合并结果。桶数增加点查和范围定位成本；盐本身不解决应用提交串行化或事务可见性问题。
+确定性盐 profile 下，精确 key 可计算出唯一桶号并执行单桶点读；点查的额外成本是盐计算。范围查询需要定位并扫描相关桶中的逻辑 key 区间，再合并结果；桶数增加范围查询的跨桶定位和归并成本。点查不应退化为多桶搜索。盐本身不解决应用提交串行化或事务可见性问题。
 
 ### 6.3 逻辑记录与物理历史方案
 
@@ -206,12 +206,13 @@ M0 的真实后端探针验证连接、Get、Put、CAS、Scan、认证/权限失
 
 ### 7.1 Authenticate 到后端身份
 
-**已确认要求：** Milvus 通过 etcd Authenticate 提交 HBase 账号凭据。服务验证凭据后发放 etcd token，后续 RPC 使用该 token 关联到授权的后端身份和表组。
+**已确认要求：** Milvus 通过 etcd Authenticate 提交 HBase 账号凭据。服务验证凭据后发放 etcd token，后续 RPC 使用该 token 关联到授权的后端身份和表组。服务 core 中的 `AuthSessionStore` 管理有界 etcd session，负责 token 校验及其到账号、表组授权和后端上下文引用的映射；`BackendIdentityProvider` 负责验证提交的凭据，并取得或恢复相应的 HBase 后端身份上下文，不负责解析或管理 etcd token/session。
 
 ~~~mermaid
 sequenceDiagram
     participant C as Go etcd client
     participant G as gRPC service
+    participant S as AuthSessionStore
     participant I as BackendIdentityProvider
     participant H as HBase
     C->>G: Authenticate(name, password)
@@ -219,13 +220,17 @@ sequenceDiagram
     I->>H: establish and validate backend identity
     H-->>I: authenticated identity and access result
     I-->>G: scoped backend context
+    G->>S: create bounded session and token mapping
+    S-->>G: etcd token
     G-->>C: etcd token
     C->>G: subsequent RPC with token
-    G->>I: resolve token to scoped identity
-    I-->>G: identity and table-group authorization
+    G->>S: validate token and resolve scoped identity
+    S-->>G: identity, table-group authorization, context reference
+    G->>I: obtain or restore backend identity context
+    I-->>G: scoped backend context
 ~~~
 
-**待输入：** B03 决定实际 HBase 认证机制、身份激活方式、目标权限和凭据交接约束。不能假设标准 HBase 使用任意 username/password 协议，也不能在 HBase 不可达时发放看似成功的 token。
+具体接口签名、session 存储方式和上下文交接机制留到实现阶段确定。**待输入：** B03 决定实际 HBase 认证机制、身份激活方式、目标权限和凭据交接约束。不能假设标准 HBase 使用任意 username/password 协议，也不能在 HBase 不可达时发放看似成功的 token。
 
 M0 建立 BackendIdentityProvider 契约并验证目标环境可用时的真实身份访问。token 的跨副本共享、全 Pod 重启后的身份激活、凭据轮换和后台任务身份生命周期需在后续身份/部署设计中完成；单 Pod 内存 session 不能被作为多副本方案。
 
@@ -339,9 +344,11 @@ M0 阶段只有在 J00–J09 对应交付、适用验证、真实目标身份与
 | 日期 | 变更 |
 |---|---|
 | 2026-10-10 | 初稿：从 M0 执行清单中提取设计目标、架构契约、候选决策、边界和未决输入，提交评审。 |
+| 2026-10-12 | 按评审澄清 HBase 探针的可见性与 durability 边界、确定性盐的点查/范围查成本，以及 etcd session 与后端身份 provider 的职责。 |
 
 ## 15. 参考
 
 - [仓库开发计划与 M0 基线](https://github.com/Reidddddd/etcd-hbase/blob/56bef2b1248d970cd2fe41f36249d96610913ae4/DEVELOPMENT_PLAN.md)
 - [etcd v3.5 API](https://etcd.io/docs/v3.5/learning/api/)
 - [Apache HBase 基础前置条件与 Java 支持](https://hbase.apache.org/docs/configuration/basic-prerequisites/)
+- [Apache HBase Durability API](https://hbase.apache.org/2.6/devapidocs/org/apache/hadoop/hbase/client/Durability.html)
