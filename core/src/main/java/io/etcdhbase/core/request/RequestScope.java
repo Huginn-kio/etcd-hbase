@@ -70,6 +70,10 @@ public final class RequestScope implements AutoCloseable {
     return hasDeadline && remainingDeadlineNanos() == 0;
   }
 
+  public boolean hasDeadline() {
+    return hasDeadline;
+  }
+
   public boolean isCancelled() {
     synchronized (lock) {
       return cancelled;
