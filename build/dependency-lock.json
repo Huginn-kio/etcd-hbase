@@ -37,6 +37,7 @@
     "maven-jar-plugin": "3.5.1",
     "maven-resources-plugin": "3.5.0",
     "maven-surefire-plugin": "3.6.0",
+    "maven-toolchains-plugin": "3.2.0",
     "os-maven-plugin": "1.7.1",
     "protobuf-maven-plugin": "0.6.1"
   },
@@ -91,6 +92,23 @@
       "repository": "https://repo.maven.apache.org/maven2",
       "sha256": "7e1446499b359675d8aabe6af2de86b85e72ae8a2a932c0b40d0e5ba57097439",
       "reason": "Public logging API; no credentials or key material may be logged."
+    },
+    "convergenceOverrides": {
+      "repository": "https://repo.maven.apache.org/maven2",
+      "resolvedVersions": {
+        "ch.qos.reload4j:reload4j:1.2.22": "222f90d3e69541218ef6e70547749d693bd4c1846817e5bd7949b3e28950f99f",
+        "org.codehaus.woodstox:stax2-api:4.2.1": "678567e48b51a42c65c699f266539ad3d676d4b1a5b0ad7d89ece8b9d5772579",
+        "commons-codec:commons-codec:1.15": "b3e9f6d63a790109bf0d056611fbed1cf69055826defeb9894a71369d246ed63",
+        "commons-logging:commons-logging:1.3.0": "66d3c980470b99b0c511dad3dfc0ae7b265ec1fb144e96bc0253a8a175fd34d9",
+        "org.apache.commons:commons-compress:1.26.2": "9168a03141d8fc7eda21a2360d83cc0412bcbb1d6204d992bd48c2573cb3c6b8",
+        "org.apache.commons:commons-lang3:3.18.0": "4eeeae8d20c078abb64b015ec158add383ac581571cddc45c68f0c9ae0230720",
+        "com.fasterxml.jackson.core:jackson-core:2.22.3": "8a501126a385b25841915d839508f8a66e2a0dbc8a6709d055ef3b3e852b094c",
+        "org.apache.yetus:audience-annotations:0.13.0": "3bfbb397b06f63a2a0a361f62ed32cf199bd92ddd48ea99281f4987edec9777b",
+        "org.apache.commons:commons-text:1.14.0": "121fce2282910c8f0c3ba793a5436b31beb710423cbe2d574a3fb7a73c508e92",
+        "com.google.code.gson:gson:2.14.0": "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
+        "com.google.errorprone:error_prone_annotations:2.50.0": "4667724877f1d37a689202da191e23efa7657c62eef93ccdac406eccfe5cdd0a"
+      },
+      "reason": "These exact versions resolve upstream Hadoop 3.4.3 and gRPC dependency-tree disagreements; Maven Enforcer verifies convergence."
     },
     "jackson": {
       "version": "2.22.3",
