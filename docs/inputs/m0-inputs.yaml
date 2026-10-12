@@ -1,0 +1,88 @@
+schema_version: 1
+updated_at: 2026-10-12T06:11:44Z
+baseline_commit: 56bef2b1248d970cd2fe41f36249d96610913ae4
+implementation_base_commit: f0b05ae30066d1bc14bd271142ee2e4996f93a69
+inputs:
+  - id: B01
+    state: missing-input
+    required_fact: Target salt algorithm, byte encoding, bucket count, pre-split boundaries, and validation vectors
+    value: null
+    source: DEVELOPMENT_PLAN.md section 10.2
+    responsible_role: Storage and project maintainers
+    affected_steps: [WP07.target, WP17.target]
+    resolution: Provide the versioned target salt profile and sample byte-to-bucket vectors; then run the target profile checks.
+  - id: B02
+    state: missing-input
+    required_fact: Target HBase, HBase client, Hadoop versions, and supported JDK 21 combination
+    value: null
+    source: DEVELOPMENT_PLAN.md section 10.2
+    responsible_role: HBase platform maintainer
+    affected_steps: [WP02.target, WP15.target, WP16.target, WP22.target]
+    resolution: Provide actual target versions and supported startup parameters; lock and exercise the target combination.
+  - id: B03
+    state: missing-input
+    required_fact: How Authenticate username/password become an authorized HBase identity, including cross-replica, startup, background, and rotation handling
+    value: null
+    source: DEVELOPMENT_PLAN.md section 10.2
+    responsible_role: HBase identity platform maintainer
+    affected_steps: [WP15.target, WP16.target]
+    resolution: Provide the authentication mechanism, dedicated test permissions, and a secure credential reference; run target identity and operation probes.
+  - id: B04
+    state: missing-input
+    required_fact: Production submission, read barrier, and renewal acceptance profile
+    value: null
+    source: DEVELOPMENT_PLAN.md section 10.2
+    responsible_role: Service owner
+    affected_steps: [WP05.targets]
+    resolution: Record the target profile when available; M0 creates an initial target draft and uses the fixed engineering smoke profile meanwhile.
+  - id: B05
+    state: missing-input
+    required_fact: Production KV, value, version, request, and new-cluster distribution
+    value: null
+    source: DEVELOPMENT_PLAN.md section 10.2
+    responsible_role: Service owner
+    affected_steps: [WP05.targets]
+    resolution: Record the target draft now; freeze production workload numbers in their later plan stages.
+  - id: B06
+    state: missing-input
+    required_fact: TLS, credential handoff, deployment, monitoring, and RPO/RTO requirements
+    value: null
+    source: DEVELOPMENT_PLAN.md section 10.2
+    responsible_role: Security and platform maintainers
+    affected_steps: [WP15.target, WP16.target]
+    resolution: Provide non-secret security and test-environment requirements plus a secure configuration reference before target access tests.
+  - id: I07
+    state: missing-input
+    required_fact: Maintainer license decision and source-notice requirements
+    value: Apache-2.0 is a candidate only; no final license is asserted
+    source: DEVELOPMENT_PLAN.md section 10.3 decision D12; M0 design section 9
+    responsible_role: Project maintainers
+    affected_steps: [WP04, WP09, WP23]
+    resolution: Obtain a maintainer decision, then add or update LICENSE and NOTICE and verify vendored source notices.
+  - id: I08
+    state: missing-input
+    required_fact: Maintainer decision for artifact coordinates and publication location
+    value: Local development candidate io.etcdhbase:etcd-hbase-parent:0.1.0-SNAPSHOT only
+    source: M0 design sections 9 and 12.1
+    responsible_role: Project maintainers
+    affected_steps: [WP04, WP22, WP23]
+    resolution: Record the approved coordinates and destination before freezing public artifact rules; do not publish during M0.
+input_request_summary:
+  - ids: [B01]
+    responsible_role: Storage and project maintainers
+    request: Provide the target salt algorithm, byte encoding, bucket count, pre-split boundaries, and sample input-to-bucket vectors.
+  - ids: [B02]
+    responsible_role: HBase platform maintainer
+    request: Provide target HBase/client/Hadoop versions, supported JDK 21 combination, and a test address.
+  - ids: [B03]
+    responsible_role: HBase identity platform maintainer
+    request: Explain how username/password map to an authorized identity, the dedicated test permissions, cross-replica/background/rotation constraints, and a secure credential reference.
+  - ids: [B04, B05]
+    responsible_role: Service owner
+    request: Provide submission/read-barrier/renewal acceptance profile and KV/value/version/request/new-cluster scale; production numbers may be frozen in later stages.
+  - ids: [B06]
+    responsible_role: Security and platform maintainers
+    request: Provide TLS, credential handoff, deployment/monitoring, backup/GC-window, and RPO/RTO requirements.
+  - ids: [I07, I08]
+    responsible_role: Project maintainers
+    request: Decide license/source-notice policy and artifact coordinates/publication location.
