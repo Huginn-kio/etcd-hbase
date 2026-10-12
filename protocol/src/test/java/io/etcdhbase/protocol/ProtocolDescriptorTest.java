@@ -4,7 +4,11 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Descriptors.EnumValueDescriptor;
 import com.google.protobuf.Descriptors.FieldDescriptor;
 import com.google.protobuf.Descriptors.MethodDescriptor;
+import etcdserverpb.AuthGrpc;
+import etcdserverpb.KVGrpc;
+import etcdserverpb.LeaseGrpc;
 import etcdserverpb.Rpc;
+import etcdserverpb.WatchGrpc;
 import java.util.Set;
 import java.util.stream.Collectors;
 import mvccpb.Kv;
@@ -14,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class EtcdProtocolDescriptorTest {
+class ProtocolDescriptorTest {
   private static final Set<String> METHOD_SIGNATURES = Set.of(
       "KV.Range:RangeRequest->RangeResponse:unary",
       "KV.Put:PutRequest->PutResponse:unary",
@@ -66,9 +70,17 @@ class EtcdProtocolDescriptorTest {
 
     Set<String> actual = descriptor.getServices().stream()
         .flatMap(service -> service.getMethods().stream())
-        .map(EtcdProtocolDescriptorTest::methodSignature)
+        .map(ProtocolDescriptorTest::methodSignature)
         .collect(Collectors.toSet());
     assertEquals(METHOD_SIGNATURES, actual);
+  }
+
+  @Test
+  void preservesDefaultGrpcJavaServiceClassNames() {
+    assertEquals("etcdserverpb.KV", KVGrpc.getServiceDescriptor().getName());
+    assertEquals("etcdserverpb.Watch", WatchGrpc.getServiceDescriptor().getName());
+    assertEquals("etcdserverpb.Lease", LeaseGrpc.getServiceDescriptor().getName());
+    assertEquals("etcdserverpb.Auth", AuthGrpc.getServiceDescriptor().getName());
   }
 
   @Test

@@ -18,4 +18,4 @@
 | Jackson / SnakeYAML | 2.22.3 / 2.7 | [Apache License 2.0](https://github.com/FasterXML/jackson/blob/2.22/LICENSE) / [Apache License 2.0](https://bitbucket.org/snakeyaml/snakeyaml/src/master/LICENSE.txt) |
 | JUnit / Mockito / AssertJ | 6.1.3 / 5.24.0 / 3.27.7 | [EPL 2.0](https://github.com/junit-team/junit5/blob/main/LICENSE.md) / [MIT](https://github.com/mockito/mockito/blob/main/LICENSE) / [Apache 2.0](https://github.com/assertj/assertj/blob/main/LICENSE) |
 
-协议 proto 文件的来源 commit 与逐文件 SHA-256 见 [`protocol/proto-sources.lock.json`](protocol/proto-sources.lock.json)；生成代码由这些输入产生。I07 的项目许可决定和 I08 的公开制品命名/发布目的地尚未提供；本跟踪表不替代这些维护者决定。新增第三方组件时，先核对所用版本的上游许可与 NOTICE，再扩展本表及机器锁文件。
+协议 proto 文件的来源 commit 与逐文件 SHA-256 见 [`protocol/upstream-lock.json`](protocol/upstream-lock.json) 和 [`protocol/UPSTREAM.md`](protocol/UPSTREAM.md)；生成代码由这些输入产生。I07 的项目许可决定和 I08 的公开制品命名/发布目的地尚未提供；本跟踪表不替代这些维护者决定。新增第三方组件时，先核对所用版本的上游许可与 NOTICE，再扩展本表及机器锁文件。

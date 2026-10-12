@@ -62,6 +62,9 @@
   "generation": {
     "protobufJava": "4.36.2",
     "protoc": "4.36.2",
+    "wellKnownProtoFiles": [
+      "google/protobuf/descriptor.proto"
+    ],
     "grpcJava": "1.84.1",
     "protocPlugin": "protoc-gen-grpc-java",
     "protobufMavenPlugin": "0.6.1",

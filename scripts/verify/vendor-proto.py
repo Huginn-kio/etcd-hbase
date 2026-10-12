@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE_LOCK = ROOT / "protocol/proto-sources.lock.json"
+SOURCE_LOCK = ROOT / "protocol/upstream-lock.json"
+PROTO_ROOT = ROOT / "protocol/src/main/proto"
 DEPENDENCY_LOCK = ROOT / "build/dependency-lock.json"
 EXPECTED_ETCD_REVISION = "1cf4bc40111fd95d1e14a90a09a146357b15eb13"
 EXPECTED_ETCD_FILES = {
@@ -18,17 +21,22 @@ EXPECTED_ETCD_FILES = {
     "etcd/api/mvccpb/kv.proto",
     "etcd/api/authpb/auth.proto",
 }
+IMPORT_PATTERN = re.compile(r'^\s*import(?:\s+(?:public|weak))?\s+"([^"]+)"\s*;', re.MULTILINE)
 
 
 def load_json(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"cannot read {path.relative_to(ROOT)}: {error}") from error
+        try:
+            label = path.relative_to(ROOT)
+        except ValueError:
+            label = path
+        raise ValueError(f"cannot read {label}: {error}") from error
 
 
-def verify() -> list[str]:
-    source_lock = load_json(SOURCE_LOCK)
+def verify(source_lock_path: Path, proto_root: Path) -> list[str]:
+    source_lock = load_json(source_lock_path)
     dependency_lock = load_json(DEPENDENCY_LOCK)
     if source_lock.get("schemaVersion") != 1:
         raise ValueError("unsupported protocol source lock schema")
@@ -50,7 +58,7 @@ def verify() -> list[str]:
             relpath = file_entry.get("path")
             if not isinstance(relpath, str) or Path(relpath).is_absolute() or ".." in Path(relpath).parts:
                 raise ValueError("every source entry needs a safe repository-relative path")
-            source_path = ROOT / "protocol/src/main/proto" / relpath
+            source_path = proto_root / relpath
             try:
                 content = source_path.read_bytes()
             except OSError as error:
@@ -65,13 +73,49 @@ def verify() -> list[str]:
     if len(entries) != len(set(entries)):
         raise ValueError("duplicate proto source path in lock")
     actual_files = {
-        path.relative_to(ROOT / "protocol/src/main/proto").as_posix()
-        for path in (ROOT / "protocol/src/main/proto").rglob("*.proto")
+        path.relative_to(proto_root).as_posix()
+        for path in proto_root.rglob("*.proto")
     }
     if set(entries) != actual_files:
         missing = sorted(set(entries) - actual_files)
         unlocked = sorted(actual_files - set(entries))
         raise ValueError(f"proto source inventory differs from lock: missing={missing}, unlocked={unlocked}")
+
+    generation = source_lock.get("generation", {})
+    well_known_files = generation.get("wellKnownProtoFiles")
+    if not isinstance(well_known_files, list) or not all(
+        isinstance(path, str) and path.startswith("google/protobuf/") for path in well_known_files
+    ):
+        raise ValueError("generation lock must list compiler-provided google/protobuf imports")
+    if len(well_known_files) != len(set(well_known_files)):
+        raise ValueError("generation lock contains duplicate well-known proto files")
+    expected_local = set(entries)
+    discovered_well_known = set()
+    reachable = set()
+    pending = ["etcd/api/etcdserverpb/rpc.proto"]
+    while pending:
+        current = pending.pop()
+        if current in reachable:
+            continue
+        if current not in expected_local:
+            raise ValueError(f"unlocked proto import in dependency closure: {current}")
+        reachable.add(current)
+        content = (proto_root / current).read_text(encoding="utf-8")
+        for imported in IMPORT_PATTERN.findall(content):
+            if imported in expected_local:
+                pending.append(imported)
+            elif imported in well_known_files:
+                discovered_well_known.add(imported)
+            else:
+                raise ValueError(f"proto import is neither vendored nor compiler-provided: {imported}")
+    if reachable != expected_local:
+        unreachable = sorted(expected_local - reachable)
+        raise ValueError(f"locked proto files are outside the etcd import closure: {unreachable}")
+    if discovered_well_known != set(well_known_files):
+        raise ValueError(
+            "compiler-provided proto import set differs from lock: "
+            f"locked={sorted(well_known_files)}, imported={sorted(discovered_well_known)}"
+        )
 
     etcd_source = next((source for source in sources if source.get("name") == "etcd"), None)
     if etcd_source is None or etcd_source.get("tag") != "v3.5.23":
@@ -81,7 +125,6 @@ def verify() -> list[str]:
     if etcd_files != EXPECTED_ETCD_FILES:
         raise ValueError(f"unexpected etcd proto set: {sorted(etcd_files)}")
 
-    generation = source_lock.get("generation", {})
     native_tools = dependency_lock.get("nativeTools", {})
     protobuf_lock = dependency_lock.get("libraries", {}).get("protobuf", {})
     if generation.get("protoc") != native_tools.get("protoc", {}).get("version"):
@@ -172,10 +215,18 @@ def verify() -> list[str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lock", type=Path, default=SOURCE_LOCK,
+                        help="upstream source lock JSON (default: protocol/upstream-lock.json)")
+    parser.add_argument("--root", type=Path, default=PROTO_ROOT,
+                        help="root directory containing the vendored proto files")
+    args = parser.parse_args()
+    lock_path = args.lock if args.lock.is_absolute() else ROOT / args.lock
+    proto_root = args.root if args.root.is_absolute() else ROOT / args.root
     try:
-        entries = verify()
+        entries = verify(lock_path.resolve(), proto_root.resolve())
     except ValueError as error:
-        print(f"M0 protocol source verification failed: {error}", file=sys.stderr)
+        print(f"M0 vendored proto verification failed: {error}", file=sys.stderr)
         return 1
     print(f"Verified {len(entries)} pinned proto sources and generator versions.")
     return 0

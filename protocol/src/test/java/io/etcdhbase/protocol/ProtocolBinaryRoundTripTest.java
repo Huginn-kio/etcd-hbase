@@ -115,4 +115,19 @@ class ProtocolBinaryRoundTripTest {
         .build();
     assertEquals(keepAlive, Rpc.LeaseKeepAliveRequest.parseFrom(keepAlive.toByteArray()));
   }
+
+  @Test
+  void preservesAuthenticateRequestAndResponseFields() throws Exception {
+    Rpc.AuthenticateRequest request = Rpc.AuthenticateRequest.newBuilder()
+        .setName("fixture-user")
+        .setPassword("fixture-password-value")
+        .build();
+    assertEquals(request, Rpc.AuthenticateRequest.parseFrom(request.toByteArray()));
+
+    Rpc.AuthenticateResponse response = Rpc.AuthenticateResponse.newBuilder()
+        .setHeader(Rpc.ResponseHeader.newBuilder().setRevision(LARGE_REVISION))
+        .setToken("fixture-token-value")
+        .build();
+    assertEquals(response, Rpc.AuthenticateResponse.parseFrom(response.toByteArray()));
+  }
 }
