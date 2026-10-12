@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "protocol": "etcd-v3.5.23",
+  "sources": [
+    {
+      "name": "etcd",
+      "repository": "https://github.com/etcd-io/etcd",
+      "tag": "v3.5.23",
+      "revision": "1cf4bc40111fd95d1e14a90a09a146357b15eb13",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "upstreamPath": "api/etcdserverpb/rpc.proto",
+          "path": "etcd/api/etcdserverpb/rpc.proto",
+          "sha256": "7cf0d098aae57522a574bf591145e55539a15212885d43709536553833cd6f40"
+        },
+        {
+          "upstreamPath": "api/mvccpb/kv.proto",
+          "path": "etcd/api/mvccpb/kv.proto",
+          "sha256": "76b0d596ecc8dd1b535be683777910a5b4fe0705fb57baccacfcc7d98d11821e"
+        },
+        {
+          "upstreamPath": "api/authpb/auth.proto",
+          "path": "etcd/api/authpb/auth.proto",
+          "sha256": "443e661f9e423d3376d513e76446e957ae0132c6f63fff4510fde3c7a587be05"
+        }
+      ]
+    },
+    {
+      "name": "gogo-protobuf",
+      "repository": "https://github.com/gogo/protobuf",
+      "tag": "v1.3.2",
+      "revision": "b03c65ea87cdc3521ede29f62fe3ce239267c1bc",
+      "license": "BSD-3-Clause",
+      "files": [
+        {
+          "upstreamPath": "gogoproto/gogo.proto",
+          "path": "gogoproto/gogo.proto",
+          "sha256": "f2f77edf7de807ded7884813d851656f4ccb18262db717a8f31061995f3e7324"
+        }
+      ]
+    },
+    {
+      "name": "googleapis",
+      "repository": "https://github.com/googleapis/googleapis",
+      "revision": "34bb7a118468a6ec56deb31842525971e41be2ac",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "upstreamPath": "google/api/annotations.proto",
+          "path": "google/api/annotations.proto",
+          "sha256": "e79ea741cb605a65e78ca322174764a4af9fde1962c1631e12b84c4934ba9a6c"
+        },
+        {
+          "upstreamPath": "google/api/http.proto",
+          "path": "google/api/http.proto",
+          "sha256": "ead99129aa15dd5f6233942030c72eec33bc0d7b1c7c260dc143293ef66c5b78"
+        }
+      ]
+    }
+  ],
+  "generation": {
+    "protobufJava": "4.36.2",
+    "protoc": "4.36.2",
+    "grpcJava": "1.84.1",
+    "protocPlugin": "protoc-gen-grpc-java",
+    "protobufMavenPlugin": "0.6.1",
+    "osMavenPlugin": "1.7.1"
+  }
+}

@@ -10,9 +10,12 @@
 | Apache HBase client / Hadoop | 2.6.6-hadoop3 / 3.4.3 | [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) |
 | gRPC Java / shaded Netty transport | 1.84.1 / 4.2.16.Final | [Apache License 2.0](https://github.com/grpc/grpc-java/blob/master/LICENSE) / [Apache License 2.0](https://github.com/netty/netty/blob/4.2/LICENSE.txt) |
 | Protocol Buffers Java / protoc | 4.36.2 | [BSD 3-Clause](https://github.com/protocolbuffers/protobuf/blob/main/LICENSE) |
+| etcd API proto sources | v3.5.23 | [Apache License 2.0](https://github.com/etcd-io/etcd/blob/v3.5.23/LICENSE) |
+| gogo proto options | v1.3.2 | [BSD 3-Clause](https://github.com/gogo/protobuf/blob/v1.3.2/LICENSE) |
+| Google API proto imports | pinned commit in protocol source lock | [Apache License 2.0](https://github.com/googleapis/googleapis/blob/34bb7a118468a6ec56deb31842525971e41be2ac/LICENSE) |
 | Guava | 33.7.2-jre | [Apache License 2.0](https://github.com/google/guava/blob/master/COPYING) |
 | SLF4J | 2.0.20 | [MIT License](https://www.slf4j.org/license.html) |
 | Jackson / SnakeYAML | 2.22.3 / 2.7 | [Apache License 2.0](https://github.com/FasterXML/jackson/blob/2.22/LICENSE) / [Apache License 2.0](https://bitbucket.org/snakeyaml/snakeyaml/src/master/LICENSE.txt) |
 | JUnit / Mockito / AssertJ | 6.1.3 / 5.24.0 / 3.27.7 | [EPL 2.0](https://github.com/junit-team/junit5/blob/main/LICENSE.md) / [MIT](https://github.com/mockito/mockito/blob/main/LICENSE) / [Apache 2.0](https://github.com/assertj/assertj/blob/main/LICENSE) |
 
-I07 的项目许可决定和 I08 的公开制品命名/发布目的地尚未提供；本跟踪表不替代这些维护者决定。新增第三方组件时，先核对所用版本的上游许可与 NOTICE，再扩展本表及机器锁文件。
+协议 proto 文件的来源 commit 与逐文件 SHA-256 见 [`protocol/proto-sources.lock.json`](protocol/proto-sources.lock.json)；生成代码由这些输入产生。I07 的项目许可决定和 I08 的公开制品命名/发布目的地尚未提供；本跟踪表不替代这些维护者决定。新增第三方组件时，先核对所用版本的上游许可与 NOTICE，再扩展本表及机器锁文件。
