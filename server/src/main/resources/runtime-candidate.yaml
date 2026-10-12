@@ -1,0 +1,32 @@
+# Disposable loopback-only profile. It does not describe target or production settings.
+schema_version: 1
+listeners:
+  - id: local-etcd
+    bind_host: 127.0.0.1
+    port: 2379
+    table_group_id: local
+hbase_profiles:
+  - id: local-hbase
+    quorum: 127.0.0.1
+    client_port: 2181
+    namespace: etcd_candidate
+    authentication_mode: DEV_NO_AUTH
+salt_profiles:
+  - id: crc32-four-buckets
+    strategy_id: crc32-bucket-v1
+    encoding_version: 1
+    bucket_count: 4
+    salt_width_bytes: 1
+    split_keys_hex: ["01", "02", "03"]
+table_groups:
+  - id: local
+    schema_version: 1
+    hbase_profile_id: local-hbase
+    salt_profile_id: crc32-four-buckets
+    identity_provider_id: dev-no-auth
+    history_layout: UNDECIDED
+resources:
+  max_config_bytes: 65536
+  max_concurrent_requests: 100
+  max_scanners_per_table: 32
+  max_request_bytes: 4194304
