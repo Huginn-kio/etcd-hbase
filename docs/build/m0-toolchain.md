@@ -25,7 +25,7 @@ Maven 运行进程和 Maven compiler/test toolchain 都检查 Java 21。版本�
 
 Maven 插件、gRPC、Protobuf/protoc、Guava、SLF4J、Hadoop、HBase、JSON/YAML 与测试库采用锁文件中的精确版本。gRPC 与 Protobuf 使用各自同一发布线的版本；protoc 及 protoc-gen-grpc-java 由 Maven 插件按平台 classifier 获取。服务传输使用 `grpc-netty-shaded`，其 Netty 实现随 gRPC 版本固定并保持 relocation，不在模块间暴露 Netty 包。
 
-Go testkit 的编译器和 etcd client module 版本也记录在锁文件中；对应 Go 源码和互通检查属于后续工作包，本层不声明已验证 Go/Java 互通。
+Go testkit 使用 Go 1.27.2；macOS arm64、Linux x64 和 Windows x64 归档摘要及 etcd client v3.5.23 的 module sums 记录在锁文件中。对应 Go 源码和互通检查属于后续工作包，本层不声明已验证 Go/Java 互通。
 
 ## HBase 候选与目标兼容性
 
@@ -44,3 +44,4 @@ Go testkit 的编译器和 etcd client module 版本也记录在锁文件中；�
 - [Apache HBase Java 支持矩阵](https://hbase.apache.org/docs/configuration/basic-prerequisites/)
 - [Apache HBase 发布下载页](https://hbase.apache.org/downloads/)
 - [Go 官方发布历史](https://go.dev/doc/devel/release)
+- [Go 官方下载与校验和](https://go.dev/dl/)
