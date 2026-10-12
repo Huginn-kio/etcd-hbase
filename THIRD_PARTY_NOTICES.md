@@ -20,7 +20,7 @@
 | Kubernetes sigs YAML | 1.2.0 | [MIT License](https://github.com/kubernetes-sigs/yaml/blob/v1.2.0/LICENSE) |
 | Google API proto imports | pinned commit in protocol source lock | [Apache License 2.0](https://github.com/googleapis/googleapis/blob/34bb7a118468a6ec56deb31842525971e41be2ac/LICENSE) |
 | Guava | 33.7.2-jre | [Apache License 2.0](https://github.com/google/guava/blob/master/COPYING) |
-| SLF4J | 2.0.20 | [MIT License](https://www.slf4j.org/license.html) |
+| SLF4J API / reload4j binding | 2.0.20 | [MIT License](https://www.slf4j.org/license.html) |
 | Jackson / SnakeYAML | 2.22.3 / 2.7 | [Apache License 2.0](https://github.com/FasterXML/jackson/blob/2.22/LICENSE) / [Apache License 2.0](https://bitbucket.org/snakeyaml/snakeyaml/src/master/LICENSE.txt) |
 | JUnit / Mockito / AssertJ | 6.1.3 / 5.24.0 / 3.27.7 | [EPL 2.0](https://github.com/junit-team/junit5/blob/main/LICENSE.md) / [MIT](https://github.com/mockito/mockito/blob/main/LICENSE) / [Apache 2.0](https://github.com/assertj/assertj/blob/main/LICENSE) |
 

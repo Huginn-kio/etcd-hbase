@@ -159,6 +159,11 @@
       "coordinate": "org.slf4j:slf4j-api:2.0.20",
       "repository": "https://repo.maven.apache.org/maven2",
       "sha256": "7e1446499b359675d8aabe6af2de86b85e72ae8a2a932c0b40d0e5ba57097439",
+      "reload4jBinding": {
+        "coordinate": "org.slf4j:slf4j-reload4j:2.0.20",
+        "repository": "https://repo.maven.apache.org/maven2",
+        "sha256": "194277130731fe0ef2a7237759f31a71dc62c116aa4fce26effeb371576ee85b"
+      },
       "reason": "Public logging API; no credentials or key material may be logged."
     },
     "convergenceOverrides": {
