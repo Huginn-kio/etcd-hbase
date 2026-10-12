@@ -110,7 +110,8 @@ class RuntimeConfigurationLoaderTest {
             .replace(
                 "authentication_mode: DEV_NO_AUTH",
                 "authentication_mode: CREDENTIAL_REFERENCE\n"
-                    + "    credential_reference: env://HBASE_CREDENTIALS");
+                    + "    credential_reference: env://HBASE_CREDENTIALS")
+            .replace("identity_provider_id: dev-no-auth", "identity_provider_id: backend-hbase");
 
     RuntimeConfiguration configuration = loader.load(bytes(securedYaml));
 
@@ -146,6 +147,25 @@ class RuntimeConfigurationLoaderTest {
         VALID_YAML.replace(
             "authentication_mode: DEV_NO_AUTH", "authentication_mode: CREDENTIAL_REFERENCE"),
         "credential_reference",
+        null);
+  }
+
+  @Test
+  void rejectsMismatchedAuthenticationModeAndIdentityProvider() {
+    assertRejected(
+        VALID_YAML.replace(
+            "identity_provider_id: dev-no-auth", "identity_provider_id: backend-hbase"),
+        "table_groups[0].identity_provider_id",
+        null);
+
+    String credentialProfile =
+        VALID_YAML.replace(
+            "authentication_mode: DEV_NO_AUTH",
+            "authentication_mode: CREDENTIAL_REFERENCE\n"
+                + "    credential_reference: env://HBASE_CREDENTIALS");
+    assertRejected(
+        credentialProfile,
+        "table_groups[0].identity_provider_id",
         null);
   }
 
@@ -189,7 +209,8 @@ class RuntimeConfigurationLoaderTest {
         VALID_YAML.replace(
             "authentication_mode: DEV_NO_AUTH",
             "authentication_mode: CREDENTIAL_REFERENCE\n"
-                + "    credential_reference: env://HBASE_CREDENTIALS");
+                + "    credential_reference: env://HBASE_CREDENTIALS")
+            .replace("identity_provider_id: dev-no-auth", "identity_provider_id: backend-hbase");
     assertRejected(
         secured.replace("127.0.0.1", "service.example").replace("port: 2379", "port: 0"),
         "port 0 requires a loopback listener",
@@ -400,7 +421,8 @@ class RuntimeConfigurationLoaderTest {
         VALID_YAML.replace(
             "authentication_mode: DEV_NO_AUTH",
             "authentication_mode: CREDENTIAL_REFERENCE\n"
-                + "    credential_reference: env://HBASE_CREDENTIALS");
+                + "    credential_reference: env://HBASE_CREDENTIALS")
+            .replace("identity_provider_id: dev-no-auth", "identity_provider_id: backend-hbase");
     String wildcardConflict =
         secured.replace(
             "    table_group_id: local\nhbase_profiles:",

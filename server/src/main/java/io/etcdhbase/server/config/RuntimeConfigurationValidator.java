@@ -9,6 +9,7 @@ import io.etcdhbase.server.config.RuntimeConfiguration.KeepDeletedCells;
 import io.etcdhbase.server.config.RuntimeConfiguration.RecordCategory;
 import io.etcdhbase.server.config.RuntimeConfiguration.TablePermission;
 import io.etcdhbase.server.config.RuntimeConfiguration.TableSchemaCandidate;
+import io.etcdhbase.spi.identity.BackendIdentityProvider;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
 import java.util.ArrayList;
@@ -222,11 +223,24 @@ final class RuntimeConfigurationValidator {
       }
       requireSupportedId(
           group.identityProviderId(), supportedProviderIds, path + ".identity_provider_id");
+      RuntimeConfiguration.HBaseProfile hbaseProfile = hbaseProfiles.get(group.hbaseProfileId());
+      boolean developmentProvider =
+          BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID
+              .equals(group.identityProviderId());
+      if (hbaseProfile.authenticationMode() == AuthenticationMode.DEV_NO_AUTH
+          && !developmentProvider) {
+        throw invalid(
+            path + ".identity_provider_id", "DEV_NO_AUTH requires the dev-no-auth provider");
+      }
+      if (hbaseProfile.authenticationMode() == AuthenticationMode.CREDENTIAL_REFERENCE
+          && developmentProvider) {
+        throw invalid(
+            path + ".identity_provider_id", "dev-no-auth cannot use a credential reference");
+      }
       if (group.historyLayout() == null) {
         throw invalid(path + ".history_layout", "is required");
       }
       validateTableGroupSchemas(group, saltProfiles.get(group.saltProfileId()), path);
-      RuntimeConfiguration.HBaseProfile hbaseProfile = hbaseProfiles.get(group.hbaseProfileId());
       Set<String> backendTableNames =
           tableNamesByBackend.computeIfAbsent(backendScope(hbaseProfile), ignored -> new HashSet<>());
       for (String tableName : tableNames(group)) {

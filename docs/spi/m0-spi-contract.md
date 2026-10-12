@@ -17,13 +17,15 @@
 
 ## 后端身份
 
-`BackendIdentityProvider` 按显式 `providerId()` 选择。`authenticate` 接收凭据和 `BackendIdentityRequest`，必须验证其访问指定 `tableGroupId` 的能力后才返回身份。身份的 `providerId`、principal 和 table group 需要与请求及配置一致。
+`BackendIdentityProvider` 按显式 `providerId()` 选择，并由 server 统一关闭。`authenticate` 接收 `BackendCredentials` 和 `AuthenticationScope`，以 `CompletionStage` 返回 `AuthorizedBackendIdentity`。提供者必须验证请求的表组权限；失败使用稳定的 `BackendIdentityException.Reason`，不能把权限不足降级成匿名访问。
 
-当前 M0 的 `authenticate` 是同步调用；实现可能因后端认证 I/O 阻塞。RPC/event-loop 调用方必须通过有界 executor 调用可能阻塞的 provider，不能在传输线程上等待认证。Provider 实例可能被并发复用，实现必须保证并发调用安全。
+`AuthorizedBackendIdentity` 包含显式 provider ID、subject、opaque context reference、不可变的允许表组集合、请求 scope 和 `credentialGeneration`。允许表组必须包含请求表组。provider 轮换身份凭据时必须递增 generation，使连接管理器不复用旧凭据代次的连接。身份 DTO 的 `toString()` 不暴露 subject 或 context reference。该身份只表示后端授权上下文，不创建、验证或替代 etcd token、lease 或 session。
 
-实现返回的 `BackendIdentity` 可以代表 provider 管理的上下文，但 accessors 和 `toString()` 不得暴露密码、token 或其他秘密。调用方只能在对应请求范围内持有该句柄，请求结束后丢弃；provider 保有底层上下文所有权。当前 SPI 尚无逐句柄释放回调或 provider shutdown hook，因此在补齐生命周期与清理契约前，不添加持有长期状态的生产 provider。身份 SPI 不创建、验证或替代 etcd token、lease 或 session。
+`authenticate` 必须尽快返回 `CompletionStage`，不能在 RPC/event-loop 线程上等待后端 I/O。需要阻塞式认证 I/O 的 provider 应使用有界、由 provider 管理的 executor。provider 实例可能被并发复用，必须保证并发调用安全。提供者验证权限失败时须用稳定的 `BackendIdentityException.Reason` 分类，不得降级为匿名访问，也不得在日志或异常信息中暴露凭据。
 
-`BackendCredentials` 接收并防御性复制 `char[]` 密钥；provider 取用副本后负责清零，并由所有者关闭原对象。`toString()` 必须保持脱敏。配置只接受受控 `env://` 或 `secret://` 引用，不嵌入凭据值。
+若异步认证需要在 `authenticate` 返回后继续使用密码，provider 必须在返回前复制 `char[]`，并在用完后清零；调用方在认证 stage 完成后关闭原始 `BackendCredentials`。provider 拥有 `contextRef` 指向的上下文和自身创建的资源。身份及上下文只能由其授权会话持有者在会话有效期内使用，不得超过该会话的生命周期。当前 SPI 尚无逐身份释放回调；provider 必须对自身上下文状态设置有界容量或过期回收策略，并在 `close()` 时停止接受新认证、清理未完成工作及释放全部 provider 资源。未来会话层须明确身份释放与会话失效的衔接。身份 SPI 不创建、验证或替代 etcd token、lease 或 session。
+
+`BackendCredentials` 接收并防御性复制 `char[]` 密钥；异步 provider 必须在 `authenticate` 返回前复制需要的密钥，并在用完后清零；调用方在身份验证完成后关闭原对象。`toString()` 保持脱敏。配置只接受受控 `env://` 或 `secret://` 引用，不嵌入凭据值。
 
 认证失败使用 `BackendIdentityException.Reason` 区分凭据拒绝、权限不足和后端不可用。实现不得将秘密写入日志或异常消息，也不得把权限不足降级成匿名访问。
 
