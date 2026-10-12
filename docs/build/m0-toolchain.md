@@ -23,7 +23,7 @@ Maven 运行进程和 Maven compiler/test toolchain 都检查 Java 21。版本�
 
 ## 插件和运行库
 
-Maven 插件、gRPC、Protobuf/protoc、Netty、Guava、SLF4J、Hadoop、HBase、JSON/YAML 与测试库采用锁文件中的精确版本。gRPC 与 Protobuf 使用各自同一发布线的版本；protoc 及 protoc-gen-grpc-java 由 Maven 插件按平台 classifier 获取。默认服务传输使用 `grpc-netty-shaded`，隔离 gRPC 与 Hadoop/HBase 的 Netty 类路径。
+Maven 插件、gRPC、Protobuf/protoc、Guava、SLF4J、Hadoop、HBase、JSON/YAML 与测试库采用锁文件中的精确版本。gRPC 与 Protobuf 使用各自同一发布线的版本；protoc 及 protoc-gen-grpc-java 由 Maven 插件按平台 classifier 获取。服务传输使用 `grpc-netty-shaded`，其 Netty 实现随 gRPC 版本固定并保持 relocation，不在模块间暴露 Netty 包。
 
 Go testkit 的编译器和 etcd client module 版本也记录在锁文件中；对应 Go 源码和互通检查属于后续工作包，本层不声明已验证 Go/Java 互通。
 

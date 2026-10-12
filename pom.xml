@@ -32,7 +32,6 @@
     <protobuf.version>4.36.2</protobuf.version>
     <hbase.version>2.6.6-hadoop3</hbase.version>
     <hadoop.version>3.4.3</hadoop.version>
-    <hbase.shaded.netty.version>4.1.13</hbase.shaded.netty.version>
     <guava.version>33.7.2-jre</guava.version>
     <slf4j.version>2.0.20</slf4j.version>
     <jackson.version>2.22.3</jackson.version>
@@ -77,11 +76,6 @@
         <groupId>org.apache.hbase</groupId>
         <artifactId>hbase-shaded-client-byo-hadoop</artifactId>
         <version>${hbase.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>org.apache.hbase.thirdparty</groupId>
-        <artifactId>hbase-shaded-netty</artifactId>
-        <version>${hbase.shaded.netty.version}</version>
       </dependency>
       <dependency>
         <groupId>org.apache.hadoop</groupId>
@@ -283,6 +277,22 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-enforcer-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

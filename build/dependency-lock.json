@@ -54,14 +54,9 @@
       "sha256": "73cc542694c25555b026a41c91f6192863afee18de947551f6225acfe23faf7a",
       "reason": "Matches the HBase 2.6.6 Hadoop 3 client build."
     },
-    "hbaseShadedNetty": {
-      "coordinate": "org.apache.hbase.thirdparty:hbase-shaded-netty:4.1.13",
-      "repository": "https://repo.maven.apache.org/maven2",
-      "sha256": "dfe5ef4cbb81b7e3a74bc7868e94cf98401cbbfe814960a8045d53150579f95d",
-      "reason": "HBase relocated Netty implementation; does not leak Netty packages into the generic SPI."
-    },
     "grpc": {
       "bom": "io.grpc:grpc-bom:1.84.1",
+      "embeddedNettyVersion": "4.2.16.Final",
       "artifacts": {
         "grpc-netty-shaded": "ea5087ea5e63f36571a6a82c73e824a0d24634218dde8dd88b0cedbce67b9c5a",
         "grpc-protobuf": "bc9b0d511eba849d85a80bd35590d2981fc9f0db7a687b79e1851a8e7dc2d34d",
@@ -149,6 +144,20 @@
         "linux-x86_64": "com.google.protobuf:protoc:exe:linux-x86_64",
         "macos-aarch_64": "com.google.protobuf:protoc:exe:osx-aarch_64"
       }
+    },
+    "protocGenGrpcJava": {
+      "version": "1.84.1",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "platformArtifacts": {
+        "linux-x86_64": {
+          "coordinate": "io.grpc:protoc-gen-grpc-java:exe:linux-x86_64",
+          "sha256": "1aae91278f0d8187641862710748df2c163582d7df0a177e549f7d8238a9a3fe"
+        },
+        "macos-aarch_64": {
+          "coordinate": "io.grpc:protoc-gen-grpc-java:exe:osx-aarch_64",
+          "sha256": "89e57db4182cac68540ec0da49962649b4e3e7eede383ec92231e2cba68e0d65"
+        }
+      }
     }
   },
   "hbase": {
@@ -177,9 +186,12 @@
     "https://maven.apache.org/tools/wrapper/maven-wrapper-plugin/wrapper-mojo.html",
     "https://maven.apache.org/plugins/index.html",
     "https://github.com/grpc/grpc-java",
+    "https://github.com/grpc/grpc-java/releases/tag/v1.84.0",
     "https://protobuf.dev/support/version-support/",
     "https://hbase.apache.org/docs/configuration/basic-prerequisites/",
     "https://hbase.apache.org/downloads/",
+    "https://repo.maven.apache.org/maven2/org/apache/hbase/hbase-shaded-client-byo-hadoop/2.6.6-hadoop3/hbase-shaded-client-byo-hadoop-2.6.6-hadoop3.pom",
+    "https://repo.maven.apache.org/maven2/org/apache/hadoop/hadoop-common/3.4.3/hadoop-common-3.4.3.pom",
     "https://go.dev/doc/devel/release"
   ]
 }
