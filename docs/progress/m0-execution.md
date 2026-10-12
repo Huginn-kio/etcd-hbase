@@ -11,7 +11,7 @@
 
 | 层 | 工作包 | 分支 | 状态 |
 |---:|---|---|---|
-| 1/10 | WP00、WP01、WP05 | `codex/m0-01-foundation` | 本地验证完成，待创建 PR |
+| 1/10 | WP00、WP01、WP05 | `codex/m0-01-foundation` | PR #4 open，已请求评审 |
 | 2/10 | WP02–WP04 | `codex/m0-02-toolchain` | 未开始 |
 | 3/10 | WP09–WP10 | `codex/m0-03-protocol-generation` | 未开始 |
 | 4/10 | WP06–WP08、WP13 | `codex/m0-04-spi-config` | 未开始 |
@@ -26,9 +26,9 @@ PR 栈的第一层以 `main` 为基线；后续层逐层基于前一层。每层
 
 ## 当前进度
 
-- 当前层：1/10。WP00、WP01、WP05 已完成本地交付和验证，准备提交首个实现 PR。
+- 当前层：1/10。WP00、WP01、WP05 已完成本地交付和验证；PR #4 已向 `main` 提交，并已请求维护者评审。
 - 已验证报告：`docs/reports/m0/20261012T061144Z-f0b05ae/WP00.md`、`WP01.md`、`WP05.md`。
-- 下一工作包：创建第一层 PR 并请求评审；随后进入 WP02–WP04，固定公开 Java 21、Maven Wrapper、Protobuf/gRPC 和构建依赖。目标 HBase 组合继续等待 B02。
+- 下一工作包：在 PR #4 基础上进入 WP02–WP04，固定公开 Java 21、Maven Wrapper、Protobuf/gRPC 和构建依赖；目标 HBase 组合继续等待 B02。评审意见到达后在本层处理并更新验证记录。
 - 未决输入：B01–B06、I07、I08；具体事实、责任角色和解除动作见 `docs/inputs/m0-inputs.yaml`。
 - 最近失败：none。
 
