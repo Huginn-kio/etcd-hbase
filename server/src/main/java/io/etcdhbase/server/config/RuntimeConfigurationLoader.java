@@ -19,6 +19,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.function.Supplier;
 import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.SafeConstructor;
@@ -29,12 +31,26 @@ import org.yaml.snakeyaml.error.YAMLException;
 public final class RuntimeConfigurationLoader {
   public static final int ABSOLUTE_MAX_CONFIG_BYTES = 64 * 1024;
   private static final int MAX_YAML_NESTING = 32;
+  private static final String ENVIRONMENT_PREFIX = "ETCD_HBASE_";
+  private static final Map<String, EnvironmentOverride> ENVIRONMENT_OVERRIDES = environmentOverrides();
   private final RuntimeConfigurationValidator validator;
   private final ObjectMapper objectMapper;
+  private final Supplier<Map<String, String>> environmentSupplier;
 
   public RuntimeConfigurationLoader(
       Set<String> supportedProviderIds, Set<String> supportedSaltStrategyIds) {
+    this(supportedProviderIds, supportedSaltStrategyIds, System::getenv);
+  }
+
+  RuntimeConfigurationLoader(
+      Set<String> supportedProviderIds,
+      Set<String> supportedSaltStrategyIds,
+      Supplier<Map<String, String>> environmentSupplier) {
     this.validator = new RuntimeConfigurationValidator(supportedProviderIds, supportedSaltStrategyIds);
+    if (environmentSupplier == null) {
+      throw new IllegalArgumentException("environment supplier is required");
+    }
+    this.environmentSupplier = environmentSupplier;
     this.objectMapper =
         JsonMapper.builder()
             .propertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
@@ -45,6 +61,11 @@ public final class RuntimeConfigurationLoader {
 
   /** Reads up to the hard limit plus one byte. The caller retains ownership of the stream. */
   public RuntimeConfiguration load(InputStream input) {
+    return load(input, environmentSupplier.get());
+  }
+
+  /** Reads one configuration and applies only the documented environment overrides. */
+  public RuntimeConfiguration load(InputStream input, Map<String, String> environment) {
     if (input == null) {
       throw invalid("configuration", "input is required");
     }
@@ -53,7 +74,7 @@ public final class RuntimeConfigurationLoader {
       if (bytes.length > ABSOLUTE_MAX_CONFIG_BYTES) {
         throw invalid("configuration", "exceeds the 65536-byte limit");
       }
-      return load(bytes);
+      return load(bytes, environment);
     } catch (IOException exception) {
       throw invalid("configuration", "could not be read");
     }
@@ -61,6 +82,11 @@ public final class RuntimeConfigurationLoader {
 
   /** Parses and validates one UTF-8 YAML document. */
   public RuntimeConfiguration load(byte[] input) {
+    return load(input, environmentSupplier.get());
+  }
+
+  /** Parses YAML, overlays documented environment values, then applies the shared validator. */
+  public RuntimeConfiguration load(byte[] input, Map<String, String> environment) {
     if (input == null) {
       throw invalid("configuration", "input is required");
     }
@@ -78,8 +104,9 @@ public final class RuntimeConfigurationLoader {
     }
 
     Object safeTree = validateYamlTree(rawRoot, "configuration", 0);
-    RuntimeConfiguration configuration = bind(safeTree);
-    validator.validate(configuration, input.length);
+    EnvironmentResult effective = applyEnvironmentOverrides(safeTree, input.length, environment);
+    RuntimeConfiguration configuration = bind(effective.tree());
+    validator.validate(configuration, effective.byteCount());
     return configuration;
   }
 
@@ -132,7 +159,10 @@ public final class RuntimeConfigurationLoader {
     if (depth > MAX_YAML_NESTING) {
       throw invalid(path, "exceeds the nesting limit");
     }
-    if (value == null || value instanceof String || value instanceof Boolean || value instanceof Number) {
+    if (value == null) {
+      throw invalid(path, "must not be null");
+    }
+    if (value instanceof String || value instanceof Boolean || value instanceof Number) {
       return value;
     }
     if (value instanceof List<?> list) {
@@ -156,6 +186,188 @@ public final class RuntimeConfigurationLoader {
       return Collections.unmodifiableMap(copy);
     }
     throw invalid(path, "contains an unsupported YAML value");
+  }
+
+  private static EnvironmentResult applyEnvironmentOverrides(
+      Object safeTree, int fileByteCount, Map<String, String> environment) {
+    if (environment == null) {
+      throw invalid("environment", "map is required");
+    }
+    Map<String, String> selected = new TreeMap<>();
+    for (Map.Entry<String, String> entry : environment.entrySet()) {
+      String name = entry.getKey();
+      if (name == null) {
+        throw invalid("environment", "contains an invalid variable name");
+      }
+      if (!name.startsWith(ENVIRONMENT_PREFIX)) {
+        continue;
+      }
+      if (!ENVIRONMENT_OVERRIDES.containsKey(name)) {
+        throw invalid("environment", "contains an unsupported ETCD_HBASE_ override");
+      }
+      selected.put(name, entry.getValue());
+    }
+
+    Map<String, Object> effectiveTree = mutableMap(mutableCopy(safeTree));
+    long effectiveBytes = fileByteCount;
+    for (Map.Entry<String, String> entry : selected.entrySet()) {
+      EnvironmentOverride override = ENVIRONMENT_OVERRIDES.get(entry.getKey());
+      String value = entry.getValue();
+      if (value == null) {
+        throw invalid(override.path(), "environment override must not be null");
+      }
+      if (value.length() > ABSOLUTE_MAX_CONFIG_BYTES) {
+        throw invalid("configuration", "file and environment overrides exceed the 65536-byte limit");
+      }
+      effectiveBytes +=
+          entry.getKey().getBytes(StandardCharsets.UTF_8).length
+              + (long) value.getBytes(StandardCharsets.UTF_8).length
+              + 2;
+      if (effectiveBytes > ABSOLUTE_MAX_CONFIG_BYTES) {
+        throw invalid("configuration", "file and environment overrides exceed the 65536-byte limit");
+      }
+      Object parsedValue = parseEnvironmentValue(value, override);
+      setOverride(effectiveTree, override, parsedValue);
+    }
+    return new EnvironmentResult(effectiveTree, (int) effectiveBytes);
+  }
+
+  private static Object parseEnvironmentValue(String value, EnvironmentOverride override) {
+    if (override.valueType() == EnvironmentValueType.STRING) {
+      return value;
+    }
+    if (!value.matches("-?[0-9]+")) {
+      throw invalid(override.path(), "environment override must be a decimal integer");
+    }
+    try {
+      if (override.valueType() == EnvironmentValueType.INTEGER) {
+        return Integer.valueOf(value);
+      }
+      return Long.valueOf(value);
+    } catch (NumberFormatException exception) {
+      throw invalid(override.path(), "environment override is outside the supported range");
+    }
+  }
+
+  private static void setOverride(
+      Map<String, Object> root, EnvironmentOverride override, Object value) {
+    Object parent = root;
+    List<String> segments = override.segments();
+    for (int index = 0; index < segments.size() - 1; index++) {
+      parent = child(parent, segments.get(index), override.path());
+      if (parent == null) {
+        throw invalid(override.path(), "cannot be overridden because its configuration section is missing");
+      }
+    }
+    if (!(parent instanceof Map<?, ?>)) {
+      throw invalid(override.path(), "cannot be overridden because its configuration section is invalid");
+    }
+    Map<String, Object> parentMap = mutableMap(parent);
+    String field = segments.getLast();
+    if (!parentMap.containsKey(field)) {
+      throw invalid(override.path(), "cannot be overridden because the field is missing from the file");
+    }
+    parentMap.put(field, value);
+  }
+
+  private static Object child(Object parent, String segment, String path) {
+    if (parent instanceof Map<?, ?> map) {
+      return map.get(segment);
+    }
+    if (parent instanceof List<?> list) {
+      try {
+        int index = Integer.parseInt(segment);
+        return index >= 0 && index < list.size() ? list.get(index) : null;
+      } catch (NumberFormatException exception) {
+        throw invalid(path, "contains an invalid collection path");
+      }
+    }
+    throw invalid(path, "cannot be overridden because its configuration section is invalid");
+  }
+
+  private static Object mutableCopy(Object value) {
+    if (value instanceof Map<?, ?> map) {
+      Map<String, Object> copy = new LinkedHashMap<>();
+      for (Map.Entry<?, ?> entry : map.entrySet()) {
+        copy.put((String) entry.getKey(), mutableCopy(entry.getValue()));
+      }
+      return copy;
+    }
+    if (value instanceof List<?> list) {
+      List<Object> copy = new ArrayList<>(list.size());
+      for (Object item : list) {
+        copy.add(mutableCopy(item));
+      }
+      return copy;
+    }
+    return value;
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> mutableMap(Object value) {
+    return (Map<String, Object>) value;
+  }
+
+  private static Map<String, EnvironmentOverride> environmentOverrides() {
+    return Map.ofEntries(
+        Map.entry(
+            "ETCD_HBASE_LISTENER_BIND_HOST",
+            new EnvironmentOverride(
+                "listeners[0].bind_host",
+                List.of("listeners", "0", "bind_host"),
+                EnvironmentValueType.STRING)),
+        Map.entry(
+            "ETCD_HBASE_LISTENER_PORT",
+            new EnvironmentOverride(
+                "listeners[0].port", List.of("listeners", "0", "port"), EnvironmentValueType.INTEGER)),
+        Map.entry(
+            "ETCD_HBASE_LISTENER_TABLE_GROUP_ID",
+            new EnvironmentOverride(
+                "listeners[0].table_group_id",
+                List.of("listeners", "0", "table_group_id"),
+                EnvironmentValueType.STRING)),
+        Map.entry(
+            "ETCD_HBASE_MAX_CONFIG_BYTES",
+            new EnvironmentOverride(
+                "resources.max_config_bytes",
+                List.of("resources", "max_config_bytes"),
+                EnvironmentValueType.INTEGER)),
+        Map.entry(
+            "ETCD_HBASE_MAX_CONCURRENT_REQUESTS",
+            new EnvironmentOverride(
+                "resources.max_concurrent_requests",
+                List.of("resources", "max_concurrent_requests"),
+                EnvironmentValueType.INTEGER)),
+        Map.entry(
+            "ETCD_HBASE_MAX_SCANNERS_PER_TABLE",
+            new EnvironmentOverride(
+                "resources.max_scanners_per_table",
+                List.of("resources", "max_scanners_per_table"),
+                EnvironmentValueType.INTEGER)),
+        Map.entry(
+            "ETCD_HBASE_REQUEST_DEADLINE_MS",
+            new EnvironmentOverride(
+                "resources.request_deadline_ms",
+                List.of("resources", "request_deadline_ms"),
+                EnvironmentValueType.INTEGER)),
+        Map.entry(
+            "ETCD_HBASE_MAX_RPC_BYTES",
+            new EnvironmentOverride(
+                "resources.max_rpc_bytes",
+                List.of("resources", "max_rpc_bytes"),
+                EnvironmentValueType.LONG)),
+        Map.entry(
+            "ETCD_HBASE_MAX_REQUEST_BYTES",
+            new EnvironmentOverride(
+                "resources.max_request_bytes",
+                List.of("resources", "max_request_bytes"),
+                EnvironmentValueType.LONG)),
+        Map.entry(
+            "ETCD_HBASE_MAX_QUEUED_REQUESTS",
+            new EnvironmentOverride(
+                "resources.max_queued_requests",
+                List.of("resources", "max_queued_requests"),
+                EnvironmentValueType.INTEGER)));
   }
 
   private RuntimeConfiguration bind(Object safeTree) {
@@ -209,4 +421,19 @@ public final class RuntimeConfigurationLoader {
   private static RuntimeConfigurationException invalid(String path, String problem) {
     return new RuntimeConfigurationException(path + " " + problem);
   }
+
+  private enum EnvironmentValueType {
+    STRING,
+    INTEGER,
+    LONG
+  }
+
+  private record EnvironmentOverride(
+      String path, List<String> segments, EnvironmentValueType valueType) {
+    private EnvironmentOverride {
+      segments = List.copyOf(segments);
+    }
+  }
+
+  private record EnvironmentResult(Object tree, int byteCount) {}
 }

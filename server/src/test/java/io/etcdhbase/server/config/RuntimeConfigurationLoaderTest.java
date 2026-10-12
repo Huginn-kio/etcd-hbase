@@ -11,48 +11,20 @@ import io.etcdhbase.server.config.RuntimeConfiguration.AuthenticationMode;
 import io.etcdhbase.server.config.RuntimeConfiguration.HistoryLayout;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 class RuntimeConfigurationLoaderTest {
-  private static final String VALID_YAML =
-      """
-      schema_version: 1
-      listeners:
-        - id: local-etcd
-          bind_host: 127.0.0.1
-          port: 2379
-          table_group_id: local
-      hbase_profiles:
-        - id: local-hbase
-          quorum: 127.0.0.1
-          client_port: 2181
-          namespace: etcd_candidate
-          authentication_mode: DEV_NO_AUTH
-      salt_profiles:
-        - id: crc32-four-buckets
-          strategy_id: crc32-bucket-v1
-          encoding_version: 1
-          bucket_count: 4
-          salt_width_bytes: 1
-          split_keys_hex: ["01", "02", "03"]
-      table_groups:
-        - id: local
-          schema_version: 1
-          hbase_profile_id: local-hbase
-          salt_profile_id: crc32-four-buckets
-          identity_provider_id: dev-no-auth
-          history_layout: UNDECIDED
-      resources:
-        max_config_bytes: 65536
-        max_concurrent_requests: 100
-        max_scanners_per_table: 32
-        max_request_bytes: 4194304
-      """;
+  private static final String VALID_YAML = readCandidateYaml();
 
   private final RuntimeConfigurationLoader loader =
-      new RuntimeConfigurationLoader(Set.of("dev-no-auth", "backend-hbase"), Set.of("crc32-bucket-v1"));
+      new RuntimeConfigurationLoader(
+          Set.of("dev-no-auth", "backend-hbase"), Set.of("crc32-bucket-v1"), Map::of);
 
   @Test
   void loadsCandidateAndRetainsUnresolvedHistoryLayout() {
@@ -63,8 +35,29 @@ class RuntimeConfigurationLoaderTest {
     assertEquals(
         AuthenticationMode.DEV_NO_AUTH,
         configuration.hbaseProfiles().getFirst().authenticationMode());
-    assertEquals(HistoryLayout.UNDECIDED, configuration.tableGroups().getFirst().historyLayout());
-    assertEquals(4, configuration.saltProfiles().getFirst().bucketCount());
+    var tableGroup = configuration.tableGroups().getFirst();
+    assertEquals(HistoryLayout.UNDECIDED, tableGroup.historyLayout());
+    assertEquals("system", tableGroup.systemTable().tableName());
+    assertEquals(2, tableGroup.historyCandidates().size());
+    var separateHistory = tableGroup.historyCandidates().getFirst();
+    assertEquals(HistoryLayout.SEPARATE_HISTORY_TABLE, separateHistory.historyLayout());
+    assertEquals(2, separateHistory.tables().size());
+    var historyTable =
+        separateHistory.tables().stream()
+            .filter(table -> table.recordCategories().contains(RuntimeConfiguration.RecordCategory.HISTORY))
+            .findFirst()
+            .orElseThrow();
+    assertEquals("history", historyTable.tableName());
+    assertEquals(1, historyTable.columnFamilies().getFirst().maxVersions());
+    var nativeVersions = tableGroup.historyCandidates().getLast();
+    assertEquals(HistoryLayout.NATIVE_CELL_VERSIONS, nativeVersions.historyLayout());
+    assertEquals(1, nativeVersions.tables().size());
+    assertEquals("kv", nativeVersions.tables().getFirst().tableName());
+    assertEquals(64, nativeVersions.tables().getFirst().columnFamilies().getFirst().maxVersions());
+    assertEquals(-1, nativeVersions.tables().getFirst().columnFamilies().getFirst().ttlSeconds());
+    assertEquals(15, nativeVersions.tables().getFirst().splitKeysHex().size());
+    assertEquals(2, nativeVersions.tables().getFirst().identityPermissions().size());
+    assertEquals(16, configuration.saltProfiles().getFirst().bucketCount());
     assertEquals(65536, configuration.resources().maxConfigBytes());
     assertThrows(
         UnsupportedOperationException.class,
@@ -76,6 +69,35 @@ class RuntimeConfigurationLoaderTest {
     try (var input = getClass().getResourceAsStream("/runtime-candidate.yaml")) {
       assertNotNull(input);
       assertEquals("local", loader.load(input).tableGroups().getFirst().id());
+    }
+  }
+
+  @Test
+  void loadsBothCheckedInHistoryLayoutExamples() throws IOException {
+    for (String example : List.of("history-table.yaml", "native-cell-versions.yaml")) {
+      try (var input = getClass().getResourceAsStream("/m0-examples/" + example)) {
+        assertNotNull(input, example);
+        var group = loader.load(input).tableGroups().getFirst();
+        HistoryLayout expectedLayout =
+            example.equals("history-table.yaml")
+                ? HistoryLayout.SEPARATE_HISTORY_TABLE
+                : HistoryLayout.NATIVE_CELL_VERSIONS;
+        assertEquals(expectedLayout, group.historyLayout(), example);
+      }
+    }
+  }
+
+  @Test
+  void loadsLoopbackRandomPortSkeletonWithExplicitDevelopmentAuthentication() throws IOException {
+    try (var input = getClass().getResourceAsStream("/m0-examples/server-skeleton.yaml")) {
+      assertNotNull(input);
+      RuntimeConfiguration configuration = loader.load(input);
+
+      assertEquals(0, configuration.listeners().getFirst().port());
+      assertEquals("127.0.0.1", configuration.listeners().getFirst().bindHost());
+      assertEquals(
+          AuthenticationMode.DEV_NO_AUTH,
+          configuration.hbaseProfiles().getFirst().authenticationMode());
     }
   }
 
@@ -95,8 +117,123 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void requiresCredentialReferenceWhenCredentialAuthenticationIsSelected() {
+    assertRejected(
+        VALID_YAML.replace("    authentication_mode: DEV_NO_AUTH\n", ""),
+        "authentication_mode",
+        null);
+    assertRejected(
+        VALID_YAML.replace(
+            "authentication_mode: DEV_NO_AUTH", "authentication_mode: CREDENTIAL_REFERENCE"),
+        "credential_reference",
+        null);
+  }
+
+  @Test
+  void rejectsNullCredentialReferenceEvenWhenDevelopmentAuthenticationIsSelected() {
+    assertRejected(
+        VALID_YAML.replace(
+            "authentication_mode: DEV_NO_AUTH",
+            "authentication_mode: DEV_NO_AUTH\n    credential_reference: null"),
+        "credential_reference",
+        null);
+  }
+
+  @Test
   void rejectsInvalidPortWithFieldPath() {
-    assertRejected(VALID_YAML.replace("port: 2379", "port: 0"), "listeners[0].port", null);
+    assertRejected(VALID_YAML.replace("port: 2379", "port: 65536"), "listeners[0].port", null);
+  }
+
+  @Test
+  void acceptsLoopbackRandomPortAndDoesNotTreatEphemeralPortsAsConflicts() {
+    String twoEphemeralListeners =
+        VALID_YAML.replace("port: 2379", "port: 0")
+            .replace(
+                "    table_group_id: local\nhbase_profiles:",
+                "    table_group_id: local\n"
+                    + "  - id: second-listener\n"
+                    + "    bind_host: 127.0.0.1\n"
+                    + "    port: 0\n"
+                    + "    table_group_id: local\n"
+                    + "hbase_profiles:");
+
+    RuntimeConfiguration configuration = loader.load(bytes(twoEphemeralListeners));
+
+    assertEquals(0, configuration.listeners().getFirst().port());
+    assertEquals(0, configuration.listeners().getLast().port());
+  }
+
+  @Test
+  void rejectsRandomPortForNonLoopbackListener() {
+    String secured =
+        VALID_YAML.replace(
+            "authentication_mode: DEV_NO_AUTH",
+            "authentication_mode: CREDENTIAL_REFERENCE\n"
+                + "    credential_reference: env://HBASE_CREDENTIALS");
+    assertRejected(
+        secured.replace("127.0.0.1", "service.example").replace("port: 2379", "port: 0"),
+        "port 0 requires a loopback listener",
+        null);
+  }
+
+  @Test
+  void appliesDocumentedEnvironmentOverridesAfterReadingTheFile() {
+    RuntimeConfiguration configuration =
+        loader.load(
+            bytes(VALID_YAML),
+            Map.of(
+                "ETCD_HBASE_LISTENER_PORT", "0",
+                "ETCD_HBASE_REQUEST_DEADLINE_MS", "9000",
+                "ETCD_HBASE_MAX_REQUEST_BYTES", "8388608",
+                "ETCD_HBASE_MAX_RPC_BYTES", "4194304"));
+
+    assertEquals(0, configuration.listeners().getFirst().port());
+    assertEquals(9000, configuration.resources().requestDeadlineMs());
+    assertEquals(8_388_608, configuration.resources().maxRequestBytes());
+    assertEquals(4_194_304, configuration.resources().maxRpcBytes());
+  }
+
+  @Test
+  void rejectsUnknownAndMalformedEnvironmentOverridesWithoutEchoingValues() {
+    String sentinel = "do-not-disclose-this-env-value";
+    RuntimeConfigurationException unknown =
+        assertThrows(
+            RuntimeConfigurationException.class,
+            () -> loader.load(bytes(VALID_YAML), Map.of("ETCD_HBASE_UNKNOWN_TOKEN", sentinel)));
+    assertTrue(unknown.getMessage().contains("unsupported ETCD_HBASE_ override"));
+    assertFalse(unknown.getMessage().contains(sentinel));
+    assertNull(unknown.getCause());
+
+    RuntimeConfigurationException malformed =
+        assertThrows(
+            RuntimeConfigurationException.class,
+            () -> loader.load(bytes(VALID_YAML), Map.of("ETCD_HBASE_LISTENER_PORT", sentinel)));
+    assertTrue(malformed.getMessage().contains("listeners[0].port"));
+    assertFalse(malformed.getMessage().contains(sentinel));
+    assertNull(malformed.getCause());
+  }
+
+  @Test
+  void boundsEffectiveFileAndEnvironmentConfigurationSize() {
+    RuntimeConfigurationException oversized =
+        assertThrows(
+            RuntimeConfigurationException.class,
+            () ->
+                loader.load(
+                    bytes(VALID_YAML),
+                    Map.of(
+                        "ETCD_HBASE_LISTENER_BIND_HOST",
+                        "x".repeat(RuntimeConfigurationLoader.ABSOLUTE_MAX_CONFIG_BYTES))));
+    assertTrue(oversized.getMessage().contains("file and environment overrides"));
+    assertFalse(oversized.getMessage().contains("x".repeat(64)));
+    assertNull(oversized.getCause());
+
+    RuntimeConfigurationException tooSmallBudget =
+        assertThrows(
+            RuntimeConfigurationException.class,
+            () -> loader.load(bytes(VALID_YAML), Map.of("ETCD_HBASE_MAX_CONFIG_BYTES", "1")));
+    assertTrue(tooSmallBudget.getMessage().contains("resources.max_config_bytes"));
+    assertNull(tooSmallBudget.getCause());
   }
 
   @Test
@@ -159,12 +296,108 @@ class RuntimeConfigurationLoaderTest {
   @Test
   void rejectsUnsortedAndIncorrectCrcSplitKeys() {
     assertRejected(
-        VALID_YAML.replace("[\"01\", \"02\", \"03\"]", "[\"02\", \"01\", \"03\"]"),
+        VALID_YAML.replace(
+            "[\"0001\", \"0002\", \"0003\", \"0004\", \"0005\", \"0006\", \"0007\", \"0008\", \"0009\", \"000a\", \"000b\", \"000c\", \"000d\", \"000e\", \"000f\"]",
+            "[\"0002\", \"0001\", \"0003\", \"0004\", \"0005\", \"0006\", \"0007\", \"0008\", \"0009\", \"000a\", \"000b\", \"000c\", \"000d\", \"000e\", \"000f\"]"),
         "split_keys_hex[1]",
         null);
     assertRejected(
-        VALID_YAML.replace("[\"01\", \"02\", \"03\"]", "[\"01\", \"02\", \"04\"]"),
-        "split_keys_hex[2]",
+        VALID_YAML.replace("\"000f\"]", "\"0010\"]"),
+        "split_keys_hex[14]",
+        null);
+
+    int systemTableStart = VALID_YAML.indexOf("system_table:");
+    int systemSplitKeysStart = VALID_YAML.indexOf("split_keys_hex:", systemTableStart);
+    String tableSplitMismatch =
+        VALID_YAML.substring(0, systemSplitKeysStart)
+            + VALID_YAML.substring(systemSplitKeysStart).replaceFirst("\"0001\"", "\"1234\"");
+    assertRejected(tableSplitMismatch, "system_table.split_keys_hex", null);
+    assertRejected(
+        VALID_YAML.replaceFirst("profile_version: 1", "profile_version: 2"),
+        "system_table.profile_version",
+        null);
+  }
+
+  @Test
+  void rejectsColumnFamilyVersionAndDeleteRetentionCombinationsThatCannotBeApplied() {
+    assertRejected(
+        VALID_YAML.replaceFirst("min_versions: 0", "min_versions: 2"),
+        "min_versions",
+        null);
+    assertRejected(
+        VALID_YAML.replaceFirst(
+            "keep_deleted_cells: \"TRUE\"",
+            "keep_deleted_cells: \"TTL\""),
+        "keep_deleted_cells",
+        null);
+    assertRejected(
+        VALID_YAML.replace("max_versions: 64", "max_versions: 1"),
+        "max_versions",
+        null);
+  }
+
+  @Test
+  void rejectsMinimumVersionsWithoutFiniteTtl() {
+    String invalidMinimumVersionPolicy =
+        VALID_YAML.replaceFirst("min_versions: 0", "min_versions: 1")
+            .replaceFirst("max_versions: 1", "max_versions: 2");
+
+    assertRejected(invalidMinimumVersionPolicy, "min_versions", null);
+  }
+
+  @Test
+  void rejectsHBaseReservedCandidateNames() {
+    assertRejected(VALID_YAML.replace("table_name: system", "table_name: zookeeper"), "table_name", null);
+    assertRejected(
+        VALID_YAML.replace("name: s", "name: recovered.edits"),
+        "column_families[0].name",
+        null);
+  }
+
+  @Test
+  void rejectsWallClockTtlForNativeRevisionVersions() {
+    int nativeCandidateStart = VALID_YAML.lastIndexOf("history_layout: NATIVE_CELL_VERSIONS");
+    String invalidNativeCandidate =
+        VALID_YAML.substring(0, nativeCandidateStart)
+            + VALID_YAML.substring(nativeCandidateStart).replaceFirst("ttl_seconds: -1", "ttl_seconds: 86400");
+    assertRejected(
+        invalidNativeCandidate,
+        "ttl_seconds",
+        null);
+  }
+
+  @Test
+  void rejectsDuplicateOrIncompleteHistoryCandidates() {
+    assertRejected(
+        VALID_YAML.replace(
+            "history_layout: NATIVE_CELL_VERSIONS",
+            "history_layout: SEPARATE_HISTORY_TABLE"),
+        "history_layout",
+        null);
+    int nativeCandidateStart = VALID_YAML.lastIndexOf("- history_layout: NATIVE_CELL_VERSIONS");
+    int candidateLineStart = VALID_YAML.lastIndexOf("\n", nativeCandidateStart) + 1;
+    int resourcesStart = VALID_YAML.indexOf("resources:", nativeCandidateStart);
+    String missingNativeCandidate =
+        VALID_YAML.substring(0, candidateLineStart) + VALID_YAML.substring(resourcesStart);
+    assertRejected(missingNativeCandidate, "history_candidates", null);
+    assertRejected(
+        VALID_YAML.replace("table_name: history", "table_name: system"),
+        "tables[1].table_name",
+        null);
+    int tableGroupsStart = VALID_YAML.indexOf("table_groups:");
+    int firstTableGroupStart = VALID_YAML.indexOf("  - id: local\n", tableGroupsStart);
+    int tableResourcesStart = VALID_YAML.indexOf("resources:\n", firstTableGroupStart);
+    String secondTableGroup =
+        VALID_YAML.substring(firstTableGroupStart, tableResourcesStart)
+            .replaceFirst("id: local", "id: other");
+    String duplicatePhysicalTables =
+        VALID_YAML.substring(0, tableResourcesStart)
+            + secondTableGroup
+            + VALID_YAML.substring(tableResourcesStart);
+    assertRejected(duplicatePhysicalTables, "table_groups[1].tables", null);
+    assertRejected(
+        VALID_YAML.replace("permissions: [READ, WRITE]", "permissions: []"),
+        "identity_permissions[0].permissions",
         null);
   }
 
@@ -227,6 +460,22 @@ class RuntimeConfigurationLoaderTest {
         "resources.max_scanners_per_table",
         null);
     assertRejected(
+        VALID_YAML.replace("request_deadline_ms: 5000", "request_deadline_ms: 0"),
+        "resources.request_deadline_ms",
+        null);
+    assertRejected(
+        VALID_YAML.replace("max_rpc_bytes: 4194304", "max_rpc_bytes: 0"),
+        "resources.max_rpc_bytes",
+        null);
+    assertRejected(
+        VALID_YAML.replace("max_rpc_bytes: 4194304", "max_rpc_bytes: 4194305"),
+        "must not exceed max_request_bytes",
+        null);
+    assertRejected(
+        VALID_YAML.replace("max_queued_requests: 1024", "max_queued_requests: 0"),
+        "resources.max_queued_requests",
+        null);
+    assertRejected(
         VALID_YAML.replace("127.0.0.1", "0.0.0.0"),
         "DEV_NO_AUTH requires a loopback listener",
         null);
@@ -267,6 +516,17 @@ class RuntimeConfigurationLoaderTest {
 
   private static byte[] bytes(String value) {
     return value.getBytes(StandardCharsets.UTF_8);
+  }
+
+  private static String readCandidateYaml() {
+    try (InputStream input = RuntimeConfigurationLoaderTest.class.getResourceAsStream("/runtime-candidate.yaml")) {
+      if (input == null) {
+        throw new IllegalStateException("runtime-candidate.yaml is missing from the test classpath");
+      }
+      return new String(input.readAllBytes(), StandardCharsets.UTF_8);
+    } catch (IOException exception) {
+      throw new UncheckedIOException(exception);
+    }
   }
 
   private static final class TrackingInputStream extends ByteArrayInputStream {

@@ -8,6 +8,18 @@
     <relativePath>../pom.xml</relativePath>
   </parent>
   <artifactId>server</artifactId>
+  <build>
+    <testResources>
+      <testResource>
+        <directory>${project.basedir}/../config/examples/m0</directory>
+        <targetPath>m0-examples</targetPath>
+      </testResource>
+      <testResource>
+        <directory>${project.basedir}/../config/schema</directory>
+        <targetPath>m0-schema</targetPath>
+      </testResource>
+    </testResources>
+  </build>
   <dependencies>
     <dependency>
       <groupId>io.etcdhbase</groupId>

@@ -1,8 +1,11 @@
 package io.etcdhbase.spi.salt;
 
-/** Immutable parameters that affect the persistent salt prefix format. */
-public record SaltParameters(int encodingVersion, int bucketCount, int saltWidthBytes) {
-  public SaltParameters {
+/** Immutable parameters that define a persistent salt prefix format. */
+public record SaltProfile(String strategyId, int encodingVersion, int bucketCount, int saltWidthBytes) {
+  public SaltProfile {
+    if (strategyId == null || strategyId.isBlank()) {
+      throw new IllegalArgumentException("strategyId must not be blank");
+    }
     if (encodingVersion < 1) {
       throw new IllegalArgumentException("encodingVersion must be positive");
     }
@@ -20,9 +23,6 @@ public record SaltParameters(int encodingVersion, int bucketCount, int saltWidth
 
   /** Encodes a bucket number as an unsigned fixed-width big-endian prefix. */
   public byte[] encodeBucket(int bucketNumber) {
-    if (encodingVersion != 1) {
-      throw new IllegalArgumentException("unsupported salt encoding version");
-    }
     if (bucketNumber < 0 || bucketNumber >= bucketCount) {
       throw new IllegalArgumentException("bucketNumber must be within the configured bucket range");
     }
