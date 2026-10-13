@@ -1,6 +1,7 @@
 package io.etcdhbase.grpc;
 
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.spi.identity.AuthenticationScope;
 import io.grpc.Context;
 import io.grpc.Deadline;
 import io.grpc.ForwardingServerCall;
@@ -22,14 +23,29 @@ public final class RequestScopeInterceptor implements ServerInterceptor {
   private static final Context.Key<RequestScope> REQUEST_SCOPE =
       Context.key("etcd-hbase-request-scope");
   private static final Context.Key<String> TRACE_ID = Context.key("etcd-hbase-trace-id");
+  private static final Context.Key<AuthenticationScope> AUTHENTICATION_SCOPE =
+      Context.key("etcd-hbase-listener-authentication-scope");
 
+  private final AuthenticationScope listenerBoundScope;
   private final RequestCompletionRecorder completionRecorder;
 
   public RequestScopeInterceptor() {
-    this(RequestCompletionRecorder.NOOP);
+    this(null, RequestCompletionRecorder.NOOP);
+  }
+
+  /** Binds every call on this listener to its configured backend scope. */
+  public RequestScopeInterceptor(AuthenticationScope listenerBoundScope) {
+    this(listenerBoundScope, RequestCompletionRecorder.NOOP);
   }
 
   public RequestScopeInterceptor(RequestCompletionRecorder completionRecorder) {
+    this(null, completionRecorder);
+  }
+
+  /** Binds request completion observations without exposing server implementation types. */
+  public RequestScopeInterceptor(
+      AuthenticationScope listenerBoundScope, RequestCompletionRecorder completionRecorder) {
+    this.listenerBoundScope = listenerBoundScope;
     this.completionRecorder = Objects.requireNonNull(completionRecorder, "completionRecorder");
   }
 
@@ -37,6 +53,15 @@ public final class RequestScopeInterceptor implements ServerInterceptor {
     RequestScope scope = REQUEST_SCOPE.get();
     if (scope == null) {
       throw new IllegalStateException("request scope is available only inside an intercepted RPC");
+    }
+    return scope;
+  }
+
+  public static AuthenticationScope currentAuthenticationScope() {
+    AuthenticationScope scope = AUTHENTICATION_SCOPE.get();
+    if (scope == null) {
+      throw new IllegalStateException(
+          "authentication scope is available only on a listener-bound server");
     }
     return scope;
   }
@@ -64,7 +89,11 @@ public final class RequestScopeInterceptor implements ServerInterceptor {
             call.getMethodDescriptor() == null
                 ? null
                 : call.getMethodDescriptor().getFullMethodName());
-    Context requestContext = parent.withValue(REQUEST_SCOPE, scope).withValue(TRACE_ID, traceId);
+    Context requestScopeContext = parent.withValue(REQUEST_SCOPE, scope).withValue(TRACE_ID, traceId);
+    Context requestContext =
+        listenerBoundScope == null
+            ? requestScopeContext
+            : requestScopeContext.withValue(AUTHENTICATION_SCOPE, listenerBoundScope);
     RequestObservation observation =
         new RequestObservation(requestContext, traceId, methodClass, scope, startedNanos);
     Context.CancellationListener cancellationListener = ignored -> scope.cancel();

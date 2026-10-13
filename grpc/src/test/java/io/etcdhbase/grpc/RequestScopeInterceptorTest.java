@@ -1,6 +1,7 @@
 package io.etcdhbase.grpc;
 
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.spi.identity.AuthenticationScope;
 import io.grpc.Context;
 import io.grpc.MethodDescriptor;
 import io.grpc.Metadata;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -132,7 +134,27 @@ class RequestScopeInterceptorTest {
     assertTrue(observation.get().elapsedNanos() >= 0);
   }
 
+  @Test
+  void retainsTheScopeBoundToTheListener() {
+    AuthenticationScope listenerScope = new AuthenticationScope("local", "local-hbase");
+    AtomicReference<AuthenticationScope> captured = new AtomicReference<>();
+
+    intercept(
+        new RequestScopeInterceptor(listenerScope),
+        (call, headers) -> {
+          captured.set(RequestScopeInterceptor.currentAuthenticationScope());
+          return new ServerCall.Listener<>() {};
+        });
+
+    assertSame(listenerScope, captured.get());
+  }
+
   private ServerCall.Listener<String> intercept(ServerCallHandler<String, String> handler) {
+    return intercept(interceptor, handler);
+  }
+
+  private static ServerCall.Listener<String> intercept(
+      RequestScopeInterceptor interceptor, ServerCallHandler<String, String> handler) {
     @SuppressWarnings("unchecked")
     ServerCall<String, String> call = mock(ServerCall.class);
     ServerCall.Listener<String> listener = interceptor.interceptCall(call, new Metadata(), handler);
