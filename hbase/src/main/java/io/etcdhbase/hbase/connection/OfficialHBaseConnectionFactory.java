@@ -93,25 +93,27 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
   @Override
   public void close() {
     List<AsyncConnection> toClose = new ArrayList<>();
+    List<Entry> toFail = new ArrayList<>();
     synchronized (lock) {
       if (closed) {
         return;
       }
       closed = true;
       for (Entry entry : connections.values()) {
-        if (entry.connection.isDone()
-            && !entry.connection.isCompletedExceptionally()
-            && !entry.connection.isCancelled()) {
-          AsyncConnection connection = entry.connection.getNow(null);
-          if (connection != null) {
-            toClose.add(connection);
-          }
-        } else {
-          entry.connection.completeExceptionally(
-              new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        if (entry.state == EntryState.READY) {
+          toClose.add(entry.readyConnection);
+          entry.state = EntryState.CLOSED;
+        } else if (entry.state == EntryState.CREATING) {
+          entry.state = EntryState.CLOSED;
+          toFail.add(entry);
         }
       }
       connections.clear();
+    }
+
+    for (Entry entry : toFail) {
+      entry.connection.completeExceptionally(
+          new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
 
     int closeFailures = 0;
@@ -162,25 +164,39 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
   private void completeSuccess(IdentityKey key, Entry entry, AsyncConnection connection) {
     boolean accepted;
     synchronized (lock) {
-      accepted = !closed && connections.get(key) == entry;
+      accepted =
+          !closed
+              && connections.get(key) == entry
+              && entry.state == EntryState.CREATING;
       if (accepted) {
-        entry.connection.complete(connection);
+        entry.state = EntryState.READY;
+        entry.readyConnection = connection;
       }
     }
     if (!accepted) {
       closeConnection(connection);
       entry.connection.completeExceptionally(
           new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      return;
+    }
+    if (!entry.connection.complete(connection)) {
+      closeConnection(connection);
     }
   }
 
   private void completeFailure(IdentityKey key, Entry entry, Throwable failure) {
     Throwable cause = unwrap(failure);
     BackendFailure safeFailure = classifyFailure(cause);
+    boolean accepted;
     synchronized (lock) {
-      if (connections.get(key) == entry) {
+      accepted =
+          connections.get(key) == entry && entry.state == EntryState.CREATING;
+      if (accepted) {
         connections.remove(key);
+        entry.state = EntryState.FAILED;
       }
+    }
+    if (accepted) {
       entry.connection.completeExceptionally(safeFailure);
     }
   }
@@ -251,6 +267,15 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
 
   private static final class Entry {
     private final CompletableFuture<AsyncConnection> connection = new CompletableFuture<>();
+    private EntryState state = EntryState.CREATING;
+    private AsyncConnection readyConnection;
+  }
+
+  private enum EntryState {
+    CREATING,
+    READY,
+    FAILED,
+    CLOSED
   }
 
   private record IdentityKey(

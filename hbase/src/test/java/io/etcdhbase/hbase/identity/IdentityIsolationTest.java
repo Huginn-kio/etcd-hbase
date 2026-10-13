@@ -10,6 +10,11 @@ import java.io.IOException;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.hbase.client.AsyncConnection;
 import org.junit.jupiter.api.Test;
@@ -100,6 +105,66 @@ class IdentityIsolationTest {
     assertSame(connection, secondCaller.join());
     factory.close();
     verify(connection).close();
+  }
+
+  @Test
+  void successfulConnectionCallbacksDoNotHoldTheManagerLock() throws Exception {
+    CompletableFuture<AsyncConnection> firstCreation = new CompletableFuture<>();
+    AsyncConnection firstConnection = mock(AsyncConnection.class);
+    var factory =
+        new OfficialHBaseConnectionFactory(
+            2,
+            identity ->
+                identity.subject().equals("alice")
+                    ? firstCreation
+                    : CompletableFuture.completedFuture(mock(AsyncConnection.class)));
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    CountDownLatch callbackStarted = new CountDownLatch(1);
+    CountDownLatch allowCallbackToFinish = new CountDownLatch(1);
+
+    try {
+      CompletableFuture<AsyncConnection> first =
+          factory
+              .connectionFor(identity("alice", "ctx-a", "local", "hbase", 1))
+              .toCompletableFuture();
+      first.thenRun(
+          () -> {
+            callbackStarted.countDown();
+            try {
+              if (!allowCallbackToFinish.await(10, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("test callback timed out");
+              }
+            } catch (InterruptedException interrupted) {
+              Thread.currentThread().interrupt();
+              throw new CompletionException(interrupted);
+            }
+          });
+
+      Future<Boolean> completion = executor.submit(() -> firstCreation.complete(firstConnection));
+      assertTrue(callbackStarted.await(5, TimeUnit.SECONDS));
+      Future<AsyncConnection> secondConnection =
+          executor.submit(
+              () ->
+                  factory
+                      .connectionFor(identity("bob", "ctx-b", "local", "hbase", 1))
+                      .toCompletableFuture()
+                      .join());
+      AsyncConnection completedSecondConnection;
+      try {
+        completedSecondConnection = secondConnection.get(5, TimeUnit.SECONDS);
+      } finally {
+        allowCallbackToFinish.countDown();
+      }
+
+      assertTrue(completion.get(5, TimeUnit.SECONDS));
+      assertSame(firstConnection, first.join());
+      assertNotSame(firstConnection, completedSecondConnection);
+    } finally {
+      allowCallbackToFinish.countDown();
+      factory.close();
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
   }
 
   @Test
