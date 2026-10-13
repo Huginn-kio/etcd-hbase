@@ -294,6 +294,18 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void rejectsFractionalValuesForIntegerConfigurationFields() {
+    assertRejected(
+        VALID_YAML.replace("    port: 2379", "    port: 2379.9"),
+        "listeners[0].port",
+        null);
+    assertRejected(
+        VALID_YAML.replace("ttl_seconds: -1", "ttl_seconds: -1.9"),
+        "ttl_seconds",
+        null);
+  }
+
+  @Test
   void rejectsUnsortedAndIncorrectCrcSplitKeys() {
     assertRejected(
         VALID_YAML.replace(
