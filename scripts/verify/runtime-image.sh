@@ -44,15 +44,21 @@ if ! docker run --rm --entrypoint java "$IMAGE" \
   echo "could not read the packaged runtime Java version" >&2
   exit 1
 fi
-python3 - "$ARTIFACT_ROOT/java-version.log" <<'PY'
+python3 - "$ROOT" "$ARTIFACT_ROOT/java-version.log" <<'PY'
+import json
 import re
 import sys
 from pathlib import Path
 
-output = Path(sys.argv[1]).read_text(encoding="utf-8")
-match = re.search(r"^\s*java\.specification\.version = (\S+)$", output, re.MULTILINE)
-if match is None or match.group(1) != "21":
+root = Path(sys.argv[1])
+output = Path(sys.argv[2]).read_text(encoding="utf-8")
+expected = json.loads((root / "build/dependency-lock.json").read_text(encoding="utf-8"))["jdk"]["release"]
+specification = re.search(r"^\s*java\.specification\.version = (\S+)$", output, re.MULTILINE)
+runtime = re.search(r"^\s*java\.runtime\.version = (\S+)$", output, re.MULTILINE)
+if specification is None or specification.group(1) != "21":
     raise SystemExit("packaged runtime image must report java.specification.version=21")
+if runtime is None or runtime.group(1) not in {expected, f"{expected}-LTS"}:
+    raise SystemExit(f"packaged runtime image must match locked Java release {expected}")
 PY
 
 "$ROOT/scripts/dev/go-m0.sh" -C testkit/go build \
@@ -98,7 +104,7 @@ if [[ "$DRIVER_STATUS" -ne 1 ]]; then
   exit 1
 fi
 
-python3 - "$ARTIFACT_ROOT/runtime.jsonl" <<'PY'
+if ! python3 - "$ARTIFACT_ROOT/runtime.jsonl" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -118,6 +124,15 @@ if record.get("evidence_scope") != "transport":
 if record.get("error", {}).get("grpc_code") != "Unimplemented":
     raise SystemExit("packaged skeleton did not return gRPC UNIMPLEMENTED")
 PY
+then
+  echo "m0driver output:" >&2
+  cat "$ARTIFACT_ROOT/m0driver.log" >&2
+  echo "runtime trace:" >&2
+  cat "$ARTIFACT_ROOT/runtime.jsonl" >&2
+  echo "container log:" >&2
+  docker logs "$CONTAINER" >&2 || true
+  exit 1
+fi
 
 docker stop --time 10 "$CONTAINER" >"$ARTIFACT_ROOT/container-stop.log"
 CONTAINER_EXIT="$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER")"

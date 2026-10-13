@@ -25,12 +25,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Download the locked Temurin JDK
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m0-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
-          distribution: temurin
-          java-version: '21.0.12.1+1'
-          check-latest: false
-          verify-signature: true
+          distribution: jdkfile
+          java-version: '21'
+          jdk-file: ${{ runner.temp }}/m0-temurin-jdk.tar.gz
           cache: maven
       - name: Verify pinned protocol and descriptor
         run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" scripts/verify/protocol.sh
@@ -77,12 +78,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Download the locked Temurin JDK
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m0-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
-          distribution: temurin
-          java-version: '21.0.12.1+1'
-          check-latest: false
-          verify-signature: true
+          distribution: jdkfile
+          java-version: '21'
+          jdk-file: ${{ runner.temp }}/m0-temurin-jdk.tar.gz
           cache: maven
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -103,12 +105,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Download the locked Temurin JDK
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m0-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
-          distribution: temurin
-          java-version: '21.0.12.1+1'
-          check-latest: false
-          verify-signature: true
+          distribution: jdkfile
+          java-version: '21'
+          jdk-file: ${{ runner.temp }}/m0-temurin-jdk.tar.gz
           cache: maven
       - name: Run exactly one non-skipped public HBase integration probe
         run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" scripts/verify/hbase-probe.sh --profile public-local
