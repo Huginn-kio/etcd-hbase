@@ -122,6 +122,16 @@ def read_project(root_pom: Path) -> tuple[list[Path], dict[str, str], dict[tuple
     properties.setdefault("pom.groupId", root_group)
     properties.setdefault("project.version", root_version)
     properties.setdefault("pom.version", root_version)
+    locked_version_properties: set[str] = set()
+    for version_node in root.findall(".//m:version", NS):
+        locked_version_properties.update(PROPERTY.findall(text(version_node) or ""))
+    pending_properties = list(locked_version_properties)
+    while pending_properties:
+        property_name = pending_properties.pop()
+        for referenced_name in PROPERTY.findall(properties.get(property_name, "")):
+            if referenced_name not in locked_version_properties:
+                locked_version_properties.add(referenced_name)
+                pending_properties.append(referenced_name)
     poms = [root_pom]
     modules = root.findall("m:modules/m:module", NS)
     for module in modules:
@@ -147,6 +157,18 @@ def read_project(root_pom: Path) -> tuple[list[Path], dict[str, str], dict[tuple
             project = ET.parse(pom).getroot()
         except (ET.ParseError, OSError) as exc:
             raise LockError(f"cannot parse {pom}: {exc}") from exc
+        if pom != root_pom:
+            module_properties_node = project.find("m:properties", NS)
+            module_property_names = {
+                child.tag.rsplit("}", 1)[-1]
+                for child in (list(module_properties_node) if module_properties_node is not None else [])
+            }
+            property_overrides = sorted(locked_version_properties & module_property_names)
+            if property_overrides:
+                raise LockError(
+                    f"module overrides locked version property "
+                    f"{', '.join(property_overrides)} in {pom}"
+                )
         for dependency in project.findall("m:dependencyManagement/m:dependencies/m:dependency", NS):
             key = identity(dependency, "")
             version = resolve(text(dependency.find("m:version", NS)), properties, str(pom))

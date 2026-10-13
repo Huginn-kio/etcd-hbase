@@ -77,6 +77,17 @@ class MavenLockTest(unittest.TestCase):
             "dependencyManagement",
         )
 
+    def test_module_property_override_of_locked_version_is_rejected(self) -> None:
+        self.assert_module_override_rejected(
+            "hbase/pom.xml",
+            """
+  <properties>
+    <hbase.version>2.6.5-hadoop3</hbase.version>
+  </properties>
+""",
+            "module overrides locked version property hbase.version",
+        )
+
     def assert_module_override_rejected(
         self, module_path: str, override: str, mismatch_label: str
     ) -> None:
