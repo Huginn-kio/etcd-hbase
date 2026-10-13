@@ -65,39 +65,36 @@ PY
   -trimpath -o "$ARTIFACT_ROOT/m0driver" ./cmd/m0driver
 
 docker run --detach --name "$CONTAINER" \
-  --publish 127.0.0.1::2379 "$IMAGE" >"$ARTIFACT_ROOT/container-id.txt"
-PORT_MAPPING="$(docker port "$CONTAINER" 2379/tcp)"
-HOST_PORT="${PORT_MAPPING##*:}"
-if [[ ! "$HOST_PORT" =~ ^[0-9]+$ ]]; then
-  echo "could not resolve the loopback-only runtime image port mapping: $PORT_MAPPING" >&2
+  "$IMAGE" >"$ARTIFACT_ROOT/container-id.txt"
+
+ready=false
+for _ in $(seq 1 150); do
+  if docker exec "$CONTAINER" bash -c ':</dev/tcp/127.0.0.1/2379' >/dev/null 2>&1; then
+    ready=true
+    break
+  fi
+  sleep 0.2
+done
+if [[ "$ready" != true ]]; then
+  echo "packaged gRPC server did not open its loopback listener" >&2
+  docker logs "$CONTAINER" >&2 || true
   exit 1
 fi
 
-python3 - "$HOST_PORT" <<'PY'
-import socket
-import sys
-import time
-
-port = int(sys.argv[1])
-deadline = time.monotonic() + 30
-while time.monotonic() < deadline:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-            break
-    except OSError:
-        time.sleep(0.2)
-else:
-    raise SystemExit("packaged gRPC server did not open its published loopback port")
-PY
+docker cp "$ARTIFACT_ROOT/m0driver" "$CONTAINER:/tmp/m0driver"
 
 set +e
-"$ARTIFACT_ROOT/m0driver" \
-  --endpoint "127.0.0.1:$HOST_PORT" \
+docker exec --user 10001:10001 "$CONTAINER" /tmp/m0driver \
+  --endpoint "127.0.0.1:2379" \
   --case m0-runtime-image-skeleton \
-  --trace "$ARTIFACT_ROOT/runtime.jsonl" \
+  --trace /tmp/runtime.jsonl \
   --timeout 2s >"$ARTIFACT_ROOT/m0driver.log" 2>&1
 DRIVER_STATUS=$?
 set -e
+if ! docker cp "$CONTAINER:/tmp/runtime.jsonl" "$ARTIFACT_ROOT/runtime.jsonl" \
+  2>"$ARTIFACT_ROOT/trace-copy.log"; then
+  : >"$ARTIFACT_ROOT/runtime.jsonl"
+fi
 if [[ "$DRIVER_STATUS" -ne 1 ]]; then
   cat "$ARTIFACT_ROOT/m0driver.log" >&2
   echo "packaged skeleton probe returned $DRIVER_STATUS, expected explicit UNIMPLEMENTED" >&2

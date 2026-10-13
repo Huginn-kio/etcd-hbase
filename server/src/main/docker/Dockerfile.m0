@@ -33,7 +33,6 @@ RUN mkdir -p /opt/m0/dist/lib /opt/m2 /opt/m0/toolchains && \
       cp "$jar" /opt/m0/dist/lib/; \
     done && \
     sed \
-      -e '0,/^    bind_host: 127\.0\.0\.1$/s//    bind_host: 0.0.0.0/' \
       -e '0,/^    port: 0$/s//    port: 2379/' \
       config/examples/m0/server-skeleton.yaml > /opt/m0/dist/server.yaml
 
