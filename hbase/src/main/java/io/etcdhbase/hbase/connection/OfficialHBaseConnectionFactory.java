@@ -14,6 +14,7 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.client.AsyncConnection;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
@@ -25,7 +26,8 @@ import org.apache.hadoop.hbase.client.ConnectionFactory;
  * of evicting a connection that may still be serving requests. Failed creations are removed so a
  * later request can retry. The configuration constructor is only for explicit development
  * no-auth identities; target authentication requires a provider-specific connection creator after
- * the target mechanism is known.
+ * the target mechanism is known. Each entry serializes connection publication with shutdown while
+ * keeping future callbacks outside the global manager lock.
  */
 public final class OfficialHBaseConnectionFactory implements HBaseConnectionFactory {
   private static final System.Logger LOGGER =
@@ -35,6 +37,7 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
   private final int maxConnections;
   private final Function<AuthorizedBackendIdentity, ? extends CompletionStage<AsyncConnection>>
       connectionCreator;
+  private final Supplier<CompletableFuture<AsyncConnection>> connectionFutureFactory;
   private final Map<IdentityKey, Entry> connections = new HashMap<>();
   private boolean closed;
 
@@ -54,11 +57,22 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
       int maxConnections,
       Function<AuthorizedBackendIdentity, ? extends CompletionStage<AsyncConnection>>
           connectionCreator) {
+    this(maxConnections, connectionCreator, CompletableFuture::new);
+  }
+
+  /** Package-private future seam lets concurrency tests pause connection publication. */
+  OfficialHBaseConnectionFactory(
+      int maxConnections,
+      Function<AuthorizedBackendIdentity, ? extends CompletionStage<AsyncConnection>>
+          connectionCreator,
+      Supplier<CompletableFuture<AsyncConnection>> connectionFutureFactory) {
     if (maxConnections < 1) {
       throw new IllegalArgumentException("maxConnections must be positive");
     }
     this.maxConnections = maxConnections;
     this.connectionCreator = Objects.requireNonNull(connectionCreator, "connectionCreator");
+    this.connectionFutureFactory =
+        Objects.requireNonNull(connectionFutureFactory, "connectionFutureFactory");
   }
 
   @Override
@@ -77,7 +91,7 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
       } else if (connections.size() >= maxConnections) {
         return failed(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
       } else {
-        entry = new Entry();
+        entry = new Entry(connectionFutureFactory.get());
         connections.put(key, entry);
         create = true;
       }
@@ -92,7 +106,7 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
 
   @Override
   public void close() {
-    List<AsyncConnection> toClose = new ArrayList<>();
+    List<Entry> toClose = new ArrayList<>();
     List<Entry> toFail = new ArrayList<>();
     synchronized (lock) {
       if (closed) {
@@ -101,7 +115,7 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
       closed = true;
       for (Entry entry : connections.values()) {
         if (entry.state == EntryState.READY) {
-          toClose.add(entry.readyConnection);
+          toClose.add(entry);
           entry.state = EntryState.CLOSED;
         } else if (entry.state == EntryState.CREATING) {
           entry.state = EntryState.CLOSED;
@@ -112,14 +126,22 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
     }
 
     for (Entry entry : toFail) {
-      entry.connection.completeExceptionally(
-          new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      synchronized (entry.publicationLock) {
+        entry.connection.completeExceptionally(
+            new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      }
     }
 
     int closeFailures = 0;
-    for (AsyncConnection connection : toClose) {
-      if (!closeConnection(connection)) {
-        closeFailures++;
+    for (Entry entry : toClose) {
+      synchronized (entry.publicationLock) {
+        if (!entry.connection.isDone()) {
+          entry.connection.completeExceptionally(
+              new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        }
+        if (!closeConnection(entry.readyConnection)) {
+          closeFailures++;
+        }
       }
     }
     if (closeFailures > 0) {
@@ -162,42 +184,46 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
   }
 
   private void completeSuccess(IdentityKey key, Entry entry, AsyncConnection connection) {
-    boolean accepted;
-    synchronized (lock) {
-      accepted =
-          !closed
-              && connections.get(key) == entry
-              && entry.state == EntryState.CREATING;
-      if (accepted) {
-        entry.state = EntryState.READY;
-        entry.readyConnection = connection;
+    synchronized (entry.publicationLock) {
+      boolean accepted;
+      synchronized (lock) {
+        accepted =
+            !closed
+                && connections.get(key) == entry
+                && entry.state == EntryState.CREATING;
+        if (accepted) {
+          entry.state = EntryState.READY;
+          entry.readyConnection = connection;
+        }
       }
-    }
-    if (!accepted) {
-      closeConnection(connection);
-      entry.connection.completeExceptionally(
-          new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-      return;
-    }
-    if (!entry.connection.complete(connection)) {
-      closeConnection(connection);
+      if (!accepted) {
+        closeConnection(connection);
+        entry.connection.completeExceptionally(
+            new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        return;
+      }
+      if (!entry.connection.complete(connection)) {
+        closeConnection(connection);
+      }
     }
   }
 
   private void completeFailure(IdentityKey key, Entry entry, Throwable failure) {
     Throwable cause = unwrap(failure);
     BackendFailure safeFailure = classifyFailure(cause);
-    boolean accepted;
-    synchronized (lock) {
-      accepted =
-          connections.get(key) == entry && entry.state == EntryState.CREATING;
-      if (accepted) {
-        connections.remove(key);
-        entry.state = EntryState.FAILED;
+    synchronized (entry.publicationLock) {
+      boolean accepted;
+      synchronized (lock) {
+        accepted =
+            connections.get(key) == entry && entry.state == EntryState.CREATING;
+        if (accepted) {
+          connections.remove(key);
+          entry.state = EntryState.FAILED;
+        }
       }
-    }
-    if (accepted) {
-      entry.connection.completeExceptionally(safeFailure);
+      if (accepted) {
+        entry.connection.completeExceptionally(safeFailure);
+      }
     }
   }
 
@@ -266,9 +292,14 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
   }
 
   private static final class Entry {
-    private final CompletableFuture<AsyncConnection> connection = new CompletableFuture<>();
+    private final CompletableFuture<AsyncConnection> connection;
+    private final Object publicationLock = new Object();
     private EntryState state = EntryState.CREATING;
     private AsyncConnection readyConnection;
+
+    private Entry(CompletableFuture<AsyncConnection> connection) {
+      this.connection = Objects.requireNonNull(connection, "connection future");
+    }
   }
 
   private enum EntryState {
