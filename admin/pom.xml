@@ -60,6 +60,15 @@
                 <additionalClasspathElement>${maven.multiModuleProjectDirectory}/hbase/target/test-classes</additionalClasspathElement>
               </additionalClasspathElements>
             </configuration>
+            <executions>
+              <execution>
+                <id>m0-admin-local-initialize</id>
+                <goals>
+                  <goal>integration-test</goal>
+                  <goal>verify</goal>
+                </goals>
+              </execution>
+            </executions>
           </plugin>
         </plugins>
       </build>

@@ -20,6 +20,34 @@
       </testResource>
     </testResources>
   </build>
+  <profiles>
+    <profile>
+      <id>m0-wire</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <failIfNoTests>true</failIfNoTests>
+              <includes>
+                <include>**/GoInteropIT.java</include>
+              </includes>
+            </configuration>
+            <executions>
+              <execution>
+                <id>m0-go-java-wire</id>
+                <goals>
+                  <goal>integration-test</goal>
+                  <goal>verify</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
   <dependencies>
     <dependency>
       <groupId>io.etcdhbase</groupId>

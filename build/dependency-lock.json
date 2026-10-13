@@ -36,6 +36,13 @@
       "sha256": "a15977e3457ff8cd803c1a37e1e53aad76e4609cd23bbca8e8f783e5c78e5fa8",
       "reason": "Pin cleanup lifecycle behavior."
     },
+    "maven-install-plugin": {
+      "version": "3.2.0",
+      "coordinate": "org.apache.maven.plugins:maven-install-plugin:3.2.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "6fd9d26eb6f473d123f6138bf54d5bae80466a84dab95ab5017590c010621e35",
+      "reason": "Install reactor JARs into the isolated repository used by the packaged runtime classpath."
+    },
     "maven-resources-plugin": {
       "version": "3.5.0",
       "coordinate": "org.apache.maven.plugins:maven-resources-plugin:3.5.0",
@@ -77,6 +84,13 @@
       "repository": "https://repo.maven.apache.org/maven2",
       "sha256": "e37a8fc9ff47435cc6bda257a4501cf79626c8115610ba33c77775ce23b4c3b7",
       "reason": "Generate dependency trees for review and convergence evidence."
+    },
+    "maven-help-plugin": {
+      "version": "3.5.2",
+      "coordinate": "org.apache.maven.plugins:maven-help-plugin:3.5.2",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "fe53082c6c51b9b4778f4dfe3e9810c18e995c34b0780c30b73fb2a156c90c03",
+      "reason": "Pin effective POM evidence generation."
     },
     "maven-enforcer-plugin": {
       "version": "3.6.3",

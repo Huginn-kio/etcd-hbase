@@ -57,6 +57,15 @@
                 <include>**/LocalHBaseProbeIT.java</include>
               </includes>
             </configuration>
+            <executions>
+              <execution>
+                <id>m0-hbase-local-probe</id>
+                <goals>
+                  <goal>integration-test</goal>
+                  <goal>verify</goal>
+                </goals>
+              </execution>
+            </executions>
           </plugin>
         </plugins>
       </build>
@@ -77,6 +86,15 @@
                 <m0.hbase.target.configRef>${etcd.hbase.m0.target.configRef}</m0.hbase.target.configRef>
               </systemPropertyVariables>
             </configuration>
+            <executions>
+              <execution>
+                <id>m0-hbase-target-probe</id>
+                <goals>
+                  <goal>integration-test</goal>
+                  <goal>verify</goal>
+                </goals>
+              </execution>
+            </executions>
           </plugin>
         </plugins>
       </build>

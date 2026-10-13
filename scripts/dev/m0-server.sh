@@ -20,20 +20,45 @@ fi
 
 BUILD_DIR="$ROOT/server/target"
 DEPENDENCY_CLASSPATH="$BUILD_DIR/m0-server-dependencies.txt"
+MAVEN_REPOSITORY="$ROOT/.artifacts/m0/server-maven-repository"
 
 "$ROOT/scripts/dev/mvn21.sh" \
   -B -ntp \
   -pl server -am \
-  -DskipTests \
+  -DskipTests -DskipITs \
+  -Dmaven.repo.local="$MAVEN_REPOSITORY" \
+  clean install
+
+"$ROOT/scripts/dev/mvn21.sh" \
+  -B -ntp \
+  -f "$ROOT/server/pom.xml" \
+  -Dmaven.repo.local="$MAVEN_REPOSITORY" \
   -Dmdep.outputFile="$DEPENDENCY_CLASSPATH" \
   -DincludeScope=runtime \
-  compile \
   org.apache.maven.plugins:maven-dependency-plugin:3.11.0:build-classpath
 
-MODULE_CLASSPATH="${ROOT}/server/target/classes:${ROOT}/hbase/target/classes:${ROOT}/grpc/target/classes:${ROOT}/core/target/classes:${ROOT}/spi/target/classes:${ROOT}/protocol/target/classes"
+if [[ ! -s "$DEPENDENCY_CLASSPATH" ]]; then
+  echo "Maven did not write the packaged runtime dependency classpath: $DEPENDENCY_CLASSPATH" >&2
+  exit 1
+fi
 DEPENDENCY_ENTRIES="$(<"$DEPENDENCY_CLASSPATH")"
+if [[ "$DEPENDENCY_ENTRIES" == *"target/classes"* ]]; then
+  echo "runtime classpath contains development classes instead of packaged module JARs" >&2
+  exit 1
+fi
+for M0_MODULE in protocol spi core hbase grpc; do
+  if [[ "$DEPENDENCY_ENTRIES" != *"/$M0_MODULE-0.1.0-SNAPSHOT.jar"* ]]; then
+    echo "packaged runtime classpath is missing the $M0_MODULE module JAR" >&2
+    exit 1
+  fi
+done
+SERVER_JAR="$BUILD_DIR/server-0.1.0-SNAPSHOT.jar"
+if [[ ! -s "$SERVER_JAR" ]]; then
+  echo "packaged server JAR is missing: $SERVER_JAR" >&2
+  exit 1
+fi
 
 exec "$JAVA_HOME/bin/java" \
-  -cp "$MODULE_CLASSPATH:$DEPENDENCY_ENTRIES" \
+  -cp "$SERVER_JAR:$DEPENDENCY_ENTRIES" \
   io.etcdhbase.server.Bootstrap \
   "$@"

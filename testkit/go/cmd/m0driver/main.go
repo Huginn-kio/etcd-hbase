@@ -17,6 +17,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"io.etcdhbase/testkit/internal/client"
 	"io.etcdhbase/testkit/internal/trace"
+	"io.etcdhbase/testkit/internal/wire"
 )
 
 func main() {
@@ -30,6 +31,9 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 && args[0] == "wire" {
+		return runWire(args[1:], stdout, stderr)
+	}
 	flags := flag.NewFlagSet("m0driver", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	endpoint := flags.String("endpoint", "127.0.0.1:2379", "etcd-compatible gRPC endpoint")
@@ -169,6 +173,43 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("request failed: grpc_code=%s", record.Error.GRPCCode)
 	}
 	return nil
+}
+
+func runWire(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("m0driver wire", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	skeletonEndpoint := flags.String("skeleton-endpoint", "", "Java skeleton gRPC endpoint")
+	fixtureEndpoint := flags.String("fixture-endpoint", "", "test-only failure fixture gRPC endpoint")
+	tracePath := flags.String("trace", "-", "JSONL output path, or - for stdout")
+	timeout := flags.Duration("timeout", 3*time.Second, "per-request deadline")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+	traceWriter, closeTrace, err := openTrace(*tracePath, stdout)
+	if err != nil {
+		return err
+	}
+	defer closeTrace()
+	probeContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := wire.Run(
+		probeContext,
+		wire.Options{
+			SkeletonEndpoint: *skeletonEndpoint,
+			FixtureEndpoint:  *fixtureEndpoint,
+			Timeout:          *timeout,
+		},
+		traceWriter,
+	); err != nil {
+		return err
+	}
+	if *tracePath != "-" {
+		_, err = fmt.Fprintf(stdout, "wire interoperability probe passed; trace=%s\n", *tracePath)
+	}
+	return err
 }
 
 type protoMessage interface {
