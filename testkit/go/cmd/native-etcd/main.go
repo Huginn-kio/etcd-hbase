@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"io.etcdhbase/testkit/internal/compare"
@@ -98,6 +99,10 @@ func runScenario(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	dataDirectory, err := insideRoot(root, "etcd-data")
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return fmt.Errorf("create native artifact root: %w", err)
 	}
@@ -114,7 +119,7 @@ func runScenario(args []string, stdout, stderr io.Writer) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	metadata, runErr := scenario.Run(ctx, suite, filepath.Join(root, "etcd-data"), traceFile)
+	metadata, runErr := scenario.Run(ctx, suite, dataDirectory, traceFile)
 	closeErr := traceFile.Close()
 	if closeErr != nil {
 		return fmt.Errorf("close trace output: %w", closeErr)
@@ -161,6 +166,10 @@ func compareTraces(args []string, stderr io.Writer) error {
 }
 
 func insideRoot(root, path string) (string, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve artifact root: %w", err)
+	}
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(root, path)
 	}
@@ -171,6 +180,24 @@ func insideRoot(root, path string) (string, error) {
 	relative, err := filepath.Rel(root, absolute)
 	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || len(relative) > 2 && relative[:3] == ".."+string(filepath.Separator) {
 		return "", errors.New("trace and metadata outputs must remain inside artifact root")
+	}
+	current := root
+	components := strings.Split(relative, string(filepath.Separator))
+	for index, component := range components {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("inspect artifact path: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", errors.New("trace, metadata, and data paths must not traverse symlinks")
+		}
+		if index < len(components)-1 && !info.IsDir() {
+			return "", errors.New("trace, metadata, and data paths must use directory components")
+		}
 	}
 	return absolute, nil
 }
