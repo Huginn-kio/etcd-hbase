@@ -141,6 +141,9 @@ func ReadJSONL(reader io.Reader) ([]Record, error) {
 		if len(payload) == 0 {
 			return nil, fmt.Errorf("trace line %d is empty", line)
 		}
+		if err := rejectDuplicateJSONKeys(payload); err != nil {
+			return nil, fmt.Errorf("trace line %d has invalid JSON: %w", line, err)
+		}
 		decoder := json.NewDecoder(bytes.NewReader(payload))
 		decoder.DisallowUnknownFields()
 		var record Record
@@ -513,6 +516,9 @@ func validateObject(raw json.RawMessage, label string, allowNull, authMethod boo
 	if len(raw) > maxRecordBytes {
 		return fmt.Errorf("%s exceeds maximum trace snapshot size", label)
 	}
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return fmt.Errorf("%s contains invalid JSON: %w", label, err)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var decoded any
@@ -530,6 +536,76 @@ func validateObject(raw json.RawMessage, label string, allowNull, authMethod boo
 	}
 	if key := findSecretKey(decoded, authMethod); key != "" {
 		return fmt.Errorf("%s contains forbidden secret field %q", label, key)
+	}
+	return nil
+}
+
+func rejectDuplicateJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := consumeJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("contains multiple JSON values")
+		}
+		return fmt.Errorf("has trailing data: %w", err)
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("object key is not a string")
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if end != json.Delim('}') {
+			return errors.New("unterminated JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if end != json.Delim(']') {
+			return errors.New("unterminated JSON array")
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
 	}
 	return nil
 }

@@ -233,6 +233,24 @@ func TestReadJSONLRejectsInvalidOrderingAndSecrets(t *testing.T) {
 	}
 }
 
+func TestTraceRejectsDuplicateJSONKeys(t *testing.T) {
+	secret := testRecord("duplicate-secret", 1)
+	secret.Request = json.RawMessage(`{"fields":{"password":"do-not-write"},"fields":{},"oneofs":{}}`)
+	if err := WriteJSONL(&bytes.Buffer{}, secret); err == nil {
+		t.Fatal("trace writer accepted a duplicate key that hides a password")
+	}
+
+	duplicateEnvelope := `{"schema":"etcd-hbase-trace/v1","case_id":"duplicate","case_id":"duplicate","ordinal":1,"method":"etcdserverpb.KV/Range","request":{"fields":{},"oneofs":{}},"response":null,"error":null,"stream_terminal":null,"evidence_scope":"native-etcd","elapsed_ns":"0"}`
+	if _, err := ReadJSONL(strings.NewReader(duplicateEnvelope)); err == nil {
+		t.Fatal("trace reader accepted duplicate envelope keys")
+	}
+
+	duplicateSnapshot := `{"schema":"etcd-hbase-trace/v1","case_id":"duplicate-snapshot","ordinal":1,"method":"etcdserverpb.KV/Range","request":{"fields":{"password":"do-not-write"},"fields":{},"oneofs":{}},"response":null,"error":null,"stream_terminal":null,"evidence_scope":"native-etcd","elapsed_ns":"0"}`
+	if _, err := ReadJSONL(strings.NewReader(duplicateSnapshot)); err == nil {
+		t.Fatal("trace reader accepted a snapshot with a hidden password")
+	}
+}
+
 func TestClassifyErrorDoesNotCopyErrorText(t *testing.T) {
 	classified := ClassifyError(context.DeadlineExceeded)
 	if classified.GRPCCode != "DeadlineExceeded" || classified.ConsumerKind != "context-deadline" {
