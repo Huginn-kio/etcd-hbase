@@ -11,9 +11,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.hadoop.hbase.client.AsyncConnection;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -32,6 +34,7 @@ class OfficialHBaseConnectionFactoryTest {
     var result = factory.connectionFor(identity());
     ExecutorService executor = Executors.newFixedThreadPool(2);
     CountDownLatch shutdownStarted = new CountDownLatch(1);
+    AtomicReference<Thread> shutdownThread = new AtomicReference<>();
 
     try {
       Future<Boolean> creationCompletion = executor.submit(() -> creation.complete(connection));
@@ -40,10 +43,12 @@ class OfficialHBaseConnectionFactoryTest {
       Future<?> shutdown =
           executor.submit(
               () -> {
+                shutdownThread.set(Thread.currentThread());
                 shutdownStarted.countDown();
                 factory.close();
               });
       assertTrue(shutdownStarted.await(5, TimeUnit.SECONDS));
+      awaitBlocked(shutdownThread.get());
       assertThrows(TimeoutException.class, () -> shutdown.get(100, TimeUnit.MILLISECONDS));
 
       publication.allowCompletion.countDown();
@@ -59,6 +64,14 @@ class OfficialHBaseConnectionFactoryTest {
       executor.shutdownNow();
       assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
     }
+  }
+
+  private static void awaitBlocked(Thread thread) throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (thread.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+      TimeUnit.MILLISECONDS.sleep(1);
+    }
+    assertEquals(Thread.State.BLOCKED, thread.getState());
   }
 
   private static AuthorizedBackendIdentity identity() {
