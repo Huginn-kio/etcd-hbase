@@ -1,0 +1,291 @@
+{
+  "schemaVersion": 1,
+  "jdk": {
+    "vendor": "Eclipse Temurin",
+    "release": "21.0.12.1+1",
+    "archives": {
+      "linux-x64": {
+        "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_linux_hotspot_21.0.12.1_1.tar.gz",
+        "sha256": "ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94"
+      },
+      "macos-aarch64": {
+        "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.12.1_1.tar.gz",
+        "sha256": "3623232f33a9c3baadf304480b2535f9a3cba8a58d42ecbb438ba267315d9998"
+      },
+      "windows-x64": {
+        "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip",
+        "sha256": "f9d6e191ab098c0d416e7d588a24420a8621cd2f4720dab2459b8b7b2d2d8b4e"
+      }
+    }
+  },
+  "maven": {
+    "version": "3.9.16",
+    "distributionUrl": "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.16/apache-maven-3.9.16-bin.zip",
+    "distributionSha256": "5af3b743dd8b876b5c45da33b676251e5f1687712644abb4ee519ca56e1d89ce",
+    "wrapperPlugin": "3.3.4",
+    "wrapperJar": {
+      "coordinate": "org.apache.maven.wrapper:maven-wrapper:3.3.4",
+      "sha256": "4e2fbf6554bc8a4702cdfdd3bef464f423393d784ddbb037216320ce55d5e4e1"
+    }
+  },
+  "plugins": {
+    "maven-clean-plugin": {
+      "version": "3.5.0",
+      "coordinate": "org.apache.maven.plugins:maven-clean-plugin:3.5.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "a15977e3457ff8cd803c1a37e1e53aad76e4609cd23bbca8e8f783e5c78e5fa8",
+      "reason": "Pin cleanup lifecycle behavior."
+    },
+    "maven-resources-plugin": {
+      "version": "3.5.0",
+      "coordinate": "org.apache.maven.plugins:maven-resources-plugin:3.5.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "2c923c63a197565a3e78f2b16d762d0f49bb83250dd2b1e6286704ea0f447060",
+      "reason": "Pin resource processing."
+    },
+    "maven-compiler-plugin": {
+      "version": "3.16.0",
+      "coordinate": "org.apache.maven.plugins:maven-compiler-plugin:3.16.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "f2a6a4668dd833cfe559dd345929196e7b61ed13f6c03f8e087ffba3d85be807",
+      "reason": "Compile with release 21 and the selected JDK toolchain."
+    },
+    "maven-surefire-plugin": {
+      "version": "3.6.0",
+      "coordinate": "org.apache.maven.plugins:maven-surefire-plugin:3.6.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "07117c7456920c14b9d3bdb9b1e82fbcb2fc5004ff2a3bd19c8fc6d25d6f15bb",
+      "reason": "Run unit tests with the Java 21 toolchain."
+    },
+    "maven-failsafe-plugin": {
+      "version": "3.6.0",
+      "coordinate": "org.apache.maven.plugins:maven-failsafe-plugin:3.6.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "d75b10ff6dce52f47ec02105c3c0e5325737a8ea842b010c25daa9d9a497e640",
+      "reason": "Run integration tests in integration-test and verify phases."
+    },
+    "maven-jar-plugin": {
+      "version": "3.5.1",
+      "coordinate": "org.apache.maven.plugins:maven-jar-plugin:3.5.1",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "c83db6059be3fec9a4a68a0e226caefaa944663008617c697e087444415181d5",
+      "reason": "Pin module JAR packaging."
+    },
+    "maven-dependency-plugin": {
+      "version": "3.11.0",
+      "coordinate": "org.apache.maven.plugins:maven-dependency-plugin:3.11.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "e37a8fc9ff47435cc6bda257a4501cf79626c8115610ba33c77775ce23b4c3b7",
+      "reason": "Generate dependency trees for review and convergence evidence."
+    },
+    "maven-enforcer-plugin": {
+      "version": "3.6.3",
+      "coordinate": "org.apache.maven.plugins:maven-enforcer-plugin:3.6.3",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "32347686c513894a2fae96eeb11527883f47b8957850d793ea833646ad954dca",
+      "reason": "Enforce Maven/JDK baseline and dependency convergence."
+    },
+    "maven-toolchains-plugin": {
+      "version": "3.2.0",
+      "coordinate": "org.apache.maven.plugins:maven-toolchains-plugin:3.2.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "f1629e0347194048ab1913ec9d5e9da86aaf088f9abe1a44bbce5055039ecff1",
+      "reason": "Select the pinned JDK for compiler and test plugins."
+    },
+    "maven-wrapper-plugin": {
+      "version": "3.3.4",
+      "coordinate": "org.apache.maven.plugins:maven-wrapper-plugin:3.3.4",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "a355a8d7cb510412da78c2a165e4f500341028a569b12afa7fe99faf87516583",
+      "reason": "Generate the committed Maven Wrapper files."
+    },
+    "protobuf-maven-plugin": {
+      "version": "0.6.1",
+      "coordinate": "org.xolstice.maven.plugins:protobuf-maven-plugin:0.6.1",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "a5b787fa7bfbb8e9f7a368df9eec394d6e50f4512b7ebe3b3d5bcec1d0fe3512",
+      "reason": "Generate protocol sources from pinned protoc binaries."
+    },
+    "os-maven-plugin": {
+      "version": "1.7.1",
+      "coordinate": "kr.motd.maven:os-maven-plugin:1.7.1",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "f47aeef86821e52b2b18758978bd045f03d722292e32e747082122c6228952e0",
+      "reason": "Resolve native code-generator classifier for the build platform."
+    }
+  },
+  "libraries": {
+    "hbase": {
+      "coordinate": "org.apache.hbase:hbase-shaded-client-byo-hadoop:2.6.6-hadoop3",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "3558022661e66eddf741316994da9b4188ab012626da7114dc4ade8dd996460d",
+      "reason": "Public Hadoop 3 compile candidate only; Java 21 runtime support is not established by the HBase support matrix."
+    },
+    "hadoop": {
+      "coordinate": "org.apache.hadoop:hadoop-common:3.4.3",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "73cc542694c25555b026a41c91f6192863afee18de947551f6225acfe23faf7a",
+      "reason": "Matches the HBase 2.6.6 Hadoop 3 client build."
+    },
+    "grpc": {
+      "bom": "io.grpc:grpc-bom:1.84.1",
+      "embeddedNettyVersion": "4.2.16.Final",
+      "artifacts": {
+        "grpc-netty-shaded": "ea5087ea5e63f36571a6a82c73e824a0d24634218dde8dd88b0cedbce67b9c5a",
+        "grpc-protobuf": "bc9b0d511eba849d85a80bd35590d2981fc9f0db7a687b79e1851a8e7dc2d34d",
+        "grpc-stub": "005473c94328005f2ea17e111e771bc47113c7ac1a33c63dd9cac78aae800014"
+      },
+      "repository": "https://repo.maven.apache.org/maven2",
+      "reason": "Use the project-published Java implementation and shaded server transport."
+    },
+    "protobuf": {
+      "javaCoordinate": "com.google.protobuf:protobuf-java:4.36.2",
+      "protocCoordinate": "com.google.protobuf:protoc:4.36.2",
+      "javaSha256": "0773e72eaf375e1285df330575bfec5bda5da674d544d0e142a17f89c8f754da",
+      "protocSha256": {
+        "linux-x86_64": "f6ee22d65361338459208da8bff801c9ca689741cba9187b34990dd45198f864",
+        "macos-aarch_64": "765ccb18be73e565bfc3e2ad94e85039ca28f928b3e62b487e51b7b8fdf1dcfb"
+      },
+      "repository": "https://repo.maven.apache.org/maven2",
+      "reason": "Use the matching supported protoc and Java runtime release."
+    },
+    "guava": {
+      "coordinate": "com.google.guava:guava:33.7.2-jre",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "b530942257fb935f8b2cfaa5f8eb5bd59c555fd8e8d01b8ce98912e077ea606c",
+      "reason": "Pinned public utility dependency; dependency convergence is enforced."
+    },
+    "slf4j": {
+      "coordinate": "org.slf4j:slf4j-api:2.0.20",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "7e1446499b359675d8aabe6af2de86b85e72ae8a2a932c0b40d0e5ba57097439",
+      "reason": "Public logging API; no credentials or key material may be logged."
+    },
+    "convergenceOverrides": {
+      "repository": "https://repo.maven.apache.org/maven2",
+      "resolvedVersions": {
+        "ch.qos.reload4j:reload4j:1.2.22": "222f90d3e69541218ef6e70547749d693bd4c1846817e5bd7949b3e28950f99f",
+        "org.codehaus.woodstox:stax2-api:4.2.1": "678567e48b51a42c65c699f266539ad3d676d4b1a5b0ad7d89ece8b9d5772579",
+        "commons-codec:commons-codec:1.15": "b3e9f6d63a790109bf0d056611fbed1cf69055826defeb9894a71369d246ed63",
+        "commons-logging:commons-logging:1.3.0": "66d3c980470b99b0c511dad3dfc0ae7b265ec1fb144e96bc0253a8a175fd34d9",
+        "org.apache.commons:commons-compress:1.26.2": "9168a03141d8fc7eda21a2360d83cc0412bcbb1d6204d992bd48c2573cb3c6b8",
+        "org.apache.commons:commons-lang3:3.18.0": "4eeeae8d20c078abb64b015ec158add383ac581571cddc45c68f0c9ae0230720",
+        "com.fasterxml.jackson.core:jackson-core:2.22.3": "8a501126a385b25841915d839508f8a66e2a0dbc8a6709d055ef3b3e852b094c",
+        "org.apache.yetus:audience-annotations:0.13.0": "3bfbb397b06f63a2a0a361f62ed32cf199bd92ddd48ea99281f4987edec9777b",
+        "org.apache.commons:commons-text:1.14.0": "121fce2282910c8f0c3ba793a5436b31beb710423cbe2d574a3fb7a73c508e92",
+        "com.google.code.gson:gson:2.14.0": "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
+        "com.google.errorprone:error_prone_annotations:2.50.0": "4667724877f1d37a689202da191e23efa7657c62eef93ccdac406eccfe5cdd0a"
+      },
+      "reason": "These exact versions resolve upstream Hadoop 3.4.3 and gRPC dependency-tree disagreements; Maven Enforcer verifies convergence."
+    },
+    "jackson": {
+      "version": "2.22.3",
+      "artifacts": {
+        "com.fasterxml.jackson.core:jackson-databind": "556db5439e206114346043f68d200497dc96a0bca62a360a81784092ebd0e0a9",
+        "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml": "2bcbc3b9abaefbeba11409b9e30ec35ed7071a61a47c8c2a9c688e40e45b90f9"
+      },
+      "repository": "https://repo.maven.apache.org/maven2",
+      "reason": "Shared JSON/YAML configuration parsing."
+    },
+    "snakeYaml": {
+      "coordinate": "org.yaml:snakeyaml:2.7",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "2e194eba45a67dee19a4e272f4a04b18de8054e9f598b094382f6dae0b0e4b5e",
+      "reason": "Explicit YAML parser version for configuration input."
+    },
+    "tests": {
+      "junitJupiter": {
+        "coordinate": "org.junit.jupiter:junit-jupiter:6.1.3",
+        "sha256": "6b0a14075c74221de53047e363860b7d19fce802bebc152df2c35c4089c6c379"
+      },
+      "mockito": {
+        "coordinate": "org.mockito:mockito-core:5.24.0",
+        "sha256": "97a1f835ad84075255aa37809e4379eff541273c02c6201cbad49bd5950932cd"
+      },
+      "assertj": {
+        "coordinate": "org.assertj:assertj-core:3.27.7",
+        "sha256": "c4a445426c3c2861666863b842cc4ec7bbb1c4226fefd370b6d2fe83d6c4ff0f"
+      },
+      "repository": "https://repo.maven.apache.org/maven2"
+    }
+  },
+  "nativeTools": {
+    "protoc": {
+      "version": "4.36.2",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "platformArtifacts": {
+        "linux-x86_64": "com.google.protobuf:protoc:exe:linux-x86_64",
+        "macos-aarch_64": "com.google.protobuf:protoc:exe:osx-aarch_64"
+      }
+    },
+    "protocGenGrpcJava": {
+      "version": "1.84.1",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "platformArtifacts": {
+        "linux-x86_64": {
+          "coordinate": "io.grpc:protoc-gen-grpc-java:exe:linux-x86_64",
+          "sha256": "1aae91278f0d8187641862710748df2c163582d7df0a177e549f7d8238a9a3fe"
+        },
+        "macos-aarch_64": {
+          "coordinate": "io.grpc:protoc-gen-grpc-java:exe:osx-aarch_64",
+          "sha256": "89e57db4182cac68540ec0da49962649b4e3e7eede383ec92231e2cba68e0d65"
+        }
+      }
+    }
+  },
+  "hbase": {
+    "public": {
+      "artifact": "org.apache.hbase:hbase-shaded-client-byo-hadoop",
+      "version": "2.6.6-hadoop3",
+      "hadoopVersion": "3.4.3",
+      "compatibility": "compile-candidate-only; HBase 2.6 requires 2.6.8+ for its Java 21 support mark"
+    },
+    "target": {
+      "version": null,
+      "hadoopVersion": null,
+      "blockedBy": "B02"
+    }
+  },
+  "go": {
+    "version": "1.27.2",
+    "moduleVersions": {
+      "go.etcd.io/etcd/client/v3": "v3.5.23"
+    },
+    "source": "https://go.dev/doc/devel/release",
+    "archives": {
+      "macos-aarch64": {
+        "url": "https://go.dev/dl/go1.27.2.darwin-arm64.tar.gz",
+        "sha256": "76812b213b1b2302c978d28fa52fa92d541704b9e7d9d5db8002c50e4018c4c5"
+      },
+      "linux-x64": {
+        "url": "https://go.dev/dl/go1.27.2.linux-amd64.tar.gz",
+        "sha256": "ecbadb99091a3f46e31f5f934b068b1864eafa7995211b39eaddf76996045fe5"
+      },
+      "windows-x64": {
+        "url": "https://go.dev/dl/go1.27.2.windows-amd64.zip",
+      "sha256": "1314008898bd40df77af4b014f777f08873dbdfbcd3d92308728ee03304fe04f"
+      }
+    },
+    "moduleChecksums": {
+      "go.etcd.io/etcd/client/v3@v3.5.23": {
+        "module": "h1:WN7sypGG326sFP5jLkFqD3anf/k6NNlV5Hy/UxvTPvc=",
+        "goMod": "h1:XTf1oMQi4ZzpXGFoPgvAqbY9JFmTFQqWI1SF4g+hV6o="
+      }
+    }
+  },
+  "sourceEvidence": [
+    "https://adoptium.net/temurin/releases?version=21",
+    "https://maven.apache.org/docs/3.9.16/release-notes.html",
+    "https://maven.apache.org/tools/wrapper/maven-wrapper-plugin/wrapper-mojo.html",
+    "https://maven.apache.org/plugins/index.html",
+    "https://github.com/grpc/grpc-java",
+    "https://github.com/grpc/grpc-java/releases/tag/v1.84.0",
+    "https://protobuf.dev/support/version-support/",
+    "https://hbase.apache.org/docs/configuration/basic-prerequisites/",
+    "https://hbase.apache.org/downloads/",
+    "https://repo.maven.apache.org/maven2/org/apache/hbase/hbase-shaded-client-byo-hadoop/2.6.6-hadoop3/hbase-shaded-client-byo-hadoop-2.6.6-hadoop3.pom",
+    "https://repo.maven.apache.org/maven2/org/apache/hadoop/hadoop-common/3.4.3/hadoop-common-3.4.3.pom",
+    "https://go.dev/doc/devel/release",
+    "https://go.dev/dl/"
+  ]
+}
