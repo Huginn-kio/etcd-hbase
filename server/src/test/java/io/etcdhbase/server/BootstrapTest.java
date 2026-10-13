@@ -26,8 +26,10 @@ import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.StreamObserver;
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -139,9 +141,10 @@ class BootstrapTest {
     assertTrue(channel.awaitTermination(2, TimeUnit.SECONDS));
     bootstrap.close();
     assertTrue(bootstrap.awaitTermination(Duration.ofSeconds(1)));
-    try (ServerSocket socket = new ServerSocket()) {
-      socket.setReuseAddress(true);
-      socket.bind(new InetSocketAddress("127.0.0.1", boundPort));
+    try (Socket socket = new Socket()) {
+      assertThrows(
+          ConnectException.class,
+          () -> socket.connect(new InetSocketAddress("127.0.0.1", boundPort), 1_000));
     }
   }
 
