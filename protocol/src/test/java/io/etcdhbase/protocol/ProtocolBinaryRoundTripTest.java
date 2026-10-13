@@ -54,9 +54,15 @@ class ProtocolBinaryRoundTripTest {
             .setLease(LARGE_REVISION)
             .setPrevKv(true))
         .build();
+    Rpc.RequestOp nestedTransaction = Rpc.RequestOp.newBuilder()
+        .setRequestTxn(Rpc.TxnRequest.newBuilder()
+            .addCompare(compare)
+            .addSuccess(put))
+        .build();
     Rpc.TxnRequest txn = Rpc.TxnRequest.newBuilder()
         .addCompare(compare)
         .addSuccess(put)
+        .addSuccess(nestedTransaction)
         .addFailure(Rpc.RequestOp.newBuilder().setRequestRange(
             Rpc.RangeRequest.newBuilder().setKey(ByteString.copyFrom(KEY))))
         .build();
@@ -67,6 +73,10 @@ class ProtocolBinaryRoundTripTest {
         decodedTxn.getSuccess(0).getRequestCase());
     assertEquals(Rpc.RequestOp.RequestCase.REQUEST_RANGE,
         decodedTxn.getFailure(0).getRequestCase());
+    Rpc.RequestOp decodedNestedTransaction = decodedTxn.getSuccess(1);
+    assertEquals(Rpc.RequestOp.RequestCase.REQUEST_TXN, decodedNestedTransaction.getRequestCase());
+    assertEquals(Rpc.RequestOp.RequestCase.REQUEST_PUT,
+        decodedNestedTransaction.getRequestTxn().getSuccess(0).getRequestCase());
 
     Kv.KeyValue previous = Kv.KeyValue.newBuilder()
         .setKey(ByteString.copyFrom(KEY))
