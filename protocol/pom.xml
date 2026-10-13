@@ -26,7 +26,6 @@
     <dependency>
       <groupId>javax.annotation</groupId>
       <artifactId>javax.annotation-api</artifactId>
-      <version>1.3.2</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -90,6 +89,7 @@
             <wire.contract.file>${project.basedir}/baseline/wire-contract.json</wire.contract.file>
             <protocol.descriptor.file>${project.build.directory}/generated-resources/protobuf/descriptor-sets/etcd-v3.5.23.protobin</protocol.descriptor.file>
             <protocol.source.lock>${project.basedir}/upstream-lock.json</protocol.source.lock>
+            <protocol.proto.root>${project.basedir}/src/main/proto</protocol.proto.root>
           </systemPropertyVariables>
         </configuration>
       </plugin>

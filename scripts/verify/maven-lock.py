@@ -18,6 +18,19 @@ POM_NS = "http://maven.apache.org/POM/4.0.0"
 NS = {"m": POM_NS}
 PROPERTY = re.compile(r"\$\{([^}]+)}")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SUPPORTED_LIBRARY_ENTRIES = {
+    "convergenceOverrides",
+    "grpc",
+    "guava",
+    "hadoop",
+    "hbase",
+    "jackson",
+    "javaxAnnotation",
+    "protobuf",
+    "slf4j",
+    "snakeYaml",
+    "tests",
+}
 
 
 class LockError(Exception):
@@ -222,7 +235,7 @@ def collect_artifacts(lock: dict[str, object]) -> list[Artifact]:
 
     libraries = lock.get("libraries", {})
     if isinstance(libraries, dict):
-        for name in ("hbase", "hadoop", "guava", "slf4j", "snakeYaml"):
+        for name in ("hbase", "hadoop", "guava", "slf4j", "snakeYaml", "javaxAnnotation"):
             record = libraries.get(name)
             if isinstance(record, dict):
                 add_artifact(artifacts, str(record.get("coordinate", "")), record.get("sha256"))
@@ -302,6 +315,9 @@ def validate_metadata(lock: dict[str, object], root_pom: Path) -> int:
     libraries = lock.get("libraries")
     if not isinstance(libraries, dict):
         raise LockError("lock.libraries must be an object")
+    unsupported_libraries = sorted(set(libraries) - SUPPORTED_LIBRARY_ENTRIES)
+    if unsupported_libraries:
+        errors.append(f"unsupported libraries entries: {unsupported_libraries}")
 
     def require_managed(coordinate: str, label: str) -> None:
         try:
@@ -311,9 +327,9 @@ def validate_metadata(lock: dict[str, object], root_pom: Path) -> int:
             return
         actual = managed_dependencies.get((group, artifact), [])
         if version not in actual:
-            errors.append(f"POM dependencyManagement does not pin {coordinate}; found {actual or 'no declaration'}")
+            errors.append(f"{label}: POM dependencyManagement does not pin {coordinate}; found {actual or 'no declaration'}")
         if any(actual_version != version for actual_version in actual):
-            errors.append(f"a module overrides locked dependencyManagement {coordinate} with {actual}")
+            errors.append(f"{label}: a module overrides locked dependencyManagement {coordinate} with {actual}")
         explicit_versions = declared_dependencies.get((group, artifact), [])
         if any(explicit_version not in ("<managed>", version) for explicit_version in explicit_versions):
             errors.append(f"a module overrides locked dependency {coordinate} with {explicit_versions}")
@@ -339,7 +355,7 @@ def validate_metadata(lock: dict[str, object], root_pom: Path) -> int:
             if any(actual_version != version for actual_version in versions):
                 errors.append(f"{label} has a module override for managed version {version}: {versions}")
 
-    for name in ("hbase", "hadoop", "guava", "slf4j", "snakeYaml"):
+    for name in ("hbase", "hadoop", "guava", "slf4j", "snakeYaml", "javaxAnnotation"):
         record = libraries.get(name)
         if isinstance(record, dict) and record.get("coordinate"):
             require_managed(str(record["coordinate"]), f"libraries.{name}")

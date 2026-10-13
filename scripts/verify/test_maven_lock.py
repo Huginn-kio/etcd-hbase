@@ -29,6 +29,43 @@ class MavenLockTest(unittest.TestCase):
     def test_project_pins_match_dependency_lock(self) -> None:
         self.assertEqual(9, maven_lock.validate_metadata(self.lock, ROOT / "pom.xml"))
 
+    def test_unhandled_library_lock_entry_is_rejected(self) -> None:
+        lock = copy.deepcopy(self.lock)
+        lock["libraries"]["futureLibrary"] = {
+            "coordinate": "org.example:future-library:1.0",
+            "sha256": "0" * 64,
+        }
+
+        with self.assertRaisesRegex(maven_lock.LockError, "unsupported libraries entries"):
+            maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+
+    def test_javax_annotation_version_must_match_the_managed_dependency(self) -> None:
+        lock = copy.deepcopy(self.lock)
+        lock["libraries"]["javaxAnnotation"]["coordinate"] = (
+            "javax.annotation:javax.annotation-api:0.0.0-review-mismatch"
+        )
+
+        with self.assertRaisesRegex(maven_lock.LockError, "libraries.javaxAnnotation"):
+            maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+
+    def test_javax_annotation_digest_is_included_in_artifact_verification(self) -> None:
+        lock = copy.deepcopy(self.lock)
+        lock["libraries"]["javaxAnnotation"]["sha256"] = "0" * 64
+        artifacts = maven_lock.collect_artifacts(lock)
+        annotation_artifact = next(
+            (artifact for artifact in artifacts if artifact.coordinate == "javax.annotation:javax.annotation-api"),
+            None,
+        )
+        self.assertIsNotNone(annotation_artifact)
+
+        assert annotation_artifact is not None
+        with tempfile.TemporaryDirectory(prefix="m0-lock-javax-annotation-") as temp_dir:
+            path = Path(temp_dir) / annotation_artifact.relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"tampered javax.annotation-api artifact")
+            with self.assertRaisesRegex(maven_lock.LockError, "SHA-256 mismatch"):
+                maven_lock.verify_artifacts([annotation_artifact], Path(temp_dir), require_all=True)
+
     def test_duplicate_json_keys_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="m0-lock-duplicate-") as temp_dir:
             path = Path(temp_dir) / "duplicate.json"
