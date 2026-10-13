@@ -2,9 +2,11 @@ package io.etcdhbase.grpc;
 
 import io.etcdhbase.core.request.RequestScope;
 import io.grpc.Context;
+import io.grpc.MethodDescriptor;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
+import io.grpc.Status;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -16,6 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class RequestScopeInterceptorTest {
   private final RequestScopeInterceptor interceptor = new RequestScopeInterceptor();
@@ -86,6 +89,47 @@ class RequestScopeInterceptorTest {
   @Test
   void currentScopeIsUnavailableOutsideAnInterceptedCall() {
     assertThrows(IllegalStateException.class, RequestScopeInterceptor::currentScope);
+    assertThrows(IllegalStateException.class, RequestScopeInterceptor::currentTraceId);
+  }
+
+  @Test
+  void recordsBoundedMethodOutcomeAndGeneratedTraceIdOnce() {
+    AtomicReference<Observation> observation = new AtomicReference<>();
+    AtomicInteger observationCount = new AtomicInteger();
+    RequestCompletionRecorder recorder =
+        (methodClass, outcome, traceId, requestScope, elapsedNanos) -> {
+          observationCount.incrementAndGet();
+          observation.set(new Observation(methodClass, outcome, traceId, elapsedNanos));
+        };
+    AtomicReference<ServerCall<String, String>> observedCall = new AtomicReference<>();
+    AtomicReference<String> contextTraceId = new AtomicReference<>();
+    @SuppressWarnings("unchecked")
+    MethodDescriptor<String, String> descriptor = mock(MethodDescriptor.class);
+    when(descriptor.getFullMethodName()).thenReturn("etcdserverpb.KV/Range");
+    @SuppressWarnings("unchecked")
+    ServerCall<String, String> call = mock(ServerCall.class);
+    when(call.getMethodDescriptor()).thenReturn(descriptor);
+    RequestScopeInterceptor observedInterceptor = new RequestScopeInterceptor(recorder);
+
+    ServerCall.Listener<String> listener =
+        observedInterceptor.interceptCall(
+            call,
+            new Metadata(),
+            (wrappedCall, headers) -> {
+              observedCall.set(wrappedCall);
+              contextTraceId.set(RequestScopeInterceptor.currentTraceId());
+              assertTrue(contextTraceId.get().matches("[0-9a-f-]{36}"));
+              return new ServerCall.Listener<>() {};
+            });
+
+    observedCall.get().close(Status.UNIMPLEMENTED, new Metadata());
+    listener.onComplete();
+
+    assertEquals(RequestCompletionRecorder.MethodClass.KV_UNARY, observation.get().methodClass());
+    assertEquals(RequestCompletionRecorder.Outcome.UNIMPLEMENTED, observation.get().outcome());
+    assertEquals(1, observationCount.get());
+    assertEquals(contextTraceId.get(), observation.get().traceId());
+    assertTrue(observation.get().elapsedNanos() >= 0);
   }
 
   private ServerCall.Listener<String> intercept(ServerCallHandler<String, String> handler) {
@@ -95,4 +139,10 @@ class RequestScopeInterceptorTest {
     assertNotNull(listener);
     return listener;
   }
+
+  private record Observation(
+      RequestCompletionRecorder.MethodClass methodClass,
+      RequestCompletionRecorder.Outcome outcome,
+      String traceId,
+      long elapsedNanos) {}
 }
