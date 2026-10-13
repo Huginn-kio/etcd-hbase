@@ -103,8 +103,28 @@ class MavenLockTest(unittest.TestCase):
             "module overrides locked version property hbase.version",
         )
 
+    def test_root_profile_property_override_of_locked_version_is_rejected(self) -> None:
+        self.assert_pom_override_rejected(
+            "pom.xml",
+            """
+  <profiles>
+    <profile>
+      <id>root-version-override</id>
+      <activation><activeByDefault>true</activeByDefault></activation>
+      <properties><hbase.version>2.6.5-hadoop3</hbase.version></properties>
+    </profile>
+  </profiles>
+""",
+            "root overrides locked version property hbase.version",
+        )
+
     def assert_module_override_rejected(
         self, module_path: str, override: str, mismatch_label: str
+    ) -> None:
+        self.assert_pom_override_rejected(module_path, override, mismatch_label)
+
+    def assert_pom_override_rejected(
+        self, pom_path: str, override: str, mismatch_label: str
     ) -> None:
         with tempfile.TemporaryDirectory(prefix="m0-lock-module-override-") as temp_dir:
             project = Path(temp_dir)
@@ -119,7 +139,7 @@ class MavenLockTest(unittest.TestCase):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(module, destination)
 
-            target = project / module_path
+            target = project / pom_path
             contents = target.read_text(encoding="utf-8")
             target.write_text(contents.replace("</project>", f"{override}</project>", 1), encoding="utf-8")
             with self.assertRaisesRegex(maven_lock.LockError, mismatch_label):

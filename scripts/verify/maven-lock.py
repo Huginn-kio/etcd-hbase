@@ -157,19 +157,22 @@ def read_project(root_pom: Path) -> tuple[list[Path], dict[str, str], dict[tuple
             project = ET.parse(pom).getroot()
         except (ET.ParseError, OSError) as exc:
             raise LockError(f"cannot parse {pom}: {exc}") from exc
+        override_property_nodes = []
         if pom != root_pom:
-            module_property_nodes = [project.find("m:properties", NS)]
-            module_property_nodes.extend(project.findall("m:profiles/m:profile/m:properties", NS))
-            module_property_names = {
+            override_property_nodes.append(project.find("m:properties", NS))
+        override_property_nodes.extend(project.findall("m:profiles/m:profile/m:properties", NS))
+        if override_property_nodes:
+            override_property_names = {
                 child.tag.rsplit("}", 1)[-1]
-                for properties_node in module_property_nodes
+                for properties_node in override_property_nodes
                 if properties_node is not None
                 for child in list(properties_node)
             }
-            property_overrides = sorted(locked_version_properties & module_property_names)
+            property_overrides = sorted(locked_version_properties & override_property_names)
             if property_overrides:
+                scope = "root" if pom == root_pom else "module"
                 raise LockError(
-                    f"module overrides locked version property "
+                    f"{scope} overrides locked version property "
                     f"{', '.join(property_overrides)} in {pom}"
                 )
         for dependency in project.findall("m:dependencyManagement/m:dependencies/m:dependency", NS):
