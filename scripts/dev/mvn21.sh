@@ -15,16 +15,12 @@ export PATH="$JAVA_HOME/bin:$PATH"
 
 python3 "$ROOT/scripts/dev/configure-toolchain.py" --java-home "$JAVA_HOME"
 python3 "$ROOT/scripts/verify/test_maven_lock.py"
-MAVEN_REPOSITORY="${ETCD_HBASE_MAVEN_REPOSITORY:-}"
-HAS_REPOSITORY_ARG=false
-for ARG in "$@"; do
-  case "$ARG" in
-    -Dmaven.repo.local=*)
-      MAVEN_REPOSITORY="${ARG#*=}"
-      HAS_REPOSITORY_ARG=true
-      ;;
-  esac
-done
+"$ROOT/scripts/verify/test_mvn21_args.sh"
+# shellcheck source=./maven-repository.sh
+source "$ROOT/scripts/dev/maven-repository.sh"
+m0_parse_maven_repo_local "$@"
+MAVEN_REPOSITORY="$M0_MAVEN_REPOSITORY"
+HAS_REPOSITORY_ARG="$M0_HAS_MAVEN_REPOSITORY_ARG"
 if [[ -n "$MAVEN_REPOSITORY" ]]; then
   python3 "$ROOT/scripts/verify/maven-lock.py" --mode preflight --repository "$MAVEN_REPOSITORY"
 else

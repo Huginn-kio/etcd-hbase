@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import shutil
 import sys
 import tempfile
 import unittest
@@ -40,6 +41,63 @@ class MavenLockTest(unittest.TestCase):
         lock["plugins"]["maven-enforcer-plugin"]["version"] = "0.0.0-review-mismatch"
         with self.assertRaisesRegex(maven_lock.LockError, "Maven lock metadata mismatch"):
             maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+
+    def test_module_plugin_management_override_is_rejected(self) -> None:
+        self.assert_module_override_rejected(
+            "spi/pom.xml",
+            """
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <artifactId>maven-clean-plugin</artifactId>
+          <version>3.4.1</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+""",
+            "pluginManagement",
+        )
+
+    def test_module_dependency_management_override_is_rejected(self) -> None:
+        self.assert_module_override_rejected(
+            "spi/pom.xml",
+            """
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>1.7.36</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+""",
+            "dependencyManagement",
+        )
+
+    def assert_module_override_rejected(
+        self, module_path: str, override: str, mismatch_label: str
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="m0-lock-module-override-") as temp_dir:
+            project = Path(temp_dir)
+            for relative in ("pom.xml", ".mvn/wrapper/maven-wrapper.properties", ".mvn/wrapper/maven-wrapper.jar"):
+                source = ROOT / relative
+                destination = project / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            for module in maven_lock.read_project(ROOT / "pom.xml")[0][1:]:
+                relative = module.relative_to(ROOT)
+                destination = project / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(module, destination)
+
+            target = project / module_path
+            contents = target.read_text(encoding="utf-8")
+            target.write_text(contents.replace("</project>", f"{override}</project>", 1), encoding="utf-8")
+            with self.assertRaisesRegex(maven_lock.LockError, mismatch_label):
+                maven_lock.validate_metadata(self.lock, project / "pom.xml")
 
     def test_wrong_native_classifier_is_rejected(self) -> None:
         lock = copy.deepcopy(self.lock)

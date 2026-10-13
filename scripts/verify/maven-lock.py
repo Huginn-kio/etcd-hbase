@@ -265,6 +265,8 @@ def validate_metadata(lock: dict[str, object], root_pom: Path) -> int:
         actual = managed_plugins.get((group, artifact), [])
         if version not in actual:
             errors.append(f"POM pluginManagement does not pin {coordinate}; found {actual or 'no declaration'}")
+        if any(actual_version != version for actual_version in actual):
+            errors.append(f"a module overrides locked pluginManagement {coordinate} with {actual}")
         explicit_versions = declared_plugins.get((group, artifact), [])
         if any(explicit_version != version for explicit_version in explicit_versions):
             errors.append(f"a module overrides locked plugin {coordinate} with {explicit_versions}")
@@ -282,6 +284,8 @@ def validate_metadata(lock: dict[str, object], root_pom: Path) -> int:
         actual = managed_dependencies.get((group, artifact), [])
         if version not in actual:
             errors.append(f"POM dependencyManagement does not pin {coordinate}; found {actual or 'no declaration'}")
+        if any(actual_version != version for actual_version in actual):
+            errors.append(f"a module overrides locked dependencyManagement {coordinate} with {actual}")
         explicit_versions = declared_dependencies.get((group, artifact), [])
         if any(explicit_version not in ("<managed>", version) for explicit_version in explicit_versions):
             errors.append(f"a module overrides locked dependency {coordinate} with {explicit_versions}")
@@ -298,10 +302,14 @@ def validate_metadata(lock: dict[str, object], root_pom: Path) -> int:
             versions = managed_dependencies.get((bom_group, bom_artifact), [])
             if bom_version not in versions:
                 errors.append(f"{label} requires imported BOM {bom_group}:{bom_artifact}:{bom_version}; found {versions or 'none'}")
+            if any(actual_version != bom_version for actual_version in versions):
+                errors.append(f"{label} has a module override for imported BOM {bom_group}:{bom_artifact}: {versions}")
         else:
             versions = managed_dependencies.get(key, [])
             if version not in versions:
                 errors.append(f"{label} version {version} is not managed by the POM; found {versions or 'none'}")
+            if any(actual_version != version for actual_version in versions):
+                errors.append(f"{label} has a module override for managed version {version}: {versions}")
 
     for name in ("hbase", "hadoop", "guava", "slf4j", "snakeYaml"):
         record = libraries.get(name)
