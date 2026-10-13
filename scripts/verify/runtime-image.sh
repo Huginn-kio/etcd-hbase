@@ -133,9 +133,10 @@ fi
 
 docker stop --time 10 "$CONTAINER" >"$ARTIFACT_ROOT/container-stop.log"
 CONTAINER_EXIT="$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER")"
-if [[ "$CONTAINER_EXIT" -ne 0 ]]; then
-  echo "packaged server did not stop cleanly (exit=$CONTAINER_EXIT)" >&2
+if [[ "$CONTAINER_EXIT" -ne 0 && "$CONTAINER_EXIT" -ne 143 ]]; then
+  echo "packaged server did not stop within the SIGTERM grace period (exit=$CONTAINER_EXIT)" >&2
+  docker logs "$CONTAINER" >&2 || true
   exit 1
 fi
 
-echo "runtime image passed: Java 21 package started, returned UNIMPLEMENTED, and shut down cleanly; artifacts=$ARTIFACT_ROOT"
+echo "runtime image passed: Java 21 package started, returned UNIMPLEMENTED, and completed shutdown before Docker forced termination; artifacts=$ARTIFACT_ROOT"
