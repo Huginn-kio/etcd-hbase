@@ -121,6 +121,12 @@
       "sha256": "3558022661e66eddf741316994da9b4188ab012626da7114dc4ade8dd996460d",
       "reason": "Public Hadoop 3 compile candidate only; Java 21 runtime support is not established by the HBase support matrix."
     },
+    "hbaseTestingUtil": {
+      "coordinate": "org.apache.hbase:hbase-testing-util:2.6.6-hadoop3",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "09a0c44d7ab947cfab98bdab49ffd5cbc2b82e589afca164f1af1d07a84c8eaa",
+      "reason": "Run public, unauthenticated HBase integration probes against an isolated temporary cluster."
+    },
     "hadoop": {
       "coordinate": "org.apache.hadoop:hadoop-common:3.4.3",
       "repository": "https://repo.maven.apache.org/maven2",

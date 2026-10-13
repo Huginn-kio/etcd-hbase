@@ -280,6 +280,14 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void ignoresTheBuildToolchainPathEnvironmentVariable() {
+    RuntimeConfiguration configuration =
+        loader.load(bytes(VALID_YAML), Map.of("ETCD_HBASE_JDK21_HOME", "/opt/jdk-21"));
+
+    assertEquals("local", configuration.tableGroups().getFirst().id());
+  }
+
+  @Test
   void boundsEffectiveFileAndEnvironmentConfigurationSize() {
     RuntimeConfigurationException oversized =
         assertThrows(
