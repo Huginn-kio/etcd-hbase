@@ -678,13 +678,25 @@ class RuntimeConfigurationLoaderTest {
         "resources.max_queued_requests",
         null);
     assertRejected(
-        VALID_YAML.replace("127.0.0.1", "0.0.0.0"),
+        VALID_YAML.replace("bind_host: 127.0.0.1", "bind_host: 0.0.0.0"),
         "DEV_NO_AUTH requires a loopback listener",
         null);
     assertRejected(
-        VALID_YAML.replace("127.0.0.1", "127.untrusted"),
+        VALID_YAML.replace("bind_host: 127.0.0.1", "bind_host: 127.untrusted"),
         "DEV_NO_AUTH requires a loopback listener",
         null);
+    assertRejected(
+        VALID_YAML.replace("quorum: 127.0.0.1", "quorum: hbase.example"),
+        "DEV_NO_AUTH requires loopback HBase quorum hosts",
+        null);
+    assertRejected(
+        VALID_YAML.replace("quorum: 127.0.0.1", "quorum: 127.0.0.1,hbase.example"),
+        "DEV_NO_AUTH requires loopback HBase quorum hosts",
+        null);
+    assertDoesNotThrow(
+        () ->
+            loader.load(
+                bytes(VALID_YAML.replace("quorum: 127.0.0.1", "quorum: localhost,127.0.0.1"))));
   }
 
   @Test

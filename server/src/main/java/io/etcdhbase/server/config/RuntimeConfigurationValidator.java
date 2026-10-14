@@ -546,6 +546,11 @@ final class RuntimeConfigurationValidator {
       if (reference != null) {
         throw invalid(path + ".credential_reference", "must be omitted for DEV_NO_AUTH");
       }
+      for (String host : profile.quorum().split(",", -1)) {
+        if (!isLoopbackHost(normalizeHost(host, path + ".quorum"))) {
+          throw invalid(path + ".quorum", "DEV_NO_AUTH requires loopback HBase quorum hosts");
+        }
+      }
       return;
     }
     if (reference == null
