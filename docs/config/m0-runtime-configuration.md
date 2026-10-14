@@ -23,7 +23,7 @@ M0 服务配置使用单一 YAML 文档。加载顺序为：读取 YAML 文件�
 
 ## 监听与身份
 
-`port: 0` 表示由操作系统分配随机端口，仅允许 loopback 地址；多个随机端口 listener 不视为端口冲突。IPv6 listener 地址按字面地址规范化后检查冲突，支持括号、压缩和展开写法，不为主机名执行 DNS 查询。`DEV_NO_AUTH` 必须显式出现在 HBase profile 中；listener 和逗号分隔的 HBase quorum 中每个地址都必须是 loopback 地址或 `localhost`。校验只解析 IP 字面地址，不为其他主机名执行 DNS 查询。其他身份模式必须提供 `env://NAME` 或 `secret://reference` credential reference；YAML 中不接受明文密码或 token。
+`port: 0` 表示由操作系统分配随机端口，仅允许 loopback 地址；多个随机端口 listener 不视为端口冲突。IPv6 listener 地址按字面地址规范化后检查冲突，支持括号、压缩和展开写法。重复端口检查会把 `localhost` 保守地视为与显式 loopback IP 可能重叠，不执行 DNS 查询。`DEV_NO_AUTH` 必须显式出现在 HBase profile 中；listener 和逗号分隔的 HBase quorum 中每个地址都必须是 loopback 地址或 `localhost`。校验只解析 IP 字面地址，不为其他主机名执行 DNS 查询。其他身份模式必须提供 `env://NAME` 或 `secret://reference` credential reference；YAML 中不接受明文密码或 token。
 
 同一 HBase quorum、client port 和 namespace 是一个物理表命名范围。即使两个 HBase profile 使用不同 ID，只要连接目标与 namespace 相同，表组就不能重复声明同名物理表。
 

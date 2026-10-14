@@ -529,7 +529,9 @@ final class RuntimeConfigurationValidator {
         if (address.port() != 0
             && existing.port() != 0
             && existing.port() == address.port()
-            && (existing.wildcard() || address.wildcard() || existing.host().equals(address.host()))) {
+            && (existing.wildcard()
+                || address.wildcard()
+                || listenerHostsOverlap(existing.host(), address.host()))) {
           throw invalid(path + ".port", "conflicts with another listener address");
         }
       }
@@ -726,6 +728,14 @@ final class RuntimeConfigurationValidator {
 
   private static boolean isLoopbackHost(String host) {
     return host.equals("localhost") || isIpv4Loopback(host) || isIpv6Loopback(host);
+  }
+
+  private static boolean listenerHostsOverlap(String left, String right) {
+    if (left.equals(right)) {
+      return true;
+    }
+    return (left.equals("localhost") && isLoopbackHost(right))
+        || (right.equals("localhost") && isLoopbackHost(left));
   }
 
   private static boolean isIpv6AnyLocalAddress(String host) {

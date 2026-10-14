@@ -278,6 +278,26 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void rejectsLocalhostListenerAliasesWithoutResolvingHostnames() {
+    for (String alias : List.of("127.0.0.1", "::1")) {
+      String localhostListener = VALID_YAML.replace("bind_host: 127.0.0.1", "bind_host: localhost");
+      String duplicate =
+          localhostListener.replace(
+              "    table_group_id: local\nhbase_profiles:",
+              "    table_group_id: local\n"
+                  + "  - id: loopback-alias-listener\n"
+                  + "    bind_host: "
+                  + alias
+                  + "\n"
+                  + "    port: 2379\n"
+                  + "    table_group_id: local\n"
+                  + "hbase_profiles:");
+
+      assertRejected(duplicate, "listeners[1].port", null);
+    }
+  }
+
+  @Test
   void rejectsEquivalentIpv6ListenerAddressesAcrossBracketAndCompressionForms() {
     for (List<String> hostPair :
         List.of(List.of("::1", "\"[::1]\""), List.of("0:0:0:0:0:0:0:1", "::1"))) {
