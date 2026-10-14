@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -146,12 +147,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 		err = requestErr
 	}
 	elapsed := time.Since(started)
-	responseSnapshot := json.RawMessage("null")
-	if response != nil {
-		responseSnapshot, err = trace.SnapshotProto(response)
-		if err != nil {
-			return errors.New("response snapshot failed")
-		}
+	responseSnapshot, snapshotErr := snapshotResponse(response)
+	if snapshotErr != nil {
+		return errors.New("response snapshot failed")
 	}
 	record := trace.Record{
 		Schema:        trace.SchemaVersion,
@@ -177,6 +175,17 @@ type protoMessage interface {
 	Reset()
 	String() string
 	ProtoMessage()
+}
+
+func snapshotResponse(message protoMessage) (json.RawMessage, error) {
+	if message == nil {
+		return json.RawMessage("null"), nil
+	}
+	value := reflect.ValueOf(message)
+	if value.Kind() == reflect.Pointer && value.IsNil() {
+		return json.RawMessage("null"), nil
+	}
+	return trace.SnapshotProto(message)
 }
 
 func openTrace(path string, stdout io.Writer) (io.Writer, func(), error) {
