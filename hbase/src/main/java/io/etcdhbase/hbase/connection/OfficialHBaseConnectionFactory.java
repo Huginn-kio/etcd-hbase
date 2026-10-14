@@ -11,8 +11,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import org.apache.hadoop.conf.Configuration;
@@ -239,6 +241,12 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
             case BACKEND_UNAVAILABLE -> BackendFailure.Category.UNAVAILABLE;
           };
       return new BackendFailure(category, cause);
+    }
+    if (cause instanceof CancellationException || cause instanceof InterruptedException) {
+      return new BackendFailure(BackendFailure.Category.CANCELLED, cause);
+    }
+    if (cause instanceof TimeoutException) {
+      return new BackendFailure(BackendFailure.Category.TIMEOUT, cause);
     }
     return new BackendFailure(BackendFailure.Category.UNAVAILABLE, cause);
   }
