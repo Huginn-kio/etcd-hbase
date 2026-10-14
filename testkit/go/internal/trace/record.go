@@ -564,8 +564,22 @@ func validateObject(raw json.RawMessage, label string, allowNull, authMethod boo
 	if decoded == nil && allowNull {
 		return nil
 	}
-	if _, ok := decoded.(map[string]any); !ok {
+	snapshot, ok := decoded.(map[string]any)
+	if !ok {
 		return fmt.Errorf("%s must be a JSON object", label)
+	}
+	if len(snapshot) != 2 {
+		return fmt.Errorf("%s must contain a protobuf snapshot envelope", label)
+	}
+	_, hasFields := snapshot["fields"].(map[string]any)
+	oneofs, hasOneofs := snapshot["oneofs"].(map[string]any)
+	if !hasFields || !hasOneofs {
+		return fmt.Errorf("%s must contain object fields and oneofs", label)
+	}
+	for _, selected := range oneofs {
+		if _, ok := selected.(string); !ok {
+			return fmt.Errorf("%s oneof selections must be strings", label)
+		}
 	}
 	if key := findSecretKey(decoded, authMethod); key != "" {
 		return fmt.Errorf("%s contains a forbidden secret field", label)

@@ -208,6 +208,43 @@ func TestJSONLRoundTripPreservesOrderAndRejectsTruncatedRecords(t *testing.T) {
 	}
 }
 
+func TestRecordRejectsMalformedProtobufSnapshotEnvelopes(t *testing.T) {
+	malformed := []struct {
+		name     string
+		snapshot json.RawMessage
+	}{
+		{name: "missing fields", snapshot: json.RawMessage(`{"oneofs":{}}`)},
+		{name: "missing oneofs", snapshot: json.RawMessage(`{"fields":{}}`)},
+		{name: "fields are not an object", snapshot: json.RawMessage(`{"fields":[],"oneofs":{}}`)},
+		{name: "oneofs are not an object", snapshot: json.RawMessage(`{"fields":{},"oneofs":[]}`)},
+		{name: "unexpected envelope field", snapshot: json.RawMessage(`{"fields":{},"oneofs":{},"extra":true}`)},
+		{name: "oneof selection is not a string", snapshot: json.RawMessage(`{"fields":{},"oneofs":{"request":1}}`)},
+	}
+
+	for _, test := range malformed {
+		t.Run(test.name, func(t *testing.T) {
+			record := testRecord("malformed-snapshot", 1)
+			record.Request = test.snapshot
+			if err := record.Validate(); err == nil {
+				t.Fatal("record accepted a malformed request snapshot envelope")
+			}
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatalf("marshal malformed record: %v", err)
+			}
+			if _, err := ReadJSONL(bytes.NewReader(append(encoded, '\n'))); err == nil {
+				t.Fatal("trace reader accepted a malformed request snapshot envelope")
+			}
+
+			record = testRecord("malformed-snapshot", 1)
+			record.Response = test.snapshot
+			if err := record.Validate(); err == nil {
+				t.Fatal("record accepted a malformed response snapshot envelope")
+			}
+		})
+	}
+}
+
 func TestWriteJSONLRejectsRecordLargerThanReaderLineLimit(t *testing.T) {
 	record := testRecord("bounded-line", 1)
 	var output bytes.Buffer
