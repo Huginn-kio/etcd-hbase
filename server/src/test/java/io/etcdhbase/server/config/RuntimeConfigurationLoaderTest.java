@@ -673,6 +673,38 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void acceptsDistinctTablesAcrossGroupsOnTheSameCanonicalBackendScope() {
+    String withProfileAlias =
+        VALID_YAML.replace(
+            "    authentication_mode: DEV_NO_AUTH\nsalt_profiles:",
+            "    authentication_mode: DEV_NO_AUTH\n"
+                + "  - id: alias-hbase\n"
+                + "    quorum: 127.000.000.001\n"
+                + "    client_port: 2181\n"
+                + "    namespace: etcd_candidate\n"
+                + "    authentication_mode: DEV_NO_AUTH\n"
+                + "salt_profiles:");
+    int tableGroupsStart = withProfileAlias.indexOf("table_groups:\n");
+    int firstGroupStart = withProfileAlias.indexOf("  - id: local\n", tableGroupsStart);
+    int resourcesStart = withProfileAlias.indexOf("resources:\n", firstGroupStart);
+    String siblingGroup =
+        withProfileAlias
+            .substring(firstGroupStart, resourcesStart)
+            .replaceFirst("id: local", "id: sibling")
+            .replace("hbase_profile_id: local-hbase", "hbase_profile_id: alias-hbase")
+            .replace("table_name: system", "table_name: sibling-system")
+            .replace("table_name: latest", "table_name: sibling-latest")
+            .replace("table_name: history", "table_name: sibling-history")
+            .replace("table_name: kv", "table_name: sibling-kv");
+    String distinctGroups =
+        withProfileAlias.substring(0, resourcesStart)
+            + siblingGroup
+            + withProfileAlias.substring(resourcesStart);
+
+    assertDoesNotThrow(() -> loader.load(bytes(distinctGroups)));
+  }
+
+  @Test
   void rejectsEmbeddedSecretAndDoesNotEchoIt() {
     String sentinel = "do-not-disclose-this-secret-value";
     RuntimeConfigurationException exception =

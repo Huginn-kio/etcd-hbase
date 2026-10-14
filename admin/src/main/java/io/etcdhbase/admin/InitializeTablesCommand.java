@@ -207,6 +207,10 @@ public final class InitializeTablesCommand {
     output.println("salt_strategy_id: " + plan.saltStrategyId());
     output.println("history_layout: " + plan.historyLayout());
     output.println("confirmation_fingerprint: sha256:" + plan.fingerprint());
+    output.println("configured_namespace_tables:");
+    for (String tableName : plan.configuredNamespaceTableNames()) {
+      output.println("  - " + plan.namespace() + ":" + tableName);
+    }
     output.println("tables:");
     for (TableGroupInitializationPlan.TablePlan table : plan.tables()) {
       output.println("  - name: " + plan.namespace() + ":" + table.name());

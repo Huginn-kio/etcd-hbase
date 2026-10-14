@@ -2,11 +2,16 @@ package io.etcdhbase.admin;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration.HBaseProfile;
+import io.etcdhbase.server.config.RuntimeConfiguration.HistoryLayoutCandidate;
+import io.etcdhbase.server.config.RuntimeConfiguration.TableGroup;
+import io.etcdhbase.server.config.RuntimeConfiguration.TableSchemaCandidate;
 import io.etcdhbase.server.config.RuntimeConfigurationLoader;
 import io.etcdhbase.spi.identity.BackendIdentityProvider;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
@@ -19,6 +24,8 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
@@ -170,20 +177,53 @@ class TableGroupInitializerTest {
         .getMaxVersions());
   }
 
+  @Test
+  void initializesConfiguredSiblingGroupsInTheSameNamespaceWithoutModifyingThem() throws Exception {
+    RuntimeConfiguration configuration = configurationWithSiblingGroup("shared_namespace");
+    TableGroupInitializationPlan local =
+        TableGroupPlanFactory.create(configuration, "local", null);
+    TableGroupInitializationPlan sibling =
+        TableGroupPlanFactory.create(configuration, "sibling", null);
+    TableGroupInitializationPlan singleGroup = plan("history-table.yaml", "shared_namespace");
+    InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
+    Set<String> expectedConfiguredTables =
+        Stream.concat(
+                local.tables().stream().map(TableGroupInitializationPlan.TablePlan::name),
+                sibling.tables().stream().map(TableGroupInitializationPlan.TablePlan::name))
+            .collect(Collectors.toUnmodifiableSet());
+
+    assertEquals(expectedConfiguredTables, Set.copyOf(local.configuredNamespaceTableNames()));
+    assertEquals(expectedConfiguredTables, Set.copyOf(sibling.configuredNamespaceTableNames()));
+    assertNotEquals(singleGroup.fingerprint(), local.fingerprint());
+
+    TableGroupInitializer.InitializationResult localResult =
+        TableGroupInitializer.initialize(local, admin);
+    Map<TableName, TableDescriptor> localDescriptors = Map.copyOf(admin.descriptors);
+    TableGroupInitializer.InitializationResult siblingResult =
+        TableGroupInitializer.initialize(sibling, admin);
+
+    assertFalse(localResult.alreadyInitialized());
+    assertFalse(siblingResult.alreadyInitialized());
+    assertEquals(local.tables().size(), localDescriptors.size());
+    assertEquals(local.tables().size() + sibling.tables().size(), admin.descriptors.size());
+    for (Map.Entry<TableName, TableDescriptor> entry : localDescriptors.entrySet()) {
+      assertSame(entry.getValue(), admin.descriptors.get(entry.getKey()));
+      assertEquals("local", entry.getValue().getValue("etcdhbase.m0.table-group-id"));
+    }
+    for (TableGroupInitializationPlan.TablePlan table : sibling.tables()) {
+      assertEquals(
+          "sibling",
+          admin.descriptors
+              .get(TableName.valueOf(sibling.namespace(), table.name()))
+              .getValue("etcdhbase.m0.table-group-id"));
+    }
+    assertTrue(TableGroupInitializer.initialize(local, admin).alreadyInitialized());
+    assertTrue(TableGroupInitializer.initialize(sibling, admin).alreadyInitialized());
+  }
+
   private static TableGroupInitializationPlan plan(String resourceName, String namespace)
       throws Exception {
-    RuntimeConfiguration configuration;
-    try (InputStream input =
-        TableGroupInitializerTest.class.getResourceAsStream("/m0-examples/" + resourceName)) {
-      if (input == null) {
-        throw new IllegalStateException("missing M0 configuration fixture");
-      }
-      configuration =
-          new RuntimeConfigurationLoader(
-                  Set.of(BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID),
-                  Set.of(HashSaltStrategy.STRATEGY_ID))
-              .load(input.readAllBytes(), Map.of());
-    }
+    RuntimeConfiguration configuration = configuration(resourceName);
     HBaseProfile profile = configuration.hbaseProfiles().getFirst();
     RuntimeConfiguration isolated =
         new RuntimeConfiguration(
@@ -201,6 +241,81 @@ class TableGroupInitializerTest {
             configuration.tableGroups(),
             configuration.resources());
     return TableGroupPlanFactory.create(isolated, "local", null);
+  }
+
+  private static RuntimeConfiguration configuration(String resourceName) throws Exception {
+    RuntimeConfiguration configuration;
+    try (InputStream input =
+        TableGroupInitializerTest.class.getResourceAsStream("/m0-examples/" + resourceName)) {
+      if (input == null) {
+        throw new IllegalStateException("missing M0 configuration fixture");
+      }
+      configuration =
+          new RuntimeConfigurationLoader(
+                  Set.of(BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID),
+                  Set.of(HashSaltStrategy.STRATEGY_ID))
+              .load(input.readAllBytes(), Map.of());
+    }
+    return configuration;
+  }
+
+  private static RuntimeConfiguration configurationWithSiblingGroup(String namespace)
+      throws Exception {
+    RuntimeConfiguration configuration = configuration("history-table.yaml");
+    HBaseProfile profile = configuration.hbaseProfiles().getFirst();
+    TableGroup selected = configuration.tableGroups().getFirst();
+    TableGroup sibling =
+        new TableGroup(
+            "sibling",
+            selected.schemaVersion(),
+            "sibling-hbase",
+            selected.saltProfileId(),
+            selected.identityProviderId(),
+            selected.historyLayout(),
+            rename(selected.systemTable(), "sibling-system"),
+            selected.historyCandidates().stream()
+                .map(
+                    candidate ->
+                        new HistoryLayoutCandidate(
+                            candidate.historyLayout(),
+                            candidate.tables().stream()
+                                .map(table -> rename(table, "sibling-" + table.tableName()))
+                                .toList()))
+                .toList());
+    RuntimeConfiguration.HBaseProfile isolatedProfile =
+        new HBaseProfile(
+            profile.id(),
+            profile.quorum(),
+            profile.clientPort(),
+            namespace,
+            profile.authenticationMode(),
+            profile.credentialReference());
+    RuntimeConfiguration.HBaseProfile aliasedProfile =
+        new HBaseProfile(
+            "sibling-hbase",
+            "127.000.000.001",
+            profile.clientPort(),
+            namespace,
+            profile.authenticationMode(),
+            profile.credentialReference());
+    return new RuntimeConfiguration(
+        configuration.schemaVersion(),
+        configuration.listeners(),
+        List.of(isolatedProfile, aliasedProfile),
+        configuration.saltProfiles(),
+        List.of(selected, sibling),
+        configuration.resources());
+  }
+
+  private static TableSchemaCandidate rename(TableSchemaCandidate table, String name) {
+    return new TableSchemaCandidate(
+        name,
+        table.schemaVersion(),
+        table.profileVersion(),
+        table.columnFamilies(),
+        table.splitKeysHex(),
+        table.recordCategories(),
+        table.identityPermissions());
   }
 
   private static final class InMemoryTableGroupAdmin implements TableGroupAdmin {

@@ -1,5 +1,6 @@
 package io.etcdhbase.admin;
 
+import io.etcdhbase.server.config.HBaseBackendScope;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration.AuthenticationMode;
 import io.etcdhbase.server.config.RuntimeConfiguration.ColumnFamilySchema;
@@ -20,6 +21,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 
 /** Immutable, credential-free view of one explicitly selected table-group candidate. */
 public record TableGroupInitializationPlan(
@@ -37,10 +39,12 @@ public record TableGroupInitializationPlan(
     int saltBucketCount,
     int saltWidthBytes,
     HistoryLayout historyLayout,
+    List<String> configuredNamespaceTableNames,
     List<TablePlan> tables,
     String fingerprint) {
 
   public TableGroupInitializationPlan {
+    configuredNamespaceTableNames = List.copyOf(configuredNamespaceTableNames);
     tables = List.copyOf(tables);
   }
 
@@ -73,12 +77,15 @@ public record TableGroupInitializationPlan(
       tables.add(TablePlan.from(candidate));
     }
     List<TablePlan> immutableTables = List.copyOf(tables);
+    List<String> configuredNamespaceTableNames =
+        configuredNamespaceTableNames(configuration, tableGroup, hbaseProfile, selectedLayout);
     String fingerprint =
         fingerprint(
             tableGroup,
             hbaseProfile,
             saltProfile,
             selectedLayout,
+            configuredNamespaceTableNames,
             immutableTables);
     return new TableGroupInitializationPlan(
         tableGroup.id(),
@@ -95,8 +102,55 @@ public record TableGroupInitializationPlan(
         saltProfile.bucketCount(),
         saltProfile.saltWidthBytes(),
         selectedLayout,
+        configuredNamespaceTableNames,
         immutableTables,
         fingerprint);
+  }
+
+  private static List<String> configuredNamespaceTableNames(
+      RuntimeConfiguration configuration,
+      TableGroup selectedGroup,
+      HBaseProfile selectedProfile,
+      HistoryLayout selectedLayout) {
+    HBaseBackendScope selectedScope = HBaseBackendScope.of(selectedProfile);
+    Set<String> tableNames = new TreeSet<>();
+    for (TableGroup group : configuration.tableGroups()) {
+      HBaseProfile profile =
+          configuration.hbaseProfiles().stream()
+              .filter(candidate -> candidate.id().equals(group.hbaseProfileId()))
+              .findFirst()
+              .orElseThrow(() -> new IllegalArgumentException(
+                  "table group references an unknown HBase profile"));
+      if (!selectedScope.equals(HBaseBackendScope.of(profile))) {
+        continue;
+      }
+      tableNames.add(group.systemTable().tableName());
+      if (group.id().equals(selectedGroup.id())) {
+        HistoryLayoutCandidate selectedCandidate =
+            group.historyCandidates().stream()
+                .filter(candidate -> candidate.historyLayout() == selectedLayout)
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                    "selected history layout is not configured"));
+        selectedCandidate.tables().stream()
+            .map(TableSchemaCandidate::tableName)
+            .forEach(tableNames::add);
+      } else {
+        if (group.historyLayout() == HistoryLayout.UNDECIDED) {
+          group.historyCandidates().stream()
+              .flatMap(candidate -> candidate.tables().stream())
+              .map(TableSchemaCandidate::tableName)
+              .forEach(tableNames::add);
+        } else {
+          group.historyCandidates().stream()
+              .filter(candidate -> candidate.historyLayout() == group.historyLayout())
+              .flatMap(candidate -> candidate.tables().stream())
+              .map(TableSchemaCandidate::tableName)
+              .forEach(tableNames::add);
+        }
+      }
+    }
+    return List.copyOf(tableNames);
   }
 
   private static String fingerprint(
@@ -104,6 +158,7 @@ public record TableGroupInitializationPlan(
       HBaseProfile hbaseProfile,
       SaltProfile saltProfile,
       HistoryLayout selectedLayout,
+      List<String> configuredNamespaceTableNames,
       List<TablePlan> tables) {
     try {
       MessageDigest digest = MessageDigest.getInstance("SHA-256");
@@ -122,6 +177,9 @@ public record TableGroupInitializationPlan(
       update(digest, saltProfile.bucketCount());
       update(digest, saltProfile.saltWidthBytes());
       update(digest, selectedLayout.name());
+      for (String tableName : configuredNamespaceTableNames) {
+        update(digest, tableName);
+      }
       for (TablePlan table : tables.stream().sorted(Comparator.comparing(TablePlan::name)).toList()) {
         update(digest, table.name());
         update(digest, table.schemaVersion());

@@ -5,7 +5,6 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -38,9 +37,9 @@ final class TableGroupInitializer {
       TableGroupInitializationPlan plan, TableGroupAdmin admin) throws Exception {
     List<PlannedTable> plannedTables =
         plan.tables().stream().map(table -> plannedTable(plan, table)).toList();
-    Set<TableName> expectedNames =
-        plannedTables.stream()
-            .map(planned -> planned.descriptor().getTableName())
+    Set<TableName> configuredNamespaceNames =
+        plan.configuredNamespaceTableNames().stream()
+            .map(name -> TableName.valueOf(plan.namespace(), name))
             .collect(Collectors.toUnmodifiableSet());
 
     List<String> namespaces = admin.listNamespaces();
@@ -51,21 +50,19 @@ final class TableGroupInitializer {
 
     List<TableName> actualNames = admin.listTableNames(plan.namespace());
     List<TableName> unrelatedTables =
-        actualNames.stream().filter(name -> !expectedNames.contains(name)).toList();
+        actualNames.stream().filter(name -> !configuredNamespaceNames.contains(name)).toList();
     if (!unrelatedTables.isEmpty()) {
       throw new IllegalArgumentException(
-          "namespace contains tables outside the confirmed table group; refusing to modify it");
+          "namespace contains tables outside the configured table scope; refusing to modify it");
     }
 
-    Map<TableName, PlannedTable> plannedByName = new LinkedHashMap<>();
-    for (PlannedTable planned : plannedTables) {
-      plannedByName.put(planned.descriptor().getTableName(), planned);
-    }
     List<PlannedTable> existingTables = new ArrayList<>();
-    for (TableName tableName : actualNames) {
-      PlannedTable planned = plannedByName.get(tableName);
-      verifyExistingTableDescriptor(planned, admin);
-      existingTables.add(planned);
+    for (PlannedTable planned : plannedTables) {
+      TableName tableName = planned.descriptor().getTableName();
+      if (actualNames.contains(tableName)) {
+        verifyExistingTableDescriptor(planned, admin);
+        existingTables.add(planned);
+      }
     }
 
     if (existingTables.size() == plannedTables.size()) {

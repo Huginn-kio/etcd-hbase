@@ -24,6 +24,8 @@ class InitializeTablesCommandTest {
     assertTrue(result.output().contains("etcd_candidate:system"));
     assertTrue(result.output().contains("etcd_candidate:latest"));
     assertTrue(result.output().contains("etcd_candidate:history"));
+    assertTrue(result.output().contains("configured_namespace_tables:\n"));
+    assertTrue(result.output().contains("  - etcd_candidate:system"));
     assertTrue(result.output().contains("split_keys_hex: [0001,0002"));
     assertTrue(result.output().contains("No HBase connection was opened"));
     assertTrue(result.error().isEmpty());

@@ -201,7 +201,7 @@ final class RuntimeConfigurationValidator {
       Map<String, RuntimeConfiguration.HBaseProfile> hbaseProfiles,
       Map<String, RuntimeConfiguration.SaltProfile> saltProfiles) {
     Map<String, RuntimeConfiguration.TableGroup> byId = new HashMap<>();
-    Map<BackendScope, Set<String>> tableNamesByBackend = new HashMap<>();
+    Map<HBaseBackendScope, Set<String>> tableNamesByBackend = new HashMap<>();
     for (int index = 0; index < groups.size(); index++) {
       RuntimeConfiguration.TableGroup group = groups.get(index);
       String path = "table_groups[" + index + "]";
@@ -252,12 +252,12 @@ final class RuntimeConfigurationValidator {
     return byId;
   }
 
-  private static BackendScope backendScope(RuntimeConfiguration.HBaseProfile profile) {
+  static HBaseBackendScope backendScope(RuntimeConfiguration.HBaseProfile profile) {
     Set<String> quorumHosts = new TreeSet<>();
     for (String host : profile.quorum().split(",", -1)) {
       quorumHosts.add(normalizeHost(host, "hbase_profiles.quorum"));
     }
-    return new BackendScope(
+    return new HBaseBackendScope(
         String.join(",", quorumHosts), profile.clientPort(), profile.namespace());
   }
 
@@ -883,8 +883,6 @@ final class RuntimeConfigurationValidator {
   private static RuntimeConfigurationException invalid(String path, String problem) {
     return new RuntimeConfigurationException(path + " " + problem);
   }
-
-  private record BackendScope(String quorum, int clientPort, String namespace) {}
 
   private record ListenerAddress(String host, int port, boolean wildcard) {}
 }
