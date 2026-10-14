@@ -7,19 +7,20 @@ import io.etcdhbase.server.config.RuntimeConfiguration.HistoryLayoutCandidate;
 import io.etcdhbase.server.config.RuntimeConfiguration.IdentityPermission;
 import io.etcdhbase.server.config.RuntimeConfiguration.KeepDeletedCells;
 import io.etcdhbase.server.config.RuntimeConfiguration.RecordCategory;
-import io.etcdhbase.server.config.RuntimeConfiguration.TableSchemaCandidate;
 import io.etcdhbase.server.config.RuntimeConfiguration.TablePermission;
+import io.etcdhbase.server.config.RuntimeConfiguration.TableSchemaCandidate;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HexFormat;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.regex.Pattern;
 
 /** Applies the cross-field and resource checks required before a configuration can be used. */
@@ -238,11 +239,10 @@ final class RuntimeConfigurationValidator {
   }
 
   private static BackendScope backendScope(RuntimeConfiguration.HBaseProfile profile) {
-    String[] quorumHosts = profile.quorum().split(",", -1);
-    for (int index = 0; index < quorumHosts.length; index++) {
-      quorumHosts[index] = quorumHosts[index].toLowerCase(Locale.ROOT);
+    Set<String> quorumHosts = new TreeSet<>();
+    for (String host : profile.quorum().split(",", -1)) {
+      quorumHosts.add(normalizeHost(host, "hbase_profiles.quorum"));
     }
-    Arrays.sort(quorumHosts);
     return new BackendScope(
         String.join(",", quorumHosts), profile.clientPort(), profile.namespace());
   }
@@ -281,6 +281,14 @@ final class RuntimeConfigurationValidator {
             RecordCategory.CONTROL))) {
       throw invalid(path + ".system_table.record_categories", "must cover the system record categories");
     }
+    validateHistoryCandidates(group, saltProfile, path, systemCategories);
+  }
+
+  private static void validateHistoryCandidates(
+      RuntimeConfiguration.TableGroup group,
+      RuntimeConfiguration.SaltProfile saltProfile,
+      String path,
+      Set<RecordCategory> systemCategories) {
     if (group.historyCandidates().size() != 2) {
       throw invalid(path + ".history_candidates", "must describe both history layouts");
     }
@@ -300,39 +308,13 @@ final class RuntimeConfigurationValidator {
         throw invalid(candidatePath + ".history_layout", "must be unique");
       }
 
-      Set<String> tableNames = new HashSet<>();
-      tableNames.add(group.systemTable().tableName());
-      Set<RecordCategory> assignedCategories = new HashSet<>(systemCategories);
-      for (int tableIndex = 0; tableIndex < candidate.tables().size(); tableIndex++) {
-        TableSchemaCandidate table = candidate.tables().get(tableIndex);
-        String tablePath = candidatePath + ".tables[" + tableIndex + "]";
-        validateTableSchema(table, saltProfile, tablePath);
-        if (!tableNames.add(table.tableName())) {
-          throw invalid(tablePath + ".table_name", "must be unique within the table group");
-        }
-        for (RecordCategory category : table.recordCategories()) {
-          if (!assignedCategories.add(category)) {
-            throw invalid(tablePath + ".record_categories", "must not assign one category to multiple tables");
-          }
-        }
-      }
-
-      if (layout == HistoryLayout.SEPARATE_HISTORY_TABLE) {
-        if (candidate.tables().size() != 2
-            || !candidate.tables().stream().anyMatch(
-                table -> table.recordCategories().equals(List.of(RecordCategory.CURRENT)))
-            || !candidate.tables().stream().anyMatch(
-                table -> table.recordCategories().equals(List.of(RecordCategory.HISTORY)))) {
-          throw invalid(candidatePath + ".tables", "must separate CURRENT and HISTORY into two tables");
-        }
-      } else if (layout == HistoryLayout.NATIVE_CELL_VERSIONS) {
-        if (candidate.tables().size() != 1
-            || !new HashSet<>(candidate.tables().getFirst().recordCategories())
-                .equals(Set.of(RecordCategory.CURRENT, RecordCategory.HISTORY))) {
-          throw invalid(candidatePath + ".tables", "must store CURRENT and HISTORY in one table");
-        }
-        validateNativeVersionCandidate(candidate.tables().getFirst(), candidatePath + ".tables[0]");
-      }
+      validateHistoryCandidate(
+          candidate,
+          layout,
+          group.systemTable().tableName(),
+          systemCategories,
+          saltProfile,
+          candidatePath);
     }
 
     if (!layouts.contains(HistoryLayout.SEPARATE_HISTORY_TABLE)
@@ -341,6 +323,52 @@ final class RuntimeConfigurationValidator {
     }
     if (group.historyLayout() != HistoryLayout.UNDECIDED && !layouts.contains(group.historyLayout())) {
       throw invalid(path + ".history_layout", "does not name a configured candidate");
+    }
+  }
+
+  private static void validateHistoryCandidate(
+      HistoryLayoutCandidate candidate,
+      HistoryLayout layout,
+      String systemTableName,
+      Set<RecordCategory> systemCategories,
+      RuntimeConfiguration.SaltProfile saltProfile,
+      String candidatePath) {
+    Set<String> tableNames = new HashSet<>();
+    tableNames.add(systemTableName);
+    Set<RecordCategory> assignedCategories = new HashSet<>(systemCategories);
+    for (int tableIndex = 0; tableIndex < candidate.tables().size(); tableIndex++) {
+      TableSchemaCandidate table = candidate.tables().get(tableIndex);
+      String tablePath = candidatePath + ".tables[" + tableIndex + "]";
+      validateTableSchema(table, saltProfile, tablePath);
+      if (!tableNames.add(table.tableName())) {
+        throw invalid(tablePath + ".table_name", "must be unique within the table group");
+      }
+      for (RecordCategory category : table.recordCategories()) {
+        if (!assignedCategories.add(category)) {
+          throw invalid(tablePath + ".record_categories", "must not assign one category to multiple tables");
+        }
+      }
+    }
+    validateHistoryCandidateLayout(candidate, layout, candidatePath);
+  }
+
+  private static void validateHistoryCandidateLayout(
+      HistoryLayoutCandidate candidate, HistoryLayout layout, String candidatePath) {
+    if (layout == HistoryLayout.SEPARATE_HISTORY_TABLE) {
+      if (candidate.tables().size() != 2
+          || !candidate.tables().stream()
+              .anyMatch(table -> table.recordCategories().equals(List.of(RecordCategory.CURRENT)))
+          || !candidate.tables().stream()
+              .anyMatch(table -> table.recordCategories().equals(List.of(RecordCategory.HISTORY)))) {
+        throw invalid(candidatePath + ".tables", "must separate CURRENT and HISTORY into two tables");
+      }
+    } else if (layout == HistoryLayout.NATIVE_CELL_VERSIONS) {
+      if (candidate.tables().size() != 1
+          || !new HashSet<>(candidate.tables().getFirst().recordCategories())
+              .equals(Set.of(RecordCategory.CURRENT, RecordCategory.HISTORY))) {
+        throw invalid(candidatePath + ".tables", "must store CURRENT and HISTORY in one table");
+      }
+      validateNativeVersionCandidate(candidate.tables().getFirst(), candidatePath + ".tables[0]");
     }
   }
 
@@ -365,9 +393,6 @@ final class RuntimeConfigurationValidator {
     if (!sameHexKeys(schema.splitKeysHex(), saltProfile.splitKeysHex())) {
       throw invalid(path + ".split_keys_hex", "must match the table group's salt profile");
     }
-    if (schema.columnFamilies().isEmpty()) {
-      throw invalid(path + ".column_families", "must contain at least one family");
-    }
     if (schema.recordCategories().isEmpty()) {
       throw invalid(path + ".record_categories", "must contain at least one category");
     }
@@ -375,11 +400,17 @@ final class RuntimeConfigurationValidator {
       throw invalid(path + ".record_categories", "must be unique");
     }
     validateIdentityPermissions(schema.identityPermissions(), path + ".identity_permissions");
+    validateColumnFamilies(schema.columnFamilies(), path + ".column_families");
+  }
 
+  private static void validateColumnFamilies(List<ColumnFamilySchema> columnFamilies, String path) {
+    if (columnFamilies.isEmpty()) {
+      throw invalid(path, "must contain at least one family");
+    }
     Set<String> familyNames = new HashSet<>();
-    for (int index = 0; index < schema.columnFamilies().size(); index++) {
-      ColumnFamilySchema family = schema.columnFamilies().get(index);
-      String familyPath = path + ".column_families[" + index + "]";
+    for (int index = 0; index < columnFamilies.size(); index++) {
+      ColumnFamilySchema family = columnFamilies.get(index);
+      String familyPath = path + "[" + index + "]";
       if (family == null) {
         throw invalid(familyPath, "is required");
       }
@@ -395,8 +426,8 @@ final class RuntimeConfigurationValidator {
       if (family.maxVersions() < 1) {
         throw invalid(familyPath + ".max_versions", "must be positive");
       }
-      if (family.minVersions() < 0 || family.minVersions() >= family.maxVersions()) {
-        throw invalid(familyPath + ".min_versions", "must be nonnegative and less than max_versions");
+      if (family.minVersions() < 0 || family.minVersions() > family.maxVersions()) {
+        throw invalid(familyPath + ".min_versions", "must be nonnegative and no greater than max_versions");
       }
       if (family.ttlSeconds() != -1 && family.ttlSeconds() < 1) {
         throw invalid(familyPath + ".ttl_seconds", "must be -1 (forever) or positive seconds");
@@ -609,10 +640,74 @@ final class RuntimeConfigurationValidator {
     if (literal.contains(":")) {
       byte[] address = parseIpv6Address(literal, path);
       int scopeIndex = literal.indexOf('%');
-      String scope = scopeIndex < 0 ? "" : literal.substring(scopeIndex);
+      String scope = normalizeIpv6Scope(literal, scopeIndex, path);
+      if (isIpv4MappedAddress(address)) {
+        if (!scope.isEmpty()) {
+          throw invalid(path, "IPv4-mapped IPv6 literals must not include a scope ID");
+        }
+        return normalizeIpv4Bytes(Arrays.copyOfRange(address, 12, 16));
+      }
       return "ipv6:" + HexFormat.of().formatHex(address) + scope;
     }
+    String ipv4Address = normalizeIpv4Literal(literal, path);
+    if (ipv4Address != null) {
+      return ipv4Address;
+    }
     return host.toLowerCase(Locale.ROOT);
+  }
+
+  private static String normalizeIpv6Scope(String literal, int scopeIndex, String path) {
+    if (scopeIndex < 0) {
+      return "";
+    }
+    String scope = literal.substring(scopeIndex + 1);
+    if (!scope.chars().allMatch(character -> character >= '0' && character <= '9')) {
+      // Interface names are case-sensitive; preserve their spelling in the listener identity.
+      return "%" + scope;
+    }
+    try {
+      int scopeId = Integer.parseInt(scope);
+      // Scope zero means no interface scope, so it aliases the unscoped literal.
+      return scopeId == 0 ? "" : "%" + scopeId;
+    } catch (NumberFormatException exception) {
+      throw invalid(path, "IPv6 scope ID must be a nonnegative 32-bit integer or interface name");
+    }
+  }
+
+  private static boolean isIpv4MappedAddress(byte[] address) {
+    for (int index = 0; index < 10; index++) {
+      if (address[index] != 0) {
+        return false;
+      }
+    }
+    return address[10] == (byte) 0xff && address[11] == (byte) 0xff;
+  }
+
+  private static String normalizeIpv4Literal(String host, String path) {
+    if (!host.matches("[0-9.]+")) {
+      return null;
+    }
+    String[] octets = host.split("\\.", -1);
+    if (octets.length != 4) {
+      throw invalid(path, "numeric IPv4 addresses must use four dotted decimal octets");
+    }
+    byte[] address = new byte[4];
+    for (int index = 0; index < octets.length; index++) {
+      String octet = octets[index].replaceFirst("^0+(?!$)", "");
+      if (octet.isEmpty() || octet.length() > 3) {
+        throw invalid(path, "IPv4 octets must be between 0 and 255");
+      }
+      int value = Integer.parseInt(octet);
+      if (value > 255) {
+        throw invalid(path, "IPv4 octets must be between 0 and 255");
+      }
+      address[index] = (byte) value;
+    }
+    return normalizeIpv4Bytes(address);
+  }
+
+  private static String normalizeIpv4Bytes(byte[] address) {
+    return "ipv4:" + HexFormat.of().formatHex(address);
   }
 
   private static boolean containsWhitespaceOrControl(String value) {
@@ -621,7 +716,7 @@ final class RuntimeConfigurationValidator {
   }
 
   private static boolean isWildcardHost(String host) {
-    return host.equals("*") || host.equals("0.0.0.0") || isIpv6AnyLocalAddress(host);
+    return host.equals("*") || host.equals("ipv4:00000000") || isIpv6AnyLocalAddress(host);
   }
 
   private static boolean isLoopbackHost(String host) {
@@ -742,44 +837,15 @@ final class RuntimeConfigurationValidator {
   }
 
   private static boolean isIpv4Loopback(String host) {
-    String[] octets = host.split("\\.", -1);
-    if (octets.length != 4 || !"127".equals(octets[0])) {
-      return false;
-    }
-    for (String octet : octets) {
-      if (octet.isEmpty() || octet.length() > 3) {
-        return false;
-      }
-      for (int index = 0; index < octet.length(); index++) {
-        if (!Character.isDigit(octet.charAt(index))) {
-          return false;
-        }
-      }
-      if (Integer.parseInt(octet) > 255) {
-        return false;
-      }
-    }
-    return true;
+    return host.startsWith("ipv4:7f");
   }
 
   private static byte[] decodeHex(String value) {
-    byte[] decoded = new byte[value.length() / 2];
-    for (int index = 0; index < decoded.length; index++) {
-      int high = Character.digit(value.charAt(index * 2), 16);
-      int low = Character.digit(value.charAt(index * 2 + 1), 16);
-      decoded[index] = (byte) ((high << 4) | low);
-    }
-    return decoded;
+    return HexFormat.of().parseHex(value);
   }
 
   private static int compareUnsigned(byte[] left, byte[] right) {
-    for (int index = 0; index < Math.min(left.length, right.length); index++) {
-      int comparison = Integer.compare(Byte.toUnsignedInt(left[index]), Byte.toUnsignedInt(right[index]));
-      if (comparison != 0) {
-        return comparison;
-      }
-    }
-    return Integer.compare(left.length, right.length);
+    return Arrays.compareUnsigned(left, right);
   }
 
   private static RuntimeConfigurationException invalid(String path, String problem) {

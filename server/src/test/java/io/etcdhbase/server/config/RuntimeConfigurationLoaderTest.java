@@ -1,5 +1,6 @@
 package io.etcdhbase.server.config;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -300,6 +301,61 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void rejectsEquivalentListenerAddressesAcrossScopeIpv4AndMappedIpv6Forms() {
+    for (List<String> hostPair :
+        List.of(
+            List.of("::1", "::1%0"),
+            List.of("127.0.0.1", "127.000.000.001"),
+            List.of("127.0.0.1", "::ffff:127.0.0.1"))) {
+      String firstListener =
+          VALID_YAML.replace("bind_host: 127.0.0.1", "bind_host: " + hostPair.getFirst());
+      String duplicate =
+          firstListener.replace(
+              "    table_group_id: local\nhbase_profiles:",
+              "    table_group_id: local\n"
+                  + "  - id: equivalent-listener\n"
+                  + "    bind_host: "
+                  + hostPair.getLast()
+                  + "\n"
+                  + "    port: 2379\n"
+                  + "    table_group_id: local\n"
+                  + "hbase_profiles:");
+
+      assertRejected(duplicate, "listeners[1].port", null);
+    }
+  }
+
+  @Test
+  void keepsNonzeroIpv6ScopeIdsDistinctWithoutResolvingHostnames() {
+    String scopedYaml =
+        VALID_YAML
+            .replace("bind_host: 127.0.0.1", "bind_host: fe80::1%2")
+            .replace(
+                "authentication_mode: DEV_NO_AUTH",
+                "authentication_mode: CREDENTIAL_REFERENCE\n"
+                    + "    credential_reference: env://HBASE_CREDENTIALS")
+            .replace("identity_provider_id: dev-no-auth", "identity_provider_id: backend-hbase")
+            .replace(
+                "    table_group_id: local\nhbase_profiles:",
+                "    table_group_id: local\n"
+                    + "  - id: other-scope-listener\n"
+                    + "    bind_host: fe80::1%3\n"
+                    + "    port: 2379\n"
+                    + "    table_group_id: local\n"
+                    + "hbase_profiles:");
+
+    assertDoesNotThrow(() -> loader.load(bytes(scopedYaml)));
+  }
+
+  @Test
+  void rejectsAmbiguousNumericIpv4AddressForms() {
+    assertRejected(
+        VALID_YAML.replace("bind_host: 127.0.0.1", "bind_host: 127.1"),
+        "listeners[0].bind_host",
+        null);
+  }
+
+  @Test
   void rejectsWildcardListenerConflictOnTheSamePort() {
     String secured =
         VALID_YAML.replace(
@@ -437,6 +493,15 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void acceptsEqualMinimumAndMaximumVersionsWithFiniteTtl() {
+    String equalVersionsWithFiniteTtl =
+        VALID_YAML.replaceFirst("min_versions: 0", "min_versions: 1")
+            .replaceFirst("ttl_seconds: -1\\n", "ttl_seconds: 3600\n");
+
+    assertDoesNotThrow(() -> loader.load(bytes(equalVersionsWithFiniteTtl)));
+  }
+
+  @Test
   void rejectsMinimumVersionsWithoutFiniteTtl() {
     String invalidMinimumVersionPolicy =
         VALID_YAML.replaceFirst("min_versions: 0", "min_versions: 1")
@@ -508,7 +573,7 @@ class RuntimeConfigurationLoaderTest {
             "    authentication_mode: DEV_NO_AUTH\nsalt_profiles:",
             "    authentication_mode: DEV_NO_AUTH\n"
                 + "  - id: other-profile\n"
-                + "    quorum: 127.0.0.1\n"
+                + "    quorum: 127.000.000.001\n"
                 + "    client_port: 2181\n"
                 + "    namespace: etcd_candidate\n"
                 + "    authentication_mode: DEV_NO_AUTH\n"

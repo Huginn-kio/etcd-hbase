@@ -19,7 +19,9 @@
 
 `BackendIdentityProvider` 按显式 `providerId()` 选择。`authenticate` 接收凭据和 `BackendIdentityRequest`，必须验证其访问指定 `tableGroupId` 的能力后才返回身份。身份的 `providerId`、principal 和 table group 需要与请求及配置一致。
 
-实现返回的 `BackendIdentity` 可以持有 provider 管理的上下文，但 accessors 和 `toString()` 不得暴露密码、token 或其他秘密。它不创建、验证或替代 etcd token、lease 或 session。
+当前 M0 的 `authenticate` 是同步调用；实现可能因后端认证 I/O 阻塞。RPC/event-loop 调用方必须通过有界 executor 调用可能阻塞的 provider，不能在传输线程上等待认证。Provider 实例可能被并发复用，实现必须保证并发调用安全。
+
+实现返回的 `BackendIdentity` 可以代表 provider 管理的上下文，但 accessors 和 `toString()` 不得暴露密码、token 或其他秘密。调用方只能在对应请求范围内持有该句柄，请求结束后丢弃；provider 保有底层上下文所有权。当前 SPI 尚无逐句柄释放回调或 provider shutdown hook，因此在补齐生命周期与清理契约前，不添加持有长期状态的生产 provider。身份 SPI 不创建、验证或替代 etcd token、lease 或 session。
 
 `BackendCredentials` 接收并防御性复制 `char[]` 密钥；provider 取用副本后负责清零，并由所有者关闭原对象。`toString()` 必须保持脱敏。配置只接受受控 `env://` 或 `secret://` 引用，不嵌入凭据值。
 
