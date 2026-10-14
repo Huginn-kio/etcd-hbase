@@ -13,6 +13,7 @@ import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -198,7 +199,7 @@ final class RuntimeConfigurationValidator {
       Map<String, RuntimeConfiguration.HBaseProfile> hbaseProfiles,
       Map<String, RuntimeConfiguration.SaltProfile> saltProfiles) {
     Map<String, RuntimeConfiguration.TableGroup> byId = new HashMap<>();
-    Map<String, Set<String>> tableNamesByHBaseProfile = new HashMap<>();
+    Map<BackendScope, Set<String>> tableNamesByBackend = new HashMap<>();
     for (int index = 0; index < groups.size(); index++) {
       RuntimeConfiguration.TableGroup group = groups.get(index);
       String path = "table_groups[" + index + "]";
@@ -224,15 +225,26 @@ final class RuntimeConfigurationValidator {
         throw invalid(path + ".history_layout", "is required");
       }
       validateTableGroupSchemas(group, saltProfiles.get(group.saltProfileId()), path);
-      Set<String> profileTableNames =
-          tableNamesByHBaseProfile.computeIfAbsent(group.hbaseProfileId(), ignored -> new HashSet<>());
+      RuntimeConfiguration.HBaseProfile hbaseProfile = hbaseProfiles.get(group.hbaseProfileId());
+      Set<String> backendTableNames =
+          tableNamesByBackend.computeIfAbsent(backendScope(hbaseProfile), ignored -> new HashSet<>());
       for (String tableName : tableNames(group)) {
-        if (!profileTableNames.add(tableName)) {
-          throw invalid(path + ".tables", "conflicts with another table group using the same HBase profile");
+        if (!backendTableNames.add(tableName)) {
+          throw invalid(path + ".tables", "conflicts with another table group on the same HBase target and namespace");
         }
       }
     }
     return byId;
+  }
+
+  private static BackendScope backendScope(RuntimeConfiguration.HBaseProfile profile) {
+    String[] quorumHosts = profile.quorum().split(",", -1);
+    for (int index = 0; index < quorumHosts.length; index++) {
+      quorumHosts[index] = quorumHosts[index].toLowerCase(Locale.ROOT);
+    }
+    Arrays.sort(quorumHosts);
+    return new BackendScope(
+        String.join(",", quorumHosts), profile.clientPort(), profile.namespace());
   }
 
   private static List<String> tableNames(RuntimeConfiguration.TableGroup group) {
@@ -585,6 +597,21 @@ final class RuntimeConfigurationValidator {
     if (host.length() > 253 || containsWhitespaceOrControl(host)) {
       throw invalid(path, "must be a bounded host name without whitespace");
     }
+    boolean startsBracket = host.startsWith("[");
+    boolean endsBracket = host.endsWith("]");
+    if (startsBracket != endsBracket) {
+      throw invalid(path, "must use balanced brackets around an IPv6 literal");
+    }
+    String literal = startsBracket ? host.substring(1, host.length() - 1) : host;
+    if (startsBracket && !literal.contains(":")) {
+      throw invalid(path, "brackets are only valid around an IPv6 literal");
+    }
+    if (literal.contains(":")) {
+      byte[] address = parseIpv6Address(literal, path);
+      int scopeIndex = literal.indexOf('%');
+      String scope = scopeIndex < 0 ? "" : literal.substring(scopeIndex);
+      return "ipv6:" + HexFormat.of().formatHex(address) + scope;
+    }
     return host.toLowerCase(Locale.ROOT);
   }
 
@@ -594,14 +621,124 @@ final class RuntimeConfigurationValidator {
   }
 
   private static boolean isWildcardHost(String host) {
-    return host.equals("*") || host.equals("0.0.0.0") || host.equals("::") || host.equals("[::]");
+    return host.equals("*") || host.equals("0.0.0.0") || isIpv6AnyLocalAddress(host);
   }
 
   private static boolean isLoopbackHost(String host) {
-    return host.equals("localhost")
-        || host.equals("::1")
-        || host.equals("[::1]")
-        || isIpv4Loopback(host);
+    return host.equals("localhost") || isIpv4Loopback(host) || isIpv6Loopback(host);
+  }
+
+  private static boolean isIpv6AnyLocalAddress(String host) {
+    return "00000000000000000000000000000000".equals(ipv6AddressBytes(host));
+  }
+
+  private static boolean isIpv6Loopback(String host) {
+    return "00000000000000000000000000000001".equals(ipv6AddressBytes(host));
+  }
+
+  private static String ipv6AddressBytes(String normalizedHost) {
+    if (!normalizedHost.startsWith("ipv6:")) {
+      return null;
+    }
+    int scopeIndex = normalizedHost.indexOf('%', "ipv6:".length());
+    return scopeIndex < 0
+        ? normalizedHost.substring("ipv6:".length())
+        : normalizedHost.substring("ipv6:".length(), scopeIndex);
+  }
+
+  /** Parses an IPv6 literal locally so configuration validation never performs DNS resolution. */
+  private static byte[] parseIpv6Address(String literal, String path) {
+    int scopeIndex = literal.indexOf('%');
+    String address = literal;
+    if (scopeIndex >= 0) {
+      if (scopeIndex == 0
+          || scopeIndex == literal.length() - 1
+          || literal.indexOf('%', scopeIndex + 1) >= 0
+          || !literal.substring(scopeIndex + 1).matches("[A-Za-z0-9_.-]{1,64}")) {
+        throw invalid(path, "must be a valid IPv6 literal");
+      }
+      address = literal.substring(0, scopeIndex);
+    }
+
+    try {
+      int compressionIndex = address.indexOf("::");
+      if (compressionIndex >= 0 && address.indexOf("::", compressionIndex + 2) >= 0) {
+        throw new IllegalArgumentException("multiple compressed sections");
+      }
+      boolean compressed = compressionIndex >= 0;
+      String leftText = compressed ? address.substring(0, compressionIndex) : address;
+      String rightText = compressed ? address.substring(compressionIndex + 2) : "";
+      List<Integer> leftGroups = parseIpv6Groups(leftText, !compressed);
+      List<Integer> rightGroups = compressed ? parseIpv6Groups(rightText, true) : List.of();
+      int zeroGroupCount = 8 - leftGroups.size() - rightGroups.size();
+      if ((compressed && zeroGroupCount < 1) || (!compressed && zeroGroupCount != 0)) {
+        throw new IllegalArgumentException("wrong number of IPv6 groups");
+      }
+
+      byte[] bytes = new byte[16];
+      int groupIndex = 0;
+      for (int group : leftGroups) {
+        writeIpv6Group(bytes, groupIndex++, group);
+      }
+      groupIndex += zeroGroupCount;
+      for (int group : rightGroups) {
+        writeIpv6Group(bytes, groupIndex++, group);
+      }
+      return bytes;
+    } catch (IllegalArgumentException exception) {
+      throw invalid(path, "must be a valid IPv6 literal");
+    }
+  }
+
+  private static List<Integer> parseIpv6Groups(String value, boolean allowIpv4Tail) {
+    if (value.isEmpty()) {
+      return List.of();
+    }
+    String[] segments = value.split(":", -1);
+    List<Integer> groups = new ArrayList<>(segments.length);
+    for (int index = 0; index < segments.length; index++) {
+      String segment = segments[index];
+      if (segment.isEmpty()) {
+        throw new IllegalArgumentException("empty IPv6 group");
+      }
+      if (segment.indexOf('.') >= 0) {
+        if (!allowIpv4Tail || index != segments.length - 1) {
+          throw new IllegalArgumentException("IPv4 tail must end an IPv6 literal");
+        }
+        appendIpv4Tail(groups, segment);
+      } else {
+        if (!segment.matches("[0-9A-Fa-f]{1,4}")) {
+          throw new IllegalArgumentException("invalid hexadecimal IPv6 group");
+        }
+        groups.add(Integer.parseInt(segment, 16));
+      }
+    }
+    return groups;
+  }
+
+  private static void appendIpv4Tail(List<Integer> groups, String literal) {
+    String[] octets = literal.split("\\.", -1);
+    if (octets.length != 4) {
+      throw new IllegalArgumentException("invalid IPv4 tail");
+    }
+    int[] values = new int[4];
+    for (int index = 0; index < octets.length; index++) {
+      if (!octets[index].matches("[0-9]{1,3}")
+          || (octets[index].length() > 1 && octets[index].charAt(0) == '0')) {
+        throw new IllegalArgumentException("invalid IPv4 octet");
+      }
+      values[index] = Integer.parseInt(octets[index]);
+      if (values[index] > 255) {
+        throw new IllegalArgumentException("IPv4 octet is out of range");
+      }
+    }
+    groups.add((values[0] << 8) | values[1]);
+    groups.add((values[2] << 8) | values[3]);
+  }
+
+  private static void writeIpv6Group(byte[] bytes, int index, int group) {
+    bytes[index * 2] = (byte) (group >>> 8);
+    bytes[index * 2 + 1] = (byte) group;
   }
 
   private static boolean isIpv4Loopback(String host) {
@@ -648,6 +785,8 @@ final class RuntimeConfigurationValidator {
   private static RuntimeConfigurationException invalid(String path, String problem) {
     return new RuntimeConfigurationException(path + " " + problem);
   }
+
+  private record BackendScope(String quorum, int clientPort, String namespace) {}
 
   private record ListenerAddress(String host, int port, boolean wildcard) {}
 }

@@ -8,6 +8,9 @@ import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.RecordComponent;
+import java.lang.reflect.Type;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
@@ -32,6 +35,8 @@ public final class RuntimeConfigurationLoader {
   public static final int ABSOLUTE_MAX_CONFIG_BYTES = 64 * 1024;
   private static final int MAX_YAML_NESTING = 32;
   private static final String ENVIRONMENT_PREFIX = "ETCD_HBASE_";
+  private static final Set<String> BUILD_ENVIRONMENT_VARIABLES =
+      Set.of("ETCD_HBASE_JDK21_HOME", "ETCD_HBASE_MAVEN_REPOSITORY");
   private static final Map<String, EnvironmentOverride> ENVIRONMENT_OVERRIDES = environmentOverrides();
   private final RuntimeConfigurationValidator validator;
   private final ObjectMapper objectMapper;
@@ -55,6 +60,8 @@ public final class RuntimeConfigurationLoader {
         JsonMapper.builder()
             .propertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+            .enable(DeserializationFeature.FAIL_ON_NUMBERS_FOR_ENUMS)
+            .enable(DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)
             .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT)
             .disable(MapperFeature.ALLOW_COERCION_OF_SCALARS)
             .build();
@@ -106,6 +113,7 @@ public final class RuntimeConfigurationLoader {
 
     Object safeTree = validateYamlTree(rawRoot, "configuration", 0);
     EnvironmentResult effective = applyEnvironmentOverrides(safeTree, input.length, environment);
+    validateRequiredProperties(effective.tree(), RuntimeConfiguration.class, "");
     RuntimeConfiguration configuration = bind(effective.tree());
     validator.validate(configuration, effective.byteCount());
     return configuration;
@@ -122,6 +130,79 @@ public final class RuntimeConfigurationLoader {
     } catch (CharacterCodingException exception) {
       throw invalid("configuration", "must be valid UTF-8");
     }
+  }
+
+  /**
+   * Checks required record properties before Jackson binding can supply primitive defaults.
+   * RuntimeConfigurationSchemaTest keeps the record fields aligned with the schema; the sole
+   * omitted-field exception is the conditional credential reference.
+   */
+  private static void validateRequiredProperties(Object value, Class<?> recordType, String path) {
+    if (!(value instanceof Map<?, ?> properties)) {
+      return;
+    }
+    for (RecordComponent component : recordType.getRecordComponents()) {
+      String propertyName = toSnakeCase(component.getName());
+      String propertyPath = appendPropertyPath(path, propertyName);
+      boolean optional =
+          recordType == RuntimeConfiguration.HBaseProfile.class
+              && component.getName().equals("credentialReference");
+      if (!properties.containsKey(propertyName)) {
+        if (!optional) {
+          throw invalid(propertyPath, "is required");
+        }
+        continue;
+      }
+
+      Object child = properties.get(propertyName);
+      if (child == null) {
+        throw invalid(propertyPath, "must not be null");
+      }
+      if (component.getType().isRecord()) {
+        validateRequiredProperties(child, component.getType(), propertyPath);
+        continue;
+      }
+      Class<?> elementType = recordListElementType(component);
+      if (elementType != null && child instanceof List<?> values) {
+        for (int index = 0; index < values.size(); index++) {
+          Object item = values.get(index);
+          String itemPath = propertyPath + "[" + index + "]";
+          if (item == null) {
+            throw invalid(itemPath, "is required");
+          }
+          validateRequiredProperties(item, elementType, itemPath);
+        }
+      }
+    }
+  }
+
+  private static Class<?> recordListElementType(RecordComponent component) {
+    if (!List.class.isAssignableFrom(component.getType())
+        || !(component.getGenericType() instanceof ParameterizedType listType)) {
+      return null;
+    }
+    Type elementType = listType.getActualTypeArguments()[0];
+    if (elementType instanceof Class<?> elementClass && elementClass.isRecord()) {
+      return elementClass;
+    }
+    return null;
+  }
+
+  private static String toSnakeCase(String name) {
+    StringBuilder result = new StringBuilder();
+    for (int index = 0; index < name.length(); index++) {
+      char character = name.charAt(index);
+      if (Character.isUpperCase(character)) {
+        result.append('_').append(Character.toLowerCase(character));
+      } else {
+        result.append(character);
+      }
+    }
+    return result.toString();
+  }
+
+  private static String appendPropertyPath(String parent, String property) {
+    return parent.isEmpty() ? property : parent + "." + property;
   }
 
   private static Object parseSingleDocument(String yamlText) {
@@ -201,6 +282,9 @@ public final class RuntimeConfigurationLoader {
         throw invalid("environment", "contains an invalid variable name");
       }
       if (!name.startsWith(ENVIRONMENT_PREFIX)) {
+        continue;
+      }
+      if (BUILD_ENVIRONMENT_VARIABLES.contains(name)) {
         continue;
       }
       if (!ENVIRONMENT_OVERRIDES.containsKey(name)) {

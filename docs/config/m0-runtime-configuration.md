@@ -1,6 +1,6 @@
 # M0 运行配置
 
-M0 服务配置使用单一 YAML 文档。加载顺序为：读取 YAML 文件、应用下表中的环境变量覆盖、绑定到 Java 配置对象，再执行统一校验。未知 YAML 字段和带 `ETCD_HBASE_` 前缀但未列出的环境变量都会导致启动配置失败。
+M0 服务配置使用单一 YAML 文档。加载顺序为：读取 YAML 文件、应用下表中的环境变量覆盖、校验必填字段并绑定到 Java 配置对象，再执行统一校验。未知 YAML 字段和未识别的运行配置环境变量都会导致启动配置失败。工具链变量 `ETCD_HBASE_JDK21_HOME` 与 `ETCD_HBASE_MAVEN_REPOSITORY` 不属于运行配置，loader 会忽略它们。
 
 ## 环境变量覆盖
 
@@ -23,7 +23,9 @@ M0 服务配置使用单一 YAML 文档。加载顺序为：读取 YAML 文件�
 
 ## 监听与身份
 
-`port: 0` 表示由操作系统分配随机端口，仅允许 loopback 地址；多个随机端口 listener 不视为端口冲突。`DEV_NO_AUTH` 必须显式出现在 HBase profile 中，并且 listener 只能绑定 loopback。其他身份模式必须提供 `env://NAME` 或 `secret://reference` credential reference；YAML 中不接受明文密码或 token。
+`port: 0` 表示由操作系统分配随机端口，仅允许 loopback 地址；多个随机端口 listener 不视为端口冲突。IPv6 listener 地址按字面地址规范化后检查冲突，支持括号、压缩和展开写法，不为主机名执行 DNS 查询。`DEV_NO_AUTH` 必须显式出现在 HBase profile 中，并且 listener 只能绑定 loopback。其他身份模式必须提供 `env://NAME` 或 `secret://reference` credential reference；YAML 中不接受明文密码或 token。
+
+同一 HBase quorum、client port 和 namespace 是一个物理表命名范围。即使两个 HBase profile 使用不同 ID，只要连接目标与 namespace 相同，表组就不能重复声明同名物理表。
 
 ## 资源预算
 

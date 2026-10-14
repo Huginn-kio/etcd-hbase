@@ -194,6 +194,31 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void ignoresKnownBuildEnvironmentVariablesButKeepsRuntimeOverrideValidation() {
+    RuntimeConfigurationLoader buildEnvironmentLoader =
+        new RuntimeConfigurationLoader(
+            Set.of("dev-no-auth", "backend-hbase"),
+            Set.of("crc32-bucket-v1"),
+            () ->
+                Map.of(
+                    "ETCD_HBASE_JDK21_HOME", "/opt/temurin-21",
+                    "ETCD_HBASE_MAVEN_REPOSITORY", "/tmp/maven-repository"));
+
+    RuntimeConfiguration configuration = buildEnvironmentLoader.load(bytes(VALID_YAML));
+
+    assertEquals("local", configuration.tableGroups().getFirst().id());
+  }
+
+  @Test
+  void defaultEnvironmentEntryPointLoadsWithTheProcessEnvironment() {
+    RuntimeConfigurationLoader defaultLoader =
+        new RuntimeConfigurationLoader(
+            Set.of("dev-no-auth", "backend-hbase"), Set.of("crc32-bucket-v1"));
+
+    assertEquals("local", defaultLoader.load(bytes(VALID_YAML)).tableGroups().getFirst().id());
+  }
+
+  @Test
   void rejectsUnknownAndMalformedEnvironmentOverridesWithoutEchoingValues() {
     String sentinel = "do-not-disclose-this-env-value";
     RuntimeConfigurationException unknown =
@@ -252,6 +277,29 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void rejectsEquivalentIpv6ListenerAddressesAcrossBracketAndCompressionForms() {
+    for (List<String> hostPair :
+        List.of(List.of("::1", "\"[::1]\""), List.of("0:0:0:0:0:0:0:1", "::1"))) {
+      String firstHost = hostPair.getFirst();
+      String secondHost = hostPair.getLast();
+      String firstListener = VALID_YAML.replace("127.0.0.1", firstHost);
+      String duplicate =
+          firstListener.replace(
+              "    table_group_id: local\nhbase_profiles:",
+              "    table_group_id: local\n"
+                  + "  - id: equivalent-ipv6-listener\n"
+                  + "    bind_host: "
+                  + secondHost
+                  + "\n"
+                  + "    port: 2379\n"
+                  + "    table_group_id: local\n"
+                  + "hbase_profiles:");
+
+      assertRejected(duplicate, "listeners[1].port", null);
+    }
+  }
+
+  @Test
   void rejectsWildcardListenerConflictOnTheSamePort() {
     String secured =
         VALID_YAML.replace(
@@ -291,6 +339,46 @@ class RuntimeConfigurationLoaderTest {
   void rejectsUnknownSchemaVersionsAndScalarCoercion() {
     assertRejected(VALID_YAML.replace("schema_version: 1", "schema_version: 2"), "schema_version", null);
     assertRejected(VALID_YAML.replace("port: 2379", "port: \"2379\""), "listeners[0].port", null);
+  }
+
+  @Test
+  void rejectsMissingRequiredPropertiesBeforePrimitiveDefaultsCanBeBound() {
+    assertRejected(
+        VALID_YAML.replace("    port: 2379\n", ""), "listeners[0].port", null);
+    assertRejected(
+        VALID_YAML.replaceFirst("          min_versions: 0\\n", ""),
+        "table_groups[0].system_table.column_families[0].min_versions",
+        null);
+  }
+
+  @Test
+  void rejectsNumericEnumOrdinalsForEveryConfiguredEnumType() {
+    assertRejected(
+        VALID_YAML.replace("authentication_mode: DEV_NO_AUTH", "authentication_mode: 0"),
+        "authentication_mode",
+        null);
+    assertRejected(
+        VALID_YAML.replace("history_layout: UNDECIDED", "history_layout: 0"),
+        "history_layout",
+        null);
+    assertRejected(
+        VALID_YAML.replaceFirst("history_layout: SEPARATE_HISTORY_TABLE", "history_layout: 0"),
+        "history_layout",
+        null);
+    assertRejected(
+        VALID_YAML.replace("keep_deleted_cells: \"FALSE\"", "keep_deleted_cells: 0"),
+        "keep_deleted_cells",
+        null);
+    assertRejected(
+        VALID_YAML.replace(
+            "record_categories: [DECISION, EVENT, LEASE, AUTH, CONTROL]",
+            "record_categories: [0, EVENT, LEASE, AUTH, CONTROL]"),
+        "record_categories",
+        null);
+    assertRejected(
+        VALID_YAML.replace("permissions: [READ, WRITE]", "permissions: [0, WRITE]"),
+        "permissions",
+        null);
   }
 
   @Test
@@ -411,6 +499,43 @@ class RuntimeConfigurationLoaderTest {
         VALID_YAML.replace("permissions: [READ, WRITE]", "permissions: []"),
         "identity_permissions[0].permissions",
         null);
+  }
+
+  @Test
+  void rejectsDuplicatePhysicalTablesAcrossHBaseProfileAliases() {
+    String withProfileAlias =
+        VALID_YAML.replace(
+            "    authentication_mode: DEV_NO_AUTH\nsalt_profiles:",
+            "    authentication_mode: DEV_NO_AUTH\n"
+                + "  - id: other-profile\n"
+                + "    quorum: 127.0.0.1\n"
+                + "    client_port: 2181\n"
+                + "    namespace: etcd_candidate\n"
+                + "    authentication_mode: DEV_NO_AUTH\n"
+                + "salt_profiles:");
+    String withAliasListener =
+        withProfileAlias.replace(
+            "    table_group_id: local\nhbase_profiles:",
+            "    table_group_id: local\n"
+                + "  - id: alias-listener\n"
+                + "    bind_host: 127.0.0.1\n"
+                + "    port: 2380\n"
+                + "    table_group_id: other\n"
+                + "hbase_profiles:");
+    int tableGroupsStart = withAliasListener.indexOf("table_groups:\n");
+    int firstGroupStart = withAliasListener.indexOf("  - id: local\n", tableGroupsStart);
+    int resourcesStart = withAliasListener.indexOf("resources:\n", firstGroupStart);
+    String secondGroup =
+        withAliasListener
+            .substring(firstGroupStart, resourcesStart)
+            .replaceFirst("id: local", "id: other")
+            .replace("hbase_profile_id: local-hbase", "hbase_profile_id: other-profile");
+    String duplicateTables =
+        withAliasListener.substring(0, resourcesStart)
+            + secondGroup
+            + withAliasListener.substring(resourcesStart);
+
+    assertRejected(duplicateTables, "table_groups[1].tables", null);
   }
 
   @Test
