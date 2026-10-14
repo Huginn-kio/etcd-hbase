@@ -2,6 +2,8 @@ package io.etcdhbase.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -9,9 +11,19 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.etcdhbase.grpc.RequestScopeInterceptor;
 import io.etcdhbase.server.fixture.FailureFixture;
 import io.etcdhbase.server.fixture.WatchCancellationFixture;
+import io.grpc.CallOptions;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.MethodDescriptor;
 import io.grpc.Server;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
+import io.grpc.stub.ClientCalls;
+import io.grpc.stub.StreamObserver;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
@@ -22,13 +34,31 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class GoInteropIT {
   private static final ObjectMapper JSON = new ObjectMapper();
   private static final Duration DRIVER_TIMEOUT = Duration.ofSeconds(30);
   private static final long EXPECTED_REVISION = 1L << 54;
+  private static final MethodDescriptor.Marshaller<byte[]> RAW_BYTES =
+      new MethodDescriptor.Marshaller<>() {
+        @Override
+        public InputStream stream(byte[] value) {
+          return new ByteArrayInputStream(value);
+        }
+
+        @Override
+        public byte[] parse(InputStream stream) {
+          try {
+            return stream.readAllBytes();
+          } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
+          }
+        }
+      };
 
   @Test
   void goClientsReachJavaServicesAndObserveBoundedErrorsAndStreams() throws Exception {
@@ -107,6 +137,88 @@ class GoInteropIT {
         bootstrap.close();
       }
     }
+  }
+
+  @Test
+  void rejectsEveryUnsupportedExternalLockAndElectionMethod() throws Exception {
+    Path config =
+        Path.of(GoInteropIT.class.getResource("/m0-examples/server-skeleton.yaml").toURI());
+    Bootstrap bootstrap = Bootstrap.start(config);
+    try {
+      Bootstrap.BoundListener listener = bootstrap.boundListeners().getFirst();
+      var channel =
+          ManagedChannelBuilder.forAddress(listener.bindHost(), listener.port())
+              .usePlaintext()
+              .build();
+      try {
+        for (String method :
+            List.of(
+                "v3lockpb.Lock/Lock",
+                "v3lockpb.Lock/Unlock",
+                "v3electionpb.Election/Campaign",
+                "v3electionpb.Election/Proclaim",
+                "v3electionpb.Election/Leader",
+                "v3electionpb.Election/Resign")) {
+          MethodDescriptor<byte[], byte[]> descriptor =
+              rawMethod(method, MethodDescriptor.MethodType.UNARY);
+          StatusRuntimeException failure =
+              assertThrows(
+                  StatusRuntimeException.class,
+                  () ->
+                      ClientCalls.blockingUnaryCall(
+                          channel, descriptor, CallOptions.DEFAULT, new byte[0]),
+                  method);
+          assertEquals(Status.Code.UNIMPLEMENTED, failure.getStatus().getCode(), method);
+        }
+
+        MethodDescriptor<byte[], byte[]> observe =
+            rawMethod("v3electionpb.Election/Observe", MethodDescriptor.MethodType.BIDI_STREAMING);
+        CountDownLatch terminal = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicReference<byte[]> response = new AtomicReference<>();
+        ClientCalls.asyncBidiStreamingCall(
+            channel.newCall(observe, CallOptions.DEFAULT),
+            new StreamObserver<>() {
+              @Override
+              public void onNext(byte[] value) {
+                response.set(value);
+              }
+
+              @Override
+              public void onError(Throwable value) {
+                failure.set(value);
+                terminal.countDown();
+              }
+
+              @Override
+              public void onCompleted() {
+                terminal.countDown();
+              }
+            });
+        assertTrue(terminal.await(2, TimeUnit.SECONDS), "Election.Observe did not terminate");
+        assertNull(response.get(), "Election.Observe unexpectedly produced a response");
+        assertTrue(failure.get() instanceof StatusRuntimeException, "Election.Observe did not fail");
+        assertEquals(
+            Status.Code.UNIMPLEMENTED,
+            Status.fromThrowable(failure.get()).getCode(),
+            "Election.Observe");
+      } finally {
+        channel.shutdownNow();
+        assertTrue(channel.awaitTermination(2, TimeUnit.SECONDS));
+      }
+    } finally {
+      bootstrap.close();
+    }
+  }
+
+  private static MethodDescriptor<byte[], byte[]> rawMethod(
+      String fullMethodName, MethodDescriptor.MethodType methodType) {
+    return MethodDescriptor.<byte[], byte[]>newBuilder()
+        .setType(methodType)
+        .setFullMethodName(fullMethodName)
+        .setRequestMarshaller(RAW_BYTES)
+        .setResponseMarshaller(RAW_BYTES)
+        .build();
   }
 
   private static void assertWireTrace(Path tracePath) throws IOException {

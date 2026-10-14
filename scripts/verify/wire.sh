@@ -102,9 +102,9 @@ tests = int(suite.attrib.get("tests", "0"))
 failures = int(suite.attrib.get("failures", "0"))
 errors = int(suite.attrib.get("errors", "0"))
 skipped = int(suite.attrib.get("skipped", "0"))
-if tests != 1 or failures or errors or skipped:
+if tests != 2 or failures or errors or skipped:
     raise SystemExit(
-        f"GoInteropIT must execute exactly one passing test (tests={tests}, failures={failures}, "
+        f"GoInteropIT must execute exactly two passing tests (tests={tests}, failures={failures}, "
         f"errors={errors}, skipped={skipped})"
     )
 records = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines() if line]
