@@ -18,7 +18,8 @@ public final class FailureFixture extends KVGrpc.KVImplBase {
   private static final int EXPECTED_KEY_LENGTH = 3;
   private static final Duration CANCELLATION_WAIT = Duration.ofSeconds(2);
 
-  private final AtomicInteger unavailableRequests = new AtomicInteger();
+  private final AtomicInteger rawUnavailableRequests = new AtomicInteger();
+  private final AtomicInteger clientV3RetryRequests = new AtomicInteger();
   private final CountDownLatch deadlineScopeClosed = new CountDownLatch(1);
 
   @Override
@@ -47,8 +48,12 @@ public final class FailureFixture extends KVGrpc.KVImplBase {
           fail(
               responseObserver,
               Status.PERMISSION_DENIED.withDescription("etcdserver: permission denied"));
-      case 'u', 'r' -> {
-        unavailableRequests.incrementAndGet();
+      case 'u' -> {
+        rawUnavailableRequests.incrementAndGet();
+        fail(responseObserver, Status.UNAVAILABLE.withDescription("etcdserver: no leader"));
+      }
+      case 'r' -> {
+        clientV3RetryRequests.incrementAndGet();
         fail(responseObserver, Status.UNAVAILABLE.withDescription("etcdserver: no leader"));
       }
       case 'd' -> waitForCallerCancellation(requestScope, responseObserver);
@@ -57,8 +62,12 @@ public final class FailureFixture extends KVGrpc.KVImplBase {
     }
   }
 
-  public int unavailableRequestCount() {
-    return unavailableRequests.get();
+  public int rawUnavailableRequestCount() {
+    return rawUnavailableRequests.get();
+  }
+
+  public int clientV3RetryRequestCount() {
+    return clientV3RetryRequests.get();
   }
 
   public boolean awaitDeadlineScopeCleanup(Duration timeout) throws InterruptedException {

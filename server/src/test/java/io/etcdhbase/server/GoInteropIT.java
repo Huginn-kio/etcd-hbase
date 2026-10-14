@@ -124,8 +124,11 @@ class GoInteropIT {
           watchFixture.awaitScopeClosed(Duration.ofSeconds(2)),
           "caller deadline did not close the Watch request scope");
       assertTrue(
-          fixture.unavailableRequestCount() >= 2,
-          "clientv3 did not exercise a bounded retry after the raw UNAVAILABLE case");
+          fixture.rawUnavailableRequestCount() >= 1,
+          "raw apiv3 UNAVAILABLE request did not reach the fixture");
+      assertTrue(
+          fixture.clientV3RetryRequestCount() >= 2,
+          "clientv3 did not retry its UNAVAILABLE request before the caller deadline");
       assertWireTrace(trace);
     } finally {
       stopProcess(driverProcess);
