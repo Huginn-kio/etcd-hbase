@@ -1,5 +1,7 @@
-<?xml version='1.0' encoding='utf-8'?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <parent>
     <groupId>io.etcdhbase</groupId>
@@ -13,5 +15,84 @@
       <groupId>com.google.protobuf</groupId>
       <artifactId>protobuf-java</artifactId>
     </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-protobuf</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-stub</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>javax.annotation</groupId>
+      <artifactId>javax.annotation-api</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
+  <build>
+    <extensions>
+      <extension>
+        <groupId>kr.motd.maven</groupId>
+        <artifactId>os-maven-plugin</artifactId>
+        <version>1.7.1</version>
+      </extension>
+    </extensions>
+    <plugins>
+      <plugin>
+        <groupId>org.xolstice.maven.plugins</groupId>
+        <artifactId>protobuf-maven-plugin</artifactId>
+        <configuration>
+          <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
+          <pluginId>grpc-java</pluginId>
+          <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
+        </configuration>
+        <executions>
+          <execution>
+            <id>generate-java-descriptor</id>
+            <goals>
+              <goal>compile</goal>
+            </goals>
+            <configuration>
+              <writeDescriptorSet>true</writeDescriptorSet>
+              <descriptorSetFileName>etcd-v3.5.23.protobin</descriptorSetFileName>
+              <descriptorSetOutputDirectory>${project.build.directory}/generated-resources/protobuf/descriptor-sets</descriptorSetOutputDirectory>
+              <includeDependenciesInDescriptorSet>true</includeDependenciesInDescriptorSet>
+              <includeSourceInfoInDescriptorSet>false</includeSourceInfoInDescriptorSet>
+              <attachDescriptorSet>false</attachDescriptorSet>
+            </configuration>
+          </execution>
+          <execution>
+            <id>generate-grpc-java</id>
+            <goals>
+              <goal>compile-custom</goal>
+            </goals>
+            <configuration>
+              <writeDescriptorSet>false</writeDescriptorSet>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <systemPropertyVariables>
+            <wire.contract.file>${project.basedir}/baseline/wire-contract.json</wire.contract.file>
+            <protocol.descriptor.file>${project.build.directory}/generated-resources/protobuf/descriptor-sets/etcd-v3.5.23.protobin</protocol.descriptor.file>
+            <protocol.source.lock>${project.basedir}/upstream-lock.json</protocol.source.lock>
+            <protocol.proto.root>${project.basedir}/src/main/proto</protocol.proto.root>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
 </project>

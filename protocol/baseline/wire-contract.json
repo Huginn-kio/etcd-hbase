@@ -1,0 +1,2715 @@
+{
+  "schema_version" : 1,
+  "protocol" : "etcd-v3.5.23",
+  "source_revision" : "1cf4bc40111fd95d1e14a90a09a146357b15eb13",
+  "files" : [ {
+    "name" : "etcd/api/etcdserverpb/rpc.proto",
+    "package" : "etcdserverpb",
+    "source_sha256" : "7cf0d098aae57522a574bf591145e55539a15212885d43709536553833cd6f40",
+    "services" : [ {
+      "name" : "Auth",
+      "full_name" : "etcdserverpb.Auth",
+      "methods" : [ {
+        "name" : "AuthDisable",
+        "full_name" : "etcdserverpb.Auth.AuthDisable",
+        "input" : "etcdserverpb.AuthDisableRequest",
+        "output" : "etcdserverpb.AuthDisableResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "AuthEnable",
+        "full_name" : "etcdserverpb.Auth.AuthEnable",
+        "input" : "etcdserverpb.AuthEnableRequest",
+        "output" : "etcdserverpb.AuthEnableResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "AuthStatus",
+        "full_name" : "etcdserverpb.Auth.AuthStatus",
+        "input" : "etcdserverpb.AuthStatusRequest",
+        "output" : "etcdserverpb.AuthStatusResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "Authenticate",
+        "full_name" : "etcdserverpb.Auth.Authenticate",
+        "input" : "etcdserverpb.AuthenticateRequest",
+        "output" : "etcdserverpb.AuthenticateResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "RoleAdd",
+        "full_name" : "etcdserverpb.Auth.RoleAdd",
+        "input" : "etcdserverpb.AuthRoleAddRequest",
+        "output" : "etcdserverpb.AuthRoleAddResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "RoleDelete",
+        "full_name" : "etcdserverpb.Auth.RoleDelete",
+        "input" : "etcdserverpb.AuthRoleDeleteRequest",
+        "output" : "etcdserverpb.AuthRoleDeleteResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "RoleGet",
+        "full_name" : "etcdserverpb.Auth.RoleGet",
+        "input" : "etcdserverpb.AuthRoleGetRequest",
+        "output" : "etcdserverpb.AuthRoleGetResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "RoleGrantPermission",
+        "full_name" : "etcdserverpb.Auth.RoleGrantPermission",
+        "input" : "etcdserverpb.AuthRoleGrantPermissionRequest",
+        "output" : "etcdserverpb.AuthRoleGrantPermissionResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "RoleList",
+        "full_name" : "etcdserverpb.Auth.RoleList",
+        "input" : "etcdserverpb.AuthRoleListRequest",
+        "output" : "etcdserverpb.AuthRoleListResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "RoleRevokePermission",
+        "full_name" : "etcdserverpb.Auth.RoleRevokePermission",
+        "input" : "etcdserverpb.AuthRoleRevokePermissionRequest",
+        "output" : "etcdserverpb.AuthRoleRevokePermissionResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "UserAdd",
+        "full_name" : "etcdserverpb.Auth.UserAdd",
+        "input" : "etcdserverpb.AuthUserAddRequest",
+        "output" : "etcdserverpb.AuthUserAddResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "UserChangePassword",
+        "full_name" : "etcdserverpb.Auth.UserChangePassword",
+        "input" : "etcdserverpb.AuthUserChangePasswordRequest",
+        "output" : "etcdserverpb.AuthUserChangePasswordResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "UserDelete",
+        "full_name" : "etcdserverpb.Auth.UserDelete",
+        "input" : "etcdserverpb.AuthUserDeleteRequest",
+        "output" : "etcdserverpb.AuthUserDeleteResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "UserGet",
+        "full_name" : "etcdserverpb.Auth.UserGet",
+        "input" : "etcdserverpb.AuthUserGetRequest",
+        "output" : "etcdserverpb.AuthUserGetResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "UserGrantRole",
+        "full_name" : "etcdserverpb.Auth.UserGrantRole",
+        "input" : "etcdserverpb.AuthUserGrantRoleRequest",
+        "output" : "etcdserverpb.AuthUserGrantRoleResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "UserList",
+        "full_name" : "etcdserverpb.Auth.UserList",
+        "input" : "etcdserverpb.AuthUserListRequest",
+        "output" : "etcdserverpb.AuthUserListResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "UserRevokeRole",
+        "full_name" : "etcdserverpb.Auth.UserRevokeRole",
+        "input" : "etcdserverpb.AuthUserRevokeRoleRequest",
+        "output" : "etcdserverpb.AuthUserRevokeRoleResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      } ]
+    }, {
+      "name" : "Cluster",
+      "full_name" : "etcdserverpb.Cluster",
+      "methods" : [ {
+        "name" : "MemberAdd",
+        "full_name" : "etcdserverpb.Cluster.MemberAdd",
+        "input" : "etcdserverpb.MemberAddRequest",
+        "output" : "etcdserverpb.MemberAddResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "MemberList",
+        "full_name" : "etcdserverpb.Cluster.MemberList",
+        "input" : "etcdserverpb.MemberListRequest",
+        "output" : "etcdserverpb.MemberListResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "MemberPromote",
+        "full_name" : "etcdserverpb.Cluster.MemberPromote",
+        "input" : "etcdserverpb.MemberPromoteRequest",
+        "output" : "etcdserverpb.MemberPromoteResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "MemberRemove",
+        "full_name" : "etcdserverpb.Cluster.MemberRemove",
+        "input" : "etcdserverpb.MemberRemoveRequest",
+        "output" : "etcdserverpb.MemberRemoveResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "MemberUpdate",
+        "full_name" : "etcdserverpb.Cluster.MemberUpdate",
+        "input" : "etcdserverpb.MemberUpdateRequest",
+        "output" : "etcdserverpb.MemberUpdateResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      } ]
+    }, {
+      "name" : "KV",
+      "full_name" : "etcdserverpb.KV",
+      "methods" : [ {
+        "name" : "Compact",
+        "full_name" : "etcdserverpb.KV.Compact",
+        "input" : "etcdserverpb.CompactionRequest",
+        "output" : "etcdserverpb.CompactionResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "DeleteRange",
+        "full_name" : "etcdserverpb.KV.DeleteRange",
+        "input" : "etcdserverpb.DeleteRangeRequest",
+        "output" : "etcdserverpb.DeleteRangeResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "Put",
+        "full_name" : "etcdserverpb.KV.Put",
+        "input" : "etcdserverpb.PutRequest",
+        "output" : "etcdserverpb.PutResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "Range",
+        "full_name" : "etcdserverpb.KV.Range",
+        "input" : "etcdserverpb.RangeRequest",
+        "output" : "etcdserverpb.RangeResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "Txn",
+        "full_name" : "etcdserverpb.KV.Txn",
+        "input" : "etcdserverpb.TxnRequest",
+        "output" : "etcdserverpb.TxnResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      } ]
+    }, {
+      "name" : "Lease",
+      "full_name" : "etcdserverpb.Lease",
+      "methods" : [ {
+        "name" : "LeaseGrant",
+        "full_name" : "etcdserverpb.Lease.LeaseGrant",
+        "input" : "etcdserverpb.LeaseGrantRequest",
+        "output" : "etcdserverpb.LeaseGrantResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "LeaseKeepAlive",
+        "full_name" : "etcdserverpb.Lease.LeaseKeepAlive",
+        "input" : "etcdserverpb.LeaseKeepAliveRequest",
+        "output" : "etcdserverpb.LeaseKeepAliveResponse",
+        "client_streaming" : true,
+        "server_streaming" : true
+      }, {
+        "name" : "LeaseLeases",
+        "full_name" : "etcdserverpb.Lease.LeaseLeases",
+        "input" : "etcdserverpb.LeaseLeasesRequest",
+        "output" : "etcdserverpb.LeaseLeasesResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "LeaseRevoke",
+        "full_name" : "etcdserverpb.Lease.LeaseRevoke",
+        "input" : "etcdserverpb.LeaseRevokeRequest",
+        "output" : "etcdserverpb.LeaseRevokeResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "LeaseTimeToLive",
+        "full_name" : "etcdserverpb.Lease.LeaseTimeToLive",
+        "input" : "etcdserverpb.LeaseTimeToLiveRequest",
+        "output" : "etcdserverpb.LeaseTimeToLiveResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      } ]
+    }, {
+      "name" : "Maintenance",
+      "full_name" : "etcdserverpb.Maintenance",
+      "methods" : [ {
+        "name" : "Alarm",
+        "full_name" : "etcdserverpb.Maintenance.Alarm",
+        "input" : "etcdserverpb.AlarmRequest",
+        "output" : "etcdserverpb.AlarmResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "Defragment",
+        "full_name" : "etcdserverpb.Maintenance.Defragment",
+        "input" : "etcdserverpb.DefragmentRequest",
+        "output" : "etcdserverpb.DefragmentResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "Downgrade",
+        "full_name" : "etcdserverpb.Maintenance.Downgrade",
+        "input" : "etcdserverpb.DowngradeRequest",
+        "output" : "etcdserverpb.DowngradeResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "Hash",
+        "full_name" : "etcdserverpb.Maintenance.Hash",
+        "input" : "etcdserverpb.HashRequest",
+        "output" : "etcdserverpb.HashResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "HashKV",
+        "full_name" : "etcdserverpb.Maintenance.HashKV",
+        "input" : "etcdserverpb.HashKVRequest",
+        "output" : "etcdserverpb.HashKVResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "MoveLeader",
+        "full_name" : "etcdserverpb.Maintenance.MoveLeader",
+        "input" : "etcdserverpb.MoveLeaderRequest",
+        "output" : "etcdserverpb.MoveLeaderResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      }, {
+        "name" : "Snapshot",
+        "full_name" : "etcdserverpb.Maintenance.Snapshot",
+        "input" : "etcdserverpb.SnapshotRequest",
+        "output" : "etcdserverpb.SnapshotResponse",
+        "client_streaming" : false,
+        "server_streaming" : true
+      }, {
+        "name" : "Status",
+        "full_name" : "etcdserverpb.Maintenance.Status",
+        "input" : "etcdserverpb.StatusRequest",
+        "output" : "etcdserverpb.StatusResponse",
+        "client_streaming" : false,
+        "server_streaming" : false
+      } ]
+    }, {
+      "name" : "Watch",
+      "full_name" : "etcdserverpb.Watch",
+      "methods" : [ {
+        "name" : "Watch",
+        "full_name" : "etcdserverpb.Watch.Watch",
+        "input" : "etcdserverpb.WatchRequest",
+        "output" : "etcdserverpb.WatchResponse",
+        "client_streaming" : true,
+        "server_streaming" : true
+      } ]
+    } ],
+    "messages" : [ {
+      "name" : "etcdserverpb.AlarmMember",
+      "fields" : [ {
+        "name" : "memberID",
+        "number" : 1,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "alarm",
+        "number" : 2,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.AlarmType",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AlarmRequest",
+      "fields" : [ {
+        "name" : "action",
+        "number" : 1,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.AlarmRequest.AlarmAction",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "memberID",
+        "number" : 2,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "alarm",
+        "number" : 3,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.AlarmType",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AlarmResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "alarms",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.AlarmMember",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthDisableRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthDisableResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthEnableRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthEnableResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleAddRequest",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleAddResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleDeleteRequest",
+      "fields" : [ {
+        "name" : "role",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleDeleteResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleGetRequest",
+      "fields" : [ {
+        "name" : "role",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleGetResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "perm",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "authpb.Permission",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleGrantPermissionRequest",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "perm",
+        "number" : 2,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "authpb.Permission",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleGrantPermissionResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleListRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleListResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "roles",
+        "number" : 2,
+        "type" : "string",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleRevokePermissionRequest",
+      "fields" : [ {
+        "name" : "role",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "key",
+        "number" : 2,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "range_end",
+        "number" : 3,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthRoleRevokePermissionResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthStatusRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthStatusResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "enabled",
+        "number" : 2,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "authRevision",
+        "number" : 3,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserAddRequest",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "password",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "options",
+        "number" : 3,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "authpb.UserAddOptions",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "hashedPassword",
+        "number" : 4,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserAddResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserChangePasswordRequest",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "password",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "hashedPassword",
+        "number" : 3,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserChangePasswordResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserDeleteRequest",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserDeleteResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserGetRequest",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserGetResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "roles",
+        "number" : 2,
+        "type" : "string",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserGrantRoleRequest",
+      "fields" : [ {
+        "name" : "user",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "role",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserGrantRoleResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserListRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserListResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "users",
+        "number" : 2,
+        "type" : "string",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserRevokeRoleRequest",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "role",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthUserRevokeRoleResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthenticateRequest",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "password",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.AuthenticateResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "token",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.CompactionRequest",
+      "fields" : [ {
+        "name" : "revision",
+        "number" : 1,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "physical",
+        "number" : 2,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.CompactionResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.Compare",
+      "fields" : [ {
+        "name" : "result",
+        "number" : 1,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.Compare.CompareResult",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "target",
+        "number" : 2,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.Compare.CompareTarget",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "key",
+        "number" : 3,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "version",
+        "number" : 4,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : "target_union",
+        "proto3_optional" : false
+      }, {
+        "name" : "create_revision",
+        "number" : 5,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : "target_union",
+        "proto3_optional" : false
+      }, {
+        "name" : "mod_revision",
+        "number" : 6,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : "target_union",
+        "proto3_optional" : false
+      }, {
+        "name" : "value",
+        "number" : 7,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : "target_union",
+        "proto3_optional" : false
+      }, {
+        "name" : "lease",
+        "number" : 8,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : "target_union",
+        "proto3_optional" : false
+      }, {
+        "name" : "range_end",
+        "number" : 64,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ {
+        "name" : "target_union",
+        "fields" : [ "create_revision", "lease", "mod_revision", "value", "version" ]
+      } ]
+    }, {
+      "name" : "etcdserverpb.DefragmentRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.DefragmentResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.DeleteRangeRequest",
+      "fields" : [ {
+        "name" : "key",
+        "number" : 1,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "range_end",
+        "number" : 2,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "prev_kv",
+        "number" : 3,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.DeleteRangeResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "deleted",
+        "number" : 2,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "prev_kvs",
+        "number" : 3,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "mvccpb.KeyValue",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.DowngradeRequest",
+      "fields" : [ {
+        "name" : "action",
+        "number" : 1,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.DowngradeRequest.DowngradeAction",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "version",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.DowngradeResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "version",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.HashKVRequest",
+      "fields" : [ {
+        "name" : "revision",
+        "number" : 1,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.HashKVResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "hash",
+        "number" : 2,
+        "type" : "uint32",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "compact_revision",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.HashRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.HashResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "hash",
+        "number" : 2,
+        "type" : "uint32",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseCheckpoint",
+      "fields" : [ {
+        "name" : "ID",
+        "number" : 1,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "remaining_TTL",
+        "number" : 2,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseCheckpointRequest",
+      "fields" : [ {
+        "name" : "checkpoints",
+        "number" : 1,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.LeaseCheckpoint",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseCheckpointResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseGrantRequest",
+      "fields" : [ {
+        "name" : "TTL",
+        "number" : 1,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "ID",
+        "number" : 2,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseGrantResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "ID",
+        "number" : 2,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "TTL",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "error",
+        "number" : 4,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseKeepAliveRequest",
+      "fields" : [ {
+        "name" : "ID",
+        "number" : 1,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseKeepAliveResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "ID",
+        "number" : 2,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "TTL",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseLeasesRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseLeasesResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "leases",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.LeaseStatus",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseRevokeRequest",
+      "fields" : [ {
+        "name" : "ID",
+        "number" : 1,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseRevokeResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseStatus",
+      "fields" : [ {
+        "name" : "ID",
+        "number" : 1,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseTimeToLiveRequest",
+      "fields" : [ {
+        "name" : "ID",
+        "number" : 1,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "keys",
+        "number" : 2,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.LeaseTimeToLiveResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "ID",
+        "number" : 2,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "TTL",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "grantedTTL",
+        "number" : 4,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "keys",
+        "number" : 5,
+        "type" : "bytes",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.Member",
+      "fields" : [ {
+        "name" : "ID",
+        "number" : 1,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "name",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "peerURLs",
+        "number" : 3,
+        "type" : "string",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "clientURLs",
+        "number" : 4,
+        "type" : "string",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "isLearner",
+        "number" : 5,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberAddRequest",
+      "fields" : [ {
+        "name" : "peerURLs",
+        "number" : 1,
+        "type" : "string",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "isLearner",
+        "number" : 2,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberAddResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "member",
+        "number" : 2,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.Member",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "members",
+        "number" : 3,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.Member",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberListRequest",
+      "fields" : [ {
+        "name" : "linearizable",
+        "number" : 1,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberListResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "members",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.Member",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberPromoteRequest",
+      "fields" : [ {
+        "name" : "ID",
+        "number" : 1,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberPromoteResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "members",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.Member",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberRemoveRequest",
+      "fields" : [ {
+        "name" : "ID",
+        "number" : 1,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberRemoveResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "members",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.Member",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberUpdateRequest",
+      "fields" : [ {
+        "name" : "ID",
+        "number" : 1,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "peerURLs",
+        "number" : 2,
+        "type" : "string",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MemberUpdateResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "members",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.Member",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MoveLeaderRequest",
+      "fields" : [ {
+        "name" : "targetID",
+        "number" : 1,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.MoveLeaderResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.PutRequest",
+      "fields" : [ {
+        "name" : "key",
+        "number" : 1,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "value",
+        "number" : 2,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "lease",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "prev_kv",
+        "number" : 4,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "ignore_value",
+        "number" : 5,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "ignore_lease",
+        "number" : 6,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.PutResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "prev_kv",
+        "number" : 2,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "mvccpb.KeyValue",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.RangeRequest",
+      "fields" : [ {
+        "name" : "key",
+        "number" : 1,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "range_end",
+        "number" : 2,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "limit",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "revision",
+        "number" : 4,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "sort_order",
+        "number" : 5,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.RangeRequest.SortOrder",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "sort_target",
+        "number" : 6,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.RangeRequest.SortTarget",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "serializable",
+        "number" : 7,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "keys_only",
+        "number" : 8,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "count_only",
+        "number" : 9,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "min_mod_revision",
+        "number" : 10,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "max_mod_revision",
+        "number" : 11,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "min_create_revision",
+        "number" : 12,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "max_create_revision",
+        "number" : 13,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.RangeResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "kvs",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "mvccpb.KeyValue",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "more",
+        "number" : 3,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "count",
+        "number" : 4,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.RequestOp",
+      "fields" : [ {
+        "name" : "request_range",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.RangeRequest",
+        "oneof" : "request",
+        "proto3_optional" : false
+      }, {
+        "name" : "request_put",
+        "number" : 2,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.PutRequest",
+        "oneof" : "request",
+        "proto3_optional" : false
+      }, {
+        "name" : "request_delete_range",
+        "number" : 3,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.DeleteRangeRequest",
+        "oneof" : "request",
+        "proto3_optional" : false
+      }, {
+        "name" : "request_txn",
+        "number" : 4,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.TxnRequest",
+        "oneof" : "request",
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ {
+        "name" : "request",
+        "fields" : [ "request_delete_range", "request_put", "request_range", "request_txn" ]
+      } ]
+    }, {
+      "name" : "etcdserverpb.ResponseHeader",
+      "fields" : [ {
+        "name" : "cluster_id",
+        "number" : 1,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "member_id",
+        "number" : 2,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "revision",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "raft_term",
+        "number" : 4,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.ResponseOp",
+      "fields" : [ {
+        "name" : "response_range",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.RangeResponse",
+        "oneof" : "response",
+        "proto3_optional" : false
+      }, {
+        "name" : "response_put",
+        "number" : 2,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.PutResponse",
+        "oneof" : "response",
+        "proto3_optional" : false
+      }, {
+        "name" : "response_delete_range",
+        "number" : 3,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.DeleteRangeResponse",
+        "oneof" : "response",
+        "proto3_optional" : false
+      }, {
+        "name" : "response_txn",
+        "number" : 4,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.TxnResponse",
+        "oneof" : "response",
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ {
+        "name" : "response",
+        "fields" : [ "response_delete_range", "response_put", "response_range", "response_txn" ]
+      } ]
+    }, {
+      "name" : "etcdserverpb.SnapshotRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.SnapshotResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "remaining_bytes",
+        "number" : 2,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "blob",
+        "number" : 3,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.StatusRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.StatusResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "version",
+        "number" : 2,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "dbSize",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "leader",
+        "number" : 4,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "raftIndex",
+        "number" : 5,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "raftTerm",
+        "number" : 6,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "raftAppliedIndex",
+        "number" : 7,
+        "type" : "uint64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "errors",
+        "number" : 8,
+        "type" : "string",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "dbSizeInUse",
+        "number" : 9,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "isLearner",
+        "number" : 10,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.TxnRequest",
+      "fields" : [ {
+        "name" : "compare",
+        "number" : 1,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.Compare",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "success",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.RequestOp",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "failure",
+        "number" : 3,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.RequestOp",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.TxnResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "succeeded",
+        "number" : 2,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "responses",
+        "number" : 3,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.ResponseOp",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.WatchCancelRequest",
+      "fields" : [ {
+        "name" : "watch_id",
+        "number" : 1,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.WatchCreateRequest",
+      "fields" : [ {
+        "name" : "key",
+        "number" : 1,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "range_end",
+        "number" : 2,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "start_revision",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "progress_notify",
+        "number" : 4,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "filters",
+        "number" : 5,
+        "type" : "enum",
+        "label" : "repeated",
+        "type_name" : "etcdserverpb.WatchCreateRequest.FilterType",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "prev_kv",
+        "number" : 6,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "watch_id",
+        "number" : 7,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "fragment",
+        "number" : 8,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.WatchProgressRequest",
+      "fields" : [ ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "etcdserverpb.WatchRequest",
+      "fields" : [ {
+        "name" : "create_request",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.WatchCreateRequest",
+        "oneof" : "request_union",
+        "proto3_optional" : false
+      }, {
+        "name" : "cancel_request",
+        "number" : 2,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.WatchCancelRequest",
+        "oneof" : "request_union",
+        "proto3_optional" : false
+      }, {
+        "name" : "progress_request",
+        "number" : 3,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.WatchProgressRequest",
+        "oneof" : "request_union",
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ {
+        "name" : "request_union",
+        "fields" : [ "cancel_request", "create_request", "progress_request" ]
+      } ]
+    }, {
+      "name" : "etcdserverpb.WatchResponse",
+      "fields" : [ {
+        "name" : "header",
+        "number" : 1,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "etcdserverpb.ResponseHeader",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "watch_id",
+        "number" : 2,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "created",
+        "number" : 3,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "canceled",
+        "number" : 4,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "compact_revision",
+        "number" : 5,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "cancel_reason",
+        "number" : 6,
+        "type" : "string",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "fragment",
+        "number" : 7,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "events",
+        "number" : 11,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "mvccpb.Event",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    } ],
+    "enums" : [ {
+      "name" : "etcdserverpb.AlarmRequest.AlarmAction",
+      "values" : [ {
+        "name" : "GET",
+        "number" : 0
+      }, {
+        "name" : "ACTIVATE",
+        "number" : 1
+      }, {
+        "name" : "DEACTIVATE",
+        "number" : 2
+      } ]
+    }, {
+      "name" : "etcdserverpb.AlarmType",
+      "values" : [ {
+        "name" : "NONE",
+        "number" : 0
+      }, {
+        "name" : "NOSPACE",
+        "number" : 1
+      }, {
+        "name" : "CORRUPT",
+        "number" : 2
+      } ]
+    }, {
+      "name" : "etcdserverpb.Compare.CompareResult",
+      "values" : [ {
+        "name" : "EQUAL",
+        "number" : 0
+      }, {
+        "name" : "GREATER",
+        "number" : 1
+      }, {
+        "name" : "LESS",
+        "number" : 2
+      }, {
+        "name" : "NOT_EQUAL",
+        "number" : 3
+      } ]
+    }, {
+      "name" : "etcdserverpb.Compare.CompareTarget",
+      "values" : [ {
+        "name" : "VERSION",
+        "number" : 0
+      }, {
+        "name" : "CREATE",
+        "number" : 1
+      }, {
+        "name" : "MOD",
+        "number" : 2
+      }, {
+        "name" : "VALUE",
+        "number" : 3
+      }, {
+        "name" : "LEASE",
+        "number" : 4
+      } ]
+    }, {
+      "name" : "etcdserverpb.DowngradeRequest.DowngradeAction",
+      "values" : [ {
+        "name" : "VALIDATE",
+        "number" : 0
+      }, {
+        "name" : "ENABLE",
+        "number" : 1
+      }, {
+        "name" : "CANCEL",
+        "number" : 2
+      } ]
+    }, {
+      "name" : "etcdserverpb.RangeRequest.SortOrder",
+      "values" : [ {
+        "name" : "NONE",
+        "number" : 0
+      }, {
+        "name" : "ASCEND",
+        "number" : 1
+      }, {
+        "name" : "DESCEND",
+        "number" : 2
+      } ]
+    }, {
+      "name" : "etcdserverpb.RangeRequest.SortTarget",
+      "values" : [ {
+        "name" : "KEY",
+        "number" : 0
+      }, {
+        "name" : "VERSION",
+        "number" : 1
+      }, {
+        "name" : "CREATE",
+        "number" : 2
+      }, {
+        "name" : "MOD",
+        "number" : 3
+      }, {
+        "name" : "VALUE",
+        "number" : 4
+      } ]
+    }, {
+      "name" : "etcdserverpb.WatchCreateRequest.FilterType",
+      "values" : [ {
+        "name" : "NOPUT",
+        "number" : 0
+      }, {
+        "name" : "NODELETE",
+        "number" : 1
+      } ]
+    } ]
+  }, {
+    "name" : "etcd/api/mvccpb/kv.proto",
+    "package" : "mvccpb",
+    "source_sha256" : "76b0d596ecc8dd1b535be683777910a5b4fe0705fb57baccacfcc7d98d11821e",
+    "services" : [ ],
+    "messages" : [ {
+      "name" : "mvccpb.Event",
+      "fields" : [ {
+        "name" : "type",
+        "number" : 1,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "mvccpb.Event.EventType",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "kv",
+        "number" : 2,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "mvccpb.KeyValue",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "prev_kv",
+        "number" : 3,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "mvccpb.KeyValue",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "mvccpb.KeyValue",
+      "fields" : [ {
+        "name" : "key",
+        "number" : 1,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "create_revision",
+        "number" : 2,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "mod_revision",
+        "number" : 3,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "version",
+        "number" : 4,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "value",
+        "number" : 5,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "lease",
+        "number" : 6,
+        "type" : "int64",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    } ],
+    "enums" : [ {
+      "name" : "mvccpb.Event.EventType",
+      "values" : [ {
+        "name" : "PUT",
+        "number" : 0
+      }, {
+        "name" : "DELETE",
+        "number" : 1
+      } ]
+    } ]
+  }, {
+    "name" : "etcd/api/authpb/auth.proto",
+    "package" : "authpb",
+    "source_sha256" : "443e661f9e423d3376d513e76446e957ae0132c6f63fff4510fde3c7a587be05",
+    "services" : [ ],
+    "messages" : [ {
+      "name" : "authpb.Permission",
+      "fields" : [ {
+        "name" : "permType",
+        "number" : 1,
+        "type" : "enum",
+        "label" : "optional",
+        "type_name" : "authpb.Permission.Type",
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "key",
+        "number" : 2,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "range_end",
+        "number" : 3,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "authpb.Role",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "keyPermission",
+        "number" : 2,
+        "type" : "message",
+        "label" : "repeated",
+        "type_name" : "authpb.Permission",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "authpb.User",
+      "fields" : [ {
+        "name" : "name",
+        "number" : 1,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "password",
+        "number" : 2,
+        "type" : "bytes",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "roles",
+        "number" : 3,
+        "type" : "string",
+        "label" : "repeated",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      }, {
+        "name" : "options",
+        "number" : 4,
+        "type" : "message",
+        "label" : "optional",
+        "type_name" : "authpb.UserAddOptions",
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    }, {
+      "name" : "authpb.UserAddOptions",
+      "fields" : [ {
+        "name" : "no_password",
+        "number" : 1,
+        "type" : "bool",
+        "label" : "optional",
+        "type_name" : null,
+        "oneof" : null,
+        "proto3_optional" : false
+      } ],
+      "oneofs" : [ ]
+    } ],
+    "enums" : [ {
+      "name" : "authpb.Permission.Type",
+      "values" : [ {
+        "name" : "READ",
+        "number" : 0
+      }, {
+        "name" : "WRITE",
+        "number" : 1
+      }, {
+        "name" : "READWRITE",
+        "number" : 2
+      } ]
+    } ]
+  } ]
+}
