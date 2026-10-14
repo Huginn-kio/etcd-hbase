@@ -20,7 +20,11 @@ import (
 
 const SchemaVersion = "etcd-hbase-trace/v1"
 
-const maxRecordBytes = 64 << 20
+const (
+	maxRecordBytes  = 64 << 20
+	maxTraceBytes   = 256 << 20
+	maxTraceRecords = 10_000
+)
 
 type legacyProtoMessage interface {
 	Reset()
@@ -145,12 +149,23 @@ func writeJSONL(writer io.Writer, record Record, maxBytes int) error {
 }
 
 func ReadJSONL(reader io.Reader) ([]Record, error) {
-	scanner := bufio.NewScanner(reader)
+	return readJSONL(reader, maxTraceBytes, maxTraceRecords)
+}
+
+func readJSONL(reader io.Reader, maxBytes int64, maxRecords int) ([]Record, error) {
+	limitedReader := &io.LimitedReader{R: reader, N: maxBytes + 1}
+	scanner := bufio.NewScanner(limitedReader)
 	scanner.Buffer(make([]byte, 64*1024), maxRecordBytes)
 	var records []Record
 	lastOrdinal := make(map[string]uint64)
 	line := 0
 	for scanner.Scan() {
+		if limitedReader.N == 0 {
+			return nil, errors.New("trace exceeds maximum total size")
+		}
+		if len(records) >= maxRecords {
+			return nil, errors.New("trace exceeds maximum record count")
+		}
 		line++
 		payload := bytes.TrimSpace(scanner.Bytes())
 		if len(payload) == 0 {
@@ -183,6 +198,9 @@ func ReadJSONL(reader io.Reader) ([]Record, error) {
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read trace line %d: %w", line+1, err)
+	}
+	if limitedReader.N == 0 {
+		return nil, errors.New("trace exceeds maximum total size")
 	}
 	return records, nil
 }

@@ -219,6 +219,26 @@ func TestWriteJSONLRejectsRecordLargerThanReaderLineLimit(t *testing.T) {
 	}
 }
 
+func TestReadJSONLBoundsTotalBytesAndRecordCount(t *testing.T) {
+	var output bytes.Buffer
+	for ordinal := uint64(1); ordinal <= 2; ordinal++ {
+		if err := WriteJSONL(&output, testRecord("bounded-trace", ordinal)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoded := output.String()
+
+	if _, err := readJSONL(strings.NewReader(encoded), int64(output.Len()), 2); err != nil {
+		t.Fatalf("reader rejected a trace exactly at both limits: %v", err)
+	}
+	if _, err := readJSONL(strings.NewReader(encoded), int64(output.Len()-1), 2); err == nil || !strings.Contains(err.Error(), "maximum total size") {
+		t.Fatalf("reader did not reject a trace above the total byte limit: %v", err)
+	}
+	if _, err := readJSONL(strings.NewReader(encoded), int64(output.Len()), 1); err == nil || !strings.Contains(err.Error(), "maximum record count") {
+		t.Fatalf("reader did not reject a trace above the record count limit: %v", err)
+	}
+}
+
 func TestTraceValidationErrorsDoNotEchoUntrustedIdentifiersOrFieldNames(t *testing.T) {
 	const sentinel = "secret-value-must-not-appear"
 
