@@ -118,6 +118,25 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void rejectsWildcardTokenInsteadOfAcceptingAnUnbindableHost() {
+    String securedYaml =
+        VALID_YAML.replace(
+            "authentication_mode: DEV_NO_AUTH",
+            "authentication_mode: CREDENTIAL_REFERENCE\n"
+                + "    credential_reference: env://HBASE_CREDENTIALS")
+            .replace("identity_provider_id: dev-no-auth", "identity_provider_id: backend-hbase");
+
+    assertRejected(
+        securedYaml.replace("bind_host: 127.0.0.1", "bind_host: \"*\""),
+        "listeners[0].bind_host",
+        null);
+    assertRejected(
+        securedYaml.replace("quorum: 127.0.0.1", "quorum: \"*\""),
+        "hbase_profiles.quorum",
+        null);
+  }
+
+  @Test
   void requiresCredentialReferenceWhenCredentialAuthenticationIsSelected() {
     assertRejected(
         VALID_YAML.replace("    authentication_mode: DEV_NO_AUTH\n", ""),

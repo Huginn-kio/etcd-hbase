@@ -635,6 +635,9 @@ final class RuntimeConfigurationValidator {
     if (host.length() > 253 || containsWhitespaceOrControl(host)) {
       throw invalid(path, "must be a bounded host name without whitespace");
     }
+    if (host.equals("*")) {
+      throw invalid(path, "must be a host name or IP literal");
+    }
     boolean startsBracket = host.startsWith("[");
     boolean endsBracket = host.endsWith("]");
     if (startsBracket != endsBracket) {
@@ -723,7 +726,7 @@ final class RuntimeConfigurationValidator {
   }
 
   private static boolean isWildcardHost(String host) {
-    return host.equals("*") || host.equals("ipv4:00000000") || isIpv6AnyLocalAddress(host);
+    return host.equals("ipv4:00000000") || isIpv6AnyLocalAddress(host);
   }
 
   private static boolean isLoopbackHost(String host) {

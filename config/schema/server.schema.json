@@ -48,7 +48,12 @@
       "required": ["id", "bind_host", "port", "table_group_id"],
       "properties": {
         "id": { "$ref": "#/$defs/Identifier" },
-        "bind_host": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "bind_host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "not": { "const": "*" }
+        },
         "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
         "table_group_id": { "$ref": "#/$defs/Identifier" }
       }
