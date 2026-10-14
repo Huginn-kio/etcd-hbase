@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -111,6 +112,47 @@ class TableGroupInitializerTest {
     assertThrows(
         IllegalArgumentException.class, () -> TableGroupInitializer.initialize(plan, admin));
     assertEquals(existingTableCount, admin.descriptors.size());
+  }
+
+  @Test
+  void fullGroupRetryIgnoresOperationalRegionSplitsAndPreservesData() throws Exception {
+    TableGroupInitializationPlan plan = plan("history-table.yaml", "m0_init_split_full");
+    InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
+    TableGroupInitializer.initialize(plan, admin);
+    TableName tableName = TableName.valueOf(plan.namespace(), "system");
+    int createdTableCount = admin.createNumber;
+    admin.splitRegion(tableName, HexFormat.of().parseHex("000080"));
+    admin.nonEmptyTables.add(tableName);
+
+    TableGroupInitializer.InitializationResult repeated =
+        TableGroupInitializer.initialize(plan, admin);
+
+    assertTrue(repeated.alreadyInitialized());
+    assertTrue(repeated.createdTables().isEmpty());
+    assertEquals(createdTableCount, admin.createNumber);
+    assertTrue(admin.nonEmptyTables.contains(tableName));
+  }
+
+  @Test
+  void partialGroupWithChangedRegionBoundariesCannotResume() throws Exception {
+    TableGroupInitializationPlan plan = plan("history-table.yaml", "m0_init_split_partial");
+    InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
+    admin.failOnCreateNumber = 2;
+    assertThrows(
+        TableGroupInitializer.PartialInitializationException.class,
+        () -> TableGroupInitializer.initialize(plan, admin));
+    TableName existing = admin.descriptors.keySet().stream().findFirst().orElseThrow();
+    admin.splitRegion(existing, HexFormat.of().parseHex("000080"));
+    int existingTableCount = admin.descriptors.size();
+    int createCount = admin.createNumber;
+
+    IllegalArgumentException failure =
+        assertThrows(
+            IllegalArgumentException.class, () -> TableGroupInitializer.initialize(plan, admin));
+
+    assertTrue(failure.getMessage().contains("different region split boundaries"));
+    assertEquals(existingTableCount, admin.descriptors.size());
+    assertEquals(createCount, admin.createNumber);
   }
 
   @Test
@@ -225,6 +267,34 @@ class TableGroupInitializerTest {
                 .build());
       }
       regions.put(tableName, List.copyOf(tableRegions));
+    }
+
+    private void splitRegion(TableName tableName, byte[] splitPoint) {
+      List<RegionInfo> tableRegions = new ArrayList<>(regions.get(tableName));
+      for (int index = 0; index < tableRegions.size(); index++) {
+        RegionInfo parent = tableRegions.get(index);
+        byte[] startKey = parent.getStartKey();
+        byte[] endKey = parent.getEndKey();
+        if (Bytes.compareTo(startKey, splitPoint) < 0
+            && (endKey.length == 0 || Bytes.compareTo(splitPoint, endKey) < 0)) {
+          tableRegions.remove(index);
+          tableRegions.add(
+              RegionInfoBuilder.newBuilder(tableName)
+                  .setStartKey(startKey)
+                  .setEndKey(splitPoint)
+                  .build());
+          tableRegions.add(
+              RegionInfoBuilder.newBuilder(tableName)
+                  .setStartKey(splitPoint)
+                  .setEndKey(endKey)
+                  .build());
+          tableRegions.sort(
+              (left, right) -> Bytes.compareTo(left.getStartKey(), right.getStartKey()));
+          regions.put(tableName, List.copyOf(tableRegions));
+          return;
+        }
+      }
+      throw new IllegalArgumentException("split point is not inside an existing region");
     }
   }
 }

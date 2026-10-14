@@ -64,7 +64,7 @@ final class TableGroupInitializer {
     List<PlannedTable> existingTables = new ArrayList<>();
     for (TableName tableName : actualNames) {
       PlannedTable planned = plannedByName.get(tableName);
-      verifyExistingTable(planned, admin);
+      verifyExistingTableDescriptor(planned, admin);
       existingTables.add(planned);
     }
 
@@ -73,6 +73,7 @@ final class TableGroupInitializer {
           plan.namespace(), List.of(), namespaceCreated, true, plan.fingerprint());
     }
     for (PlannedTable existing : existingTables) {
+      verifyExistingRegionBoundaries(existing, admin);
       if (!admin.isEmpty(existing.descriptor().getTableName())) {
         throw new IllegalArgumentException(
             "a partial table group already contains data; refusing to add more tables");
@@ -100,7 +101,7 @@ final class TableGroupInitializer {
         plan.fingerprint());
   }
 
-  private static void verifyExistingTable(PlannedTable planned, TableGroupAdmin admin)
+  private static void verifyExistingTableDescriptor(PlannedTable planned, TableGroupAdmin admin)
       throws Exception {
     TableName tableName = planned.descriptor().getTableName();
     TableDescriptor actual = admin.getDescriptor(tableName);
@@ -108,7 +109,11 @@ final class TableGroupInitializer {
       throw new IllegalArgumentException(
           "an existing table does not match the confirmed schema and profile");
     }
+  }
 
+  private static void verifyExistingRegionBoundaries(PlannedTable planned, TableGroupAdmin admin)
+      throws Exception {
+    TableName tableName = planned.descriptor().getTableName();
     List<byte[]> expectedStartKeys = new ArrayList<>();
     expectedStartKeys.add(new byte[0]);
     expectedStartKeys.addAll(Arrays.asList(planned.splitKeys()));
