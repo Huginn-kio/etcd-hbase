@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the Go toolchain's effective module graph against the project lock."""
+"""Verify the Go module lock and its regression cases."""
 
 from __future__ import annotations
 
@@ -137,8 +137,22 @@ def validate() -> int:
     return len(expected_versions)
 
 
+def run_regression_tests() -> None:
+    test_path = ROOT / "scripts" / "verify" / "test_go_module_lock.py"
+    result = subprocess.run(
+        [sys.executable, "-B", str(test_path)],
+        cwd=ROOT,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise LockError(
+            f"Go module lock regression tests failed with exit code {result.returncode}"
+        )
+
+
 def main() -> int:
     try:
+        run_regression_tests()
         count = validate()
     except (LockError, OSError, TypeError, ValueError) as error:
         print(f"go-module-lock: {error}", file=sys.stderr)
