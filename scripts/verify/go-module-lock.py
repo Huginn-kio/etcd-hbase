@@ -105,6 +105,19 @@ def validate() -> int:
         raise LockError("go.mod toolchain differs from the dependency lock")
 
     actual_modules = module_graph()
+    unlocked_direct_modules = sorted(
+        module
+        for module, metadata in actual_modules.items()
+        if not metadata.get("Main")
+        and not metadata.get("Indirect", False)
+        and module not in expected_versions
+    )
+    if unlocked_direct_modules:
+        raise LockError(
+            "module graph contains unlocked direct modules: "
+            + ", ".join(unlocked_direct_modules)
+        )
+
     sums = go_sum_entries()
     for module, expected_version in expected_versions.items():
         actual = actual_modules.get(module)
