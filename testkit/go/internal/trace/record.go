@@ -116,6 +116,13 @@ func ClassifyError(err error) *Error {
 }
 
 func WriteJSONL(writer io.Writer, record Record) error {
+	return writeJSONL(writer, record, maxRecordBytes)
+}
+
+func writeJSONL(writer io.Writer, record Record, maxBytes int) error {
+	if writer == nil {
+		return errors.New("trace writer is required")
+	}
 	if err := record.Validate(); err != nil {
 		return err
 	}
@@ -123,8 +130,16 @@ func WriteJSONL(writer io.Writer, record Record) error {
 	if err != nil {
 		return fmt.Errorf("encode trace record: %w", err)
 	}
-	if _, err := writer.Write(append(encoded, '\n')); err != nil {
+	if len(encoded) > maxBytes {
+		return fmt.Errorf("encoded trace record exceeds maximum %d-byte line", maxBytes)
+	}
+	line := append(encoded, '\n')
+	written, err := writer.Write(line)
+	if err != nil {
 		return fmt.Errorf("write trace record: %w", err)
+	}
+	if written != len(line) {
+		return io.ErrShortWrite
 	}
 	return nil
 }
@@ -148,20 +163,20 @@ func ReadJSONL(reader io.Reader) ([]Record, error) {
 		decoder.DisallowUnknownFields()
 		var record Record
 		if err := decoder.Decode(&record); err != nil {
-			return nil, fmt.Errorf("decode trace line %d: %w", line, err)
+			return nil, fmt.Errorf("decode trace line %d: invalid record JSON", line)
 		}
 		var trailing any
 		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 			if err == nil {
 				return nil, fmt.Errorf("trace line %d contains multiple JSON values", line)
 			}
-			return nil, fmt.Errorf("trace line %d has trailing data: %w", line, err)
+			return nil, fmt.Errorf("trace line %d has trailing data", line)
 		}
 		if err := record.Validate(); err != nil {
 			return nil, fmt.Errorf("validate trace line %d: %w", line, err)
 		}
 		if previous, ok := lastOrdinal[record.CaseID]; ok && record.Ordinal <= previous {
-			return nil, fmt.Errorf("trace line %d ordinal %d is not after %d for case %q", line, record.Ordinal, previous, record.CaseID)
+			return nil, fmt.Errorf("trace line %d ordinal %d is not after previous ordinal %d", line, record.Ordinal, previous)
 		}
 		lastOrdinal[record.CaseID] = record.Ordinal
 		records = append(records, record)
@@ -174,22 +189,22 @@ func ReadJSONL(reader io.Reader) ([]Record, error) {
 
 func (record Record) Validate() error {
 	if record.Schema != SchemaVersion {
-		return fmt.Errorf("unsupported trace schema %q", record.Schema)
+		return errors.New("unsupported trace schema")
 	}
 	if record.CaseID == "" || !safeIdentifier(record.CaseID) {
-		return fmt.Errorf("invalid case_id %q", record.CaseID)
+		return errors.New("invalid case_id")
 	}
 	if record.Ordinal == 0 || record.Ordinal > 1<<53-1 {
 		return errors.New("ordinal must be a positive safe JSON integer")
 	}
 	service, method, found := strings.Cut(record.Method, "/")
 	if !found || service == "" || method == "" || strings.Contains(method, "/") || strings.ContainsAny(record.Method, " \t\r\n") {
-		return fmt.Errorf("invalid method path %q", record.Method)
+		return errors.New("invalid method path")
 	}
 	switch record.EvidenceScope {
 	case "transport", "transport-fixture", "native-etcd", "target-hbase":
 	default:
-		return fmt.Errorf("invalid evidence_scope %q", record.EvidenceScope)
+		return errors.New("invalid evidence_scope")
 	}
 	elapsed, err := strconv.ParseUint(record.ElapsedNS, 10, 64)
 	if err != nil || strconv.FormatUint(elapsed, 10) != record.ElapsedNS {
@@ -204,22 +219,22 @@ func (record Record) Validate() error {
 	}
 	if record.Error != nil {
 		if !validGRPCCode(record.Error.GRPCCode) {
-			return fmt.Errorf("invalid grpc_code %q", record.Error.GRPCCode)
+			return errors.New("invalid grpc_code")
 		}
 		switch record.Error.ConsumerKind {
 		case "grpc-status", "etcd-client-error", "context-canceled", "context-deadline", "go-error":
 		default:
-			return fmt.Errorf("invalid consumer_kind %q", record.Error.ConsumerKind)
+			return errors.New("invalid consumer_kind")
 		}
 	}
 	if record.StreamTerminal != nil {
 		switch record.StreamTerminal.Kind {
 		case "eof", "grpc-status", "context-canceled", "context-deadline", "client-close":
 		default:
-			return fmt.Errorf("invalid stream terminal kind %q", record.StreamTerminal.Kind)
+			return errors.New("invalid stream terminal kind")
 		}
 		if record.StreamTerminal.Kind == "grpc-status" && !validGRPCCode(record.StreamTerminal.GRPCCode) {
-			return fmt.Errorf("invalid stream terminal grpc_code %q", record.StreamTerminal.GRPCCode)
+			return errors.New("invalid stream terminal grpc_code")
 		}
 	}
 	return nil
@@ -535,7 +550,7 @@ func validateObject(raw json.RawMessage, label string, allowNull, authMethod boo
 		return fmt.Errorf("%s must be a JSON object", label)
 	}
 	if key := findSecretKey(decoded, authMethod); key != "" {
-		return fmt.Errorf("%s contains forbidden secret field %q", label, key)
+		return fmt.Errorf("%s contains a forbidden secret field", label)
 	}
 	return nil
 }
@@ -577,7 +592,7 @@ func consumeJSONValue(decoder *json.Decoder) error {
 				return errors.New("object key is not a string")
 			}
 			if _, exists := seen[key]; exists {
-				return fmt.Errorf("duplicate JSON object key %q", key)
+				return errors.New("duplicate JSON object key")
 			}
 			seen[key] = struct{}{}
 			if err := consumeJSONValue(decoder); err != nil {

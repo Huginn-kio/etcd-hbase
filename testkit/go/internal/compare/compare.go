@@ -70,55 +70,10 @@ func Compare(left, right []trace.Record) error {
 			continue
 		}
 		if !equalWithCountAllowance(leftNormalized[index], rightNormalized[index]) {
-			return fmt.Errorf("trace record %d differs at %s for %s case %s", index+1, firstDifference(leftNormalized[index], rightNormalized[index], "$"), left[index].Method, left[index].CaseID)
+			return fmt.Errorf("trace record %d differs", index+1)
 		}
 	}
 	return nil
-}
-
-func firstDifference(left, right any, path string) string {
-	if reflect.DeepEqual(left, right) {
-		return ""
-	}
-	leftMap, leftOK := left.(map[string]any)
-	rightMap, rightOK := right.(map[string]any)
-	if leftOK && rightOK {
-		keys := make([]string, 0, len(leftMap)+len(rightMap))
-		seen := make(map[string]struct{}, len(leftMap)+len(rightMap))
-		for key := range leftMap {
-			seen[key] = struct{}{}
-		}
-		for key := range rightMap {
-			seen[key] = struct{}{}
-		}
-		for key := range seen {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			leftValue, leftExists := leftMap[key]
-			rightValue, rightExists := rightMap[key]
-			if !leftExists || !rightExists {
-				return path + "." + key
-			}
-			if difference := firstDifference(leftValue, rightValue, path+"."+key); difference != "" {
-				return difference
-			}
-		}
-	}
-	leftSlice, leftOK := left.([]any)
-	rightSlice, rightOK := right.([]any)
-	if leftOK && rightOK {
-		if len(leftSlice) != len(rightSlice) {
-			return path + ".length"
-		}
-		for index := range leftSlice {
-			if difference := firstDifference(leftSlice[index], rightSlice[index], fmt.Sprintf("%s[%d]", path, index)); difference != "" {
-				return difference
-			}
-		}
-	}
-	return path
 }
 
 func normalize(records []trace.Record) ([]map[string]any, error) {
@@ -155,19 +110,19 @@ func normalize(records []trace.Record) ([]map[string]any, error) {
 	for _, record := range records {
 		request, err := decodeNullable(record.Request)
 		if err != nil {
-			return nil, fmt.Errorf("decode request for %s: %w", record.Method, err)
+			return nil, fmt.Errorf("decode request in trace record %d: invalid snapshot JSON", record.Ordinal)
 		}
 		response, err := decodeNullable(record.Response)
 		if err != nil {
-			return nil, fmt.Errorf("decode response for %s: %w", record.Method, err)
+			return nil, fmt.Errorf("decode response in trace record %d: invalid snapshot JSON", record.Ordinal)
 		}
 		request, err = normalizeValue(request, record.Method, baseRevision, ids, sequences)
 		if err != nil {
-			return nil, fmt.Errorf("normalize request for %s: %w", record.Method, err)
+			return nil, fmt.Errorf("normalize request in trace record %d: %w", record.Ordinal, err)
 		}
 		response, err = normalizeValue(response, record.Method, baseRevision, ids, sequences)
 		if err != nil {
-			return nil, fmt.Errorf("normalize response for %s: %w", record.Method, err)
+			return nil, fmt.Errorf("normalize response in trace record %d: %w", record.Ordinal, err)
 		}
 		normalized = append(normalized, map[string]any{
 			"schema":          record.Schema,
@@ -192,7 +147,7 @@ func decodeNullable(raw json.RawMessage) (any, error) {
 	decoder.UseNumber()
 	var value any
 	if err := decoder.Decode(&value); err != nil {
-		return nil, err
+		return nil, errors.New("invalid snapshot JSON")
 	}
 	return value, nil
 }
@@ -255,7 +210,7 @@ func normalizeValue(value any, method string, baseRevision int64, ids map[string
 			if isRevisionField(key) {
 				revision, err := parseRevision(child)
 				if err != nil {
-					return nil, fmt.Errorf("field %q: %w", key, err)
+					return nil, fmt.Errorf("invalid revision field: %w", err)
 				}
 				if revision > 0 {
 					revision -= baseRevision
@@ -269,7 +224,7 @@ func normalizeValue(value any, method string, baseRevision int64, ids map[string
 			if domain := identityDomain(method, key); domain != "" {
 				id, err := parseID(child)
 				if err != nil {
-					return nil, fmt.Errorf("identity field %q: %w", key, err)
+					return nil, fmt.Errorf("invalid identity field: %w", err)
 				}
 				if id == "0" {
 					result[key] = id

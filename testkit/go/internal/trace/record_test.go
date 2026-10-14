@@ -208,6 +208,43 @@ func TestJSONLRoundTripPreservesOrderAndRejectsTruncatedRecords(t *testing.T) {
 	}
 }
 
+func TestWriteJSONLRejectsRecordLargerThanReaderLineLimit(t *testing.T) {
+	record := testRecord("bounded-line", 1)
+	var output bytes.Buffer
+	if err := writeJSONL(&output, record, 100); err == nil {
+		t.Fatal("writer accepted a record larger than the configured line limit")
+	}
+	if output.Len() != 0 {
+		t.Fatalf("writer emitted a partial record before rejecting it: %d bytes", output.Len())
+	}
+}
+
+func TestTraceValidationErrorsDoNotEchoUntrustedIdentifiersOrFieldNames(t *testing.T) {
+	const sentinel = "secret-value-must-not-appear"
+
+	invalidCase := testRecord(sentinel+"!", 1)
+	if err := invalidCase.Validate(); err == nil || strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("case_id validation leaked an untrusted value: %v", err)
+	}
+	invalidMethod := testRecord("safe-case", 1)
+	invalidMethod.Method = sentinel
+	if err := invalidMethod.Validate(); err == nil || strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("method validation leaked an untrusted value: %v", err)
+	}
+
+	secretField := testRecord("safe-case", 1)
+	secretField.Request = json.RawMessage(`{"fields":{"password-` + sentinel + `":"x"},"oneofs":{}}`)
+	if err := secretField.Validate(); err == nil || strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("secret-field validation leaked an untrusted field name: %v", err)
+	}
+
+	duplicateKey := testRecord("safe-case", 1)
+	duplicateKey.Request = json.RawMessage(`{"fields":{"` + sentinel + `":1,"` + sentinel + `":2},"oneofs":{}}`)
+	if err := duplicateKey.Validate(); err == nil || strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("duplicate-key validation leaked an untrusted field name: %v", err)
+	}
+}
+
 func TestReadJSONLRejectsInvalidOrderingAndSecrets(t *testing.T) {
 	var output bytes.Buffer
 	if err := WriteJSONL(&output, testRecord("ordered", 2)); err != nil {

@@ -83,6 +83,21 @@ func TestCompareRejectsDamagedProtocolTraces(t *testing.T) {
 	}
 }
 
+func TestCompareMismatchDoesNotEchoTraceIdentifiers(t *testing.T) {
+	const sentinel = "secret-value-must-not-appear"
+	left := baselineTrace(1, 101, 202, 7)
+	right := baselineTrace(1, 101, 202, 7)
+	right[1].CaseID = sentinel
+	right[1].Method = "etcdserverpb.KV/" + sentinel
+	err := Compare(left, right)
+	if err == nil {
+		t.Fatal("trace mismatch was accepted")
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("comparison error leaked an untrusted identifier: %v", err)
+	}
+}
+
 func TestCompareTracesRejectsMalformedJSONL(t *testing.T) {
 	if err := CompareTraces(strings.NewReader("{}\n"), strings.NewReader("{}\n")); err == nil {
 		t.Fatal("invalid JSONL trace was accepted")
