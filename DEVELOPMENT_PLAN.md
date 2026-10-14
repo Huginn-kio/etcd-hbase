@@ -3,7 +3,7 @@
 > 文档版本：0.6（补充执行顺序；M0 进度更新） · 更新日期：2026-10-14 · 开发基线：**JDK 21**
 >
 > 当前状态：开发计划及 M0 设计已批准；J00 调用基线、能力矩阵与分类目标初稿已于 2026-10-12 经评审并合并。PR #5（WP02–WP04）已合并为 `fe55cedfd2682d91e23245dd5929157b5317f073`；PR #6（WP09–WP10）已由 reviewer 批准并合并为最新上游 `main` `4b2864ac3e75c7940da76cc6628286fe9566e245`。PR #7–#13 仍开放，均以该上游 `main` 为 base、head 位于用户 fork；PR #4 已按要求关闭。
-> 当前实现与验证：PR #6 的两项 P2 和递归 Txn wire 覆盖建议均已修复并经 reviewer 确认。PR #7 的 listener 等价地址和列族 min/max 边界问题已修复；锁定 JDK 21 下 exact-head clean verify 为 9 模块、60 个测试全通过，正式复审仍待维护者回复。PR #8 的路径逃逸与重复 JSON key 防护已修复；exact-head Go tests/vet/mod verify、API 矩阵和 native oracle 均通过。PR #8–#12 描述已同步当前 head、main 基线和验证证据。在本次 PR #13 文档状态修订前，最新完整 public run `20261014T043255Z-47871` 对应实现提交 `d4e3ebc1e9d0675cbdfab729d2c89228391ac95a`，通过 123 tests / 26 suites，0 failures/errors/skips；9 个 public 步骤通过，runtime-image 因本机 Docker CLI 缺失而跳过。Go/Java wire 覆盖 10 条 trace，8 个模块 JAR 两次 clean build 的 SHA-256 一致。PR #13 的本次文档状态更新在最终 head 上另行运行完整 public 验证，精确索引保存在本地执行记录并在 PR 描述中引用。
+> 当前实现与验证：PR #6 的两项 P2 和递归 Txn wire 覆盖建议均已修复并经 reviewer 确认。PR #7 的 listener 等价地址和列族 min/max 边界问题已修复；锁定 JDK 21 下 exact-head clean verify 为 9 模块、60 个测试全通过，正式复审仍待维护者回复。PR #8 的路径逃逸与重复 JSON key 防护已修复；exact-head Go tests/vet/mod verify、API 矩阵和 native oracle 均通过。PR #8–#12 描述已同步当前 head、main 基线和验证证据。在本次 PR #13 文档状态修订前，最新完整 public run `20261014T043255Z-47871` 对应实现提交 `d4e3ebc1e9d0675cbdfab729d2c89228391ac95a`，通过 123 tests / 26 suites，0 failures/errors/skips；9 个 public 步骤通过，runtime-image 因本机 Docker CLI 缺失而跳过。Go/Java wire 覆盖 10 条 trace，8 个模块 JAR 两次 clean build 的 SHA-256 一致。PR #13 最终文档 head、完整 public run 与 fork Actions 结果均以 PR 描述为准；详细进度和索引仅存本地。
 > 待完成：PR #7–#13 等待外部评审；`reidchan` 因非上游 collaborator 无法添加（GitHub HTTP 422），未替换 reviewer。B01/B02/B03/B06、I07/I08 仍待用户或维护者提供；target HBase 尚未验收，M0 阶段保持未验收。本文中的类、表结构和算法为拟定方案；勾选任务必须附实现、验证和评审证据。
 
 ## 1. 评审摘要
@@ -479,7 +479,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
 
 ## 8. 分阶段开发任务
 
-每项包含实现与完成标准；跟踪字段用于日常更新。本计划定义验证用例，M0 public 实现由 PR #5–#13 分层交付；PR #5、#6 已合并，PR #7–#13 仍开放。任务状态分别依据当前代码、本地 public run、fork 上当前 head 的 CI、目标环境输入及真实评审记录；本地 smoke 不替代 target HBase 或 M0 阶段验收。PR #7–#13 最新推送前均核对并 rebase 到 upstream `main` `4b2864ac3e75c7940da76cc6628286fe9566e245`，所有 PR 的 base 保持 `main`。本次主计划状态修订前的完整 public run `20261014T043255Z-47871` 对应实现提交 `d4e3ebc1e9d0675cbdfab729d2c89228391ac95a`，通过 123 tests / 26 suites，0 failures/errors/skips；9 个 public 步骤通过，runtime-image 因本机缺 Docker CLI 跳过。PR #13 的最终文档 head 会再次运行完整 public 验证，并在本地进度索引和 PR 描述中记录准确 head 与 run。
+每项包含实现与完成标准；跟踪字段用于日常更新。本计划定义验证用例，M0 public 实现由 PR #5–#13 分层交付；PR #5、#6 已合并，PR #7–#13 仍开放。任务状态分别依据当前代码、本地 public run、fork 上当前 head 的 CI、目标环境输入及真实评审记录；本地 smoke 不替代 target HBase 或 M0 阶段验收。PR #7–#13 最新推送前均核对并 rebase 到 upstream `main` `4b2864ac3e75c7940da76cc6628286fe9566e245`，所有 PR 的 base 保持 `main`。本次主计划状态修订前的完整 public run `20261014T043255Z-47871` 对应实现提交 `d4e3ebc1e9d0675cbdfab729d2c89228391ac95a`，通过 123 tests / 26 suites，0 failures/errors/skips；9 个 public 步骤通过，runtime-image 因本机缺 Docker CLI 跳过。PR #13 最终文档 head 的完整 public run 和 fork Actions 由 PR 描述引用；详细执行记录与 JSON 索引保留本地。
 
 ### M0：工程、运行环境与协议基线
 
