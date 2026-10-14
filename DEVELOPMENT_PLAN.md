@@ -1,8 +1,10 @@
 # etcd-hbase 开发计划与进度记录
 
-> 文档版本：0.6（补充执行顺序；J00 进度更新） · 更新日期：2026-10-12 · 开发基线：**JDK 21**
+> 文档版本：0.6（补充执行顺序；M0 进度更新） · 更新日期：2026-10-13 · 开发基线：**JDK 21**
 >
-> 当前状态：开发计划及 M0 设计已批准，进入 M0；J00 调用基线、能力矩阵与分类目标初稿已交付，静态审计验证通过，待评审。尚无 Java 运行实现或端到端验证。本文中的类、表结构和算法为拟定方案；勾选任务必须附实现、验证和评审证据。
+> 当前状态：开发计划及 M0 设计已批准；J00 调用基线、能力矩阵与分类目标初稿已于 2026-10-12 经评审并合并。PR #5（WP02–WP04）已于 2026-10-13 10:16 UTC 合并到上游 `main`，merge commit 为 `fe55cedfd2682d91e23245dd5929157b5317f073`。PR #6–#13 仍开放，均以最新上游 `main` 为 base、head 位于用户 fork；PR #4 已按要求关闭。
+> 当前实现与验证：PR #6 的两项 P2 和递归 Txn wire 覆盖建议已修复，复核意见回复见 [PR #6 follow-up](https://github.com/Reidddddd/etcd-hbase/pull/6#issuecomment-6147548058)；PR #7 小数配置截断和 PR #8 native testkit symlink 路径逃逸已由自查修复。本地 public run `20261013T150055Z-10063`（验证提交 `f33e0640454cc712ca9bd201829434582f4b36d4`）为 113 tests / 26 suites，0 failures/errors/skips；9 个 public 验证步骤通过，本机 Docker CLI 缺失导致 runtime-image 步骤跳过。PR #13 同一 head 的 Actions [run `38418348538`](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38418348538) 为 5/5 jobs 成功，包括 packaged Java 21 runtime image。
+> 待完成：PR #6 等待 reviewer 复核，PR #7–#13 等待外部评审；`reidchan` 因非上游 collaborator 无法添加（GitHub HTTP 422），未替换 reviewer。B01/B02/B03/B06、I07/I08 仍待用户或维护者提供；target HBase 尚未验收，M0 阶段保持未验收。本文中的类、表结构和算法为拟定方案；勾选任务必须附实现、验证和评审证据。
 
 ## 1. 评审摘要
 
@@ -35,7 +37,7 @@
 
 补充设计前提：目标 HBase 平台具备充足容量与成熟运维能力。以此开展实现，容量数据用于确定兼容层调度、资源消耗和实际收益；不预设 HBase 总体容量不足。应用副本以无本地持久化、可在 K8s 替换和扩展为部署目标，具体验收见第 3.5 节。
 
-开发状态：**已完成 0 / 78，未完成 78 / 78；已验收阶段 0 / 9。** 每次更新任务状态后，同步第 2 节汇总。
+开发状态：**已完成 1 / 78，未完成 77 / 78；已验收阶段 0 / 9。** 每次更新任务状态后，同步第 2 节汇总。
 
 ### 1.3 评审需要形成的结论
 
@@ -70,7 +72,7 @@
 
 | 阶段 | 目标 | 总任务 | 已完成 | 未完成 | 阶段状态 | 负责人 | 计划/实际完成日期 | 验收记录 |
 |---|---|---:|---:|---:|---|---|---|---|
-| M0 | 工程、运行环境与协议基线 | 10 | 0 | 10 | 进行中 | Codex（J00） | — / — | J00 待评审，阶段未验收 |
+| M0 | 工程、运行环境与协议基线 | 10 | 1 | 9 | 进行中 | Codex（J00） | — / — | J00 已完成；M0 目标输入、CI 与评审未齐，阶段未验收 |
 | M1 | HBase 存储、盐桶扫描与预算 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M2 | 提交、MVCC、恢复与热点可行性 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M3 | KV / Range / Txn | 7 | 0 | 7 | 未开始 | 待分配 | — / — | — |
@@ -79,17 +81,17 @@
 | M6 | Milvus 新集群接入 | 8 | 0 | 8 | 未开始 | 待分配 | — / — | — |
 | M7 | HBase 压力、故障与长期运行 | 8 | 0 | 8 | 未开始 | 待分配 | — / — | — |
 | M8 | 新集群灰度与交付 | 7 | 0 | 7 | 未开始 | 待分配 | — / — | — |
-| **合计** | | **78** | **0** | **78** | **进行中** | | | |
+| **合计** | | **78** | **1** | **77** | **进行中** | | | |
 
 ### 2.3 已完成 / 未完成记录
 
-**已完成任务：暂无。** 完成后在下表追加简要记录，原任务及证据仍保留在所属阶段。
+**已完成任务：1 项。** 原任务及证据仍保留在所属阶段。
 
 | 完成日期 | 任务 ID | 交付内容 | PR / commit | 验证报告 | 评审人 |
 |---|---|---|---|---|---|
-| — | — | 暂无已完成任务 | — | — | — |
+| 2026-10-12 | J00 | 固化 Milvus v3.0.1 调用基线、API 矩阵与分类验收目标初稿；仅交付静态基线 | PR [#3](https://github.com/Reidddddd/etcd-hbase/pull/3)，合并 commit `e73d02e1279eb31c0820bf2033a0fc34d9893b62` | [J00 静态审计](docs/reports/j00-baseline-audit.md) | Huginn-kio，APPROVED（限静态基线范围） |
 
-**未完成任务：第 8 节全部 78 项。** 每个任务的状态、负责人和证据直接写在任务下面；不要另建一份重复任务清单。
+**未完成任务：第 8 节其余 77 项。** 每个任务的状态、负责人和证据直接写在任务下面；不要另建一份重复任务清单。
 
 建议每个任务使用独立 PR 或可审查的提交，PR 标明任务 ID。完成一个任务时同时更新：任务勾选、跟踪字段、阶段计数、完成记录。阶段验收另留报告，不能仅根据完成数判断阶段通过。
 
@@ -477,46 +479,46 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
 
 ## 8. 分阶段开发任务
 
-每项包含实现与完成标准；跟踪字段用于日常更新。验证用例是未来开发交付要求，本次仅编写计划，没有执行实现测试。
+每项包含实现与完成标准；跟踪字段用于日常更新。本计划定义验证用例，M0 public 实现由 PR #5–#13 分层交付；PR #5 已合并，PR #6–#13 仍开放。任务状态分别依据当前代码、本地 public run、fork 上当前 head 的 CI、目标环境输入及真实评审记录；本地 smoke 不替代 target HBase 或 M0 阶段验收。PR #6–#13 最近一次推送均以最新上游 `main` `fe55cedfd2682d91e23245dd5929157b5317f073` 为基线。最新本地 public run `20261013T150055Z-10063` 在验证提交 `f33e0640454cc712ca9bd201829434582f4b36d4` 上通过 113 tests / 26 suites；PR #13 同一 head 的 Actions run `38418348538` 已 5/5 jobs 通过。Docker CLI 缺失导致本机 runtime-image 步骤跳过，但 GitHub Actions packaged-image job 已通过。上游 PR status-check 汇总栏仍为空。
 
 ### M0：工程、运行环境与协议基线
 
-**状态：进行中｜已完成 0 / 10｜未完成 10｜负责人：Codex（J00）｜计划/实际日期：— / —**
+**状态：进行中｜已完成 1 / 10｜未完成 9｜负责人：Codex（J00）｜计划/实际日期：— / —**
 
 **进入条件：** 以公开技术范围和集成调用分析开始；B01–B06 按具体任务关闭，默认实现使用公开可复现环境。
 
 **阶段交付：** docs/api-matrix.md、docs/milvus-etcd-usage.md、依赖锁定/CI、环境与容量输入报告。
 
-- [ ] **J00｜固化当前 Milvus 请求选项、API 范围与 Count 差异**
+- [x] **J00｜固化当前 Milvus 请求选项、API 范围与 Count 差异**
   - 依赖：已有调用分析与初步技术/协议基线；负载目标按 J00.3 单独完善。
   - 完成标准：交付 docs/api-matrix.md、docs/milvus-etcd-usage.md 与分类目标报告；固定可公开引用的版本、具体区间、响应/错误消费者、全部首版能力和 Count 差异，不引入迁移工具。
   - 子任务 / 交付物（各项记录状态、负责人、日期、PR 与证据）：
-    - [ ] **J00.1** 调用/版本审计：固定 Milvus tag/commit、Go client、etcd 协议与部署方式，记录扫描/更新范围和实际消费路径。
-      - 状态：待评审；证据：[调用基线](docs/milvus-etcd-usage.md)、[固定源码摘要与 RPC 清单](docs/baselines/j00-source-baseline.json)。
-    - [ ] **J00.2** 能力矩阵：覆盖首版全部功能、参数组合、响应字段、错误行为、Count 消费者和原已明确不支持项。
-      - 状态：待评审；证据：[API 矩阵与 33 项用例定义](docs/api-matrix.md)。WP20 已在两个独立的原生 etcd 实例运行清单中的 13 个步骤；这只验证原生 testkit 子集，不代表 Java 服务或完整 C01–C33 行为验收通过。
-    - [ ] **J00.3** 负载与目标：按第 6.2 节分类建初稿，按任务需要完善；不阻塞 J01/J09 和基础协议工程。
-      - 状态：待评审；证据：[分类目标及 8 项负载 profile 初稿](docs/acceptance-targets.md)，实际环境/目标仍待 B01–B06 输入。
+    - [x] **J00.1** 调用/版本审计：固定 Milvus tag/commit、Go client、etcd 协议与部署方式，记录扫描/更新范围和实际消费路径。
+      - 状态：已完成；评审范围为静态基线；证据：[调用基线](docs/milvus-etcd-usage.md)、[固定源码摘要与 RPC 清单](docs/baselines/j00-source-baseline.json)。
+    - [x] **J00.2** 能力矩阵：覆盖首版全部功能、参数组合、响应字段、错误行为、Count 消费者和原已明确不支持项。
+      - 状态：已完成；证据：[API 矩阵与 33 项用例定义](docs/api-matrix.md)。WP20 已在两个独立的原生 etcd 实例运行清单中的 13 个步骤；这只验证原生 testkit 子集，不代表 Java 服务或完整 C01–C33 行为验收通过。
+    - [x] **J00.3** 负载与目标：按第 6.2 节分类建初稿，按任务需要完善；不阻塞 J01/J09 和基础协议工程。
+      - 状态：已完成初稿；目标环境/生产输入仍待 B01–B06 补齐；证据：[分类目标及 8 项负载 profile 初稿](docs/acceptance-targets.md)。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=待评审；负责人=Codex；分支=codex/j00-baseline；完成日期=—；PR/commit=—；验证报告=[J00 静态审计](docs/reports/j00-baseline-audit.md)；评审人/结论=—。
+  - 跟踪：状态=已完成；负责人=Codex；分支=codex/j00-baseline；完成日期=2026-10-12；PR/commit=[PR #3](https://github.com/Reidddddd/etcd-hbase/pull/3)、`e73d02e1279eb31c0820bf2033a0fc34d9893b62`；验证报告=[J00 静态审计](docs/reports/j00-baseline-audit.md)；评审人/结论=Huginn-kio APPROVED，限静态调用基线/API/目标初稿；不代表运行验证或 M0 验收。
 
 - [ ] **J01｜Maven 模块、Wrapper、Java 21 toolchain、release=21、CI 和依赖锁定**
   - 依赖：已确认的 JDK 21、模块及初步协议基线；不等待 J00 全部交付。
   - 完成标准：开发/CI/镜像 Java 基线统一 21，可重复构建；protobuf/Netty/Guava/Hadoop 冲突及解决方式有记录。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=进行中（工程基线已合并；完整 J01 验证闭环待其余层评审）；负责人=Codex；分支=codex/m0-02-toolchain；PR/commit=[PR #5](https://github.com/Reidddddd/etcd-hbase/pull/5)、merge commit `fe55cedfd2682d91e23245dd5929157b5317f073`；验证报告=定向验证：`test_maven_lock.py` 11/11、Maven 参数用例 8/8、Java 21 Maven `-N validate` BUILD SUCCESS；所有已报告的版本锁覆盖问题和 active-by-default profile 覆盖均已拒绝。Reidddddd 于 2026-10-13 09:57 UTC 评论确认根 profile P2 已修复且无新增问题；PR 随后已合并。最新 public full run 为 `20261013T150055Z-10063`（验证源提交 `f33e0640`；113 tests / 26 suites，0 failures/errors/skips）；9 个 public 步骤通过，runtime-image 因本机缺少 Docker CLI 跳过。PR #13 同一 head 的 Actions run `38418348538` 为 5/5 jobs 成功并验证 packaged runtime image。公开候选为 HBase `2.6.6-hadoop3`，真实 public-local 探针已运行；Apache 矩阵要求 HBase 2.6.8+ 才标记 Java 21 支持，且目标 B02 未提供，因此不宣称官方 Java 21 或 target 兼容。
 
 - [ ] **J02｜vendoring etcd proto 和 Java 生成配置**
   - 依赖：J01 的生成模块构建基础可用；其余依赖锁定按对应接入任务验收。
   - 完成标准：服务路径及字段编号与 v3.5.23 对照。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=待评审；负责人=Codex；分支=codex/m0-03-protocol；PR/commit=[PR #6](https://github.com/Reidddddd/etcd-hbase/pull/6)、当前 head `24610b89`；验证报告=本地 public run `20261013T150055Z-10063` 的 protocol/descriptor/wire 步骤通过；PR #13 Actions run `38418348538` 的 5 个 jobs 成功并覆盖该层；固定 proto、descriptor 和 wire 守卫已提交，历史 review findings 已修复，等待 reviewer 复核。
 
 - [ ] **J03｜KV/Watch/Lease/Auth 等 gRPC 骨架与 Header/Error 工厂**
   - 依赖：J02。
   - 完成标准：Go client 能完成最小请求/流和错误识别。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=待评审；负责人=Codex；分支=codex/m0-08-grpc-protocol（PR #11 head `fd9ef8b2`）、codex/m0-09-grpc-skeleton（PR #12 head `78a23ced`）；验证报告=本地 public run `20261013T150055Z-10063` 通过，PR #13 Actions run `38418348538` 的 5 个 jobs 成功；PR #11 暂无 fork Actions run；外部评审待进行。
 
 - [ ] **J04｜实际后端身份接入与基础 HBase 操作**
   - 依赖：J01 的实际接入构建基础；B02/B03 的身份/访问输入，子项按第 7.3 节推进。
@@ -525,7 +527,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J04.1** 确认实际认证机制与 BackendIdentityProvider/HBase 连接适配边界，记录跨副本与后台身份所需输入。
     - [ ] **J04.2** 完成基础连接及 Get/Put/CAS/Scan，记录身份隔离、认证失败、超时和关闭行为。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=阻塞；负责人=Codex；分支=codex/m0-06-request-hbase-identity、codex/m0-07-hbase-init；PR/commit=[PR #9](https://github.com/Reidddddd/etcd-hbase/pull/9)、[PR #10](https://github.com/Reidddddd/etcd-hbase/pull/10)；公开身份契约、连接工厂和 public-local Get/Put/CAS/Scan 已实现/验证；本地 review 修复使连接 future 的成功/失败完成回调不再在 manager 锁内执行，并增加回归测试；目标版本/身份/安全输入 B02/B03/B06 缺失，真实目标身份操作未执行。
 
 - [ ] **J05｜盐 profile、候选表配置与初始化 CLI 原型**
   - 依赖：B01 的编码输入；候选表配置不等待完整 B05 负载目标。
@@ -535,7 +537,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J05.2** 候选表配置：列族、版本/TTL/删除行为、schema 和表组配置；支持两种历史存储原型。
     - [ ] **J05.3** 初始化 CLI 原型：空表组创建、配置校验和重复操作保护；正式启动/恢复归 J55。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=阻塞；负责人=Codex；分支=codex/m0-04-spi-config、codex/m0-07-hbase-init；PR/commit=[PR #7](https://github.com/Reidddddd/etcd-hbase/pull/7)、[PR #10](https://github.com/Reidddddd/etcd-hbase/pull/10)；公开盐/表候选与两种布局的开发初始化 CLI 已实现/验证；目标盐输入 B01 缺失，目标初始化未验证。
 
 - [ ] **J06｜配置 schema、日志、指标、deadline/取消上下文**
   - 依赖：J01。
@@ -545,25 +547,25 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J06.2** 基础日志/指标：请求、排队、提交、流和资源记录，凭据不进入日志或标签。
     - [ ] **J06.3** 请求上下文：deadline、取消传播与释放；已发布提交继续由服务恢复上下文持有。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=待评审；负责人=Codex；分支=codex/m0-04-spi-config、codex/m0-06-request-hbase-identity、codex/m0-08-grpc-protocol；PR/commit=[PR #7](https://github.com/Reidddddd/etcd-hbase/pull/7)、[#9](https://github.com/Reidddddd/etcd-hbase/pull/9)、[#11](https://github.com/Reidddddd/etcd-hbase/pull/11)；配置、取消/资源清理、trace ID 和有限类别请求完成指标已有实现及 Java 21 单测；外部评审待进行。
 
 - [ ] **J07｜原生 etcd 对照 testkit、Go 请求驱动与历史记录格式**
   - 依赖：J02。
   - 完成标准：固定 etcd v3.5.23、请求和结果格式；只允许已接受的 Count 差异，Lease ID 身份映射不能掩盖事件或版本错误。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=待评审；负责人=Codex；分支=codex/m0-05-go-testkit（PR #8 head `b7a617ec`）、codex/m0-09-grpc-skeleton（PR #12 head `78a23ced`）；PR/commit=[PR #8](https://github.com/Reidddddd/etcd-hbase/pull/8)、[PR #12](https://github.com/Reidddddd/etcd-hbase/pull/12)；Go 驱动、原生 etcd 13 步 manifest 子集及 Go/Java unary/stream/error 互通已验证。自查增加了 native trace/metadata/data symlink 路径逃逸拒绝及回归测试；Go tests、vet、native oracle 和 PR #12 CI 通过。完整 C01–C33 和 Java 业务等价未覆盖；外部评审待进行。
 
 - [ ] **J08｜公开扩展 SPI 与内部 port 边界**
   - 依赖：J01 和初步需求基线；J00.2 完善时核对能力。
   - 完成标准：明确公开 API 最小范围、内部存储/提交模型边界及 provider ID/版本/生命周期；先验证盐/身份/连接和装配需求，再稳定配置/指标/绑定接口；内核不变量不能通过扩展绕过。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=待评审；负责人=Codex；分支=codex/m0-04-spi-config；PR/commit=[PR #7](https://github.com/Reidddddd/etcd-hbase/pull/7)；公开 SPI 和新增模块边界文档、provider 标识/版本及不可变身份 DTO 已实现并测试；外部评审待进行。
 
 - [ ] **J09｜开源仓库规范、许可证与公开构建边界**
   - 依赖：已确认的开源交付要求；构建规则随 J01 完善，不等待 J00 完整审计。
   - 完成标准：维护者确认许可证；记录 LICENSE/NOTICE、协议与依赖来源要求；提供贡献/问题/变更模板，固定 artifact 命名与发布位置；建立仅使用公开依赖、占位配置及公开可获取资源的 CI 规则。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=阻塞；负责人=Codex；分支=codex/m0-02-toolchain、codex/m0-04-spi-config；PR/commit=[PR #5](https://github.com/Reidddddd/etcd-hbase/pull/5)、[PR #7](https://github.com/Reidddddd/etcd-hbase/pull/7)；公开许可证/制品策略及来源台账已提交；维护者许可证 I07 和公开制品 I08 决定缺失，J09 尚未满足完成标准。
 
 **退出条件：** JDK 21 依赖和实际 HBase 认证可用，盐规则/预分区及目标已记录；Go client 最小协议/流/错误互通。原型不代表完整业务语义。公开 SPI、许可证/仓库规则及公共构建边界已评审。
 
@@ -1224,11 +1226,13 @@ KV 一致性与 Watch 的顺序、完整性及恢复分别验证，再验证联�
 | B01 | 盐算法、编码、桶数、预分区边界 | J05/J10 生产编码 | 待分配 | 规则及示例校验数据确认 | 待安排 | 待输入 |
 | B02 | HBase/client/Hadoop 版本及 JDK 21 允许组合 | J01/J04 | 待分配 | 实际版本、依赖、启动参数确认 | 待安排 | 待输入 |
 | B03 | Authenticate 提供的 HBase 账号密码如何转换实际后端认证，跨副本/启动/后台身份及轮换流程 | J04/J50/J51/J56 | 待分配 | 实际 client 认证机制、身份激活与安全交接/轮换流程验证 | 待安排 | 待输入 |
-| B04 | 应用提交、读屏障及续租排队的验收 profile | J29 负载报告与调度选型 | 服务开发 | 目标请求规模、延迟与报告判定口径明确；不阻塞基础实现 | 待安排 | 待输入 |
-| B05 | 真实 KV/版本/请求与新集群数量分布 | J17/J70–J77 | 待分配 | 第 6.2 节目标和负载数据冻结 | 待安排 | 待输入 |
+| B04 | 应用提交、读屏障及续租排队的验收 profile | J29 负载报告与调度选型 | 服务开发 | 目标请求规模、延迟与报告判定口径明确；不阻塞 M0 | 后续容量验收前 | 待输入（不阻塞 M0） |
+| B05 | 真实 KV/版本/请求与新集群数量分布 | J17/J70–J77 | 待分配 | 第 6.2 节目标和负载数据冻结；不阻塞 M0 | 后续容量验收前 | 待输入（不阻塞 M0） |
 | B06 | TLS、token/凭据安全交接、部署、监控与 RPO/RTO 规范 | J50/J56/J57/J80 | 待分配 | 规范与验收负责人确认 | 待安排 | 待输入 |
+| I07 | 项目许可证选择及源码、生成代码、proto、依赖和发行包审查结论 | J09 | 项目维护者 | 维护者确认许可证，审阅来源/通知并补齐正式许可文件 | M0 退出前 | 待输入 |
+| I08 | 公开 artifact 坐标、命名、发布位置及授权规则 | J09 | 项目维护者 | 维护者确认公开坐标和目的地；更新发行规则 | M0 退出前 | 待输入 |
 
-这些输入阻塞对应能力冻结或生产验收；不阻塞其余已具备条件的工程任务。
+这些输入阻塞对应能力冻结或生产验收；B04/B05 的生产数值按后续容量工作包收集，不阻塞 M0。其余已具备条件的工程任务继续推进。
 
 ### 10.3 决策登记
 
@@ -1272,7 +1276,18 @@ KV 一致性与 Watch 的顺序、完整性及恢复分别验证，再验证联�
 | 2026-10-09 | 开源规划 | 无开发任务完成 | 通用化文档；补公开 SPI、默认实现、独立扩展及发布任务 | D10 确认，RV07 待评审；R11/R12 未关闭 | 第 3.1.1–3.1.3 节；无实现验证报告 |
 | 2026-10-09 | 评审反馈修订 | 无开发任务完成 | 固定首版范围、拆子任务、调整依赖/检查点，补原生多版本原型与 K8s 多副本 | D05/D06 更新；D13/D14、R13/R14 新增；风险未因文档修改关闭 | PR #1 首轮反馈；本版文档，无实现验证报告 |
 | 2026-10-09 | 二轮建议补充 | 无开发任务完成 | 明确 C1 成熟度，补第一批启动顺序与实际前置 | F07/F08 文档已处理；首版范围与开发计数保持 | PR #1 二轮方案评论；第 7.2/7.3 节，无实现验证报告 |
-| 2026-10-12 | Codex | 无已评审完成任务，计数仍为 0/78 | J00.1–J00.3 本地交付待评审；下一项 J01 | Milvus 最低 v3.0.1 已确认；etcd 仍为 v3.5.23；TSO 吞错风险保留；B01–B06 待输入 | [J00 审计报告](docs/reports/j00-baseline-audit.md)；静态验证通过，未执行运行验证 |
+| 2026-10-12 | Codex | J00 完成并合并（计数 1/78） | 开始 J01–J09 分层实现 | B01–B06 待输入；Milvus v3.0.1、etcd v3.5.23 固定 | [J00 审计报告](docs/reports/j00-baseline-audit.md)；PR #3 静态评审通过，不包含运行验收 |
+| 2026-10-13 | Codex | J00 状态按 PR #3 合并评审更新；M0 public 实现与状态台账已提交 PR #5–#13，PR #5 的两轮 P2 已修复；本地 public run 109/109 tests 通过 | 完成 WP23 本地证据索引；跟进 PR #5 复审和 #6–#13 外部评审；收集 target 输入 | B01/B02/B03/B06、I07/I08 缺失；fork Actions run `38358687871` 对应 head `d06b87c` 且 5 个 job 成功；M0 阶段未验收 | PR #3/#5–#13；[fork CI run 38358687871](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38358687871)；本地 run `20261013T063622Z-60974`；外部输入台账 `docs/inputs/m0-inputs.yaml` |
+| 2026-10-13 | Codex | HBase connection factory 自查修复 future completion under lock；本地 public run 110/110 tests 通过 | 推送 PR #9–#13 重基后的关联 heads，获取新 CI；跟进 PR #5 复审和其余外部评审；收集 target 输入 | B01/B02/B03/B06、I07/I08 缺失；最新已完成 fork Actions run `38360415811` 仍对应修复前 head `c822b6c`；M0 阶段未验收 | 本地 run `20261013T072209Z-82530`（代码 head `499eeb9`）；[前一 fork CI run 38360415811](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38360415811)；PR #9 review-fix commit `ee6f8df` |
+| 2026-10-13 | Codex | PR #9 修复连接发布与 shutdown 竞态；public 验证 111 tests / 25 suites 通过；后续加固并验证竞态测试；PR #12/#13 最新 heads 的 fork Actions 均 5/5 jobs 成功 | 跟进 PR #5 复审和其他 PR 评审；等待用户提供 target 输入并完成目标 HBase 验收 | B01/B02/B03/B06、I07/I08 待输入；M0 阶段未验收 | public run `20261013T080617Z-7860`（代码 head `90865e0`）；后续 Java 21 SPI/core/HBase reactor 30 tests 通过；PR #9 commits `808956b`、`258f307`；[PR #12 Actions 38370630366](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38370630366)（head `ffe6359`）；[PR #13 Actions 38370657581](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38370657581)（head `d52e516`）；本地报告 run `20261013T080617Z-7860` |
+| 2026-10-13 | Codex | 修复 PR #5 第三项 P2，并自查补齐 active-by-default profile 属性覆盖拒绝；针对性测试 10/10、Java 21 Maven `-N validate` 通过；PR #6–#13 分支重基并推送；PR #12/#13 最新代码 heads 的 Actions 各 5/5 jobs 成功 | 跟进 PR #5 复审及其余 PR review；等待用户稍后提供 B01/B02/B03/B06/I07/I08，再完成目标验收 | PR #5 最新 head `0432b66` 等待复审；目标输入待提供；M0 阶段未验收 | [PR #5](https://github.com/Reidddddd/etcd-hbase/pull/5)；[PR #12 Actions 38375189025](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38375189025)（head `6aab9cd`）；[PR #13 Actions 38375200476](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38375200476)（head `ff5c16e`）；`test_maven_lock.py` 10/10；Java 21 `mvn21.sh -N validate` |
+| 2026-10-13 | Codex | 修复 PR #5 根 POM active-by-default profile 覆盖锁定版本的 P2；11 项锁校验、8 项 Maven 仓库参数用例及 pinned Java 21 `-N validate` 通过；PR #6–#13 顺序重基、推送到 fork | 跟进 PR #5 正式 review state、其他 PR review；等待用户提供 B01/B02/B03/B06/I07/I08，再完成目标验收 | Reidddddd 已评论确认根 profile P2 关闭、无新问题；PR #5 尚无 formal review state；目标输入待提供；M0 阶段未验收 | [PR #5](https://github.com/Reidddddd/etcd-hbase/pull/5) 最新评审评论（2026-10-13 09:57 UTC）；[PR #12 Actions 38377923057](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38377923057)（code head `f921f00`）；[PR #13 Actions 38378933651](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38378933651)（docs head `69b1e1a`）；定向用例 `11/11`、`8/8`，Java 21 `-N validate` |
+| 2026-10-13 | Codex | Reidddddd 复核 PR #5 head `dfc1754`，确认根 POM profile P2 已修复且无新增问题；独立运行 11/11 锁校验、8 项 Maven 参数、metadata 和 shell 检查均通过 | 更新主计划/评审记录；继续等待 PR #5 formal review state、其他 PR feedback 及 target 输入 | 本次结论来自 issue-level comment，PR #5 尚无正式 review state；B01/B02/B03/B06/I07/I08 待提供；M0 阶段未验收 | [PR #5 最新 review comment](https://github.com/Reidddddd/etcd-hbase/pull/5)（2026-10-13 09:57 UTC）；head `dfc1754`；[PR #12 CI 38377923057](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38377923057)；[PR #13 CI 38378933651](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38378933651) |
+| 2026-10-13 | Codex | PR #5 已于 10:16 UTC 合并为 `fe55ced`；PR #6–#13 顺序 rebase 至最新上游 `main` 并以精确 lease 推送；PR #12/#13 rebase 后的 Actions 各 5/5 jobs 成功 | 更新主计划与本地恢复记录；继续处理 PR #6–#13 评审及 M0 可独立推进项 | B01/B02/B03/B06/I07/I08 待提供；M0 阶段未验收 | PR #5 merge commit `fe55cedfd2682d91e23245dd5929157b5317f073`；PR #6–#13 当前 fork heads；[PR #12 run](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38382737972)；[PR #13 run](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38382743748) |
+| 2026-10-13 | Codex | 修复并推送 PR #6 的 Maven 依赖锁、proto 来源摘要守卫和递归 Txn round-trip review findings；修复 PR #7 小数整数配置截断；本地 public run 113/113 tests、26 suites 通过；最新 PR #12/#13 fork CI 各 5/5 jobs 成功 | 等待 PR #6 reviewer 复核及 PR #7–#13 review；B01/B02/B03/B06/I07/I08 到齐后完成目标验收 | PR #6 修复待复核，指定 `reidchan` reviewer 因非上游 collaborator 无法添加；目标输入待提供，M0 阶段未验收 | PR #6 commits `c72094e`、`8b4952e`、`24610b8`；PR #7 commit `17c2922`；本地 public report run `20261013T112151Z-97213`（执行报告仅存本地）；[PR #12 CI 38390829046](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38390829046)；[PR #13 CI 38390833115](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38390833115) |
+| 2026-10-13 | Codex | 自查修复 PR #8 native artifact symlink 路径逃逸（commit `b7a617e`），并将修复重放至 PR #9–#13；本地 public run `20261013T121300Z-25385` 在代码验证 head `222df150` 上 113/113 tests、26 suites 通过，8 个模块 JAR 可重复；PR #12/#13 当前验证 heads 的 CI 各 5/5 jobs 成功 | 跟进 PR #6 复核及 PR #8–#13 外部 review；等待 B01/B02/B03/B06/I07/I08 并完成 target 验收 | 当前 PR #8–#13 未见正式 review/行内意见；指定 `reidchan` reviewer 因非上游 collaborator 无法添加；target 输入待提供，M0 阶段未验收 | [PR #8](https://github.com/Reidddddd/etcd-hbase/pull/8) head `b7a617e`；[PR #12 CI 38396422940](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38396422940) head `78a23ced`；[PR #13 CI 38396428426](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38396428426) code head `222df150`；public report run `20261013T121300Z-25385`（执行报告保留本地）；target 缺口 B01/B02/B03/B06/I07/I08 |
+| 2026-10-13 | Codex | PR #6 的两项 P2 和递归 Txn 建议已在 head `24610b8` 修复；重新运行 Maven lock 14/14、Maven 参数 8/8、协议 13/13，proto 注释变更负向检查按预期失败，并在 [PR #6 follow-up](https://github.com/Reidddddd/etcd-hbase/pull/6#issuecomment-6147548058) 请求复核。PR #13 同步前一层的 shutdown probe 超时测试，head `832e79e` 的 Actions 5/5 jobs 成功；最新 public run 为 113 tests / 26 suites。 | 等待 PR #6 reviewer 复核和 PR #7–#13 外部评审；等待 B01/B02/B03/B06/I07/I08 后完成 target 验收 | PR #6–#13 均以 `main` 为 base；`reidchan` 无法加入且未替换 reviewer；target 输入仍缺，M0 未验收 | [PR #6 follow-up](https://github.com/Reidddddd/etcd-hbase/pull/6#issuecomment-6147548058)；[PR #13](https://github.com/Reidddddd/etcd-hbase/pull/13)；[Actions 38412514696](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38412514696)；public run `20261013T135801Z-75492` |
+| 2026-10-13 | Codex | 在 PR #13 head `f33e0640` 上重新核实 public run `20261013T150055Z-10063`：113 tests / 26 suites，无失败、错误或跳过测试；9 个 public 步骤通过，runtime-image 因本机缺 Docker CLI 跳过。相同 head 的 Actions run `38418348538` 5/5 jobs 成功（含 packaged runtime image）。PR #6–#13 仍全部开放且以 `main` 为 base；#6 修复说明已发，尚无新 reviewer 结论；#7–#13 暂无评审意见。 | 继续跟进 PR review；等待 B01/B02/B03/B06/I07/I08 后完成 target 验收 | 本地 public HBase 和 CI 不构成 target 身份/权限/TLS 或目标版本验收；M0 阶段保持未验收 | [PR #6 follow-up](https://github.com/Reidddddd/etcd-hbase/pull/6#issuecomment-6147548058)；[PR #13](https://github.com/Reidddddd/etcd-hbase/pull/13)；[Actions 38418348538](https://github.com/Huginn-kio/etcd-hbase/actions/runs/38418348538)；本地 INDEX `.artifacts/m0/public/20261013T150055Z-10063/INDEX.json` |
 
 ### 11.2 单任务完成记录
 
@@ -1370,7 +1385,7 @@ Milvus 最低支持版本已确认 v3.0.1。J00 固定审计该 tag 的 `658cbd1
 
 集成验证需要同时核对所选版本的设计文档与源码；升级版本时重新核对调用清单、错误消费和恢复顺序，并记录可公开引用的依据。
 
-J00 已交付 [API 矩阵](docs/api-matrix.md)、[调用基线](docs/milvus-etcd-usage.md) 与 [分类目标初稿](docs/acceptance-targets.md)，包含区间、调用选项、响应/错误消费者和验证用例定义。交付目前待评审，不能记录为已完成任务或运行兼容性已通过。
+J00 已交付 [API 矩阵](docs/api-matrix.md)、[调用基线](docs/milvus-etcd-usage.md) 与 [分类目标初稿](docs/acceptance-targets.md)，包含区间、调用选项、响应/错误消费者和验证用例定义。PR #3 已于 2026-10-12 由 Huginn-kio APPROVED 并合并，范围仅限静态基线；这不代表运行兼容性或 M0 阶段验收通过。
 
 ### 13.2 官方协议与接口资料
 
