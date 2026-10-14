@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
@@ -88,6 +89,39 @@ class InitializeTablesCommandTest {
   }
 
   @Test
+  void separatesConfigurationReadErrorsFromBackendIoErrors() throws Exception {
+    String configuration = examplePath("history-table.yaml");
+    String confirmationFingerprint =
+        fingerprint(runPlan("history-table.yaml").output())
+            .substring("confirmation_fingerprint: ".length());
+    CommandResult backendFailure =
+        runWithApplyOperation(
+            (plan, output) -> {
+              throw new IOException("simulated backend failure");
+            },
+            "init",
+            "apply",
+            "--config",
+            configuration,
+            "--confirm-table-group",
+            "local",
+            "--confirm-plan",
+            confirmationFingerprint);
+
+    assertEquals(4, backendFailure.exitCode());
+    assertTrue(backendFailure.error().contains("HBase operation failed (IOException)"));
+    assertFalse(backendFailure.error().contains("configuration cannot be read"));
+
+    Path missingConfiguration = Files.createTempFile("m0-admin-missing-", ".yaml");
+    Files.delete(missingConfiguration);
+    CommandResult configurationFailure =
+        run("init", "plan", "--config", missingConfiguration.toString());
+
+    assertEquals(2, configurationFailure.exitCode());
+    assertTrue(configurationFailure.error().contains("configuration cannot be read"));
+  }
+
+  @Test
   void planOutputDoesNotContainCredentialFieldNamesOrYamlComments() throws Exception {
     CommandResult result = runPlan("history-table.yaml");
 
@@ -120,6 +154,21 @@ class InitializeTablesCommandTest {
     try (PrintStream outputStream = new PrintStream(output, true, StandardCharsets.UTF_8);
         PrintStream errorStream = new PrintStream(error, true, StandardCharsets.UTF_8)) {
       int exitCode = InitializeTablesCommand.run(args, outputStream, errorStream);
+      return new CommandResult(
+          exitCode,
+          output.toString(StandardCharsets.UTF_8),
+          error.toString(StandardCharsets.UTF_8));
+    }
+  }
+
+  private static CommandResult runWithApplyOperation(
+      InitializeTablesCommand.ApplyOperation applyOperation, String... args) {
+    ByteArrayOutputStream output = new ByteArrayOutputStream();
+    ByteArrayOutputStream error = new ByteArrayOutputStream();
+    try (PrintStream outputStream = new PrintStream(output, true, StandardCharsets.UTF_8);
+        PrintStream errorStream = new PrintStream(error, true, StandardCharsets.UTF_8)) {
+      int exitCode =
+          InitializeTablesCommand.run(args, outputStream, errorStream, applyOperation);
       return new CommandResult(
           exitCode,
           output.toString(StandardCharsets.UTF_8),

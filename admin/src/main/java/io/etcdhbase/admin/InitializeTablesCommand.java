@@ -53,9 +53,20 @@ public final class InitializeTablesCommand {
   }
 
   static int run(String[] args, PrintStream output, PrintStream error) {
+    return run(args, output, error, InitializeTablesCommand::apply);
+  }
+
+  static int run(
+      String[] args, PrintStream output, PrintStream error, ApplyOperation applyOperation) {
     try {
       Options options = Options.parse(args);
-      RuntimeConfiguration configuration = load(options.configPath());
+      RuntimeConfiguration configuration;
+      try {
+        configuration = load(options.configPath());
+      } catch (IOException failure) {
+        error.println("m0-admin error: configuration cannot be read");
+        return 2;
+      }
       String requestedGroup =
           options.action().equals("plan") ? options.tableGroupId() : options.confirmTableGroup();
       TableGroupInitializationPlan plan =
@@ -64,7 +75,7 @@ public final class InitializeTablesCommand {
         printPlan(plan, output);
       } else {
         confirm(plan, options);
-        apply(plan, output);
+        applyOperation.apply(plan, output);
       }
       return 0;
     } catch (TableGroupInitializer.PartialInitializationException failure) {
@@ -75,9 +86,6 @@ public final class InitializeTablesCommand {
           tableNames(failure.createdTables()),
           failure.planFingerprint());
       return 4;
-    } catch (IOException failure) {
-      error.println("m0-admin error: configuration cannot be read");
-      return 2;
     } catch (IllegalArgumentException failure) {
       error.println("m0-admin error: " + failure.getMessage());
       return 2;
@@ -86,6 +94,11 @@ public final class InitializeTablesCommand {
           "m0-admin error: HBase operation failed (" + failure.getClass().getSimpleName() + ")");
       return 4;
     }
+  }
+
+  @FunctionalInterface
+  interface ApplyOperation {
+    void apply(TableGroupInitializationPlan plan, PrintStream output) throws Exception;
   }
 
   private static RuntimeConfiguration load(Path configPath) throws IOException {
