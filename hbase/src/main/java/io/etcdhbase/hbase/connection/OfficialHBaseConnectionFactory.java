@@ -132,7 +132,7 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
         Entry creating = entry;
         entry.deadline =
             deadlines.schedule(
-                () -> completeFailure(key, creating, new TimeoutException()),
+                () -> expireCreation(key, creating),
                 creationTimeout.toNanos(),
                 TimeUnit.NANOSECONDS);
         create = true;
@@ -159,7 +159,7 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
         if (entry.state == EntryState.READY) {
           toClose.add(entry);
           entry.state = EntryState.CLOSED;
-        } else if (entry.state == EntryState.CREATING) {
+        } else if (entry.state == EntryState.CREATING || entry.state == EntryState.TIMED_OUT) {
           entry.state = EntryState.CLOSED;
           toFail.add(entry);
         }
@@ -239,6 +239,12 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
       }
       if (!accepted) {
         closeConnection(connection);
+        synchronized (lock) {
+          if (connections.get(key) == entry && entry.state == EntryState.TIMED_OUT) {
+            connections.remove(key);
+            entry.state = EntryState.FAILED;
+          }
+        }
         entry.connection.completeExceptionally(
             new BackendFailure(BackendFailure.Category.UNAVAILABLE));
         return;
@@ -254,7 +260,9 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
     synchronized (entry.publicationLock) {
       boolean accepted;
       synchronized (lock) {
-        accepted = connections.get(key) == entry && entry.state == EntryState.CREATING;
+        accepted =
+            connections.get(key) == entry
+                && (entry.state == EntryState.CREATING || entry.state == EntryState.TIMED_OUT);
         if (accepted) {
           connections.remove(key);
           entry.state = EntryState.FAILED;
@@ -264,6 +272,20 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
       if (accepted) {
         entry.connection.completeExceptionally(safeFailure);
       }
+    }
+  }
+
+  private void expireCreation(IdentityKey key, Entry entry) {
+    synchronized (entry.publicationLock) {
+      synchronized (lock) {
+        if (connections.get(key) != entry || entry.state != EntryState.CREATING) {
+          return;
+        }
+        // Retain its capacity until provider work settles; retries cannot create unlimited orphans.
+        entry.state = EntryState.TIMED_OUT;
+      }
+      entry.connection.completeExceptionally(
+          new BackendFailure(BackendFailure.Category.TIMEOUT, new TimeoutException()));
     }
   }
 
@@ -320,6 +342,7 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
 
   private enum EntryState {
     CREATING,
+    TIMED_OUT,
     READY,
     FAILED,
     CLOSED

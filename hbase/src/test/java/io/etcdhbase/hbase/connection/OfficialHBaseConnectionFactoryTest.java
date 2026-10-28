@@ -30,7 +30,7 @@ import org.junit.jupiter.api.Test;
 
 class OfficialHBaseConnectionFactoryTest {
   @Test
-  void sharedCreationDeadlineReleasesCapacityAndClosesLateConnections() throws Exception {
+  void sharedCreationDeadlineRetainsCapacityUntilLateConnectionIsClosed() throws Exception {
     CompletableFuture<AsyncConnection> stalled = new CompletableFuture<>();
     AtomicInteger attempts = new AtomicInteger();
     AsyncConnection retryConnection = mock(AsyncConnection.class);
@@ -50,10 +50,18 @@ class OfficialHBaseConnectionFactoryTest {
       assertEquals(
           BackendFailure.Category.TIMEOUT,
           assertInstanceOf(BackendFailure.class, failure.getCause()).category());
-      assertSame(retryConnection, factory.connectionFor(identity()).toCompletableFuture().join());
+      assertEquals(1, attempts.get());
+      var rejected =
+          assertThrows(
+              CompletionException.class,
+              () -> factory.connectionFor(identity()).toCompletableFuture().join());
+      assertEquals(
+          BackendFailure.Category.TIMEOUT,
+          assertInstanceOf(BackendFailure.class, rejected.getCause()).category());
       AsyncConnection lateConnection = mock(AsyncConnection.class);
       stalled.complete(lateConnection);
       verify(lateConnection).close();
+      assertSame(retryConnection, factory.connectionFor(identity()).toCompletableFuture().join());
     }
     verify(retryConnection).close();
   }
