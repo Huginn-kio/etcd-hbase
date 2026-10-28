@@ -5,7 +5,9 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import io.etcdhbase.core.error.BackendFailure;
@@ -29,6 +31,33 @@ import org.apache.hadoop.hbase.client.AsyncConnection;
 import org.junit.jupiter.api.Test;
 
 class OfficialHBaseConnectionFactoryTest {
+  @Test
+  void failedLateCloseRetainsCapacityAndIsRetriedOnShutdown() throws Exception {
+    CompletableFuture<AsyncConnection> creation = new CompletableFuture<>();
+    AsyncConnection late = mock(AsyncConnection.class);
+    doThrow(new java.io.IOException("private backend diagnostic")).doNothing().when(late).close();
+    AtomicInteger attempts = new AtomicInteger();
+    try (var factory =
+        new OfficialHBaseConnectionFactory(
+            1,
+            Duration.ofMillis(100),
+            ignored -> {
+              attempts.incrementAndGet();
+              return creation;
+            })) {
+      var waiting = factory.connectionFor(identity()).toCompletableFuture();
+      assertThrows(
+          java.util.concurrent.ExecutionException.class, () -> waiting.get(5, TimeUnit.SECONDS));
+      creation.complete(late);
+      assertThrows(
+          CompletionException.class,
+          () -> factory.connectionFor(identity()).toCompletableFuture().join());
+      assertEquals(1, attempts.get());
+      verify(late).close();
+    }
+    verify(late, times(2)).close();
+  }
+
   @Test
   void sharedCreationDeadlineRetainsCapacityUntilLateConnectionIsClosed() throws Exception {
     CompletableFuture<AsyncConnection> stalled = new CompletableFuture<>();

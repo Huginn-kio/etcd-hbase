@@ -156,7 +156,7 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
       }
       closed = true;
       for (Entry entry : connections.values()) {
-        if (entry.state == EntryState.READY) {
+        if (entry.state == EntryState.READY || entry.state == EntryState.CLOSE_FAILED) {
           toClose.add(entry);
           entry.state = EntryState.CLOSED;
         } else if (entry.state == EntryState.CREATING || entry.state == EntryState.TIMED_OUT) {
@@ -238,11 +238,17 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
         }
       }
       if (!accepted) {
-        closeConnection(connection);
+        boolean released = closeConnection(connection);
         synchronized (lock) {
           if (connections.get(key) == entry && entry.state == EntryState.TIMED_OUT) {
-            connections.remove(key);
-            entry.state = EntryState.FAILED;
+            if (released) {
+              connections.remove(key);
+              entry.state = EntryState.FAILED;
+            } else {
+              // An unsuccessful close must not turn an occupied backend slot into free capacity.
+              entry.readyConnection = connection;
+              entry.state = EntryState.CLOSE_FAILED;
+            }
           }
         }
         entry.connection.completeExceptionally(
@@ -344,6 +350,7 @@ public final class OfficialHBaseConnectionFactory implements HBaseConnectionFact
     CREATING,
     TIMED_OUT,
     READY,
+    CLOSE_FAILED,
     FAILED,
     CLOSED
   }
