@@ -20,6 +20,9 @@ public final class BackendIdentityException extends Exception {
   public enum Reason {
     INVALID_CREDENTIALS("backend credentials were rejected"),
     INSUFFICIENT_PERMISSION("backend identity lacks table-group access"),
+    RESOURCE_LIMIT("backend identity capacity was reached"),
+    TIMEOUT("backend identity verification timed out"),
+    CANCELLED("backend identity verification was cancelled"),
     BACKEND_UNAVAILABLE("backend identity could not be verified");
 
     private final String safeMessage;

@@ -54,6 +54,9 @@ public final class HBaseFailures {
             switch (identityFailure.reason()) {
               case INVALID_CREDENTIALS -> BackendFailure.Category.AUTHENTICATION;
               case INSUFFICIENT_PERMISSION -> BackendFailure.Category.PERMISSION;
+              case RESOURCE_LIMIT -> BackendFailure.Category.RESOURCE_LIMIT;
+              case TIMEOUT -> BackendFailure.Category.TIMEOUT;
+              case CANCELLED -> BackendFailure.Category.CANCELLED;
               case BACKEND_UNAVAILABLE -> BackendFailure.Category.UNAVAILABLE;
             },
             root);
@@ -61,7 +64,9 @@ public final class HBaseFailures {
       if (current instanceof AccessDeniedException || current instanceof AccessControlException) {
         return new BackendFailure(BackendFailure.Category.PERMISSION, root);
       }
-      if (current instanceof SaslException || current instanceof InvalidToken) {
+      if (current instanceof SaslException
+          || current instanceof InvalidToken
+          || current instanceof javax.security.auth.login.LoginException) {
         return new BackendFailure(BackendFailure.Category.AUTHENTICATION, root);
       }
       if (current instanceof CancellationException || current instanceof InterruptedException) {
