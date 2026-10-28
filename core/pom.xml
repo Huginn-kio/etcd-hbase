@@ -10,6 +10,11 @@
   <artifactId>core</artifactId>
   <dependencies>
     <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>io.etcdhbase</groupId>
       <artifactId>spi</artifactId>
       <version>${project.version}</version>

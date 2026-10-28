@@ -255,7 +255,10 @@
   "go": {
     "version": "1.27.2",
     "moduleVersions": {
-      "go.etcd.io/etcd/client/v3": "v3.5.23"
+      "go.etcd.io/etcd/client/v3": "v3.5.23",
+      "go.etcd.io/etcd/api/v3": "v3.5.23",
+      "go.etcd.io/etcd/client/pkg/v3": "v3.5.23",
+      "google.golang.org/grpc": "v1.79.3"
     },
     "source": "https://go.dev/doc/devel/release",
     "archives": {
@@ -269,13 +272,25 @@
       },
       "windows-x64": {
         "url": "https://go.dev/dl/go1.27.2.windows-amd64.zip",
-      "sha256": "1314008898bd40df77af4b014f777f08873dbdfbcd3d92308728ee03304fe04f"
+        "sha256": "1314008898bd40df77af4b014f777f08873dbdfbcd3d92308728ee03304fe04f"
       }
     },
     "moduleChecksums": {
       "go.etcd.io/etcd/client/v3@v3.5.23": {
         "module": "h1:WN7sypGG326sFP5jLkFqD3anf/k6NNlV5Hy/UxvTPvc=",
         "goMod": "h1:XTf1oMQi4ZzpXGFoPgvAqbY9JFmTFQqWI1SF4g+hV6o="
+      },
+      "go.etcd.io/etcd/api/v3@v3.5.23": {
+        "module": "h1:tQi/RaO6peOhmf0c11miU3RQIYPZmiL3UzG9V+f8g6k=",
+        "goMod": "h1:QP4ZLWROP49Kk/vPLhudxYQcF4ndhMQ1gvJE4rCTAgc="
+      },
+      "go.etcd.io/etcd/client/pkg/v3@v3.5.23": {
+        "module": "h1:RzwVV28JgOwGl5TUjA47s9IWxl5qQjM2VqSh8wjFFLM=",
+        "goMod": "h1:IdIjxGUGNy+8HWeVlbBXDqmPqe+n8GsVGVYnccAEZ5o="
+      },
+      "google.golang.org/grpc@v1.79.3": {
+        "module": "h1:sybAEdRIEtvcD68Gx7dmnwjZKlyfuc61Dyo9pGXXkKE=",
+        "goMod": "h1:KmT0Kjez+0dde/v2j9vzwoAScgEPx/Bw1CYChhHLrHQ="
       }
     }
   },

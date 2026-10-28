@@ -1,0 +1,37 @@
+name: J03 protocol skeleton
+
+on:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: j03-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  java-go-smoke:
+    name: Java 21 and Go protocol smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Download the locked Temurin JDK
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/j03-temurin-jdk.tar.gz"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: jdkfile
+          java-version: '21'
+          jdk-file: ${{ runner.temp }}/j03-temurin-jdk.tar.gz
+          cache: maven
+      - name: Verify J03 methods, errors, streams and Go interoperability
+        run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" scripts/verify/j03.sh
