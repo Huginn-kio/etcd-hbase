@@ -214,6 +214,12 @@
       "sha256": "e04ba5195bcd555dc95650f7cc614d151e4bcd52d29a10b8aa2197f3ab89ab9b",
       "reason": "Provide the javax.annotation.Generated type emitted by the pinned grpc-java code generator on Java 21."
     },
+    "hadoopMiniKdc": {
+      "coordinate": "org.apache.hadoop:hadoop-minikdc:3.4.3",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "1c5b5a31868a0878518381ae4d91b80c3e997ec4bbdbb9b85c40a049ebeb1014",
+      "reason": "Test-only temporary Kerberos KDC for isolated password, keytab and ticket-cache authentication."
+    },
     "hbaseTestingUtil": {
       "coordinate": "org.apache.hbase:hbase-testing-util:2.6.6-hadoop3",
       "repository": "https://repo.maven.apache.org/maven2",

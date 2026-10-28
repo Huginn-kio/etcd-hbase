@@ -57,6 +57,23 @@ class MavenLockTest(unittest.TestCase):
             with self.assertRaisesRegex(maven_lock.LockError, "SHA-256 mismatch"):
                 maven_lock.verify_artifacts([artifact], Path(directory), require_all=True)
 
+    def test_hadoop_minikdc_version_and_digest_are_enforced(self) -> None:
+        lock = copy.deepcopy(self.lock)
+        lock["libraries"]["hadoopMiniKdc"]["coordinate"] = (
+            "org.apache.hadoop:hadoop-minikdc:0.0.0-review-mismatch"
+        )
+        with self.assertRaisesRegex(maven_lock.LockError, "libraries.hadoopMiniKdc"):
+            maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+
+        artifact = next(item for item in maven_lock.collect_artifacts(self.lock)
+                        if item.coordinate == "org.apache.hadoop:hadoop-minikdc")
+        with tempfile.TemporaryDirectory(prefix="j04-lock-minikdc-") as directory:
+            path = Path(directory) / artifact.relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"tampered MiniKdc artifact")
+            with self.assertRaisesRegex(maven_lock.LockError, "SHA-256 mismatch"):
+                maven_lock.verify_artifacts([artifact], Path(directory), require_all=True)
+
     def test_javax_annotation_version_must_match_the_managed_dependency(self) -> None:
         lock = copy.deepcopy(self.lock)
         lock["libraries"]["javaxAnnotation"]["coordinate"] = (

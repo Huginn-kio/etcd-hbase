@@ -34,6 +34,19 @@ class BackendCredentialsTest {
   }
 
   @Test
+  void boundsSecretCopiesAndRejectsAccessAfterClose() {
+    try (var credentials = new BackendCredentials("user", new char[] {'a', 'b'})) {
+      assertThrows(IllegalArgumentException.class, () -> credentials.copySecret(-1));
+      assertThrows(IllegalArgumentException.class, () -> credentials.copySecret(1));
+      char[] copy = credentials.copySecret(2);
+      assertArrayEquals(new char[] {'a', 'b'}, copy);
+      Arrays.fill(copy, '\0');
+      credentials.close();
+      assertThrows(IllegalStateException.class, () -> credentials.copySecret(2));
+    }
+  }
+
+  @Test
   void rejectsMissingPrincipalAndSecret() {
     assertThrows(IllegalArgumentException.class, () -> new BackendCredentials(" ", new char[0]));
     assertThrows(NullPointerException.class, () -> new BackendCredentials("user", null));

@@ -40,8 +40,8 @@ public final class DevelopmentIdentityProvider implements BackendIdentityProvide
     }
     char[] secretCopy;
     try {
-      secretCopy = credentials.copySecret();
-    } catch (IllegalStateException exception) {
+      secretCopy = credentials.copySecret(0);
+    } catch (IllegalArgumentException | IllegalStateException exception) {
       return CompletableFuture.failedFuture(
           new BackendIdentityException(Reason.INVALID_CREDENTIALS));
     }

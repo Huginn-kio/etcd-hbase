@@ -26,6 +26,15 @@ public final class BackendCredentials implements AutoCloseable {
     return secret.clone();
   }
 
+  /** Rejects an oversized secret before allocating the caller-owned copy. */
+  public synchronized char[] copySecret(int maximumCharacters) {
+    ensureOpen();
+    if (maximumCharacters < 0 || secret.length > maximumCharacters) {
+      throw new IllegalArgumentException("credential secret exceeds the configured limit");
+    }
+    return secret.clone();
+  }
+
   public synchronized boolean isClosed() {
     return closed;
   }

@@ -3,10 +3,10 @@ package io.etcdhbase.hbase.connection;
 import org.apache.hadoop.conf.Configuration;
 
 /** Restricts the process-identity shortcut to an explicitly local, unauthenticated ZK profile. */
-final class DevelopmentConnectionConfiguration {
+public final class DevelopmentConnectionConfiguration {
   private DevelopmentConnectionConfiguration() {}
 
-  static void validate(Configuration configuration) {
+  public static void validate(Configuration configuration) {
     if (!"simple".equals(configuration.get("hbase.security.authentication", "simple"))
         || !"simple".equals(configuration.get("hadoop.security.authentication", "simple"))
         || configuration.getBoolean("hbase.security.authorization", false)) {

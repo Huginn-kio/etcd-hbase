@@ -1,5 +1,6 @@
 package io.etcdhbase.hbase.identity;
 
+import io.etcdhbase.hbase.api.HBaseUserContext;
 import io.etcdhbase.spi.identity.BackendCredentials;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
@@ -24,7 +25,7 @@ import org.apache.hadoop.security.token.Token;
  * <p>The owning provider must close all connections using this user before closing this carrier. It
  * never installs a process-wide login user or puts a password into Configuration or a String.
  */
-public final class DigestPasswordUser implements AutoCloseable {
+public final class DigestPasswordUser implements HBaseUserContext {
   private final User user;
   private final Token<AuthenticationTokenIdentifier> token;
   private boolean closed;
@@ -38,7 +39,7 @@ public final class DigestPasswordUser implements AutoCloseable {
     Objects.requireNonNull(credentials, "credentials");
     requireText(clusterId, 128);
     requireText(credentials.principal(), 256);
-    char[] secret = credentials.copySecret();
+    char[] secret = credentials.copySecret(4096);
     ByteBuffer encoded = null;
     byte[] password = null;
     boolean transferred = false;
