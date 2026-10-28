@@ -68,6 +68,13 @@ for module in ("spi", "core", "hbase"):
         suites.append({"file": str(relative), "sha256": hashlib.sha256(report.read_bytes()).hexdigest(), **counts})
         for key, value in counts.items():
             totals[key] += value
+required_authentication_suites = {
+    "HBaseBackendIdentityProviderTest", "KerberosUserContextTest", "DelegationTokenUserTest",
+    "DigestPasswordUserTest", "HBaseAuthenticationProvidersTest", "HBaseAccessVerifiersTest",
+}
+observed_authentication_suites = {Path(suite["file"]).stem.rsplit(".", 1)[-1] for suite in suites}
+if not required_authentication_suites <= observed_authentication_suites:
+    raise SystemExit("missing required J04 authentication suites")
 integration = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.probe.LocalHBaseProbeIT.xml"
 if not integration.is_file() or int(ET.parse(integration).getroot().attrib.get("tests", "0")) != 1:
     raise SystemExit("J04 real HBase integration test must execute exactly once")
@@ -88,7 +95,14 @@ summary = {
                  "hadoop_client": lock["hbase"]["public"]["hadoopVersion"]},
     "dependency_lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
     "backend": "temporary HBase; simple authentication; not target credentials",
-    "digest": "official HBase SASL client protocol fixture; not target HBase acceptance",
+    "authentication": {
+        "simple": "unified provider and real temporary HBase; development only, no target ACL proof",
+        "kerberos": "temporary KDC password/keytab/ticket-cache and official HBase GSSAPI exchange",
+        "delegation_token": "official Hadoop token encoding, bounded parsing and credential ownership",
+        "digest_password": "official HBase SASL client protocol fixture",
+        "custom_provider": "official registry loading and selector extension fixture",
+        "target_hbase": "not_verified",
+    },
     "target_hbase": "not_verified", "target_authentication": "not_verified",
 }
 (artifacts / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

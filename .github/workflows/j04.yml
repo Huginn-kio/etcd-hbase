@@ -33,5 +33,5 @@ jobs:
           java-version: '21'
           jdk-file: ${{ runner.temp }}/j04-temurin-jdk.tar.gz
           cache: maven
-      - name: Verify identity, bounded connections, DIGEST fixture and HBase operations
+      - name: Verify authentication adapters, bounded connections and real HBase operations
         run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" scripts/verify/hbase-probe.sh --profile public-local

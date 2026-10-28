@@ -2,13 +2,20 @@ package io.etcdhbase.hbase.probe;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.hbase.connection.OfficialHBaseConnectionFactory;
 import io.etcdhbase.hbase.identity.DevelopmentIdentityProvider;
+import io.etcdhbase.hbase.identity.HBaseAuthenticators;
+import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.spi.identity.AuthenticationScope;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.etcdhbase.spi.identity.BackendCredentials;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -20,6 +27,7 @@ import org.apache.hadoop.hbase.client.AsyncAdmin;
 import org.apache.hadoop.hbase.client.AsyncConnection;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.Durability;
+import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -113,7 +121,55 @@ class LocalHBaseProbeIT {
         "hbase-probe resource namespace=%s table=%s family=d auth=development-no-auth%n",
         namespace, tableName);
 
-    BackendProbe.ProbeResult result = BackendProbe.execute(serviceConnection, tableName, runId);
+    // Exercise the unified provider against a real backend. SIMPLE provides no user proof; this
+    // explicit development-only verifier establishes reachability, not a target ACL assertion.
+    BackendProbe.ProbeResult result;
+    try (var provider =
+        new HBaseBackendIdentityProvider(
+            "local-unified",
+            new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID),
+            clientConfiguration,
+            HBaseAuthenticators.simpleDevelopment(),
+            (connection, scope) ->
+                connection
+                    .getTable(tableName)
+                    .get(new Get(new byte[] {1}))
+                    .thenApply(ignored -> null),
+            2,
+            2,
+            Duration.ofSeconds(30))) {
+      AuthorizedBackendIdentity alice;
+      AuthorizedBackendIdentity bob;
+      try (var first = new BackendCredentials("alice", new char[0]);
+          var second = new BackendCredentials("bob", new char[0]);
+          var invalid = new BackendCredentials("alice", new char[] {'x'})) {
+        assertThrows(
+            java.util.concurrent.ExecutionException.class,
+            () ->
+                provider
+                    .authenticate(invalid, new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID))
+                    .toCompletableFuture()
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+        alice =
+            provider
+                .authenticate(first, new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID))
+                .toCompletableFuture()
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        bob =
+            provider
+                .authenticate(second, new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID))
+                .toCompletableFuture()
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+      }
+      assertNotEquals(alice.contextRef(), bob.contextRef());
+      var aliceConnection = provider.connectionFor(alice).toCompletableFuture().get();
+      assertSame(aliceConnection, provider.connectionFor(alice).toCompletableFuture().get());
+      var bobConnection = provider.connectionFor(bob).toCompletableFuture().get();
+      assertNotSame(aliceConnection, bobConnection);
+      result = BackendProbe.execute(aliceConnection, tableName, runId);
+      BackendProbe.verifyPersistedValue(bobConnection, tableName, runId);
+    }
+
     assertTrue(result.rawBytesRoundTrip());
     assertTrue(result.compareAndMutateSucceeded());
     assertTrue(result.staleCompareAndMutateRejected());
