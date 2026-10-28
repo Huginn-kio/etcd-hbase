@@ -1,8 +1,8 @@
 # etcd-hbase 开发计划与进度记录
 
-> 文档版本：0.6（补充执行顺序；J00 进度更新） · 更新日期：2026-10-12 · 开发基线：**JDK 21**
+> 文档版本：0.7（J04 临时环境交付与已合并任务核对） · 更新日期：2026-10-28 · 开发基线：**JDK 21**
 >
-> 当前状态：开发计划及 M0 设计已批准，进入 M0。J03 已提供可启动的 gRPC 骨架、Header/Error 工厂和最小 Go/Java 协议验证，待 PR #7 评审；未实现的业务方法返回 UNIMPLEMENTED。目标 HBase 接入归 J04，尚未验收。本文中的后续类、表结构和算法仍按任务逐项实现；勾选任务必须附实现、验证和评审证据。
+> 当前状态：开发计划及 M0 设计已批准，进入 M0。J03 已在 PR #7 批准合并，提供 gRPC 骨架、Header/Error 工厂及最小 Go/Java 验证；未实现业务仍返回 UNIMPLEMENTED。J04 的身份契约、连接工厂、DIGEST 凭据载体与真实临时 HBase 探针由 PR #8 交付；目标环境身份和权限尚未验收。本文中的后续类、表结构和算法仍按任务逐项实现；勾选任务必须附实现、验证和评审证据。
 
 ## 1. 评审摘要
 
@@ -35,7 +35,7 @@
 
 补充设计前提：目标 HBase 平台具备充足容量与成熟运维能力。以此开展实现，容量数据用于确定兼容层调度、资源消耗和实际收益；不预设 HBase 总体容量不足。应用副本以无本地持久化、可在 K8s 替换和扩展为部署目标，具体验收见第 3.5 节。
 
-开发状态：**已完成 0 / 78，未完成 78 / 78；已验收阶段 0 / 9。** 每次更新任务状态后，同步第 2 节汇总。
+开发状态：**已完成 3 / 78，未完成 75 / 78；已验收阶段 0 / 9。** 每次更新任务状态后，同步第 2 节汇总。
 
 ### 1.3 评审需要形成的结论
 
@@ -70,7 +70,7 @@
 
 | 阶段 | 目标 | 总任务 | 已完成 | 未完成 | 阶段状态 | 负责人 | 计划/实际完成日期 | 验收记录 |
 |---|---|---:|---:|---:|---|---|---|---|
-| M0 | 工程、运行环境与协议基线 | 10 | 0 | 10 | 进行中 | Codex（J00） | — / — | J00 待评审，阶段未验收 |
+| M0 | 工程、运行环境与协议基线 | 10 | 3 | 7 | 进行中 | Codex | — / — | J00/J02/J03 已完成；J01 剩余补验、J04 目标身份与阶段验收未完成 |
 | M1 | HBase 存储、盐桶扫描与预算 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M2 | 提交、MVCC、恢复与热点可行性 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M3 | KV / Range / Txn | 7 | 0 | 7 | 未开始 | 待分配 | — / — | — |
@@ -79,17 +79,19 @@
 | M6 | Milvus 新集群接入 | 8 | 0 | 8 | 未开始 | 待分配 | — / — | — |
 | M7 | HBase 压力、故障与长期运行 | 8 | 0 | 8 | 未开始 | 待分配 | — / — | — |
 | M8 | 新集群灰度与交付 | 7 | 0 | 7 | 未开始 | 待分配 | — / — | — |
-| **合计** | | **78** | **0** | **78** | **进行中** | | | |
+| **合计** | | **78** | **3** | **75** | **进行中** | | | |
 
 ### 2.3 已完成 / 未完成记录
 
-**已完成任务：暂无。** 完成后在下表追加简要记录，原任务及证据仍保留在所属阶段。
+**已完成任务：J00、J02、J03。** 以下按实际实现、验证与正式批准核对；不据此宣布 M0 通过。
 
 | 完成日期 | 任务 ID | 交付内容 | PR / commit | 验证报告 | 评审人 |
 |---|---|---|---|---|---|
-| — | — | 暂无已完成任务 | — | — | — |
+| 2026-10-12 | J00 | 静态调用、API 矩阵与目标初稿 | [PR #3](https://github.com/Reidddddd/etcd-hbase/pull/3) | [J00 审计](docs/reports/j00-baseline-audit.md) | Huginn-kio，APPROVED |
+| 2026-10-14 | J02 | 上游 proto、生成与 wire 守卫 | [PR #6](https://github.com/Reidddddd/etcd-hbase/pull/6) | [协议基线](docs/protocol/m0-wire-baseline.md)；J03 当前回归覆盖 | Reidddddd，APPROVED |
+| 2026-10-28 | J03 | gRPC 骨架、Header/Error 与最小 Go 互通 | [PR #7](https://github.com/Reidddddd/etcd-hbase/pull/7) | [J03 说明](docs/protocol/j03-grpc-skeleton.md)；31 项测试及运行证据 | Reidddddd，APPROVED |
 
-**未完成任务：第 8 节全部 78 项。** 每个任务的状态、负责人和证据直接写在任务下面；不要另建一份重复任务清单。
+**未完成任务：75 项。J01 的公开工程基线已批准合并，目标兼容及发行镜像等剩余检查随 J04/J09 补验；J01 与 J04–J09 仍未勾选。** 每个任务的状态、负责人和证据直接写在任务下面；不要另建一份重复任务清单。
 
 建议每个任务使用独立 PR 或可审查的提交，PR 标明任务 ID。完成一个任务时同时更新：任务勾选、跟踪字段、阶段计数、完成记录。阶段验收另留报告，不能仅根据完成数判断阶段通过。
 
@@ -477,46 +479,46 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
 
 ## 8. 分阶段开发任务
 
-每项包含实现与完成标准；跟踪字段用于日常更新。验证用例是未来开发交付要求，本次仅编写计划，没有执行实现测试。
+每项包含实现与完成标准；跟踪字段记录实际交付、验证及评审，未完成项仍保留其后续验证要求。
 
 ### M0：工程、运行环境与协议基线
 
-**状态：进行中｜已完成 0 / 10｜未完成 10｜负责人：Codex（J00）｜计划/实际日期：— / —**
+**状态：进行中｜已完成 3 / 10｜未完成 7｜负责人：Codex｜计划/实际日期：— / —**
 
 **进入条件：** 以公开技术范围和集成调用分析开始；B01–B06 按具体任务关闭，默认实现使用公开可复现环境。
 
 **阶段交付：** docs/api-matrix.md、docs/milvus-etcd-usage.md、依赖锁定/CI、环境与容量输入报告。
 
-- [ ] **J00｜固化当前 Milvus 请求选项、API 范围与 Count 差异**
+- [x] **J00｜固化当前 Milvus 请求选项、API 范围与 Count 差异**
   - 依赖：已有调用分析与初步技术/协议基线；负载目标按 J00.3 单独完善。
   - 完成标准：交付 docs/api-matrix.md、docs/milvus-etcd-usage.md 与分类目标报告；固定可公开引用的版本、具体区间、响应/错误消费者、全部首版能力和 Count 差异，不引入迁移工具。
   - 子任务 / 交付物（各项记录状态、负责人、日期、PR 与证据）：
-    - [ ] **J00.1** 调用/版本审计：固定 Milvus tag/commit、Go client、etcd 协议与部署方式，记录扫描/更新范围和实际消费路径。
-      - 状态：待评审；证据：[调用基线](docs/milvus-etcd-usage.md)、[固定源码摘要与 RPC 清单](docs/baselines/j00-source-baseline.json)。
-    - [ ] **J00.2** 能力矩阵：覆盖首版全部功能、参数组合、响应字段、错误行为、Count 消费者和原已明确不支持项。
-      - 状态：待评审；证据：[API 矩阵与 33 项用例定义](docs/api-matrix.md)，行为用例尚未执行。
-    - [ ] **J00.3** 负载与目标：按第 6.2 节分类建初稿，按任务需要完善；不阻塞 J01/J09 和基础协议工程。
-      - 状态：待评审；证据：[分类目标及 8 项负载 profile 初稿](docs/acceptance-targets.md)，实际环境/目标仍待 B01–B06 输入。
+    - [x] **J00.1** 调用/版本审计：固定 Milvus tag/commit、Go client、etcd 协议与部署方式，记录扫描/更新范围和实际消费路径。
+      - 状态：已评审合并（静态交付）；证据：[调用基线](docs/milvus-etcd-usage.md)、[固定源码摘要与 RPC 清单](docs/baselines/j00-source-baseline.json)。
+    - [x] **J00.2** 能力矩阵：覆盖首版全部功能、参数组合、响应字段、错误行为、Count 消费者和原已明确不支持项。
+      - 状态：已评审合并（静态交付）；证据：[API 矩阵与 33 项用例定义](docs/api-matrix.md)，行为用例尚未执行。
+    - [x] **J00.3** 负载与目标：按第 6.2 节分类建初稿，按任务需要完善；不阻塞 J01/J09 和基础协议工程。
+      - 状态：已评审合并（静态交付）；证据：[分类目标及 8 项负载 profile 初稿](docs/acceptance-targets.md)，实际环境/目标仍待 B01–B06 输入。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=待评审；负责人=Codex；分支=codex/j00-baseline；完成日期=—；PR/commit=—；验证报告=[J00 静态审计](docs/reports/j00-baseline-audit.md)；评审人/结论=—。
+  - 跟踪：状态=已完成；负责人=Codex；分支=codex/j00-baseline；完成日期=2026-10-12；PR/commit=[PR #3](https://github.com/Reidddddd/etcd-hbase/pull/3)；验证报告=[J00 静态审计](docs/reports/j00-baseline-audit.md)；评审人/结论=Huginn-kio，APPROVED；只关闭静态审计范围。
 
 - [ ] **J01｜Maven 模块、Wrapper、Java 21 toolchain、release=21、CI 和依赖锁定**
   - 依赖：已确认的 JDK 21、模块及初步协议基线；不等待 J00 全部交付。
   - 完成标准：开发/CI/镜像 Java 基线统一 21，可重复构建；protobuf/Netty/Guava/Hadoop 冲突及解决方式有记录。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=待验证（公开基线已批准合并）；负责人=Codex；完成日期=—；PR/commit=[PR #5](https://github.com/Reidddddd/etcd-hbase/pull/5)；验证依据=[工具链说明](docs/build/m0-toolchain.md)；评审人/结论=Reidddddd，APPROVED；目标兼容与镜像剩余项分别在 J04/J09 补验。
 
-- [ ] **J02｜vendoring etcd proto 和 Java 生成配置**
+- [x] **J02｜vendoring etcd proto 和 Java 生成配置**
   - 依赖：J01 的生成模块构建基础可用；其余依赖锁定按对应接入任务验收。
   - 完成标准：服务路径及字段编号与 v3.5.23 对照。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=已完成；负责人=Codex；完成日期=2026-10-14；PR/commit=[PR #6](https://github.com/Reidddddd/etcd-hbase/pull/6)；验证依据=[协议基线](docs/protocol/m0-wire-baseline.md)、scripts/verify/j03.sh；评审人/结论=Reidddddd，APPROVED。
 
-- [ ] **J03｜KV/Watch/Lease/Auth 等 gRPC 骨架与 Header/Error 工厂**
+- [x] **J03｜KV/Watch/Lease/Auth 等 gRPC 骨架与 Header/Error 工厂**
   - 依赖：J02。
   - 完成标准：Go client 能完成最小请求/流和错误识别。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=待评审；负责人=Codex；分支=codex/j03-grpc-skeleton；完成日期=—；PR/commit=[PR #7](https://github.com/Reidddddd/etcd-hbase/pull/7)；验证入口=scripts/verify/j03.sh；范围与复核依据=[J03 骨架说明](docs/protocol/j03-grpc-skeleton.md)；评审人/结论=待正式评审，不据本地验证勾选阶段完成。
+  - 跟踪：状态=已完成；负责人=Codex；完成日期=2026-10-28；PR/commit=[PR #7](https://github.com/Reidddddd/etcd-hbase/pull/7)；验证入口=scripts/verify/j03.sh（31 项，0 失败/错误/跳过）；范围=[J03 骨架说明](docs/protocol/j03-grpc-skeleton.md)；评审人/结论=Reidddddd，APPROVED；不包含后端业务成功语义。
 
 - [ ] **J04｜实际后端身份接入与基础 HBase 操作**
   - 依赖：J01 的实际接入构建基础；B02/B03 的身份/访问输入，子项按第 7.3 节推进。
@@ -525,7 +527,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J04.1** 确认实际认证机制与 BackendIdentityProvider/HBase 连接适配边界，记录跨副本与后台身份所需输入。
     - [ ] **J04.2** 完成基础连接及 Get/Put/CAS/Scan，记录身份隔离、认证失败、超时和关闭行为。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=待验证（本轮先临时环境）；负责人=Codex；完成日期=—；PR/commit=[PR #8](https://github.com/Reidddddd/etcd-hbase/pull/8)；验证入口=scripts/verify/hbase-probe.sh --profile public-local（33 项，0 失败/错误/跳过）；范围=[后端接入说明](docs/hbase/j04-backend-access.md)；评审人/结论=待评审；DIGEST 用户名/密码机制已确认，目标身份、权限及 TLS 尚未验证。
 
 - [ ] **J05｜盐 profile、候选表配置与初始化 CLI 原型**
   - 依赖：B01 的编码输入；候选表配置不等待完整 B05 负载目标。
