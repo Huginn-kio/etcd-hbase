@@ -213,6 +213,12 @@
       "repository": "https://repo.maven.apache.org/maven2",
       "sha256": "e04ba5195bcd555dc95650f7cc614d151e4bcd52d29a10b8aa2197f3ab89ab9b",
       "reason": "Provide the javax.annotation.Generated type emitted by the pinned grpc-java code generator on Java 21."
+    },
+    "hbaseTestingUtil": {
+      "coordinate": "org.apache.hbase:hbase-testing-util:2.6.6-hadoop3",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "09a0c44d7ab947cfab98bdab49ffd5cbc2b82e589afca164f1af1d07a84c8eaa",
+      "reason": "J04 public-local probe with an isolated temporary HBase cluster; not target authentication evidence."
     }
   },
   "nativeTools": {

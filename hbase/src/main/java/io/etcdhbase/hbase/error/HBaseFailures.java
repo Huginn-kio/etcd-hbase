@@ -10,7 +10,9 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import javax.security.sasl.SaslException;
+import org.apache.hadoop.hbase.ipc.CallTimeoutException;
 import org.apache.hadoop.hbase.security.AccessDeniedException;
+import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
 
@@ -32,6 +34,18 @@ public final class HBaseFailures {
     // Bound inspection even for a malformed or cyclic backend exception chain.
     Throwable current = root;
     for (int depth = 0; current != null && depth < 16; depth++, current = current.getCause()) {
+      if (current instanceof RemoteException remote) {
+        Throwable decoded =
+            remote.unwrapRemoteException(
+                AccessDeniedException.class,
+                AccessControlException.class,
+                InvalidToken.class,
+                SaslException.class,
+                CallTimeoutException.class);
+        if (decoded != remote) {
+          return new BackendFailure(classify(decoded).category(), root);
+        }
+      }
       if (current instanceof BackendFailure known) {
         return known;
       }
@@ -53,7 +67,9 @@ public final class HBaseFailures {
       if (current instanceof CancellationException || current instanceof InterruptedException) {
         return new BackendFailure(BackendFailure.Category.CANCELLED, root);
       }
-      if (current instanceof TimeoutException || current instanceof SocketTimeoutException) {
+      if (current instanceof TimeoutException
+          || current instanceof SocketTimeoutException
+          || current instanceof CallTimeoutException) {
         return new BackendFailure(BackendFailure.Category.TIMEOUT, root);
       }
       if (current instanceof IOException) {

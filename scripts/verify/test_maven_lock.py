@@ -39,6 +39,24 @@ class MavenLockTest(unittest.TestCase):
         with self.assertRaisesRegex(maven_lock.LockError, "unsupported libraries entries"):
             maven_lock.validate_metadata(lock, ROOT / "pom.xml")
 
+    def test_hbase_testing_util_version_and_digest_are_enforced(self) -> None:
+        lock = copy.deepcopy(self.lock)
+        lock["libraries"]["hbaseTestingUtil"]["coordinate"] = (
+            "org.apache.hbase:hbase-testing-util:0.0.0-review-mismatch"
+        )
+        with self.assertRaisesRegex(maven_lock.LockError, "libraries.hbaseTestingUtil"):
+            maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+
+        artifacts = maven_lock.collect_artifacts(self.lock)
+        artifact = next(item for item in artifacts
+                        if item.coordinate == "org.apache.hbase:hbase-testing-util")
+        with tempfile.TemporaryDirectory(prefix="j04-lock-hbase-test-") as directory:
+            path = Path(directory) / artifact.relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"tampered HBase testing artifact")
+            with self.assertRaisesRegex(maven_lock.LockError, "SHA-256 mismatch"):
+                maven_lock.verify_artifacts([artifact], Path(directory), require_all=True)
+
     def test_javax_annotation_version_must_match_the_managed_dependency(self) -> None:
         lock = copy.deepcopy(self.lock)
         lock["libraries"]["javaxAnnotation"]["coordinate"] = (

@@ -7,7 +7,7 @@
 | Eclipse Temurin JDK | 21.0.12.1+1 | [GPL-2.0 with Classpath Exception](https://github.com/adoptium/temurin21-binaries/blob/master/LICENSE) |
 | Go toolchain | 1.27.2 | [BSD 3-Clause](https://go.dev/LICENSE) |
 | Apache Maven / Maven Wrapper 与构建插件 | 3.9.16 / 3.3.4 / 见锁文件 | [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) |
-| Apache HBase client / Hadoop | 2.6.6-hadoop3 / 3.4.3 | [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) |
+| Apache HBase client / testing-util / Hadoop | 2.6.6-hadoop3 / 3.4.3 | [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) |
 | gRPC Java / shaded Netty transport | 1.84.1 / 4.2.16.Final | [Apache License 2.0](https://github.com/grpc/grpc-java/blob/master/LICENSE) / [Apache License 2.0](https://github.com/netty/netty/blob/4.2/LICENSE.txt) |
 | Protocol Buffers Java / protoc | 4.36.2 | [BSD 3-Clause](https://github.com/protocolbuffers/protobuf/blob/main/LICENSE) |
 | etcd API proto sources | v3.5.23 | [Apache License 2.0](https://github.com/etcd-io/etcd/blob/v3.5.23/LICENSE) |

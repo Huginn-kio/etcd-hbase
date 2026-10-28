@@ -10,6 +10,7 @@ An etcd v3 API-compatible server backed by Apache HBase, built with Java 21.
 - [Milvus 调用基线](docs/milvus-etcd-usage.md)：以最低支持版本 v3.0.1 固定调用、client/proto 版本与错误消费者。
 - [首版 API 与验证矩阵](docs/api-matrix.md)、[分类验收目标](docs/acceptance-targets.md)、[J00 审计报告](docs/reports/j00-baseline-audit.md)：调用范围、目标初稿与静态审计依据。
 - [J03 gRPC 骨架与互通](docs/protocol/j03-grpc-skeleton.md)：启动参数、Header/Error 契约、Java/Go 验证与后端版本边界。
+- [J04 后端身份与 HBase 探针](docs/hbase/j04-backend-access.md)：身份/连接生命周期、DIGEST 凭据载体及临时环境验证范围。
 
 当前提供可启动的 J03 协议骨架，未实现方法明确返回 UNIMPLEMENTED。完整存储和业务语义按后续 J 任务及阶段推进；首版 Count 与其他兼容范围以开发计划的能力矩阵为准。
 
