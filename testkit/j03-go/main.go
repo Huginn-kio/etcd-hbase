@@ -49,6 +49,13 @@ func run(endpoint, fixtureEndpoint string, timeout time.Duration) error {
 	}
 	defer fixture.Close()
 
+	if err := checkSkeleton(skeleton, timeout); err != nil {
+		return err
+	}
+	return checkErrorFixture(fixture, timeout)
+}
+
+func checkSkeleton(skeleton *clientv3.Client, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	response, callErr := pb.NewKVClient(skeleton.ActiveConnection()).Range(ctx, rangeRequest())
 	cancel()
@@ -76,7 +83,11 @@ func run(endpoint, fixtureEndpoint string, timeout time.Duration) error {
 	if err := checkWatch(skeleton, timeout, codes.Unimplemented); err != nil {
 		return err
 	}
-	ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	return checkKeepAlive(skeleton, timeout)
+}
+
+func checkKeepAlive(skeleton *clientv3.Client, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	keepalive, callErr := pb.NewLeaseClient(skeleton.ActiveConnection()).LeaseKeepAlive(ctx)
 	if callErr == nil {
 		callErr = keepalive.Send(&pb.LeaseKeepAliveRequest{ID: largeRevision})
@@ -85,13 +96,13 @@ func run(endpoint, fixtureEndpoint string, timeout time.Duration) error {
 		_, callErr = keepalive.Recv()
 	}
 	cancel()
-	if err := requireFailure("skeleton LeaseKeepAlive terminal", callErr, codes.Unimplemented, nil); err != nil {
-		return err
-	}
+	return requireFailure("skeleton LeaseKeepAlive terminal", callErr, codes.Unimplemented, nil)
+}
 
+func checkErrorFixture(fixture *clientv3.Client, timeout time.Duration) error {
 	// The Java integration test checks the received bytes and revision; the fixture only emits errors.
-	ctx, cancel = context.WithTimeout(context.Background(), timeout)
-	_, callErr = pb.NewKVClient(fixture.ActiveConnection()).Range(ctx, rangeRequest())
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	_, callErr := pb.NewKVClient(fixture.ActiveConnection()).Range(ctx, rangeRequest())
 	cancel()
 	if err := requireFailure("fixture bytes/int64 Range", callErr, codes.Unavailable, nil); err != nil {
 		return err
