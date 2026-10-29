@@ -102,12 +102,12 @@ if [[ ! -x "$go_bin" ]]; then
   mv "$extract_tmp/go" "$tool_dir"
 fi
 
-version_output="$("$go_bin" version)"
-if [[ "$version_output" != "go version go$go_version "* ]]; then
-  echo "locked Go version mismatch: expected go$go_version, got $version_output" >&2
-  exit 1
-fi
-
+# Public verification does not inherit private Go mirrors, credentials or home configuration.
+export GOENV=off
+export GOAUTH=off
+export GOPROXY=https://proxy.golang.org,direct
+export GOSUMDB=sum.golang.org
+export GOPRIVATE= GONOPROXY= GONOSUMDB= GOINSECURE=
 export GOTOOLCHAIN=local
 export GOWORK=off
 export GOFLAGS=-mod=readonly
@@ -115,5 +115,12 @@ export GOPATH="$ARTIFACT_ROOT/gopath"
 export GOMODCACHE="$GOPATH/pkg/mod"
 export GOCACHE="$ARTIFACT_ROOT/build-cache"
 mkdir -p "$GOPATH" "$GOMODCACHE" "$GOCACHE"
+export GOROOT="$tool_dir"
+version_output="$("$go_bin" version)"
+if [[ "$version_output" != "go version go$go_version "* ]]; then
+  echo "locked Go version mismatch: expected go$go_version, got $version_output" >&2
+  exit 1
+fi
+
 cd "$module_dir"
 exec "$go_bin" "$@"

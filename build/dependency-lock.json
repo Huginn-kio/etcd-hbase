@@ -282,7 +282,16 @@
       "go.etcd.io/etcd/client/v3": "v3.5.23",
       "go.etcd.io/etcd/api/v3": "v3.5.23",
       "go.etcd.io/etcd/client/pkg/v3": "v3.5.23",
-      "google.golang.org/grpc": "v1.79.3"
+      "google.golang.org/grpc": "v1.79.3",
+      "github.com/gogo/protobuf": "v1.3.2",
+      "google.golang.org/protobuf": "v1.36.10",
+      "go.etcd.io/bbolt": "v1.3.12",
+      "go.etcd.io/etcd/client/v2": "v2.305.23",
+      "go.etcd.io/etcd/pkg/v3": "v3.5.23",
+      "go.etcd.io/etcd/raft/v3": "v3.5.23",
+      "go.etcd.io/etcd/server/v3": "v3.5.23",
+      "sigs.k8s.io/yaml": "v1.2.0",
+      "go.uber.org/zap": "v1.17.0"
     },
     "source": "https://go.dev/doc/devel/release",
     "archives": {
@@ -315,8 +324,45 @@
       "google.golang.org/grpc@v1.79.3": {
         "module": "h1:sybAEdRIEtvcD68Gx7dmnwjZKlyfuc61Dyo9pGXXkKE=",
         "goMod": "h1:KmT0Kjez+0dde/v2j9vzwoAScgEPx/Bw1CYChhHLrHQ="
+      },
+      "github.com/gogo/protobuf@v1.3.2": {
+        "module": "h1:Ov1cvc58UF3b5XjBnZv7+opcTcQFZebYjWzi34vdm4Q=",
+        "goMod": "h1:P1XiOD3dCwIKUDQYPy72D8LYyHL2YPYrpS2s69NZV8Q="
+      },
+      "google.golang.org/protobuf@v1.36.10": {
+        "module": "h1:AYd7cD/uASjIL6Q9LiTjz8JLcrh/88q5UObnmY3aOOE=",
+        "goMod": "h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco="
+      },
+      "go.etcd.io/bbolt@v1.3.12": {
+        "module": "h1:UAxZAIuJqzFwByP19gZC3zd5robK3FOangrGS+Fdczg=",
+        "goMod": "h1:Gi2toLZr1jFkuReJm+yEPn7H8wk6ooptePtHYCbCS1g="
+      },
+      "go.etcd.io/etcd/client/v2@v2.305.23": {
+        "module": "h1:lo6nsSHjp3tGsRLrzmM+neVSahXxbhxnfoatEdB6nao=",
+        "goMod": "h1:Up9T9+5M3MMcCj/V0nDfadBERNMxIYf1tdycva1dXM4="
+      },
+      "go.etcd.io/etcd/pkg/v3@v3.5.23": {
+        "module": "h1:q2skPu7VFC7oerL3MrFqImVACjAFWPlZMjHU0zll9x4=",
+        "goMod": "h1:zUWlm5U4HgvDg+0PUWb8TgMF7ZrUiQA8aQq7FxE0WHo="
+      },
+      "go.etcd.io/etcd/raft/v3@v3.5.23": {
+        "module": "h1:NhCdh4xz1VsrqHd2c+h6SLvhE95B1Hs7K+ESaAs6LLQ=",
+        "goMod": "h1:NJz9BGkhGvru47lIc1wL0QHsg5yvHTy6tUpEqM69ERM="
+      },
+      "go.etcd.io/etcd/server/v3@v3.5.23": {
+        "module": "h1:2g1hz32pp1TYMI7xUyifR8gXOlUnTBCfixV+uJ8BqRU=",
+        "goMod": "h1:sZwt/lLSwYQ/S5aAbzSQX2xNw1WA0Fo5noUCVxVYB4g="
+      },
+      "sigs.k8s.io/yaml@v1.2.0": {
+        "module": "h1:kr/MCeFWJWTwyaHoR9c8EjH9OumOmoF9YGiZd7lFm/Q=",
+        "goMod": "h1:yfXDCHCao9+ENCvLSE62v9VSji2MKu5jeNfTrofGhJc="
+      },
+      "go.uber.org/zap@v1.17.0": {
+        "module": "h1:MTjgFu6ZLKvY6Pvaqk97GlxNBuMpV4Hy/3P6tRGlI2U=",
+        "goMod": "h1:MXVU+bhUf/A7Xi2HNOnopQOrmycQ5Ih87HtOu4q5SSo="
       }
-    }
+    },
+    "goDirectiveVersion": "1.27.2"
   },
   "sourceEvidence": [
     "https://adoptium.net/temurin/releases?version=21",
