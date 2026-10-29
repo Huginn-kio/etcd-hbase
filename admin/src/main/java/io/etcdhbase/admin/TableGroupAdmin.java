@@ -19,6 +19,7 @@ interface TableGroupAdmin {
 
   List<RegionInfo> getRegions(TableName table) throws Exception;
 
+  /** Includes retained versions and tombstones; logical invisibility alone is insufficient. */
   boolean isEmpty(TableName table) throws Exception;
 
   void createTable(TableDescriptor descriptor, byte[][] splitKeys) throws Exception;

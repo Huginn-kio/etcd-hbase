@@ -2,6 +2,7 @@ package io.etcdhbase.admin;
 
 import static io.etcdhbase.admin.HBaseOperationAwaiter.OPERATION_TIMEOUT;
 import static io.etcdhbase.admin.HBaseOperationAwaiter.await;
+import static io.etcdhbase.spi.identity.BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -47,6 +48,7 @@ import org.apache.hadoop.hbase.client.Durability;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.RegionInfo;
+import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.security.access.Permission;
 import org.apache.hadoop.hbase.security.access.Permission.Action;
@@ -151,6 +153,30 @@ class InitializeTablesIT {
               () -> TableGroupInitializer.initialize(plan, new FailSecondCreate(admin)));
       assertEquals(1, failure.createdTables().size());
       assertEquals(1, admin.listTableNames(namespace).size());
+      assertEquals(2, TableGroupInitializer.initialize(plan, admin).createdTables().size());
+      assertProvisioned(session.connection(), plan);
+      putProbe(session.connection(), plan);
+      initializeSiblingAndCheckParent(plan, sibling, session.connection());
+    }
+    System.out.println(
+        "j05-real recovery=partial-resume siblings-preserved=true" + " status=passed");
+  }
+
+  @Test
+  void deletedRecordsDoNotMakeAPartialGroupPristineAgain() throws Exception {
+    String namespace = ownedNamespace("deleted");
+    ObjectNode tree =
+        localConfiguration("history-table.json", namespace, localCluster.clientConfiguration());
+    ((ObjectNode) tree.at("/table_groups/0/system_table/column_families/0"))
+        .put("keep_deleted_cells", "TRUE");
+    var plan = TableGroupPlanFactory.create(InitializationFixtures.load(tree), "local", null);
+    try (var session =
+        simpleSession(
+            localCluster.clientConfiguration(), new AuthenticationScope("local", "local-hbase"))) {
+      var admin = new AsyncTableGroupAdmin(session.connection());
+      assertThrows(
+          TableGroupInitializer.PartialInitializationException.class,
+          () -> TableGroupInitializer.initialize(plan, new FailSecondCreate(admin)));
       putProbe(session.connection(), plan);
       assertEquals(
           TableGroupInitializer.ConflictReason.PARTIAL_DATA,
@@ -158,17 +184,24 @@ class InitializeTablesIT {
                   TableGroupInitializer.ConflictException.class,
                   () -> TableGroupInitializer.initialize(plan, admin))
               .reason());
-      await(
-          session.connection().getTable(systemTable(plan)).delete(new Delete(ROW)),
-          OPERATION_TIMEOUT);
-      assertEquals(2, TableGroupInitializer.initialize(plan, admin).createdTables().size());
-      assertProvisioned(session.connection(), plan);
-      putProbe(session.connection(), plan);
-      initializeSiblingAndCheckParent(plan, sibling, session.connection());
+      var table = session.connection().getTable(systemTable(plan));
+      await(table.delete(new Delete(ROW)), OPERATION_TIMEOUT);
+      assertTrue(await(table.get(new Get(ROW)), OPERATION_TIMEOUT).isEmpty());
+      assertFalse(
+          await(
+                  table.scanAll(new Scan().setRaw(true).readAllVersions().setLimit(1)),
+                  OPERATION_TIMEOUT)
+              .isEmpty(),
+          "the test requires a real retained version or delete marker");
+      assertEquals(
+          TableGroupInitializer.ConflictReason.PARTIAL_DATA,
+          assertThrows(
+                  TableGroupInitializer.ConflictException.class,
+                  () -> TableGroupInitializer.initialize(plan, admin))
+              .reason());
+      assertEquals(1, admin.listTableNames(namespace).size());
     }
-    System.out.println(
-        "j05-real recovery=partial-resume nonempty-refused=true siblings-preserved=true"
-            + " status=passed");
+    System.out.println("j05-real recovery=deleted-records-refused raw-scan=true status=passed");
   }
 
   @Test
@@ -269,7 +302,7 @@ class InitializeTablesIT {
       throws Exception {
     var provider =
         new HBaseBackendIdentityProvider(
-            "dev-no-auth",
+            DEVELOPMENT_NO_AUTH_PROVIDER_ID,
             scope,
             backend,
             HBaseAuthenticators.simpleDevelopment(),

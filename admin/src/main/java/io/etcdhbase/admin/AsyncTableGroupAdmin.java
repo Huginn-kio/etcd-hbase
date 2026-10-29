@@ -60,9 +60,13 @@ final class AsyncTableGroupAdmin implements TableGroupAdmin {
   public boolean isEmpty(TableName table) throws Exception {
     var scan =
         new Scan()
+            .setRaw(true)
+            .readAllVersions()
             .setLimit(1)
             .setCaching(1)
             .setMaxResultSize(1024)
+            // A logically deleted row can still contain versions or tombstones. Only a raw,
+            // key-only read can establish that a partial prototype has no retained cells.
             .setFilter(new FilterList(new FirstKeyOnlyFilter(), new KeyOnlyFilter()));
     var bounded =
         connection
