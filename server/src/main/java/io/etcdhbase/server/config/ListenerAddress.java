@@ -2,11 +2,15 @@ package io.etcdhbase.server.config;
 
 import io.etcdhbase.admin.config.EndpointHost;
 
-/**
- * Listener literals use the same host parser and conservative alias identity as HBase endpoints.
- */
+/** Listener literals use the same host parser and transport normalization as HBase endpoints. */
 public final class ListenerAddress {
   private ListenerAddress() {}
+
+  static boolean overlaps(EndpointHost left, EndpointHost right) {
+    return left.connectionName().equals(right.connectionName())
+        || (left.connectionName().equals("localhost") && right.isLoopback())
+        || (right.connectionName().equals("localhost") && left.isLoopback());
+  }
 
   public static EndpointHost parse(String input) {
     if (input == null || input.isBlank() || !input.equals(input.strip())) {

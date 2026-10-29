@@ -1,9 +1,14 @@
 package io.etcdhbase.server.config;
 
+import io.etcdhbase.admin.config.EndpointHost;
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
 import io.etcdhbase.admin.config.InitializationConfigurationValidator;
 import io.etcdhbase.admin.config.StrictConfigurationJson;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -22,7 +27,7 @@ public final class RuntimeConfigurationValidator {
         configuration.hbaseProfiles().stream()
             .collect(Collectors.toMap(profile -> profile.id(), Function.identity()));
     Set<String> identifiers = new HashSet<>();
-    Set<String> sockets = new HashSet<>();
+    Map<Integer, List<EndpointHost>> sockets = new HashMap<>();
     require(
         !configuration.listeners().isEmpty() && configuration.listeners().size() <= 64,
         "service requires between one and 64 listeners");
@@ -36,16 +41,24 @@ public final class RuntimeConfigurationValidator {
       var host = ListenerAddress.parse(listener.bindHost());
       require(listener.port() >= 0 && listener.port() <= 65535, "invalid listener port");
       require(listener.port() != 0 || host.isLoopback(), "ephemeral ports require loopback");
-      if (listener.port() != 0) {
-        require(
-            sockets.add(host.scopeIdentity() + ":" + listener.port()),
-            "listener socket bindings overlap");
-      }
+      registerSocket(listener, host, sockets);
       if (profiles.get(group.hbaseProfileId()).authenticationMode()
           == AuthenticationMode.DEV_NO_AUTH) {
         require(host.isLoopback(), "development listeners require loopback");
       }
     }
+  }
+
+  private static void registerSocket(
+      RuntimeConfiguration.Listener listener,
+      EndpointHost host,
+      Map<Integer, List<EndpointHost>> sockets) {
+    if (listener.port() == 0) return;
+    var samePort = sockets.computeIfAbsent(listener.port(), ignored -> new ArrayList<>());
+    boolean overlapping =
+        samePort.stream().anyMatch(previous -> ListenerAddress.overlaps(previous, host));
+    require(!overlapping, "listener socket bindings overlap");
+    samePort.add(host);
   }
 
   private static void validateBudgets(RuntimeConfiguration.ResourceBudgets budget, long bytes) {

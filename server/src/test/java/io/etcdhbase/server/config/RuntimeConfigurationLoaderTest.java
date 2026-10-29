@@ -162,6 +162,24 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void distinguishesActualLoopbackSocketsWhileRejectingEquivalentIpForms() throws Exception {
+    var tree = mapper.readTree(example());
+    var listeners = (com.fasterxml.jackson.databind.node.ArrayNode) tree.path("listeners");
+    var first = (ObjectNode) listeners.get(0);
+    first.put("port", 12345);
+    var second = first.deepCopy().put("id", "second").put("bind_host", "127.0.0.2");
+    listeners.add(second);
+    assertEquals(2, load(mapper.writeValueAsBytes(tree)).listeners().size());
+    second.put("bind_host", "[::ffff:127.0.0.1]");
+    assertThrows(IllegalArgumentException.class, () -> load(mapper.writeValueAsBytes(tree)));
+    first.put("bind_host", "::1");
+    second.put("bind_host", "[0:0:0:0:0:0:0:1]");
+    assertThrows(IllegalArgumentException.class, () -> load(mapper.writeValueAsBytes(tree)));
+    second.put("bind_host", "127.0.0.2");
+    assertEquals(2, load(mapper.writeValueAsBytes(tree)).listeners().size());
+  }
+
+  @Test
   void detectsPhysicalProfileAliasesAndNamespaceTableCollisions() throws Exception {
     var tree = mapper.readTree(example());
     var profiles = (com.fasterxml.jackson.databind.node.ArrayNode) tree.path("hbase_profiles");

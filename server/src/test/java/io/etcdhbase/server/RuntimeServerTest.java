@@ -43,9 +43,11 @@ class RuntimeServerTest {
 
   @Test
   void rollsBackAnEarlierListenerIfALaterBindFails() throws Exception {
-    try (var held = new ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+    try (var held =
+        new ServerSocket(0, 1, java.net.InetAddress.getByAddress(new byte[] {127, 0, 0, 1}))) {
       int firstPort;
-      try (var reservation = new ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+      try (var reservation =
+          new ServerSocket(0, 1, java.net.InetAddress.getByAddress(new byte[] {127, 0, 0, 1}))) {
         firstPort = reservation.getLocalPort();
       }
       var tree = example();
