@@ -138,23 +138,44 @@ final class RequestLifecycle<RequestT, ResponseT> {
   void finish(Status status) {
     if (!finished.compareAndSet(false, true)) return;
     context.removeListener(cancellation);
-    try {
-      if (status.getCode() == Status.Code.CANCELLED
-          || status.getCode() == Status.Code.DEADLINE_EXCEEDED) scope.cancel();
-      else scope.close();
-    } finally {
-      try {
-        context.close();
-      } finally {
-        owner.release();
-        owner.record(
-            methodClass,
-            classifyOutcome(status),
-            traceId,
-            scope,
-            Math.max(0, System.nanoTime() - startedNanos));
-      }
-    }
+    var contextClosed = new java.util.concurrent.CompletableFuture<Void>();
+    scope
+        .cleanupCompletion()
+        .runAfterBoth(
+            contextClosed,
+            () -> {
+              owner.release();
+              owner.record(
+                  methodClass,
+                  classifyOutcome(status),
+                  traceId,
+                  scope,
+                  Math.max(0, System.nanoTime() - startedNanos));
+            });
+    Runnable closeContext =
+        () -> {
+          try {
+            context.close();
+          } finally {
+            contextClosed.complete(null);
+          }
+        };
+    java.util.concurrent.Executor executor =
+        cleanup ->
+            owner.executeCleanup(
+                () -> {
+                  try {
+                    cleanup.run();
+                  } finally {
+                    closeContext.run();
+                  }
+                });
+    boolean started =
+        status.getCode() == Status.Code.CANCELLED
+                || status.getCode() == Status.Code.DEADLINE_EXCEEDED
+            ? scope.cancelAsync(executor)
+            : scope.closeAsync(executor);
+    if (!started) owner.executeCleanup(closeContext);
   }
 
   private Status cancelledStatus() {

@@ -99,6 +99,7 @@ public final class Bootstrap implements AutoCloseable {
     } catch (IOException | RuntimeException | Error failure) {
       server.shutdownNow();
       deadlines.shutdownNow();
+      requests.close();
       throw failure;
     }
   }
@@ -150,7 +151,11 @@ public final class Bootstrap implements AutoCloseable {
       server.shutdownNow();
       Thread.currentThread().interrupt();
     } finally {
-      deadlines.shutdownNow();
+      try {
+        requests.close();
+      } finally {
+        deadlines.shutdownNow();
+      }
     }
   }
 

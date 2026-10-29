@@ -11,10 +11,11 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.LongSupplier;
 
-/** Owns the deadline, cancellation state, and request-scoped resources for one operation. */
+/** Owns request resources; stopping new work and completing cleanup are separate transitions. */
 public final class RequestScope implements AutoCloseable {
   private final boolean hasDeadline;
   private final long deadlineNanos;
@@ -24,22 +25,22 @@ public final class RequestScope implements AutoCloseable {
   private final Set<AutoCloseable> registrations =
       Collections.newSetFromMap(new IdentityHashMap<>());
   private final AtomicInteger cleanupFailureCount = new AtomicInteger();
-
+  private final CompletableFuture<Void> cleanupCompletion = new CompletableFuture<>();
   private boolean cancelled;
   private boolean closed;
+  private boolean cleanupFinished;
+  private int pendingCleanup;
 
   public static RequestScope withTimeout(Duration timeout) {
     Objects.requireNonNull(timeout, "timeout");
-    if (timeout.isNegative()) {
-      throw new IllegalArgumentException("timeout must not be negative");
-    }
-    long timeoutNanos;
+    if (timeout.isNegative()) throw new IllegalArgumentException("timeout must not be negative");
+    long nanos;
     try {
-      timeoutNanos = timeout.toNanos();
+      nanos = timeout.toNanos();
     } catch (ArithmeticException overflow) {
-      timeoutNanos = Long.MAX_VALUE;
+      nanos = Long.MAX_VALUE;
     }
-    return new RequestScope(timeoutNanos, System::nanoTime);
+    return new RequestScope(nanos, System::nanoTime);
   }
 
   public static RequestScope withoutDeadline() {
@@ -56,12 +57,8 @@ public final class RequestScope implements AutoCloseable {
     this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
   }
 
-  /** Returns the remaining monotonic deadline budget, or {@link Long#MAX_VALUE} if unbounded. */
   public long remainingDeadlineNanos() {
-    if (!hasDeadline) {
-      return Long.MAX_VALUE;
-    }
-    return Math.max(0, deadlineNanos - nanoTime.getAsLong());
+    return hasDeadline ? Math.max(0, deadlineNanos - nanoTime.getAsLong()) : Long.MAX_VALUE;
   }
 
   public boolean isDeadlineExceeded() {
@@ -78,6 +75,7 @@ public final class RequestScope implements AutoCloseable {
     }
   }
 
+  /** True once new work is stopped, including while another caller is still closing resources. */
   public boolean isClosed() {
     synchronized (lock) {
       return closed;
@@ -88,12 +86,29 @@ public final class RequestScope implements AutoCloseable {
     return cleanupFailureCount.get();
   }
 
-  /** Cancels the scope and releases registered resources. Repeated cancellation is harmless. */
-  public boolean cancel() {
-    return finish(true);
+  /** Read-only completion of all resources registered before or during the closing batch. */
+  public CompletionStage<Void> cleanupCompletion() {
+    return cleanupCompletion.minimalCompletionStage();
   }
 
-  /** Tracks a request-owned future, never a shared connection or producer future. */
+  public boolean cancel() {
+    return finish(true, Runnable::run);
+  }
+
+  @Override
+  public void close() {
+    finish(false, Runnable::run);
+  }
+
+  public boolean cancelAsync(Executor cleanupExecutor) {
+    return finish(true, cleanupExecutor);
+  }
+
+  public boolean closeAsync(Executor cleanupExecutor) {
+    return finish(false, cleanupExecutor);
+  }
+
+  /** Tracks request-owned work, never the producer future of a shared connection. */
   public <T> CompletableFuture<T> track(CompletableFuture<T> operation) {
     Objects.requireNonNull(operation, "operation");
     AutoCloseable cancellation = () -> operation.cancel(true);
@@ -108,89 +123,93 @@ public final class RequestScope implements AutoCloseable {
     return operation;
   }
 
-  /**
-   * Registers a resource once by object identity; resources close in reverse registration order.
-   */
+  /** Identity-deduplicated, reverse-order cleanup; a late resource is closed synchronously. */
   public void registerCleanup(AutoCloseable resource) {
     Objects.requireNonNull(resource, "resource");
-    boolean closeImmediately;
+    boolean joinsClosingBatch;
     synchronized (lock) {
-      if (!registrations.add(resource)) {
+      if (!registrations.add(resource)) return;
+      if (!closed) {
+        cleanupOrder.push(resource);
         return;
       }
-      closeImmediately = closed;
-      if (!closeImmediately) {
-        cleanupOrder.push(resource);
-      }
+      joinsClosingBatch = !cleanupFinished;
+      if (joinsClosingBatch) pendingCleanup++;
     }
-    if (closeImmediately) {
-      closeResource(resource);
-    }
+    closeResource(resource, joinsClosingBatch);
   }
 
-  /**
-   * Binds scope lifetime to the terminal completion of the owned asynchronous operation.
-   * Cancellation releases registered resources; operation-specific cancellation should also be
-   * registered as cleanup when the underlying client supports it.
-   */
+  /** Root-operation completion stops the request without replacing its original failure. */
   public <T> CompletionStage<T> own(CompletionStage<T> operation) {
-    Objects.requireNonNull(operation, "operation");
-    return operation.whenComplete((ignored, failure) -> close());
+    return Objects.requireNonNull(operation, "operation")
+        .whenComplete((ignored, failure) -> close());
   }
 
-  @Override
-  public void close() {
-    finish(false);
-  }
-
-  private boolean finish(boolean cancellation) {
+  private boolean finish(boolean cancellation, Executor executor) {
+    Objects.requireNonNull(executor, "cleanupExecutor");
     List<AutoCloseable> resources;
     synchronized (lock) {
-      if (closed) {
-        return false;
-      }
+      if (closed) return false;
       cancelled = cancellation;
       closed = true;
       resources = new ArrayList<>(cleanupOrder);
       cleanupOrder.clear();
+      // The batch sentinel keeps completion pending until the cleanup task itself has run.
+      pendingCleanup = resources.size() + 1;
     }
-
-    Error fatalFailure = null;
-    for (AutoCloseable resource : resources) {
-      try {
-        resource.close();
-      } catch (Exception failure) {
-        cleanupFailureCount.incrementAndGet();
-      } catch (Error failure) {
-        cleanupFailureCount.incrementAndGet();
-        if (fatalFailure == null) {
-          fatalFailure = failure;
-        }
-      }
-    }
-    if (fatalFailure != null) {
-      throw fatalFailure;
+    Runnable cleanup = () -> closeBatch(resources);
+    try {
+      executor.execute(cleanup);
+    } catch (java.util.concurrent.RejectedExecutionException rejected) {
+      // Generic callers retain cleanup responsibility when their executor refuses ownership.
+      cleanup.run();
+      throw rejected;
     }
     return true;
   }
 
-  private void closeResource(AutoCloseable resource) {
+  private void closeBatch(List<AutoCloseable> resources) {
+    Error fatal = null;
+    try {
+      for (var resource : resources) {
+        try {
+          closeResource(resource, true);
+        } catch (Error failure) {
+          if (fatal == null) fatal = failure;
+        }
+      }
+    } finally {
+      resourceClosed();
+    }
+    if (fatal != null) throw fatal;
+  }
+
+  private void closeResource(AutoCloseable resource, boolean joinsClosingBatch) {
     try {
       resource.close();
     } catch (Exception failure) {
       cleanupFailureCount.incrementAndGet();
+    } catch (Error failure) {
+      cleanupFailureCount.incrementAndGet();
+      throw failure;
+    } finally {
+      if (joinsClosingBatch) resourceClosed();
     }
   }
 
-  private static long requireNonNegative(long timeoutNanos) {
-    if (timeoutNanos < 0) {
-      throw new IllegalArgumentException("timeout must not be negative");
+  private void resourceClosed() {
+    boolean complete;
+    synchronized (lock) {
+      pendingCleanup--;
+      complete = pendingCleanup == 0;
+      if (complete) cleanupFinished = true;
     }
-    return timeoutNanos;
+    // Completion callbacks can re-enter this scope; never run them under its state lock.
+    if (complete) cleanupCompletion.complete(null);
   }
 
   private static long deadline(long timeoutNanos, LongSupplier nanoTime) {
-    long start = Objects.requireNonNull(nanoTime, "nanoTime").getAsLong();
-    return start + requireNonNegative(timeoutNanos);
+    if (timeoutNanos < 0) throw new IllegalArgumentException("timeout must not be negative");
+    return Objects.requireNonNull(nanoTime, "nanoTime").getAsLong() + timeoutNanos;
   }
 }

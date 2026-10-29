@@ -15,9 +15,9 @@ scripts/dev/runtime-server.sh --config config/examples/j06/server.json
 
 每个 listener 独立限制并发请求数、单条入站 RPC 字节及一次调用累计 protobuf 请求字节。没有排队实现，因此 `max_queued_requests` 必须为 0；超额立即返回 RESOURCE_EXHAUSTED。scanner 上限在当前配置中预留给存储 adapter，尚无生产业务 scanner 路径，不能将此字段视为生产表级配额已实现。排队、提交等待、连接池等业务指标随实际 owner 实现，不填虚假测量值。
 
-RequestScope 使用 monotonic deadline；gRPC 采用客户端和服务端预算中较早的 deadline，超时会终止调用。取消、异常和正常完成只归还一次准入额度并释放请求资源；取消后取得的资源立即关闭。清理失败按数量记录，继续清理其他资源；致命 Error 在清理后传播。观测失败单独计数，不能改变业务结果或泄漏额度。handler 异常在协议边界映射为安全状态，原始异常/metadata/请求内容不进入请求日志。
+RequestScope 使用 monotonic deadline；gRPC 采用客户端和服务端预算中较早的 deadline，超时会终止调用。取消、异常和正常完成首先停止接收新工作；有界清理执行器接管释放工作，scope 和 gRPC context 清理均完成后才归还一次准入额度并记录 cleanup 结果。资源清理或 future 的同步完成回调不在共享 deadline 线程执行；取消后取得的资源立即关闭。清理失败按数量记录，继续清理其他资源；致命 Error 在清理后传播。观测失败单独计数，不能改变业务结果或泄漏额度。handler 异常在协议边界映射为安全状态，原始异常/metadata/请求内容不进入请求日志。
 
-J04 HBaseRequestContext 只取消请求持有的 future 和 scanner；借用连接时使用独立等待 future，不能关闭或取消 factory 的共享连接。HBase 已接受的 mutation 不因 future 取消而承诺回滚；已发布提交的恢复归 J27。scope 的资源关闭钩子须及时返回，不能执行无界阻塞工作。
+J04 HBaseRequestContext 只取消请求持有的 future 和 scanner；借用连接时使用独立等待 future，不能关闭或取消 factory 的共享连接。HBase 已接受的 mutation 不因 future 取消而承诺回滚；已发布提交的恢复归 J27。清理任务数受仍持有的请求额度约束，清理 worker 有上限；进程关闭有界等待清理 drain，超时明确失败，保留已接管的清理任务。资源关闭钩子仍须及时返回。
 
 日志只包含有限方法类别、结果类别、时延、剩余预算和服务端生成 trace UUID。指标只使用方法/结果枚举，记录完成数、累计时延和 cleanup 失败数；准入中请求数从同一 semaphore 状态读取。key、账号、凭据、token、任意异常消息或表组名不作为标签。
 

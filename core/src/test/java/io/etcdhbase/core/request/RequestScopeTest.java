@@ -17,6 +17,46 @@ import org.junit.jupiter.api.Test;
 
 class RequestScopeTest {
   @Test
+  void completionWaitsForAsyncAndLateCleanupWithoutBlockingReentrantClose() throws Exception {
+    var scope = RequestScope.withoutDeadline();
+    var pending = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+    scope.registerCleanup(scope::close);
+    assertTrue(scope.closeAsync(pending::set));
+    assertTrue(scope.isClosed());
+    assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+    scope.close();
+    pending.get().run();
+    assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+    var fatal = new AssertionError("private-cleanup-error");
+    assertSame(
+        fatal,
+        assertThrows(
+            AssertionError.class,
+            () ->
+                scope.registerCleanup(
+                    () -> {
+                      throw fatal;
+                    })));
+    assertEquals(1, scope.cleanupFailureCount());
+  }
+
+  @Test
+  void rejectedCleanupExecutorRetainsTheCallersCleanupResponsibility() {
+    var scope = RequestScope.withoutDeadline();
+    var closes = new AtomicLong();
+    scope.registerCleanup(closes::incrementAndGet);
+    assertThrows(
+        java.util.concurrent.RejectedExecutionException.class,
+        () ->
+            scope.closeAsync(
+                task -> {
+                  throw new java.util.concurrent.RejectedExecutionException();
+                }));
+    assertEquals(1, closes.get());
+    assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+  }
+
+  @Test
   void cancellationWinsBeforeLateRegistrationAndAllCleanupStillRuns() throws Exception {
     RequestScope scope = RequestScope.withoutDeadline();
     var entered = new java.util.concurrent.CountDownLatch(1);

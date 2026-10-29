@@ -30,6 +30,60 @@ import org.junit.jupiter.api.Test;
 
 class RequestLifecycleTest {
   @Test
+  void holdsAdmissionUntilConcurrentCleanupReallyCompletesAndRecordsItsFailure() throws Exception {
+    var entered = new CountDownLatch(1);
+    var release = new CountDownLatch(1);
+    try (var fixture = new Fixture(Duration.ofSeconds(5), RequestCompletionRecorder.NOOP)) {
+      fixture.extraCleanup =
+          () -> {
+            entered.countDown();
+            release.await();
+            throw new java.io.IOException("private-cleanup-value");
+          };
+      var call = fixture.call();
+      assertTrue(fixture.started.await(2, TimeUnit.SECONDS));
+      try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+        try {
+          var cancellation = executor.submit(() -> fixture.scope.get().cancel());
+          assertTrue(entered.await(2, TimeUnit.SECONDS));
+          call.cancel("cancelled", null);
+          assertTrue(fixture.terminal.await(2, TimeUnit.SECONDS));
+          assertEquals(1, fixture.interceptor.activeRequests());
+          assertEquals(1, fixture.completed.getCount());
+          release.countDown();
+          assertTrue(cancellation.get(2, TimeUnit.SECONDS));
+          assertTrue(fixture.completed.await(2, TimeUnit.SECONDS));
+          assertEquals(0, fixture.interceptor.activeRequests());
+          assertEquals(1, fixture.recordedCleanupFailures.get());
+        } finally {
+          release.countDown();
+        }
+      }
+    } finally {
+      release.countDown();
+    }
+  }
+
+  @Test
+  void blockedFutureCallbackCannotDelayAnotherCallsDeadline() throws Exception {
+    try (var fixture = new Fixture(Duration.ofMillis(300), RequestCompletionRecorder.NOOP, 2)) {
+      fixture.blockTrackedCallback = true;
+      try {
+        fixture.call();
+        assertTrue(fixture.callbackEntered.await(2, TimeUnit.SECONDS));
+        var secondDone = new CountDownLatch(1);
+        var secondStatus = new AtomicReference<Status>();
+        fixture.call(secondDone, secondStatus);
+        assertTrue(secondDone.await(2, TimeUnit.SECONDS));
+        assertEquals(Status.Code.DEADLINE_EXCEEDED, secondStatus.get().getCode());
+        assertEquals(1, fixture.releaseCallback.getCount());
+      } finally {
+        fixture.releaseCallback.countDown();
+      }
+    }
+  }
+
+  @Test
   void streamingRequestByteBudgetRejectsTheSecondMessageBeforeTheHandlerSeesIt() throws Exception {
     try (var fixture = new Fixture(Duration.ofSeconds(5), RequestCompletionRecorder.NOOP)) {
       var call =
@@ -103,21 +157,22 @@ class RequestLifecycleTest {
 
   @Test
   void observerFailureCannotMaskHandlerFailureOrLeakAdmission() throws Exception {
-    try (var fixture =
+    var fixture =
         new Fixture(
             Duration.ofSeconds(5),
             (method, outcome, trace, scope, elapsed) -> {
               throw new IllegalStateException("private-observation-value");
-            })) {
+            });
+    try (fixture) {
       fixture.throwInHandler = true;
       fixture.call();
       assertTrue(fixture.terminal.await(3, TimeUnit.SECONDS));
       assertTrue(fixture.cleaned.await(2, TimeUnit.SECONDS));
       assertTrue(fixture.completed.await(2, TimeUnit.SECONDS));
       assertEquals(0, fixture.interceptor.activeRequests());
-      assertEquals(1, fixture.interceptor.observationFailureCount());
       assertEquals(Status.Code.INTERNAL, fixture.status.get().getCode());
     }
+    assertEquals(1, fixture.interceptor.observationFailureCount());
   }
 
   private static final class Fixture implements AutoCloseable {
@@ -137,17 +192,30 @@ class RequestLifecycleTest {
     final Server server;
     final ManagedChannel channel;
     volatile boolean throwInHandler;
+    volatile AutoCloseable extraCleanup;
+    volatile boolean blockTrackedCallback;
+    final CountDownLatch callbackEntered = new CountDownLatch(1);
+    final CountDownLatch releaseCallback = new CountDownLatch(1);
+    final java.util.concurrent.atomic.AtomicInteger handlers =
+        new java.util.concurrent.atomic.AtomicInteger();
+    final java.util.concurrent.atomic.AtomicInteger recordedCleanupFailures =
+        new java.util.concurrent.atomic.AtomicInteger();
 
     Fixture(Duration timeout, RequestCompletionRecorder recorder) throws Exception {
+      this(timeout, recorder, 1);
+    }
+
+    Fixture(Duration timeout, RequestCompletionRecorder recorder, int capacity) throws Exception {
       scheduler.setRemoveOnCancelPolicy(true);
       interceptor =
           new RequestScopeInterceptor(
               scheduler,
-              1,
+              capacity,
               timeout,
               1024,
               (method, outcome, trace, request, elapsed) -> {
                 try {
+                  recordedCleanupFailures.set(request.cleanupFailureCount());
                   recorder.recordCompletion(method, outcome, trace, request, elapsed);
                 } finally {
                   if (request.isClosed()) completed.countDown();
@@ -164,7 +232,21 @@ class RequestLifecycleTest {
                       var current = RequestScopeInterceptor.currentScope();
                       scope.set(current);
                       current.registerCleanup(cleaned::countDown);
-                      current.track(shared.copy());
+                      var tracked = current.track(shared.copy());
+                      if (blockTrackedCallback && handlers.incrementAndGet() == 1) {
+                        tracked.whenComplete(
+                            (value, failure) -> {
+                              callbackEntered.countDown();
+                              try {
+                                if (!releaseCallback.await(5, TimeUnit.SECONDS))
+                                  throw new AssertionError("callback release timed out");
+                              } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                throw new AssertionError(interrupted);
+                              }
+                            });
+                      }
+                      if (extraCleanup != null) current.registerCleanup(extraCleanup);
                       started.countDown();
                       if (throwInHandler) throw new IllegalStateException("private-handler-value");
                     }
@@ -197,13 +279,18 @@ class RequestLifecycleTest {
     }
 
     ClientCall<Rpc.RangeRequest, Rpc.RangeResponse> call() {
+      return call(terminal, status);
+    }
+
+    ClientCall<Rpc.RangeRequest, Rpc.RangeResponse> call(
+        CountDownLatch done, AtomicReference<Status> observed) {
       var call = channel.newCall(KVGrpc.getRangeMethod(), CallOptions.DEFAULT);
       call.start(
           new ClientCall.Listener<>() {
             @Override
             public void onClose(Status result, Metadata trailers) {
-              status.set(result);
-              terminal.countDown();
+              observed.set(result);
+              done.countDown();
             }
           },
           new Metadata());
@@ -218,6 +305,7 @@ class RequestLifecycleTest {
       channel.shutdownNow();
       server.shutdownNow();
       scheduler.shutdownNow();
+      interceptor.close();
       assertTrue(channel.awaitTermination(3, TimeUnit.SECONDS));
       assertTrue(server.awaitTermination(3, TimeUnit.SECONDS));
       assertTrue(scheduler.awaitTermination(3, TimeUnit.SECONDS));

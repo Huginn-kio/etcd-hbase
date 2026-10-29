@@ -18,11 +18,14 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Enforces bounded admission and propagates client/server deadlines into request-owned resources.
  */
-public final class RequestScopeInterceptor implements ServerInterceptor {
+public final class RequestScopeInterceptor implements ServerInterceptor, AutoCloseable {
   static final Context.Key<RequestScope> SCOPE = Context.key("etcd-hbase-request-scope");
   static final Context.Key<String> TRACE = Context.key("etcd-hbase-trace-id");
   private final ScheduledExecutorService scheduler;
   private final Semaphore admission;
+  private final Object gate = new Object();
+  private final java.util.concurrent.ThreadPoolExecutor cleanupExecutor;
+  private boolean closing;
   private final int maxConcurrentRequests;
   private final Duration timeout;
   private final int maxRequestBytes;
@@ -46,6 +49,15 @@ public final class RequestScopeInterceptor implements ServerInterceptor {
       throw new IllegalArgumentException("invalid request budget");
     }
     this.admission = new Semaphore(maxConcurrentRequests);
+    int cleanupWorkers = Math.min(maxConcurrentRequests, 4);
+    this.cleanupExecutor =
+        new java.util.concurrent.ThreadPoolExecutor(
+            cleanupWorkers,
+            cleanupWorkers,
+            0,
+            TimeUnit.MILLISECONDS,
+            new java.util.concurrent.ArrayBlockingQueue<>(maxConcurrentRequests),
+            Thread.ofPlatform().daemon().name("grpc-request-cleanup-", 0).factory());
     this.maxConcurrentRequests = maxConcurrentRequests;
     this.maxRequestBytes = maxRequestBytes;
   }
@@ -73,7 +85,7 @@ public final class RequestScopeInterceptor implements ServerInterceptor {
       ServerCallHandler<RequestT, ResponseT> next) {
     var methodClass =
         RequestLifecycle.classifyMethod(call.getMethodDescriptor().getFullMethodName());
-    if (!admission.tryAcquire()) {
+    if (!acquire()) {
       try (var scope = RequestScope.withTimeout(timeout)) {
         scope.close();
         record(
@@ -112,8 +124,49 @@ public final class RequestScopeInterceptor implements ServerInterceptor {
     }
   }
 
+  private boolean acquire() {
+    synchronized (gate) {
+      return !closing && admission.tryAcquire();
+    }
+  }
+
+  void executeCleanup(Runnable cleanup) {
+    // At most maxConcurrentRequests calls hold permits, and each submits exactly one task.
+    cleanupExecutor.execute(cleanup);
+  }
+
   void release() {
-    admission.release();
+    synchronized (gate) {
+      admission.release();
+      if (closing && activeRequests() == 0) cleanupExecutor.shutdown();
+      gate.notifyAll();
+    }
+  }
+
+  @Override
+  public void close() {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    synchronized (gate) {
+      closing = true;
+      if (activeRequests() == 0) cleanupExecutor.shutdown();
+      try {
+        while (activeRequests() != 0) {
+          long remaining = deadline - System.nanoTime();
+          if (remaining <= 0) throw new IllegalStateException("request cleanup did not drain");
+          TimeUnit.NANOSECONDS.timedWait(gate, remaining);
+        }
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException("request cleanup drain interrupted");
+      }
+    }
+    try {
+      if (!cleanupExecutor.awaitTermination(5, TimeUnit.SECONDS))
+        throw new IllegalStateException("request cleanup workers did not terminate");
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("request cleanup shutdown interrupted");
+    }
   }
 
   void record(
