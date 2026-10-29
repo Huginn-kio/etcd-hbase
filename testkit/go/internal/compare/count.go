@@ -5,14 +5,16 @@ import (
 	"strconv"
 )
 
-func equalWithCountAllowance(left, right map[string]any, leftScope, rightScope string) bool {
-	if leftScope == rightScope {
-		return false
-	}
+type countPolicy string
+
+const (
+	strictCount    countPolicy = ""
+	pageCount      countPolicy = "page"
+	existenceCount countPolicy = "existence"
+)
+
+func equalWithCountAllowance(left, right map[string]any, leftScope string, policy countPolicy) bool {
 	if !reflect.DeepEqual(withoutResponse(left), withoutResponse(right)) {
-		return false
-	}
-	if !existenceCountRequest(left) {
 		return false
 	}
 	leftResponse, okLeft := left["response"].(map[string]any)
@@ -25,39 +27,52 @@ func equalWithCountAllowance(left, right map[string]any, leftScope, rightScope s
 	if !okLeft || !okRight {
 		return false
 	}
-	leftCount, ok := leftFields["count"].(string)
-	if !ok || !canonicalCount(leftCount) {
-		return false
-	}
-	rightCount, ok := rightFields["count"].(string)
-	if !ok || !canonicalCount(rightCount) {
-		return false
-	}
-	nativeCount, targetCount := leftCount, rightCount
+	nativeFields, targetFields := leftFields, rightFields
 	if leftScope == "target-hbase" {
-		nativeCount, targetCount = rightCount, leftCount
+		nativeFields, targetFields = rightFields, leftFields
 	}
-	want := "1"
-	if nativeCount == "0" {
-		want = "0"
-	}
-	if targetCount != want {
+	if !validTargetCount(nativeFields, targetFields, policy) {
 		return false
 	}
-	leftCopy := cloneMap(leftResponse)
-	rightCopy := cloneMap(rightResponse)
-	leftFieldCopy := cloneMap(leftFields)
-	rightFieldCopy := cloneMap(rightFields)
-	delete(leftFieldCopy, "count")
-	delete(rightFieldCopy, "count")
-	leftCopy["fields"] = leftFieldCopy
-	rightCopy["fields"] = rightFieldCopy
-	return reflect.DeepEqual(leftCopy, rightCopy)
+	return reflect.DeepEqual(responseWithoutCount(leftResponse, leftFields), responseWithoutCount(rightResponse, rightFields))
 }
 
-func canonicalCount(value string) bool {
+func validTargetCount(nativeFields, targetFields map[string]any, policy countPolicy) bool {
+	nativeCount, nativeOK := responseCount(nativeFields)
+	targetCount, targetOK := responseCount(targetFields)
+	if !nativeOK || !targetOK {
+		return false
+	}
+	switch policy {
+	case pageCount:
+		kvs, ok := targetFields["kvs"].([]any)
+		pageSize := int64(len(kvs))
+		return ok && nativeCount >= pageSize && targetCount == pageSize
+	case existenceCount:
+		if nativeCount == 0 {
+			return targetCount == 0
+		}
+		return targetCount == 1
+	default:
+		return false
+	}
+}
+
+func responseCount(fields map[string]any) (int64, bool) {
+	value, ok := fields["count"].(string)
+	if !ok {
+		return 0, false
+	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
-	return err == nil && parsed >= 0 && strconv.FormatInt(parsed, 10) == value
+	return parsed, err == nil && parsed >= 0 && strconv.FormatInt(parsed, 10) == value
+}
+
+func responseWithoutCount(response, fields map[string]any) map[string]any {
+	copy := cloneMap(response)
+	fieldCopy := cloneMap(fields)
+	delete(fieldCopy, "count")
+	copy["fields"] = fieldCopy
+	return copy
 }
 
 func withoutResponse(record map[string]any) map[string]any {
@@ -74,22 +89,39 @@ func cloneMap(value map[string]any) map[string]any {
 	return result
 }
 
-func existenceCountRequest(left map[string]any) bool {
-	caseID, _ := left["case_id"].(string)
-	method, _ := left["method"].(string)
-	if caseID != "C05" || method != "etcdserverpb.KV/Range" {
-		return false
+// Case IDs describe coverage. The allowance follows the actual Range request.
+func countPolicyForRequest(record map[string]any) countPolicy {
+	if record["method"] != "etcdserverpb.KV/Range" {
+		return strictCount
 	}
-	request, ok := left["request"].(map[string]any)
+	request, ok := record["request"].(map[string]any)
 	if !ok {
-		return false
+		return strictCount
 	}
-	requestFields, ok := request["fields"].(map[string]any)
-	if !ok || requestFields["countOnly"] != true || requestFields["limit"] != "1" {
-		return false
+	fields, ok := request["fields"].(map[string]any)
+	if !ok {
+		return strictCount
 	}
-	if end, ok := requestFields["rangeEnd"].(string); !ok || end == "" {
-		return false
+	if end, ok := fields["rangeEnd"].(string); !ok || end == "" {
+		return strictCount
 	}
-	return true
+	encodedLimit, ok := fields["limit"].(string)
+	if !ok {
+		return strictCount
+	}
+	limit, err := strconv.ParseInt(encodedLimit, 10, 64)
+	if err != nil || limit <= 0 || strconv.FormatInt(limit, 10) != encodedLimit {
+		return strictCount
+	}
+	countOnly, ok := fields["countOnly"].(bool)
+	if !ok {
+		return strictCount
+	}
+	if !countOnly {
+		return pageCount
+	}
+	if limit == 1 {
+		return existenceCount
+	}
+	return strictCount
 }

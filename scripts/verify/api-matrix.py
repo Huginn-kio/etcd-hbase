@@ -23,6 +23,11 @@ REQUIRED_COUNT_RULES = {
     "prefix_count_only_limit_one",
     "other_range_count_only",
 }
+REQUIRED_COUNT_DIFFERENCES = {
+    "limited_range": ("C03", "page_length"),
+    "prefix_count_only_limit_one": ("C05", "existence_0_or_1"),
+}
+PRESERVED_COUNT_FIELDS = {"Kvs", "More", "Header", "revision", "errors"}
 
 
 class MatrixError(Exception):
@@ -204,6 +209,8 @@ def validate_case_and_usage_refs(
 
 def validate_count_policy(path: Path) -> None:
     policy = read_json(path)
+    if not isinstance(policy, dict) or policy.get("schema_version") != 2:
+        raise MatrixError("Count policy must use schema version 2")
     rules = policy.get("rules", [])
     ids = [rule.get("id") for rule in rules]
     if len(rules) != 6 or set(ids) != REQUIRED_COUNT_RULES or len(ids) != len(set(ids)):
@@ -212,17 +219,37 @@ def validate_count_policy(path: Path) -> None:
         for required in ("request", "count", "more", "case_ids"):
             if not rule.get(required):
                 raise MatrixError(f"Count rule {rule.get('id')} lacks {required}")
-    difference = policy.get("accepted_difference", {})
-    if (
-        difference.get("method") != "etcdserverpb.KV/Range"
-        or difference.get("case_id") != "C05"
-        or difference.get("field") != "Count"
-        or not {"Kvs", "More", "Header"}.issubset(set(difference.get("preserved_fields", [])))
-    ):
-        raise MatrixError("accepted Count difference must be limited to Count for C05")
+    validate_count_differences(policy)
     other_count_only = next(rule for rule in rules if rule["id"] == "other_range_count_only")
     if "UNIMPLEMENTED" not in str(other_count_only.get("error", "")):
         raise MatrixError("other range CountOnly must explicitly return UNIMPLEMENTED")
+
+
+def validate_count_differences(policy: dict[str, Any]) -> None:
+    differences = policy.get("accepted_differences")
+    if "accepted_difference" in policy or not isinstance(differences, list) or len(differences) != 2:
+        raise MatrixError("accepted Count differences require page and existence success rules")
+    if any(not isinstance(item, dict) or not isinstance(item.get("rule_id"), str) for item in differences):
+        raise MatrixError("accepted Count differences require named rule objects")
+    rule_ids = [item["rule_id"] for item in differences]
+    if set(rule_ids) != set(REQUIRED_COUNT_DIFFERENCES) or len(set(rule_ids)) != len(rule_ids):
+        raise MatrixError("accepted Count differences must uniquely cover page and existence rules")
+    for difference in differences:
+        validate_count_difference(difference)
+
+
+def validate_count_difference(difference: dict[str, Any]) -> None:
+    case_id, target_count = REQUIRED_COUNT_DIFFERENCES[difference["rule_id"]]
+    preserved = difference.get("preserved_fields")
+    if (difference.get("method") != "etcdserverpb.KV/Range" or difference.get("field") != "Count"
+            or difference.get("case_ids") != [case_id] or difference.get("target_count") != target_count
+            or difference.get("successful_responses_only") is not True):
+        raise MatrixError("accepted Count differences must only adjust approved successful Range Counts")
+    if (not isinstance(preserved, list) or not all(isinstance(field, str) for field in preserved)
+            or len(preserved) != len(PRESERVED_COUNT_FIELDS) or set(preserved) != PRESERVED_COUNT_FIELDS):
+        raise MatrixError("accepted Count differences must preserve Kvs, More, Header, revision and errors")
+    if not isinstance(difference.get("scope"), str) or not difference["scope"].strip():
+        raise MatrixError("accepted Count differences need an explicit scope")
 
 
 def validate_source_versions(wire: dict[str, Any], cases_data: dict[str, Any]) -> None:

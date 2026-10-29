@@ -54,7 +54,9 @@ Range 的非 KEY 排序属于 J35 要逐项说明支持或明确拒绝的边界�
 | 范围 CountOnly + Limit=1 | 真实存在性 0/1，Kvs 空 | More=false；不以随机数或缓存猜测存在性 |
 | 其他范围 CountOnly | 明确 UNIMPLEMENTED | 不发起准确全范围计数 |
 
-范围 CountOnly+Limit=1 可能与原生总数不同；只豁免这里的 Count，不豁免 More、revision、错误或任何其他字段。原生 [MVCC Count 路径][mvcc-count] 返回空 KVs，[Range 组装][range-response] 仅在返回 KVs 超过 Limit 时设置 More，因此本组合 More=false，即使匹配数大于一。C05 仍需执行运行对照；不能用普通 Range 的额外记录规则要求 CountOnly 再扫描第二条。消费者与迁移工具的区别见调用基线的 Count 审计。
+成功的有 Limit 普通 Range 和范围 CountOnly+Limit=1 都可能与原生匹配总数不同：前者要求目标 Count 等于本页 len(Kvs)，后者要求真实存在性 0/1。`testkit/count-policy.json` 的 schema 2 分别记录两项成功 Count 规则，C03/C05 是覆盖索引；对照器按请求语义识别，不把规则限制为 case 标签。仅允许 Count 转换，Kvs、More、Header、revision、错误及其他字段仍严格比较；双方成功但目标 Count 非法时，即使两侧 Count 相同也必须拒绝。失败观察不应用成功 Count 规则，response=null 时仍完整比较错误身份，同 code 的 FutureRev 与 Compacted 不能视为相同。
+
+原生 [MVCC Count 路径][mvcc-count] 对普通分页返回匹配总数，而 [Range 组装][range-response] 会截断 Kvs 并保留真实 More；CountOnly 返回空 KVs，仅在返回 Kvs 超过 Limit 时设置 More，因此 CountOnly+Limit=1 的 More=false，即使匹配数大于一。C03/C05 都需执行正反运行对照；不能用普通 Range 的额外记录规则要求 CountOnly 再扫描第二条。消费者与迁移工具的区别见调用基线的 Count 审计。
 
 ## 4 Lease / Watch
 

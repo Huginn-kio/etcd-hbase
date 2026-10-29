@@ -32,7 +32,7 @@ scripts/verify/j07.sh
 
 对照时仅忽略耗时，分别映射 cluster/member/lease ID，并对所有正 revision 应用同一个场景偏移；相对 revision 与请求中的零值保持不同。映射保留引用和事件关系，不能删除或排序响应来凑一致。
 
-C05 的范围 CountOnly+Limit=1 在 native/target 跨范围对照时，仅允许原生总数转换为目标存在性 0/1；More、Kvs、Header、revision、错误及其他字段仍严格一致。native/native 和 target/target 不豁免 Count。未分类错误不能建立等价结论。十种损坏样本分别验证事件、More、deleted、revision、Txn 分支、PrevKV、流终止、同 code 不同错误、存在性及 JSONL 截断均会失败。
+native/target 跨范围对照按成功 Range 请求识别两项已接受差异：普通 Limit>0 的 Count 必须为目标本页 len(Kvs)，范围 CountOnly+Limit=1 的 Count 必须为目标真实存在性 0/1。C03/C05 是覆盖场景，不是以标签绕过规则的开关。More、Kvs、Header、revision、错误及其他字段仍严格一致；双方 Count 数值相同也不放过非法目标成功结果。失败观察的 response=null 不套成功 Count 规则，双方相同错误可等价、不同错误身份仍拒绝。native/native 和 target/target 不豁免 Count。未分类错误不能建立等价结论。十种损坏样本分别验证事件、More、deleted、revision、Txn 分支、PrevKV、流终止、同 code 不同错误、存在性及 JSONL 截断均会失败；普通分页另以真实 native trace 派生目标样本核对页内 Count、非法总数及其他字段差异，派生样本不代表目标 HBase 实测。
 
 ## 4 验证边界
 

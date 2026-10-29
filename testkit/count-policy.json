@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "protocol": "etcd-v3.5.23",
   "rules": [
     {
@@ -58,17 +58,42 @@
       ]
     }
   ],
-  "accepted_difference": {
-    "method": "etcdserverpb.KV/Range",
-    "case_id": "C05",
-    "field": "Count",
-    "scope": "Range CountOnly with Limit=1 reports existence 0/1 instead of total matching keys",
-    "preserved_fields": [
-      "Kvs",
-      "More",
-      "Header",
-      "revision",
-      "errors"
-    ]
-  }
+  "accepted_differences": [
+    {
+      "rule_id": "limited_range",
+      "method": "etcdserverpb.KV/Range",
+      "case_ids": [
+        "C03"
+      ],
+      "field": "Count",
+      "successful_responses_only": true,
+      "target_count": "page_length",
+      "scope": "Successful ordinary Range with limit>0 reports len(Kvs in this page) instead of total matching keys",
+      "preserved_fields": [
+        "Kvs",
+        "More",
+        "Header",
+        "revision",
+        "errors"
+      ]
+    },
+    {
+      "rule_id": "prefix_count_only_limit_one",
+      "method": "etcdserverpb.KV/Range",
+      "case_ids": [
+        "C05"
+      ],
+      "field": "Count",
+      "successful_responses_only": true,
+      "target_count": "existence_0_or_1",
+      "scope": "Successful range CountOnly with Limit=1 reports existence 0/1 instead of total matching keys",
+      "preserved_fields": [
+        "Kvs",
+        "More",
+        "Header",
+        "revision",
+        "errors"
+      ]
+    }
+  ]
 }

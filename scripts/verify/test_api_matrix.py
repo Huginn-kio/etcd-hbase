@@ -81,16 +81,39 @@ class APIMatrixTest(unittest.TestCase):
                 with self.assertRaisesRegex(matrix.MatrixError, expected_error):
                     matrix.validate(self.args)
 
-    def test_count_exception_cannot_expand_beyond_c05_count(self):
+    def test_count_policy_requires_both_success_allowances(self):
+        path = self.args.cases.parent.parent / "count-policy.json"
+        matrix.validate_count_policy(path)
+        original = path.read_text()
+        for difference in json.loads(original)["accepted_differences"]:
+            with self.subTest(missing_rule=difference["rule_id"]):
+                document = json.loads(original)
+                document["accepted_differences"].remove(difference)
+                path.write_text(json.dumps(document))
+                with self.assertRaisesRegex(matrix.MatrixError, "accepted Count differences"):
+                    matrix.validate_count_policy(path)
+
+    def test_count_exceptions_cannot_expand_beyond_success_count(self):
         path = self.args.cases.parent.parent / "count-policy.json"
         original = path.read_text()
-        for change in ({"case_id": "C04"}, {"field": "Header"}, {"preserved_fields": ["Kvs", "More"]}):
-            with self.subTest(change=change):
+        mutations = ({"case_ids": ["C04"]}, {"field": "Header"}, {"method": "etcdserverpb.KV/Put"},
+                     {"preserved_fields": ["Kvs", "More", "Header", "revision"]},
+                     {"successful_responses_only": False}, {"target_count": "total_count"})
+        for rule_index in (0, 1):
+            for change in mutations:
+                with self.subTest(rule_index=rule_index, change=change):
+                    document = json.loads(original)
+                    document["accepted_differences"][rule_index].update(change)
+                    path.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(matrix.MatrixError, "accepted Count differences"):
+                        matrix.validate_count_policy(path)
+        for invalid_rules in ([], None, {}, [None, None], [json.loads(original)["accepted_differences"][0]] * 2):
+            with self.subTest(invalid_rules=invalid_rules):
                 document = json.loads(original)
-                document["accepted_difference"].update(change)
+                document["accepted_differences"] = invalid_rules
                 path.write_text(json.dumps(document))
-                with self.assertRaisesRegex(matrix.MatrixError, "limited to Count for C05"):
-                    matrix.validate(self.args)
+                with self.assertRaisesRegex(matrix.MatrixError, "accepted Count differences"):
+                    matrix.validate_count_policy(path)
 
     def test_descriptor_duplicates_and_missing_message_inventory_are_rejected(self):
         original = self.args.wire_contract.read_text()

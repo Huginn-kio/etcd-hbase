@@ -67,16 +67,21 @@ func Compare(left, right []trace.Record) error {
 	for index := range leftNormalized {
 		// Evidence provenance is checked above; it is not a wire field.
 		rightNormalized[index]["evidence_scope"] = leftNormalized[index]["evidence_scope"]
-		if leftScope != rightScope && existenceCountRequest(leftNormalized[index]) {
-			if !equalWithCountAllowance(leftNormalized[index], rightNormalized[index], leftScope, rightScope) {
-				return fmt.Errorf("trace record %d violates the existence Count policy", index+1)
+		policy := strictCount
+		bothSucceeded := left[index].Error == nil && right[index].Error == nil &&
+			left[index].StreamTerminal == nil && right[index].StreamTerminal == nil
+		if leftScope != rightScope && bothSucceeded {
+			policy = countPolicyForRequest(leftNormalized[index])
+		}
+		// A successful target Count must satisfy its contract even when both
+		// observed Counts happen to be equal. Failed observations stay strict.
+		if policy != strictCount {
+			if !equalWithCountAllowance(leftNormalized[index], rightNormalized[index], leftScope, policy) {
+				return fmt.Errorf("trace record %d violates the %s Count policy", index+1, policy)
 			}
 			continue
 		}
-		if reflect.DeepEqual(leftNormalized[index], rightNormalized[index]) {
-			continue
-		}
-		if !equalWithCountAllowance(leftNormalized[index], rightNormalized[index], leftScope, rightScope) {
+		if !reflect.DeepEqual(leftNormalized[index], rightNormalized[index]) {
 			return fmt.Errorf("trace record %d differs", index+1)
 		}
 	}
