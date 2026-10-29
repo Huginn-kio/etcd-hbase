@@ -73,74 +73,122 @@ func normalizeTrace(args []string, stderr io.Writer) error {
 	return nil
 }
 
+type scenarioOptions struct {
+	scenarioPath string
+	artifactRoot string
+	tracePath    string
+	metadataPath string
+}
+
+type scenarioPaths struct {
+	artifactRoot  string
+	traceFile     string
+	metadataFile  string
+	dataDirectory string
+}
+
 func runScenario(args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("native-etcd run", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	scenarioPath := flags.String("scenario", "../scenarios/m0-native.yaml", "pinned native scenario manifest")
-	artifactRoot := flags.String("artifact-root", "", "ignored directory for all native etcd data and outputs")
-	tracePath := flags.String("trace", "", "JSONL request/response trace output")
-	metadataPath := flags.String("metadata", "", "JSON build and distribution metadata output")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 || *artifactRoot == "" || *tracePath == "" || *metadataPath == "" {
-		return errors.New("run requires --artifact-root, --trace, and --metadata")
-	}
-	root, err := filepath.Abs(*artifactRoot)
-	if err != nil {
-		return fmt.Errorf("resolve artifact root: %w", err)
-	}
-	traceFilePath, err := insideRoot(root, *tracePath)
+	options, err := parseScenarioOptions(args, stderr)
 	if err != nil {
 		return err
 	}
-	metadataFilePath, err := insideRoot(root, *metadataPath)
+	paths, err := prepareScenarioPaths(options)
 	if err != nil {
 		return err
 	}
-	dataDirectory, err := insideRoot(root, "etcd-data")
+	suite, err := scenario.LoadSuite(options.scenarioPath)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return fmt.Errorf("create native artifact root: %w", err)
-	}
-	suite, err := scenario.LoadSuite(*scenarioPath)
-	if err != nil {
-		return err
-	}
-	artifactFS, err := os.OpenRoot(root)
+	artifactFS, err := os.OpenRoot(paths.artifactRoot)
 	if err != nil {
 		return errors.New("open native artifact directory failed")
 	}
 	defer artifactFS.Close()
-	traceRelative, _ := filepath.Rel(root, traceFilePath)
-	if err := artifactFS.MkdirAll(filepath.Dir(traceRelative), 0o700); err != nil {
-		return errors.New("create trace directory failed")
+	return executeNativeScenario(suite, paths, artifactFS, stdout)
+}
+
+func parseScenarioOptions(args []string, stderr io.Writer) (scenarioOptions, error) {
+	options := scenarioOptions{}
+	flags := flag.NewFlagSet("native-etcd run", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.StringVar(&options.scenarioPath, "scenario", "../scenarios/m0-native.yaml", "pinned native scenario manifest")
+	flags.StringVar(&options.artifactRoot, "artifact-root", "", "ignored directory for all native etcd data and outputs")
+	flags.StringVar(&options.tracePath, "trace", "", "JSONL request/response trace output")
+	flags.StringVar(&options.metadataPath, "metadata", "", "JSON build and distribution metadata output")
+	if err := flags.Parse(args); err != nil {
+		return scenarioOptions{}, err
 	}
-	traceFile, err := artifactFS.OpenFile(traceRelative, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if flags.NArg() != 0 || options.artifactRoot == "" || options.tracePath == "" || options.metadataPath == "" {
+		return scenarioOptions{}, errors.New("run requires --artifact-root, --trace, and --metadata")
+	}
+	return options, nil
+}
+
+func prepareScenarioPaths(options scenarioOptions) (scenarioPaths, error) {
+	root, err := filepath.Abs(options.artifactRoot)
 	if err != nil {
-		return fmt.Errorf("open trace output: %w", err)
+		return scenarioPaths{}, fmt.Errorf("resolve artifact root: %w", err)
+	}
+	traceFile, err := insideRoot(root, options.tracePath)
+	if err != nil {
+		return scenarioPaths{}, err
+	}
+	metadataFile, err := insideRoot(root, options.metadataPath)
+	if err != nil {
+		return scenarioPaths{}, err
+	}
+	dataDirectory, err := insideRoot(root, "etcd-data")
+	if err != nil {
+		return scenarioPaths{}, err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return scenarioPaths{}, fmt.Errorf("create native artifact root: %w", err)
+	}
+	return scenarioPaths{
+		artifactRoot:  root,
+		traceFile:     traceFile,
+		metadataFile:  metadataFile,
+		dataDirectory: dataDirectory,
+	}, nil
+}
+
+func executeNativeScenario(suite scenario.Suite, paths scenarioPaths, artifactFS *os.Root, stdout io.Writer) error {
+	traceFile, err := openTraceOutput(artifactFS, paths.traceFile)
+	if err != nil {
+		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	metadata, runErr := scenario.Run(ctx, suite, dataDirectory, traceFile)
+	metadata, runErr := scenario.Run(ctx, suite, paths.dataDirectory, traceFile)
 	closeErr := traceFile.Close()
 	if closeErr != nil {
 		return fmt.Errorf("close trace output: %w", closeErr)
 	}
 	if metadata.ScenarioID != "" {
-		if err := writeMetadata(artifactFS, metadataFilePath, metadata); err != nil {
+		if err := writeMetadata(artifactFS, paths.metadataFile, metadata); err != nil {
 			return err
 		}
 	}
 	if runErr != nil {
 		return runErr
 	}
-	if _, err := fmt.Fprintf(stdout, "native scenario %s passed; trace=%s metadata=%s\n", suite.ID, traceFilePath, metadataFilePath); err != nil {
+	if _, err := fmt.Fprintf(stdout, "native scenario %s passed; trace=%s metadata=%s\n", suite.ID, paths.traceFile, paths.metadataFile); err != nil {
 		return err
 	}
 	return nil
+}
+
+func openTraceOutput(artifactFS *os.Root, path string) (*os.File, error) {
+	relative, _ := filepath.Rel(artifactFS.Name(), path)
+	if err := artifactFS.MkdirAll(filepath.Dir(relative), 0o700); err != nil {
+		return nil, errors.New("create trace directory failed")
+	}
+	file, err := artifactFS.OpenFile(relative, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open trace output: %w", err)
+	}
+	return file, nil
 }
 
 func compareTraces(args []string, stderr io.Writer) error {

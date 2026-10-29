@@ -39,63 +39,86 @@ func (runner *runner) run(ctx context.Context) error {
 }
 
 func (runner *runner) binaryAndRanges(ctx context.Context, kv etcdserverpb.KVClient, binaryKey []byte) error {
+	if err := runner.binaryRoundTrip(ctx, kv, binaryKey); err != nil {
+		return err
+	}
+	if err := runner.preparePrefixKeys(ctx, kv); err != nil {
+		return err
+	}
+	prefix := []byte("m0/prefix/")
+	prefixEnd := prefixRangeEnd(prefix)
+	if err := runner.limitedPrefixRange(ctx, kv, prefix, prefixEnd); err != nil {
+		return err
+	}
+	return runner.countOnlyPrefixRange(ctx, kv, prefix, prefixEnd)
+}
+
+func (runner *runner) binaryRoundTrip(ctx context.Context, kv etcdserverpb.KVClient, binaryKey []byte) error {
 	binaryValue := []byte{0x00, 0x80, 0xff, 'v'}
-	putReq := &etcdserverpb.PutRequest{Key: binaryKey, Value: binaryValue}
-	putResp, err := runner.call(ctx, "C01", "etcdserverpb.KV/Put", putReq, func(requestCtx context.Context) (protoMessage, error) {
-		return kv.Put(requestCtx, putReq)
+	putRequest := &etcdserverpb.PutRequest{Key: binaryKey, Value: binaryValue}
+	putResponse, err := runner.call(ctx, "C01", "etcdserverpb.KV/Put", putRequest, func(requestContext context.Context) (protoMessage, error) {
+		return kv.Put(requestContext, putRequest)
 	})
 	if err != nil {
 		return err
 	}
-	if putResp == nil {
+	if putResponse == nil {
 		return errors.New("native binary Put returned no response")
 	}
-	rangeReq := &etcdserverpb.RangeRequest{Key: binaryKey}
-	rangeResp, err := runner.call(ctx, "C01", "etcdserverpb.KV/Range", rangeReq, func(requestCtx context.Context) (protoMessage, error) {
-		return kv.Range(requestCtx, rangeReq)
+	rangeRequest := &etcdserverpb.RangeRequest{Key: binaryKey}
+	rangeResult, err := runner.call(ctx, "C01", "etcdserverpb.KV/Range", rangeRequest, func(requestContext context.Context) (protoMessage, error) {
+		return kv.Range(requestContext, rangeRequest)
 	})
 	if err != nil {
 		return err
 	}
-	binaryRange, ok := rangeResp.(*etcdserverpb.RangeResponse)
-	if !ok || len(binaryRange.Kvs) != 1 || string(binaryRange.Kvs[0].Key) != string(binaryKey) || string(binaryRange.Kvs[0].Value) != string(binaryValue) {
+	response, ok := rangeResult.(*etcdserverpb.RangeResponse)
+	if !ok || len(response.Kvs) != 1 || string(response.Kvs[0].Key) != string(binaryKey) || string(response.Kvs[0].Value) != string(binaryValue) {
 		return errors.New("native binary Range did not return the original key and value")
 	}
+	return nil
+}
 
+func (runner *runner) preparePrefixKeys(ctx context.Context, kv etcdserverpb.KVClient) error {
 	for index, value := range [][]byte{[]byte("one"), []byte("two"), []byte("three")} {
 		key := []byte(fmt.Sprintf("m0/prefix/%d", index+1))
 		request := &etcdserverpb.PutRequest{Key: key, Value: value}
-		if _, err := runner.call(ctx, "C01", "etcdserverpb.KV/Put", request, func(requestCtx context.Context) (protoMessage, error) {
-			return kv.Put(requestCtx, request)
+		if _, err := runner.call(ctx, "C01", "etcdserverpb.KV/Put", request, func(requestContext context.Context) (protoMessage, error) {
+			return kv.Put(requestContext, request)
 		}); err != nil {
 			return err
 		}
 	}
-	prefix := []byte("m0/prefix/")
-	prefixEnd := prefixRangeEnd(prefix)
-	limited := &etcdserverpb.RangeRequest{Key: prefix, RangeEnd: prefixEnd, Limit: 2}
-	limitedResp, err := runner.call(ctx, "C03", "etcdserverpb.KV/Range", limited, func(requestCtx context.Context) (protoMessage, error) {
-		return kv.Range(requestCtx, limited)
+	return nil
+}
+
+func (runner *runner) limitedPrefixRange(ctx context.Context, kv etcdserverpb.KVClient, prefix, prefixEnd []byte) error {
+	request := &etcdserverpb.RangeRequest{Key: prefix, RangeEnd: prefixEnd, Limit: 2}
+	result, err := runner.call(ctx, "C03", "etcdserverpb.KV/Range", request, func(requestContext context.Context) (protoMessage, error) {
+		return kv.Range(requestContext, request)
 	})
 	if err != nil {
 		return err
 	}
-	limitedRange, ok := limitedResp.(*etcdserverpb.RangeResponse)
-	if !ok || len(limitedRange.Kvs) != 2 || !limitedRange.More {
+	response, ok := result.(*etcdserverpb.RangeResponse)
+	if !ok || len(response.Kvs) != 2 || !response.More {
 		return errors.New("native prefix Range did not preserve Limit and More")
 	}
-	countOnly := &etcdserverpb.RangeRequest{Key: prefix, RangeEnd: prefixEnd, Limit: 1, CountOnly: true}
-	countResp, err := runner.call(ctx, "C05", "etcdserverpb.KV/Range", countOnly, func(requestCtx context.Context) (protoMessage, error) {
-		return kv.Range(requestCtx, countOnly)
+	return nil
+}
+
+func (runner *runner) countOnlyPrefixRange(ctx context.Context, kv etcdserverpb.KVClient, prefix, prefixEnd []byte) error {
+	request := &etcdserverpb.RangeRequest{Key: prefix, RangeEnd: prefixEnd, Limit: 1, CountOnly: true}
+	result, err := runner.call(ctx, "C05", "etcdserverpb.KV/Range", request, func(requestContext context.Context) (protoMessage, error) {
+		return kv.Range(requestContext, request)
 	})
 	if err != nil {
 		return err
 	}
-	countRange, ok := countResp.(*etcdserverpb.RangeResponse)
-	if !ok || len(countRange.Kvs) != 0 || countRange.Count != 3 || countRange.More {
+	response, ok := result.(*etcdserverpb.RangeResponse)
+	if !ok || len(response.Kvs) != 0 || response.Count != 3 || response.More {
 		return errors.New("native CountOnly Range did not return the expected count, empty KVs, and More=false")
 	}
-
 	return nil
 }
 

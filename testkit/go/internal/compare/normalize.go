@@ -9,83 +9,107 @@ import (
 	"strconv"
 )
 
+// A normalizer owns correspondence for the whole trace, including requests
+// and responses. Record and container helpers never reset that correspondence.
+type traceNormalizer struct {
+	baseRevision      int64
+	identities        map[string]map[string]string
+	identitySequences map[string]uint64
+}
+
 func normalize(records []trace.Record) ([]map[string]any, error) {
-	if len(records) == 0 {
-		return nil, errors.New("trace is empty")
+	if err := validateTrace(records); err != nil {
+		return nil, err
 	}
-	last := make(map[string]uint64)
+	baseRevision, err := baselineRevision(records)
+	if err != nil {
+		return nil, err
+	}
+	normalizer := traceNormalizer{
+		baseRevision:      baseRevision,
+		identities:        map[string]map[string]string{"cluster": {}, "member": {}, "lease": {}},
+		identitySequences: make(map[string]uint64),
+	}
+	normalized := make([]map[string]any, 0, len(records))
 	for _, record := range records {
-		if err := record.Validate(); err != nil {
+		converted, err := normalizer.record(record)
+		if err != nil {
 			return nil, err
 		}
-		if record.Ordinal <= last[record.CaseID] {
-			return nil, errors.New("record ordinals must increase within each case")
+		normalized = append(normalized, converted)
+	}
+	return normalized, nil
+}
+
+func validateTrace(records []trace.Record) error {
+	if len(records) == 0 {
+		return errors.New("trace is empty")
+	}
+	lastOrdinalByCase := make(map[string]uint64)
+	for _, record := range records {
+		if err := record.Validate(); err != nil {
+			return err
 		}
-		last[record.CaseID] = record.Ordinal
+		if record.Ordinal <= lastOrdinalByCase[record.CaseID] {
+			return errors.New("record ordinals must increase within each case")
+		}
+		lastOrdinalByCase[record.CaseID] = record.Ordinal
 	}
+	return nil
+}
+
+func baselineRevision(records []trace.Record) (int64, error) {
 	if records[0].CaseID != "native-baseline" || records[0].Error != nil {
-		return nil, errors.New("trace must begin with a successful native baseline")
+		return 0, errors.New("trace must begin with a successful native baseline")
 	}
-	baseRevision, found := int64(0), false
 	for _, record := range records {
 		if record.CaseID != "native-baseline" || len(record.Response) == 0 || bytes.Equal(record.Response, []byte("null")) {
 			continue
 		}
 		response, err := decodeObject(record.Response)
 		if err != nil {
-			return nil, fmt.Errorf("decode baseline response: %w", err)
+			return 0, fmt.Errorf("decode baseline response: %w", err)
 		}
 		revision, err := responseRevision(response)
 		if err != nil {
-			return nil, fmt.Errorf("read scenario baseline revision: %w", err)
+			return 0, fmt.Errorf("read scenario baseline revision: %w", err)
 		}
 		if revision < 1 {
-			return nil, errors.New("baseline revision must be positive")
+			return 0, errors.New("baseline revision must be positive")
 		}
-		baseRevision, found = revision, true
-		break
+		return revision, nil
 	}
-	if !found {
-		return nil, errors.New("trace has no native-baseline scenario record")
-	}
+	return 0, errors.New("trace has no native-baseline scenario record")
+}
 
-	ids := map[string]map[string]string{
-		"cluster": {},
-		"member":  {},
-		"lease":   {},
+func (normalizer *traceNormalizer) record(record trace.Record) (map[string]any, error) {
+	request, err := decodeNullable(record.Request)
+	if err != nil {
+		return nil, fmt.Errorf("decode request in trace record %d: invalid snapshot JSON", record.Ordinal)
 	}
-	sequences := map[string]uint64{}
-	normalized := make([]map[string]any, 0, len(records))
-	for _, record := range records {
-		request, err := decodeNullable(record.Request)
-		if err != nil {
-			return nil, fmt.Errorf("decode request in trace record %d: invalid snapshot JSON", record.Ordinal)
-		}
-		response, err := decodeNullable(record.Response)
-		if err != nil {
-			return nil, fmt.Errorf("decode response in trace record %d: invalid snapshot JSON", record.Ordinal)
-		}
-		request, err = normalizeValue(request, record.Method, baseRevision, ids, sequences)
-		if err != nil {
-			return nil, fmt.Errorf("normalize request in trace record %d: %w", record.Ordinal, err)
-		}
-		response, err = normalizeValue(response, record.Method, baseRevision, ids, sequences)
-		if err != nil {
-			return nil, fmt.Errorf("normalize response in trace record %d: %w", record.Ordinal, err)
-		}
-		normalized = append(normalized, map[string]any{
-			"schema":          record.Schema,
-			"case_id":         record.CaseID,
-			"ordinal":         record.Ordinal,
-			"method":          record.Method,
-			"request":         request,
-			"response":        response,
-			"error":           record.Error,
-			"stream_terminal": record.StreamTerminal,
-			"evidence_scope":  record.EvidenceScope,
-		})
+	response, err := decodeNullable(record.Response)
+	if err != nil {
+		return nil, fmt.Errorf("decode response in trace record %d: invalid snapshot JSON", record.Ordinal)
 	}
-	return normalized, nil
+	request, err = normalizer.value(request, record.Method)
+	if err != nil {
+		return nil, fmt.Errorf("normalize request in trace record %d: %w", record.Ordinal, err)
+	}
+	response, err = normalizer.value(response, record.Method)
+	if err != nil {
+		return nil, fmt.Errorf("normalize response in trace record %d: %w", record.Ordinal, err)
+	}
+	return map[string]any{
+		"schema":          record.Schema,
+		"case_id":         record.CaseID,
+		"ordinal":         record.Ordinal,
+		"method":          record.Method,
+		"request":         request,
+		"response":        response,
+		"error":           record.Error,
+		"stream_terminal": record.StreamTerminal,
+		"evidence_scope":  record.EvidenceScope,
+	}, nil
 }
 
 func decodeNullable(raw json.RawMessage) (any, error) {

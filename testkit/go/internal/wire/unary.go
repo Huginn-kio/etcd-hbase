@@ -47,81 +47,78 @@ func probeSkeletonUnary(
 	return nil
 }
 
-func probeFixtureErrors(
-	ctx context.Context,
-	options Options,
-	connection *clientv3.Client,
-	output io.Writer,
-) error {
+type fixtureErrorProbe struct {
+	caseID   string
+	request  *etcdserverpb.RangeRequest
+	timeout  time.Duration
+	invoke   func(context.Context, *etcdserverpb.RangeRequest) error
+	validate func(error) error
+	mismatch string
+}
+
+func probeFixtureErrors(ctx context.Context, options Options, connection *clientv3.Client, output io.Writer) error {
+	for _, probe := range fixtureErrorProbes(connection, options.Timeout) {
+		if err := runFixtureErrorProbe(ctx, output, probe); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fixtureErrorProbes(connection *clientv3.Client, timeout time.Duration) []fixtureErrorProbe {
 	requestFor := func(marker byte) *etcdserverpb.RangeRequest {
 		return &etcdserverpb.RangeRequest{Key: probeKeys[marker], Revision: protocolRevision}
 	}
+	clientRange := func(ctx context.Context, request *etcdserverpb.RangeRequest) error {
+		_, err := connection.KV.Get(ctx, string(request.Key), clientv3.WithRev(protocolRevision))
+		return clientv3.ContextError(ctx, err)
+	}
+	mappedRawRange := func(ctx context.Context, request *etcdserverpb.RangeRequest) error {
+		_, err := client.RawKV(connection).Range(ctx, request)
+		return rpctypes.Error(err)
+	}
+	rawDeadlineRange := func(ctx context.Context, request *etcdserverpb.RangeRequest) error {
+		_, err := client.RawKV(connection).Range(ctx, request)
+		return clientv3.ContextError(ctx, err)
+	}
+	return []fixtureErrorProbe{
+		{
+			caseID: "wire-fixture-clientv3-auth", request: requestFor('a'), timeout: timeout, invoke: clientRange,
+			validate: func(err error) error { return expectError(err, codes.InvalidArgument, rpctypes.ErrAuthFailed) },
+			mismatch: "clientv3 authentication sentinel mismatch",
+		},
+		{
+			caseID: "wire-fixture-raw-permission", request: requestFor('p'), timeout: timeout, invoke: mappedRawRange,
+			validate: func(err error) error { return expectError(err, codes.PermissionDenied, rpctypes.ErrPermissionDenied) },
+			mismatch: "raw apiv3 permission sentinel mismatch",
+		},
+		{
+			caseID: "wire-fixture-raw-unavailable", request: requestFor('u'), timeout: timeout, invoke: mappedRawRange,
+			validate: func(err error) error { return expectError(err, codes.Unavailable, nil) },
+			mismatch: "raw apiv3 unavailable mapping mismatch",
+		},
+		{
+			caseID: "wire-fixture-clientv3-retry-deadline", request: requestFor('r'), timeout: min(timeout, 300*time.Millisecond),
+			invoke: clientRange, validate: expectDeadline, mismatch: "clientv3 retry did not stop at its deadline",
+		},
+		{
+			caseID: "wire-fixture-raw-deadline-cancel", request: requestFor('d'), timeout: min(timeout, 300*time.Millisecond),
+			invoke: rawDeadlineRange, validate: expectDeadline, mismatch: "raw apiv3 deadline did not cancel the request",
+		},
+	}
+}
 
-	request := requestFor('a')
-	rpcContext, cancel := context.WithTimeout(ctx, options.Timeout)
+func runFixtureErrorProbe(ctx context.Context, output io.Writer, probe fixtureErrorProbe) error {
+	rpcContext, cancel := context.WithTimeout(ctx, probe.timeout)
 	started := time.Now()
-	_, callErr := connection.KV.Get(rpcContext, string(request.Key), clientv3.WithRev(protocolRevision))
-	callErr = clientv3.ContextError(rpcContext, callErr)
+	// Each invocation retains its raw/clientv3 mapping while the context is live.
+	callErr := probe.invoke(rpcContext, probe.request)
 	cancel()
-	if err := writeUnaryRecord(output, "wire-fixture-clientv3-auth", "transport-fixture", request, callErr, time.Since(started)); err != nil {
+	if err := writeUnaryRecord(output, probe.caseID, "transport-fixture", probe.request, callErr, time.Since(started)); err != nil {
 		return err
 	}
-	if err := expectError(callErr, codes.InvalidArgument, rpctypes.ErrAuthFailed); err != nil {
-		return fmt.Errorf("clientv3 authentication sentinel mismatch: %w", err)
-	}
-
-	request = requestFor('p')
-	rpcContext, cancel = context.WithTimeout(ctx, options.Timeout)
-	started = time.Now()
-	_, callErr = client.RawKV(connection).Range(rpcContext, request)
-	callErr = rpctypes.Error(callErr)
-	cancel()
-	if err := writeUnaryRecord(output, "wire-fixture-raw-permission", "transport-fixture", request, callErr, time.Since(started)); err != nil {
-		return err
-	}
-	if err := expectError(callErr, codes.PermissionDenied, rpctypes.ErrPermissionDenied); err != nil {
-		return fmt.Errorf("raw apiv3 permission sentinel mismatch: %w", err)
-	}
-
-	request = requestFor('u')
-	rpcContext, cancel = context.WithTimeout(ctx, options.Timeout)
-	started = time.Now()
-	_, callErr = client.RawKV(connection).Range(rpcContext, request)
-	callErr = rpctypes.Error(callErr)
-	cancel()
-	if err := writeUnaryRecord(output, "wire-fixture-raw-unavailable", "transport-fixture", request, callErr, time.Since(started)); err != nil {
-		return err
-	}
-	if err := expectError(callErr, codes.Unavailable, nil); err != nil {
-		return fmt.Errorf("raw apiv3 unavailable mapping mismatch: %w", err)
-	}
-
-	request = requestFor('r')
-	boundedRetryTimeout := min(options.Timeout, 300*time.Millisecond)
-	rpcContext, cancel = context.WithTimeout(ctx, boundedRetryTimeout)
-	started = time.Now()
-	_, callErr = connection.KV.Get(rpcContext, string(request.Key), clientv3.WithRev(protocolRevision))
-	callErr = clientv3.ContextError(rpcContext, callErr)
-	cancel()
-	if err := writeUnaryRecord(output, "wire-fixture-clientv3-retry-deadline", "transport-fixture", request, callErr, time.Since(started)); err != nil {
-		return err
-	}
-	if err := expectDeadline(callErr); err != nil {
-		return fmt.Errorf("clientv3 retry did not stop at its deadline: %w", err)
-	}
-
-	request = requestFor('d')
-	requestTimeout := min(options.Timeout, 300*time.Millisecond)
-	rpcContext, cancel = context.WithTimeout(ctx, requestTimeout)
-	started = time.Now()
-	_, callErr = client.RawKV(connection).Range(rpcContext, request)
-	callErr = clientv3.ContextError(rpcContext, callErr)
-	cancel()
-	if err := writeUnaryRecord(output, "wire-fixture-raw-deadline-cancel", "transport-fixture", request, callErr, time.Since(started)); err != nil {
-		return err
-	}
-	if err := expectDeadline(callErr); err != nil {
-		return fmt.Errorf("raw apiv3 deadline did not cancel the request: %w", err)
+	if err := probe.validate(callErr); err != nil {
+		return fmt.Errorf("%s: %w", probe.mismatch, err)
 	}
 	return nil
 }

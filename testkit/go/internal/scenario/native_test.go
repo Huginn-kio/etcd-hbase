@@ -80,82 +80,159 @@ func testContext(t *testing.T) context.Context {
 
 func assertNativeEvidence(t *testing.T, records []trace.Record) {
 	t.Helper()
-	var sawMore, sawCountOnly, sawTxnSuccess, sawTxnFailure, sawPrevKV, sawLeaseKeepAlive, sawRevoke, sawWatchCreated, sawWatchEvent, sawWatchTerminal, sawCompactionError bool
 	for _, record := range records {
 		if record.EvidenceScope != "native-etcd" {
 			t.Fatalf("record %s has wrong evidence scope %q", record.CaseID, record.EvidenceScope)
 		}
+	}
+	assertRangeEvidence(t, records)
+	assertTxnEvidence(t, records)
+	assertDeleteEvidence(t, records)
+	assertLeaseEvidence(t, records)
+	assertWatchEvidence(t, records)
+	assertCompactionEvidence(t, records)
+}
+
+func assertRangeEvidence(t *testing.T, records []trace.Record) {
+	t.Helper()
+	var sawMore, sawCountOnly bool
+	for _, record := range records {
 		switch record.CaseID {
 		case "C03":
-			if response := decodeSnapshot(t, record.Response); responseBool(response, "more") {
+			if responseBool(decodeSnapshot(t, record.Response), "more") {
 				sawMore = true
 			}
 		case "C05":
-			request := decodeSnapshot(t, record.Request)
-			response := decodeSnapshot(t, record.Response)
-			count, countOK := response["count"].(string)
-			more, moreOK := response["more"].(bool)
-			if requestBool(request, "countOnly") && countOK && count == "3" && moreOK && !more && responseArrayLen(response, "kvs") == 0 {
+			if isCountOnlyEvidence(t, record) {
 				sawCountOnly = true
 			}
+		}
+	}
+	requireNativeEvidence(t, "Limit/More", sawMore)
+	requireNativeEvidence(t, "CountOnly", sawCountOnly)
+}
+
+func isCountOnlyEvidence(t *testing.T, record trace.Record) bool {
+	t.Helper()
+	request := decodeSnapshot(t, record.Request)
+	response := decodeSnapshot(t, record.Response)
+	count, countOK := response["count"].(string)
+	more, moreOK := response["more"].(bool)
+	return requestBool(request, "countOnly") && countOK && count == "3" && moreOK && !more && responseArrayLen(response, "kvs") == 0
+}
+
+func assertTxnEvidence(t *testing.T, records []trace.Record) {
+	t.Helper()
+	var sawSuccess, sawFailure bool
+	for _, record := range records {
+		switch record.CaseID {
 		case "C11":
-			sawTxnSuccess = responseBool(decodeSnapshot(t, record.Response), "succeeded")
+			sawSuccess = responseBool(decodeSnapshot(t, record.Response), "succeeded")
 		case "C12":
-			sawTxnFailure = !responseBool(decodeSnapshot(t, record.Response), "succeeded")
-		case "C09":
-			if record.Method == "etcdserverpb.KV/DeleteRange" {
-				sawPrevKV = responseArrayLen(decodeSnapshot(t, record.Response), "prevKvs") == 1
-			}
-		case "C17":
-			if record.StreamTerminal != nil && record.StreamTerminal.Kind == "eof" {
-				sawLeaseKeepAlive = true
-			}
-		case "C18":
-			if record.Method == "etcdserverpb.Lease/LeaseRevoke" && record.Error == nil {
-				sawRevoke = true
-			}
-		case "C19":
-			if record.Response != nil && len(record.Response) > 0 && string(record.Response) != "null" {
-				response := decodeSnapshot(t, record.Response)
-				if responseBool(response, "created") {
-					watchID, watchIDOK := response["watchId"].(string)
-					sawWatchCreated = watchIDOK && watchID == "0" && response["header"] != nil
-				}
-				if events, ok := response["events"].([]any); ok && len(events) == 1 {
-					request := decodeSnapshot(t, record.Request)
-					create := snapshotChildFields(request, "createRequest")
-					event, _ := events[0].(map[string]any)
-					eventFields, _ := event["fields"].(map[string]any)
-					keyValue := snapshotChildFields(eventFields, "kv")
-					header := snapshotChildFields(response, "header")
-					startRevision, startOK := create["startRevision"].(string)
-					modRevision, modOK := keyValue["modRevision"].(string)
-					headerRevision, headerOK := header["revision"].(string)
-					if startOK && modOK && headerOK && startRevision == modRevision && modRevision == headerRevision &&
-						keyValue["value"] == "YWZ0ZXItd2F0Y2gtcmV2aXNpb24=" {
-						sawWatchEvent = true
-					}
-				}
-			}
-			if record.StreamTerminal != nil && record.StreamTerminal.Kind == "context-canceled" {
-				sawWatchTerminal = true
-			}
-		case "C06":
-			if record.Error != nil && record.Error.GRPCCode == "OutOfRange" && record.Error.SemanticKind == "etcd/Compacted" {
-				sawCompactionError = true
-			}
+			sawFailure = !responseBool(decodeSnapshot(t, record.Response), "succeeded")
 		}
 	}
-	checks := map[string]bool{
-		"Limit/More": sawMore, "CountOnly": sawCountOnly, "Txn success branch": sawTxnSuccess,
-		"Txn failure branch": sawTxnFailure, "Delete PrevKV": sawPrevKV, "LeaseKeepAlive EOF": sawLeaseKeepAlive,
-		"LeaseRevoke": sawRevoke, "Watch created response": sawWatchCreated, "Watch event": sawWatchEvent,
-		"Watch cancellation terminal": sawWatchTerminal, "compacted revision error": sawCompactionError,
-	}
-	for name, passed := range checks {
-		if !passed {
-			t.Errorf("native trace is missing %s evidence", name)
+	requireNativeEvidence(t, "Txn success branch", sawSuccess)
+	requireNativeEvidence(t, "Txn failure branch", sawFailure)
+}
+
+func assertDeleteEvidence(t *testing.T, records []trace.Record) {
+	t.Helper()
+	sawPrevKV := false
+	for _, record := range records {
+		if record.CaseID == "C09" && record.Method == "etcdserverpb.KV/DeleteRange" {
+			sawPrevKV = responseArrayLen(decodeSnapshot(t, record.Response), "prevKvs") == 1
 		}
+	}
+	requireNativeEvidence(t, "Delete PrevKV", sawPrevKV)
+}
+
+func assertLeaseEvidence(t *testing.T, records []trace.Record) {
+	t.Helper()
+	var sawKeepAlive, sawRevoke bool
+	for _, record := range records {
+		if record.CaseID == "C17" && record.StreamTerminal != nil && record.StreamTerminal.Kind == "eof" {
+			sawKeepAlive = true
+		}
+		if record.CaseID == "C18" && record.Method == "etcdserverpb.Lease/LeaseRevoke" && record.Error == nil {
+			sawRevoke = true
+		}
+	}
+	requireNativeEvidence(t, "LeaseKeepAlive EOF", sawKeepAlive)
+	requireNativeEvidence(t, "LeaseRevoke", sawRevoke)
+}
+
+type watchEvidence struct {
+	created  bool
+	event    bool
+	terminal bool
+}
+
+func assertWatchEvidence(t *testing.T, records []trace.Record) {
+	t.Helper()
+	evidence := watchEvidence{}
+	for _, record := range records {
+		if record.CaseID == "C19" {
+			evidence.observe(t, record)
+		}
+	}
+	requireNativeEvidence(t, "Watch created response", evidence.created)
+	requireNativeEvidence(t, "Watch event", evidence.event)
+	requireNativeEvidence(t, "Watch cancellation terminal", evidence.terminal)
+}
+
+func (evidence *watchEvidence) observe(t *testing.T, record trace.Record) {
+	t.Helper()
+	if record.StreamTerminal != nil && record.StreamTerminal.Kind == "context-canceled" {
+		evidence.terminal = true
+	}
+	if len(record.Response) == 0 || string(record.Response) == "null" {
+		return
+	}
+	response := decodeSnapshot(t, record.Response)
+	if responseBool(response, "created") {
+		watchID, watchIDOK := response["watchId"].(string)
+		evidence.created = watchIDOK && watchID == "0" && response["header"] != nil
+	}
+	if isExpectedWatchEvent(t, record, response) {
+		evidence.event = true
+	}
+}
+
+func isExpectedWatchEvent(t *testing.T, record trace.Record, response map[string]any) bool {
+	t.Helper()
+	events, ok := response["events"].([]any)
+	if !ok || len(events) != 1 {
+		return false
+	}
+	request := decodeSnapshot(t, record.Request)
+	create := snapshotChildFields(request, "createRequest")
+	event, _ := events[0].(map[string]any)
+	eventFields, _ := event["fields"].(map[string]any)
+	keyValue := snapshotChildFields(eventFields, "kv")
+	header := snapshotChildFields(response, "header")
+	startRevision, startOK := create["startRevision"].(string)
+	modRevision, modOK := keyValue["modRevision"].(string)
+	headerRevision, headerOK := header["revision"].(string)
+	matchingRevisions := startOK && modOK && headerOK && startRevision == modRevision && modRevision == headerRevision
+	expectedValue := keyValue["value"] == "YWZ0ZXItd2F0Y2gtcmV2aXNpb24="
+	return matchingRevisions && expectedValue
+}
+
+func assertCompactionEvidence(t *testing.T, records []trace.Record) {
+	t.Helper()
+	for _, record := range records {
+		if record.CaseID == "C06" && record.Error != nil && record.Error.GRPCCode == "OutOfRange" && record.Error.SemanticKind == "etcd/Compacted" {
+			return
+		}
+	}
+	requireNativeEvidence(t, "compacted revision error", false)
+}
+
+func requireNativeEvidence(t *testing.T, name string, passed bool) {
+	t.Helper()
+	if !passed {
+		t.Errorf("native trace is missing %s evidence", name)
 	}
 }
 

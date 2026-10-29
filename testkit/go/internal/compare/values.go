@@ -8,67 +8,82 @@ import (
 	"strings"
 )
 
-func normalizeValue(value any, method string, baseRevision int64, ids map[string]map[string]string, sequences map[string]uint64) (any, error) {
+func (normalizer *traceNormalizer) value(value any, method string) (any, error) {
 	switch typed := value.(type) {
 	case map[string]any:
-		keys := make([]string, 0, len(typed))
-		for key := range typed {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		result := make(map[string]any, len(typed))
-		for _, key := range keys {
-			child := typed[key]
-			if isRevisionField(key) {
-				revision, err := parseRevision(child)
-				if err != nil {
-					return nil, fmt.Errorf("invalid revision field: %w", err)
-				}
-				if revision > 0 {
-					result[key] = "relative:" + strconv.FormatInt(revision-baseRevision, 10)
-				} else {
-					result[key] = strconv.FormatInt(revision, 10)
-				}
-				continue
-			}
-			if domain := identityDomain(method, key); domain != "" {
-				id, err := parseID(child, domain)
-				if err != nil {
-					return nil, fmt.Errorf("invalid identity field: %w", err)
-				}
-				if id == "0" {
-					result[key] = id
-					continue
-				}
-				canonical, ok := ids[domain][id]
-				if !ok {
-					sequences[domain]++
-					canonical = fmt.Sprintf("%s:%d", domain, sequences[domain])
-					ids[domain][id] = canonical
-				}
-				result[key] = canonical
-				continue
-			}
-			normalized, err := normalizeValue(child, method, baseRevision, ids, sequences)
-			if err != nil {
-				return nil, err
-			}
-			result[key] = normalized
-		}
-		return result, nil
+		return normalizer.object(typed, method)
 	case []any:
-		result := make([]any, len(typed))
-		for index, child := range typed {
-			normalized, err := normalizeValue(child, method, baseRevision, ids, sequences)
-			if err != nil {
-				return nil, err
-			}
-			result[index] = normalized
-		}
-		return result, nil
+		return normalizer.array(typed, method)
 	default:
 		return value, nil
 	}
+}
+
+func (normalizer *traceNormalizer) object(fields map[string]any, method string) (map[string]any, error) {
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make(map[string]any, len(fields))
+	for _, key := range keys {
+		converted, err := normalizer.field(key, fields[key], method)
+		if err != nil {
+			return nil, err
+		}
+		result[key] = converted
+	}
+	return result, nil
+}
+
+func (normalizer *traceNormalizer) field(key string, value any, method string) (any, error) {
+	if isRevisionField(key) {
+		return normalizer.revision(value)
+	}
+	if domain := identityDomain(method, key); domain != "" {
+		return normalizer.identity(value, domain)
+	}
+	return normalizer.value(value, method)
+}
+
+func (normalizer *traceNormalizer) revision(value any) (string, error) {
+	revision, err := parseRevision(value)
+	if err != nil {
+		return "", fmt.Errorf("invalid revision field: %w", err)
+	}
+	if revision > 0 {
+		return "relative:" + strconv.FormatInt(revision-normalizer.baseRevision, 10), nil
+	}
+	return strconv.FormatInt(revision, 10), nil
+}
+
+func (normalizer *traceNormalizer) identity(value any, domain string) (string, error) {
+	id, err := parseID(value, domain)
+	if err != nil {
+		return "", fmt.Errorf("invalid identity field: %w", err)
+	}
+	if id == "0" {
+		return id, nil
+	}
+	if canonical, ok := normalizer.identities[domain][id]; ok {
+		return canonical, nil
+	}
+	normalizer.identitySequences[domain]++
+	canonical := fmt.Sprintf("%s:%d", domain, normalizer.identitySequences[domain])
+	normalizer.identities[domain][id] = canonical
+	return canonical, nil
+}
+
+func (normalizer *traceNormalizer) array(values []any, method string) ([]any, error) {
+	result := make([]any, len(values))
+	for index, child := range values {
+		converted, err := normalizer.value(child, method)
+		if err != nil {
+			return nil, err
+		}
+		result[index] = converted
+	}
+	return result, nil
 }
 
 func isRevisionField(key string) bool {

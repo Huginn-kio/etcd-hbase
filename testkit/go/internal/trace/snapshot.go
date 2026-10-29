@@ -60,67 +60,93 @@ func snapshotMessage(value reflect.Value, authContext bool) (messageSnapshot, er
 	snapshot := messageSnapshot{Fields: make(map[string]any), Oneofs: make(map[string]string)}
 	typeOf := value.Type()
 	for index := 0; index < value.NumField(); index++ {
-		field := typeOf.Field(index)
-		fieldValue := value.Field(index)
-		if field.Name == "XXX_unrecognized" {
-			if fieldValue.Len() != 0 {
-				return messageSnapshot{}, fmt.Errorf("unknown protobuf fields in %s cannot be represented losslessly", typeOf.Name())
-			}
-			continue
+		if err := snapshot.messageField(typeOf.Field(index), value.Field(index), typeOf.Name(), authContext); err != nil {
+			return messageSnapshot{}, err
 		}
-		oneofName := field.Tag.Get("protobuf_oneof")
-		if oneofName != "" {
-			if fieldValue.IsNil() {
-				continue
-			}
-			wrapper := indirect(fieldValue)
-			if !wrapper.IsValid() || wrapper.Kind() != reflect.Struct {
-				return messageSnapshot{}, fmt.Errorf("invalid oneof wrapper %s.%s", typeOf.Name(), field.Name)
-			}
-			for childIndex := 0; childIndex < wrapper.NumField(); childIndex++ {
-				child := wrapper.Type().Field(childIndex)
-				wireKind, protoName, jsonName := parseProtoTag(child.Tag.Get("protobuf"))
-				if protoName == "" {
-					continue
-				}
-				if isSensitiveName(protoName) || (authContext && containsName(protoName)) {
-					snapshot.Fields[protoName+"_present"] = fieldPresent(wrapper.Field(childIndex))
-					continue
-				}
-				converted, err := snapshotValue(wrapper.Field(childIndex), wireKind, authContext)
-				if err != nil {
-					return messageSnapshot{}, fmt.Errorf("snapshot %s.%s: %w", typeOf.Name(), protoName, err)
-				}
-				snapshot.Fields[jsonName] = converted
-				snapshot.Oneofs[oneofName] = protoName
-			}
-			continue
-		}
-		wireKind, protoName, jsonName := parseProtoTag(field.Tag.Get("protobuf"))
-		if protoName == "" || !fieldValue.CanInterface() {
-			continue
-		}
-		if authContext && containsName(protoName) {
-			if fieldValue.Kind() == reflect.Slice {
-				snapshot.Fields[jsonName+"_count"] = fieldValue.Len()
-			} else {
-				snapshot.Fields[jsonName+"_present"] = fieldPresent(fieldValue)
-			}
-			continue
-		}
-		if isSensitiveName(protoName) {
-			if authContext {
-				snapshot.Fields[jsonName+"_present"] = fieldPresent(fieldValue)
-			}
-			continue
-		}
-		converted, err := snapshotValue(fieldValue, wireKind, authContext)
-		if err != nil {
-			return messageSnapshot{}, fmt.Errorf("snapshot %s.%s: %w", typeOf.Name(), protoName, err)
-		}
-		snapshot.Fields[jsonName] = converted
 	}
 	return snapshot, nil
+}
+
+func (snapshot *messageSnapshot) messageField(field reflect.StructField, value reflect.Value, messageName string, authContext bool) error {
+	if field.Name == "XXX_unrecognized" {
+		if value.Len() != 0 {
+			return fmt.Errorf("unknown protobuf fields in %s cannot be represented losslessly", messageName)
+		}
+		return nil
+	}
+	if oneofName := field.Tag.Get("protobuf_oneof"); oneofName != "" {
+		return snapshot.oneofFields(value, oneofName, messageName, field.Name, authContext)
+	}
+	return snapshot.ordinaryField(field, value, messageName, authContext)
+}
+
+func (snapshot *messageSnapshot) ordinaryField(field reflect.StructField, value reflect.Value, messageName string, authContext bool) error {
+	wireKind, protoName, jsonName := parseProtoTag(field.Tag.Get("protobuf"))
+	if protoName == "" || !value.CanInterface() {
+		return nil
+	}
+	if snapshot.redactOrdinaryField(value, protoName, jsonName, authContext) {
+		return nil
+	}
+	converted, err := snapshotValue(value, wireKind, authContext)
+	if err != nil {
+		return fmt.Errorf("snapshot %s.%s: %w", messageName, protoName, err)
+	}
+	snapshot.Fields[jsonName] = converted
+	return nil
+}
+
+func (snapshot *messageSnapshot) redactOrdinaryField(value reflect.Value, protoName, jsonName string, authContext bool) bool {
+	if authContext && containsName(protoName) {
+		if value.Kind() == reflect.Slice {
+			snapshot.Fields[jsonName+"_count"] = value.Len()
+		} else {
+			snapshot.Fields[jsonName+"_present"] = fieldPresent(value)
+		}
+		return true
+	}
+	if !isSensitiveName(protoName) {
+		return false
+	}
+	if authContext {
+		snapshot.Fields[jsonName+"_present"] = fieldPresent(value)
+	}
+	return true
+}
+
+func (snapshot *messageSnapshot) oneofFields(value reflect.Value, oneofName, messageName, fieldName string, authContext bool) error {
+	if value.IsNil() {
+		return nil
+	}
+	wrapper := indirect(value)
+	if !wrapper.IsValid() || wrapper.Kind() != reflect.Struct {
+		return fmt.Errorf("invalid oneof wrapper %s.%s", messageName, fieldName)
+	}
+	for index := 0; index < wrapper.NumField(); index++ {
+		if err := snapshot.oneofField(wrapper.Type().Field(index), wrapper.Field(index), oneofName, messageName, authContext); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (snapshot *messageSnapshot) oneofField(field reflect.StructField, value reflect.Value, oneofName, messageName string, authContext bool) error {
+	wireKind, protoName, jsonName := parseProtoTag(field.Tag.Get("protobuf"))
+	if protoName == "" {
+		return nil
+	}
+	// Oneof redaction retains the existing proto-name presence representation.
+	if isSensitiveName(protoName) || (authContext && containsName(protoName)) {
+		snapshot.Fields[protoName+"_present"] = fieldPresent(value)
+		return nil
+	}
+	converted, err := snapshotValue(value, wireKind, authContext)
+	if err != nil {
+		return fmt.Errorf("snapshot %s.%s: %w", messageName, protoName, err)
+	}
+	snapshot.Fields[jsonName] = converted
+	snapshot.Oneofs[oneofName] = protoName
+	return nil
 }
 
 func snapshotValue(value reflect.Value, wireKind string, authContext bool) (any, error) {
@@ -149,6 +175,10 @@ func snapshotValue(value reflect.Value, wireKind string, authContext bool) (any,
 			return snapshotMessage(value, authContext)
 		}
 	}
+	return snapshotFieldValue(value, wireKind, authContext)
+}
+
+func snapshotFieldValue(value reflect.Value, wireKind string, authContext bool) (any, error) {
 	switch value.Kind() {
 	case reflect.Bool:
 		return value.Bool(), nil
@@ -164,56 +194,72 @@ func snapshotValue(value reflect.Value, wireKind string, authContext bool) (any,
 		}
 		return value.Uint(), nil
 	case reflect.Float32, reflect.Float64:
-		floatValue := value.Float()
-		if math.IsNaN(floatValue) || math.IsInf(floatValue, 0) {
-			return strconv.FormatFloat(floatValue, 'g', -1, value.Type().Bits()), nil
-		}
-		return floatValue, nil
+		return snapshotFloat(value), nil
 	case reflect.String:
 		if !utf8.ValidString(value.String()) {
 			return nil, errors.New("protobuf string is not valid UTF-8")
 		}
 		return value.String(), nil
 	case reflect.Slice:
-		if value.Type().Elem().Kind() == reflect.Uint8 {
-			return base64.StdEncoding.EncodeToString(value.Bytes()), nil
-		}
-		items := make([]any, value.Len())
-		for index := 0; index < value.Len(); index++ {
-			converted, err := snapshotValue(value.Index(index), wireKind, authContext)
-			if err != nil {
-				return nil, fmt.Errorf("element %d: %w", index, err)
-			}
-			items[index] = converted
-		}
-		return items, nil
+		return snapshotSlice(value, wireKind, authContext)
 	case reflect.Array:
-		items := make([]any, value.Len())
-		for index := 0; index < value.Len(); index++ {
-			converted, err := snapshotValue(value.Index(index), wireKind, authContext)
-			if err != nil {
-				return nil, err
-			}
-			items[index] = converted
-		}
-		return items, nil
+		return snapshotArray(value, wireKind, authContext)
 	case reflect.Map:
-		result := make(map[string]any, value.Len())
-		iterator := value.MapRange()
-		for iterator.Next() {
-			key := fmt.Sprint(iterator.Key().Interface())
-			converted, err := snapshotValue(iterator.Value(), wireKind, authContext)
-			if err != nil {
-				return nil, fmt.Errorf("map value %q: %w", key, err)
-			}
-			result[key] = converted
-		}
-		return result, nil
+		return snapshotMap(value, wireKind, authContext)
 	case reflect.Struct:
 		return snapshotMessage(value, authContext)
 	default:
 		return nil, fmt.Errorf("unsupported generated field kind %s", value.Kind())
 	}
+}
+
+func snapshotFloat(value reflect.Value) any {
+	floatValue := value.Float()
+	if math.IsNaN(floatValue) || math.IsInf(floatValue, 0) {
+		return strconv.FormatFloat(floatValue, 'g', -1, value.Type().Bits())
+	}
+	return floatValue
+}
+
+func snapshotSlice(value reflect.Value, wireKind string, authContext bool) (any, error) {
+	if value.Type().Elem().Kind() == reflect.Uint8 {
+		return base64.StdEncoding.EncodeToString(value.Bytes()), nil
+	}
+	items := make([]any, value.Len())
+	for index := 0; index < value.Len(); index++ {
+		converted, err := snapshotValue(value.Index(index), wireKind, authContext)
+		if err != nil {
+			return nil, fmt.Errorf("element %d: %w", index, err)
+		}
+		items[index] = converted
+	}
+	return items, nil
+}
+
+func snapshotArray(value reflect.Value, wireKind string, authContext bool) (any, error) {
+	items := make([]any, value.Len())
+	for index := 0; index < value.Len(); index++ {
+		converted, err := snapshotValue(value.Index(index), wireKind, authContext)
+		if err != nil {
+			return nil, err
+		}
+		items[index] = converted
+	}
+	return items, nil
+}
+
+func snapshotMap(value reflect.Value, wireKind string, authContext bool) (any, error) {
+	result := make(map[string]any, value.Len())
+	iterator := value.MapRange()
+	for iterator.Next() {
+		key := fmt.Sprint(iterator.Key().Interface())
+		converted, err := snapshotValue(iterator.Value(), wireKind, authContext)
+		if err != nil {
+			return nil, fmt.Errorf("map value %q: %w", key, err)
+		}
+		result[key] = converted
+	}
+	return result, nil
 }
 
 func parseProtoTag(tag string) (wireKind, protoName, jsonName string) {

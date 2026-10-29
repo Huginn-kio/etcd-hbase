@@ -34,17 +34,7 @@ func findSecretKey(value any, authMethod bool) string {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, child := range typed {
-			normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", ""))
-			lowerKey := strings.ToLower(key)
-			if strings.HasSuffix(lowerKey, "_present") || strings.HasSuffix(key, "Present") {
-				if _, ok := child.(bool); !ok {
-					return key
-				}
-			} else if strings.HasSuffix(lowerKey, "_count") || (len(key) > len("count") && strings.HasSuffix(key, "Count")) {
-				if number, ok := child.(json.Number); !ok || !isNonNegativeInteger(number) {
-					return key
-				}
-			} else if isSensitiveName(normalized) || (authMethod && containsName(key)) {
+			if unsafeSnapshotField(key, child, authMethod) {
 				return key
 			}
 			if nested := findSecretKey(child, authMethod); nested != "" {
@@ -59,6 +49,19 @@ func findSecretKey(value any, authMethod bool) string {
 		}
 	}
 	return ""
+}
+
+func unsafeSnapshotField(key string, value any, authMethod bool) bool {
+	lowerKey := strings.ToLower(key)
+	if strings.HasSuffix(lowerKey, "_present") || strings.HasSuffix(key, "Present") {
+		_, ok := value.(bool)
+		return !ok
+	}
+	if strings.HasSuffix(lowerKey, "_count") || (len(key) > len("count") && strings.HasSuffix(key, "Count")) {
+		number, ok := value.(json.Number)
+		return !ok || !isNonNegativeInteger(number)
+	}
+	return isSensitiveName(key) || (authMethod && containsName(key))
 }
 
 func isNonNegativeInteger(number json.Number) bool {
