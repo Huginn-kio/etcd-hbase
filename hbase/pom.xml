@@ -10,6 +10,11 @@
   <artifactId>hbase</artifactId>
   <dependencies>
     <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>io.etcdhbase</groupId>
       <artifactId>core</artifactId>
       <version>${project.version}</version>
@@ -48,6 +53,34 @@
       <scope>test</scope>
     </dependency>
   </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>stage-hbase-server-protobuf</id>
+            <phase>process-test-resources</phase>
+            <goals><goal>copy</goal></goals>
+            <configuration>
+              <artifactItems>
+                <artifactItem>
+                  <groupId>com.google.protobuf</groupId>
+                  <artifactId>protobuf-java</artifactId>
+                  <version>2.5.0</version>
+                  <type>jar</type>
+                  <outputDirectory>${project.build.directory}/server-libs</outputDirectory>
+                  <destFileName>protobuf-java-server.jar</destFileName>
+                  <overWrite>true</overWrite>
+                </artifactItem>
+              </artifactItems>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
   <profiles>
     <profile>
       <id>j04-hbase-local</id>

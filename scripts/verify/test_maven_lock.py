@@ -83,6 +83,38 @@ class MavenLockTest(unittest.TestCase):
         with self.assertRaisesRegex(maven_lock.LockError, "libraries.javaxAnnotation"):
             maven_lock.validate_metadata(lock, ROOT / "pom.xml")
 
+    def test_isolated_server_and_test_logger_pins_and_digests_are_enforced(self) -> None:
+        for name in ("hbaseServerProtobuf", "slf4jTestLogger"):
+            lock = copy.deepcopy(self.lock)
+            coordinate = str(lock["libraries"][name]["coordinate"])
+            lock["libraries"][name]["coordinate"] = coordinate.rsplit(":", 1)[0] + ":0.0.0-review-mismatch"
+            with self.assertRaisesRegex(maven_lock.LockError, "libraries." + name):
+                maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+            artifact = next(item for item in maven_lock.collect_artifacts(self.lock)
+                            if item.coordinate == coordinate.rsplit(":", 1)[0])
+            with tempfile.TemporaryDirectory(prefix="j04-test-runtime-lock-") as directory:
+                path = Path(directory) / artifact.relative_path
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"tampered isolated test artifact")
+                with self.assertRaisesRegex(maven_lock.LockError, "SHA-256 mismatch"):
+                    maven_lock.verify_artifacts([artifact], Path(directory), require_all=True)
+
+    def test_server_protobuf_copy_cannot_move_to_application_compile(self) -> None:
+        self.assert_pom_override_rejected("hbase/pom.xml", """
+  <build><plugins><plugin>
+    <groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId>
+    <executions><execution><id>stage-hbase-server-protobuf</id><phase>compile</phase>
+      <goals><goal>copy</goal></goals>
+    </execution></executions>
+  </plugin></plugins></build>
+""", "libraries.hbaseServerProtobuf must be staged only for tests")
+
+    def test_isolated_server_runtime_cannot_be_removed_from_the_lock(self) -> None:
+        lock = copy.deepcopy(self.lock)
+        del lock["libraries"]["hbaseServerProtobuf"]
+        with self.assertRaisesRegex(maven_lock.LockError, "libraries.hbaseServerProtobuf is required"):
+            maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+
     def test_javax_annotation_digest_is_included_in_artifact_verification(self) -> None:
         lock = copy.deepcopy(self.lock)
         lock["libraries"]["javaxAnnotation"]["sha256"] = "0" * 64

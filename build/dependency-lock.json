@@ -225,6 +225,18 @@
       "repository": "https://repo.maven.apache.org/maven2",
       "sha256": "09a0c44d7ab947cfab98bdab49ffd5cbc2b82e589afca164f1af1d07a84c8eaa",
       "reason": "J04 public-local probe with an isolated temporary HBase cluster; not target authentication evidence."
+    },
+    "slf4jTestLogger": {
+      "coordinate": "org.slf4j:slf4j-simple:2.0.20",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "8e701404786a4f87219d39d4853c86dfe4e86ae99376a39749df6c08e75022e0",
+      "reason": "Test-only logging for real secure HBase server authentication and ACL diagnostics."
+    },
+    "hbaseServerProtobuf": {
+      "coordinate": "com.google.protobuf:protobuf-java:2.5.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "e0c1c64575c005601725e7c6a02cebf9e1285e888f756b2a1d73ffa8d725cc74",
+      "reason": "Isolated unshaded HBase test server ABI only; never added to the application classpath."
     }
   },
   "nativeTools": {

@@ -26,10 +26,12 @@ SUPPORTED_LIBRARY_ENTRIES = {
     "hadoopMiniKdc",
     "hbase",
     "hbaseTestingUtil",
+    "hbaseServerProtobuf",
     "jackson",
     "javaxAnnotation",
     "protobuf",
     "slf4j",
+    "slf4jTestLogger",
     "snakeYaml",
     "tests",
 }
@@ -237,7 +239,7 @@ def collect_artifacts(lock: dict[str, object]) -> list[Artifact]:
 
     libraries = lock.get("libraries", {})
     if isinstance(libraries, dict):
-        for name in ("hbase", "hbaseTestingUtil", "hadoop", "hadoopMiniKdc", "guava", "slf4j", "snakeYaml", "javaxAnnotation"):
+        for name in ("hbase", "hbaseTestingUtil", "hbaseServerProtobuf", "hadoop", "hadoopMiniKdc", "guava", "slf4j", "slf4jTestLogger", "snakeYaml", "javaxAnnotation"):
             record = libraries.get(name)
             if isinstance(record, dict):
                 add_artifact(artifacts, str(record.get("coordinate", "")), record.get("sha256"))
@@ -357,10 +359,37 @@ def validate_metadata(lock: dict[str, object], root_pom: Path) -> int:
             if any(actual_version != version for actual_version in versions):
                 errors.append(f"{label} has a module override for managed version {version}: {versions}")
 
-    for name in ("hbase", "hbaseTestingUtil", "hadoop", "hadoopMiniKdc", "guava", "slf4j", "snakeYaml", "javaxAnnotation"):
+    for name in ("hbase", "hbaseTestingUtil", "hadoop", "hadoopMiniKdc", "guava", "slf4j", "slf4jTestLogger", "snakeYaml", "javaxAnnotation"):
         record = libraries.get(name)
         if isinstance(record, dict) and record.get("coordinate"):
             require_managed(str(record["coordinate"]), f"libraries.{name}")
+
+    # The unshaded test server requires a legacy protobuf ABI, outside the application dependency graph.
+    server_protobuf = libraries.get("hbaseServerProtobuf")
+    if not isinstance(server_protobuf, dict):
+        errors.append("libraries.hbaseServerProtobuf is required for the isolated test runtime")
+    else:
+        module = ET.parse(root_pom.parent / "hbase" / "pom.xml").getroot()
+        copies = []
+        for plugin in module.findall("m:build/m:plugins/m:plugin", NS):
+            if text(plugin.find("m:artifactId", NS)) != "maven-dependency-plugin":
+                continue
+            for execution in plugin.findall("m:executions/m:execution", NS):
+                if text(execution.find("m:id", NS)) != "stage-hbase-server-protobuf":
+                    continue
+                if (text(execution.find("m:phase", NS)) != "process-test-resources"
+                        or [text(goal) for goal in execution.findall("m:goals/m:goal", NS)] != ["copy"]):
+                    errors.append("libraries.hbaseServerProtobuf must be staged only for tests")
+                copies.extend(execution.findall("m:configuration/m:artifactItems/m:artifactItem", NS))
+        if len(copies) != 1:
+            errors.append("libraries.hbaseServerProtobuf requires one isolated test-server artifact")
+        else:
+            item = copies[0]
+            coordinate = ":".join(text(item.find("m:" + name, NS)) or "" for name in ("groupId", "artifactId", "version"))
+            if (coordinate != server_protobuf.get("coordinate")
+                    or text(item.find("m:outputDirectory", NS)) != "${project.build.directory}/server-libs"
+                    or text(item.find("m:destFileName", NS)) != "protobuf-java-server.jar"):
+                errors.append("libraries.hbaseServerProtobuf differs from its isolated Maven copy")
 
     grpc = libraries.get("grpc")
     grpc_version = None

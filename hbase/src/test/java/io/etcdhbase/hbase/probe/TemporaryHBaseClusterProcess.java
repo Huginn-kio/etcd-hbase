@@ -237,6 +237,14 @@ public final class TemporaryHBaseClusterProcess implements AutoCloseable {
       if (process.isAlive()) {
         process.destroyForcibly();
       }
+      if (Files.isRegularFile(logFile)) {
+        Path diagnostics = directory.getParent().resolve("failsafe-reports");
+        Files.createDirectories(diagnostics);
+        Files.copy(
+            logFile,
+            diagnostics.resolve(directory.getFileName() + ".log"),
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+      }
       try (var paths = Files.walk(directory)) {
         for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
           Files.deleteIfExists(path);
@@ -256,16 +264,33 @@ public final class TemporaryHBaseClusterProcess implements AutoCloseable {
     }
   }
 
-  private static String unshadedServerClasspath() {
+  private static String unshadedServerClasspath() throws Exception {
     String[] entries = System.getProperty("java.class.path", "").split(java.io.File.pathSeparator);
     List<String> isolated = new ArrayList<>(entries.length);
     for (String entry : entries) {
       Path path = Path.of(entry);
       String name = path.getFileName() == null ? "" : path.getFileName().toString();
-      if (!name.startsWith("hbase-shaded-client-byo-hadoop-")) {
+      if (!name.startsWith("hbase-shaded-client-byo-hadoop-")
+          && !name.startsWith("protobuf-java-")) {
         isolated.add(entry);
       }
     }
+    Path testClasses =
+        Path.of(
+            TemporaryHBaseClusterProcess.class
+                .getProtectionDomain()
+                .getCodeSource()
+                .getLocation()
+                .toURI());
+    Path legacyProtobuf =
+        testClasses.resolveSibling("server-libs").resolve("protobuf-java-server.jar");
+    if (!Files.isRegularFile(legacyProtobuf)) {
+      throw new IOException(
+          "isolated HBase server protobuf is missing; run the Maven test lifecycle");
+    }
+    // Only the disposable unshaded server needs the legacy ABI. The application keeps its proto
+    // BOM.
+    isolated.add(legacyProtobuf.toAbsolutePath().toString());
     return String.join(java.io.File.pathSeparator, isolated);
   }
 
