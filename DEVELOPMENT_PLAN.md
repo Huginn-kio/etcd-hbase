@@ -527,7 +527,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J04.1** 确认实际认证机制与 BackendIdentityProvider/HBase 连接适配边界，记录跨副本与后台身份所需输入。
     - [ ] **J04.2** 完成基础连接及 Get/Put/CAS/Scan，记录身份隔离、认证失败、超时和关闭行为。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=待验证（本轮先临时环境）；负责人=Codex；完成日期=—；PR/commit=[PR #8](https://github.com/Reidddddd/etcd-hbase/pull/8)；验证入口=scripts/verify/hbase-probe.sh --profile public-local（54 项，0 失败/错误/跳过）；范围=[后端接入说明](docs/hbase/j04-backend-access.md)；评审人/结论=待评审；统一入口覆盖 SIMPLE 开发路径、Kerberos（密码/keytab/票据缓存）、标准 delegation token、账号密码 DIGEST 及自定义 SASL/provider；公开 fixture 与目标验证分别记录，目标身份、权限及 TLS 尚未验证。
+  - 跟踪：状态=待验证（本轮先临时环境）；负责人=Codex；完成日期=—；PR/commit=[PR #8](https://github.com/Reidddddd/etcd-hbase/pull/8)；验证入口=scripts/verify/hbase-probe.sh --profile public-local（42 项，0 失败/错误/跳过）；范围=[后端接入说明](docs/hbase/j04-backend-access.md)；评审人/结论=待评审；统一入口覆盖 SIMPLE 开发路径、Kerberos（密码/keytab/票据缓存）、标准 delegation token、账号密码 DIGEST 及自定义 SASL/provider；公开 fixture 与目标验证分别记录，目标身份、权限及 TLS 尚未验证。
 
 - [ ] **J05｜盐 profile、候选表配置与初始化 CLI 原型**
   - 依赖：B01 的编码输入；候选表配置不等待完整 B05 负载目标。

@@ -47,7 +47,7 @@ Keytab/票据缓存是服务端受控身份来源，不能把“客户端提交�
 
 凭据在异步返回前复制，受长度约束并在使用后清零；后端密码不放入 `Configuration` 或 String。token 解码在分配数组及调用 HBase identifier decoder 前核对输入长度，验证 owner、kind、cluster 和有效期；服务器仍负责验证真实 token。凭据不进入 SPI 身份 handle、日志、异常公开消息或 etcd token。
 
-`HBaseFailures` 区分认证、权限、超时、取消、资源容量、不可用和未知失败。原有 `OfficialHBaseConnectionFactory` 保留独立的有界连接缓存契约，适用于已验证身份；`DevelopmentIdentityProvider` 的 synthetic identity 仅用于显式开发无认证路径。
+`HBaseFailures` 区分认证、权限、超时、取消、资源容量、不可用和未知失败。连接和身份上下文统一由 `HBaseBackendIdentityProvider` 持有；生产适配与临时探针使用同一套容量、超时、签发身份和关闭机制。开发模式只通过显式 `simpleDevelopment` 适配器进入统一路径。
 
 ## 4. 验证入口与证据
 

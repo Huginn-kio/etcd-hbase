@@ -5,11 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.etcdhbase.hbase.connection.OfficialHBaseConnectionFactory;
-import io.etcdhbase.hbase.identity.DevelopmentIdentityProvider;
 import io.etcdhbase.hbase.identity.HBaseAuthenticators;
 import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.spi.identity.AuthenticationScope;
@@ -27,7 +24,6 @@ import org.apache.hadoop.hbase.client.AsyncAdmin;
 import org.apache.hadoop.hbase.client.AsyncConnection;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.Durability;
-import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,8 +34,7 @@ class LocalHBaseProbeIT {
   private static final String PROFILE_ID = "local-hbase";
   private static final String TABLE_GROUP_ID = "local";
 
-  private final DevelopmentIdentityProvider identityProvider = new DevelopmentIdentityProvider();
-  private final List<OfficialHBaseConnectionFactory> connectionFactories = new ArrayList<>();
+  private final List<HBaseBackendIdentityProvider> providers = new ArrayList<>();
   private TemporaryHBaseClusterProcess cluster;
   private Configuration clientConfiguration;
   private String namespace;
@@ -82,8 +77,7 @@ class LocalHBaseProbeIT {
       }
     }
 
-    List<AutoCloseable> resources = new ArrayList<>(connectionFactories);
-    resources.add(identityProvider);
+    List<AutoCloseable> resources = new ArrayList<>(providers);
     if (cluster != null) {
       resources.add(cluster);
     }
@@ -106,8 +100,12 @@ class LocalHBaseProbeIT {
   @Test
   void verifiesRawBytesCasScanIndependentReadAndConnectionRecreation() throws Exception {
     String runId = namespace.substring("etcd_hbase_m0_".length());
-    OfficialHBaseConnectionFactory serviceFactory = newConnectionFactory();
-    AsyncConnection serviceConnection = openConnection(serviceFactory);
+    HBaseBackendIdentityProvider serviceProvider = newProvider(2);
+    AuthorizedBackendIdentity alice = authenticate(serviceProvider, "alice");
+    AsyncConnection serviceConnection =
+        await(serviceProvider.connectionFor(alice).toCompletableFuture());
+    assertSame(
+        serviceConnection, await(serviceProvider.connectionFor(alice).toCompletableFuture()));
     AsyncAdmin admin = serviceConnection.getAdmin();
     await(admin.createNamespace(NamespaceDescriptor.create(namespace).build()));
     await(
@@ -121,54 +119,12 @@ class LocalHBaseProbeIT {
         "hbase-probe resource namespace=%s table=%s family=d auth=development-no-auth%n",
         namespace, tableName);
 
-    // Exercise the unified provider against a real backend. SIMPLE provides no user proof; this
-    // explicit development-only verifier establishes reachability, not a target ACL assertion.
-    BackendProbe.ProbeResult result;
-    try (var provider =
-        new HBaseBackendIdentityProvider(
-            "local-unified",
-            new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID),
-            clientConfiguration,
-            HBaseAuthenticators.simpleDevelopment(),
-            (connection, scope) ->
-                connection
-                    .getTable(tableName)
-                    .get(new Get(new byte[] {1}))
-                    .thenApply(ignored -> null),
-            2,
-            2,
-            Duration.ofSeconds(30))) {
-      AuthorizedBackendIdentity alice;
-      AuthorizedBackendIdentity bob;
-      try (var first = new BackendCredentials("alice", new char[0]);
-          var second = new BackendCredentials("bob", new char[0]);
-          var invalid = new BackendCredentials("alice", new char[] {'x'})) {
-        assertThrows(
-            java.util.concurrent.ExecutionException.class,
-            () ->
-                provider
-                    .authenticate(invalid, new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID))
-                    .toCompletableFuture()
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
-        alice =
-            provider
-                .authenticate(first, new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID))
-                .toCompletableFuture()
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        bob =
-            provider
-                .authenticate(second, new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID))
-                .toCompletableFuture()
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-      }
-      assertNotEquals(alice.contextRef(), bob.contextRef());
-      var aliceConnection = provider.connectionFor(alice).toCompletableFuture().get();
-      assertSame(aliceConnection, provider.connectionFor(alice).toCompletableFuture().get());
-      var bobConnection = provider.connectionFor(bob).toCompletableFuture().get();
-      assertNotSame(aliceConnection, bobConnection);
-      result = BackendProbe.execute(aliceConnection, tableName, runId);
-      BackendProbe.verifyPersistedValue(bobConnection, tableName, runId);
-    }
+    AuthorizedBackendIdentity bob = authenticate(serviceProvider, "bob");
+    assertNotEquals(alice.contextRef(), bob.contextRef());
+    AsyncConnection bobConnection = await(serviceProvider.connectionFor(bob).toCompletableFuture());
+    assertNotSame(serviceConnection, bobConnection);
+    BackendProbe.ProbeResult result = BackendProbe.execute(serviceConnection, tableName, runId);
+    BackendProbe.verifyPersistedValue(bobConnection, tableName, runId);
 
     assertTrue(result.rawBytesRoundTrip());
     assertTrue(result.compareAndMutateSucceeded());
@@ -177,52 +133,67 @@ class LocalHBaseProbeIT {
     // A second run in the same table must neither scan nor mutate the first run's rows.
     assertEquals(2, BackendProbe.execute(serviceConnection, tableName, runId + "b").scannedRows());
 
-    OfficialHBaseConnectionFactory independentFactory = newConnectionFactory();
-    BackendProbe.verifyPersistedValue(openConnection(independentFactory), tableName, runId);
-    independentFactory.close();
+    HBaseBackendIdentityProvider independentProvider = newProvider(1);
+    AsyncConnection independentConnection = openConnection(independentProvider);
+    BackendProbe.verifyPersistedValue(independentConnection, tableName, runId);
+    independentProvider.close();
+    assertTrue(independentConnection.isClosed());
 
-    serviceFactory.close();
-    OfficialHBaseConnectionFactory restartedFactory = newConnectionFactory();
-    AsyncConnection restartedConnection = openConnection(restartedFactory);
+    serviceProvider.close();
+    assertTrue(serviceConnection.isClosed());
+    assertTrue(bobConnection.isClosed());
+    HBaseBackendIdentityProvider restartedProvider = newProvider(1);
+    AsyncConnection restartedConnection = openConnection(restartedProvider);
     BackendProbe.verifyPersistedValue(restartedConnection, tableName, runId);
     BackendProbe.cleanup(restartedConnection, tableName, runId + "b");
     // Removing one run's exact rows preserves the first run's value.
     BackendProbe.verifyPersistedValue(restartedConnection, tableName, runId);
-    restartedFactory.close();
+    restartedProvider.close();
     assertTrue(restartedConnection.isClosed());
 
     System.out.printf(
         "hbase-probe profile=public-local authentication=simple authorization=false"
             + " hbase.version=%s hbase.jvm=%s client.jvm=%s operations=put,get,cas,scan,delete"
             + " independentRead=true reconnectRead=true runIsolation=true tableDurability=SYNC_WAL"
-            + " mutationDurability=SYNC_WAL closed=true%n",
+            + " mutationDurability=SYNC_WAL connectionOwner=unified-provider closed=true%n",
         cluster.hbaseVersion(), cluster.jvmVersion(), Runtime.version());
   }
 
   private AsyncConnection openConnection() throws Exception {
-    return openConnection(newConnectionFactory());
+    return openConnection(newProvider(1));
   }
 
-  private AsyncConnection openConnection(OfficialHBaseConnectionFactory factory) throws Exception {
-    AuthorizedBackendIdentity identity;
-    try (BackendCredentials credentials = new BackendCredentials("m0-local-probe", new char[0])) {
-      identity =
-          identityProvider
+  private AsyncConnection openConnection(HBaseBackendIdentityProvider provider) throws Exception {
+    AuthorizedBackendIdentity identity = authenticate(provider, "m0-local-probe");
+    return await(provider.connectionFor(identity).toCompletableFuture());
+  }
+
+  private AuthorizedBackendIdentity authenticate(
+      HBaseBackendIdentityProvider provider, String principal) throws Exception {
+    try (var credentials = new BackendCredentials(principal, new char[0])) {
+      return await(
+          provider
               .authenticate(credentials, new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID))
-              .toCompletableFuture()
-              .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+              .toCompletableFuture());
     }
-    return factory
-        .connectionFor(identity)
-        .toCompletableFuture()
-        .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
   }
 
-  private OfficialHBaseConnectionFactory newConnectionFactory() {
-    OfficialHBaseConnectionFactory factory =
-        new OfficialHBaseConnectionFactory(clientConfiguration, PROFILE_ID, 1);
-    connectionFactories.add(factory);
-    return factory;
+  private HBaseBackendIdentityProvider newProvider(int maximumContexts) {
+    // SIMPLE has no ownership proof or ACL enforcement. This actual, non-mutating RPC verifies
+    // development reachability before namespace/table creation, never target authorization.
+    var provider =
+        new HBaseBackendIdentityProvider(
+            "local-unified",
+            new AuthenticationScope(TABLE_GROUP_ID, PROFILE_ID),
+            clientConfiguration,
+            HBaseAuthenticators.simpleDevelopment(),
+            (connection, scope) ->
+                connection.getAdmin().listNamespaces().thenApply(ignored -> null),
+            maximumContexts,
+            maximumContexts,
+            Duration.ofSeconds(30));
+    providers.add(provider);
+    return provider;
   }
 
   private static <T> T await(java.util.concurrent.CompletableFuture<T> future) throws Exception {
