@@ -2,7 +2,7 @@
 
 M0 当前提供配置校验、请求生命周期、协议骨架、HBase 基础接入和测试工具。生产 RPC 的业务 handler 返回 `UNIMPLEMENTED`。运行包的启动、错误互通与关闭证据不代表完整 KV、Txn、Watch、Lease 或 Auth 已实现，也不代表目标集群验收。
 
-## 公开完整验证
+## 1 公开完整验证
 
 需要 Python 3.11+ 和 POSIX 环境；公开 CI 使用 Ubuntu 24.04。使用 [锁定工具链](m0-toolchain.md) 配置 `ETCD_HBASE_JDK21_HOME` 后，在仓库根目录执行：
 
@@ -24,7 +24,7 @@ Maven SNAPSHOT 依赖安装到本工作树专用的 `.artifacts/m0/j09/maven-rep
 
 完整公开验证退出 `0`。本机 Docker CLI 或默认本地 daemon 不可用时，其他检查仍执行并记录镜像 `unavailable`，最终退出 `2`、状态 `partial`；失败检查退出非零。镜像配置文件存在或其他检查成功都不能代替实际镜像验证。J09 公开 CI 在 Ubuntu 上要求完整入口及索引复核均成功，不跳过镜像测试。
 
-## 运行包与镜像边界
+## 2 运行包与镜像边界
 
 每次运行的 `runtime/` 是可搬移运行目录。`etcd-hbase` 启动脚本保留 Maven runtime classpath 顺序；运行 JAR 必须与本轮构建的七个生产模块逐一匹配。`testkit`、test JAR、`target/classes`、旧 protobuf 2.5.0、同名碰撞或过期 SNAPSHOT 不能进入运行 classpath。
 
@@ -36,7 +36,7 @@ JAVA_HOME="$ETCD_HBASE_JDK21_HOME" .artifacts/m0/public/<run>/runtime/etcd-hbase
 
 镜像来源、tag、index/platform digest、平台与 JRE vendor/patch 记录于 [dependency-lock.json](../../build/dependency-lock.json)。Dockerfile 固定 `linux/amd64` 平台 manifest。镜像只复制已验证运行目录；基础镜像拉取需要访问公开 registry；`--network none` 限制构建容器的网络，不从镜像内执行 Maven 或下载项目依赖。测试容器使用 UID/GID 65532、只读根文件系统、有限 tmpfs/内存/进程数、无外部网络及 capabilities，测试结束在 30 秒总预算内删除本次 UUID 标记的资源；外层取消宽限为 45 秒，给内层 JVM/容器清理留出时间。镜像验证不执行 push 或部署。
 
-## 许可、发布与验收
+## 3 许可、发布与验收
 
 [release-decisions.json](../../build/release-decisions.json) 记录 I07/I08 的显式状态。当前项目许可证、完整第三方通知审阅、公开 artifact 坐标、发布位置与授权规则仍待维护者决定；本地 SNAPSHOT 不构成发布决定。`release-readiness.py --require-decisions` 在这些输入缺失时退出 `2`，普通检查只报告状态，不授权或执行发布。
 
