@@ -30,6 +30,36 @@ class RuntimeConfigurationSchemaTest {
     }
   }
 
+  @Test
+  void schemaDescribesTheSharedColumnFamilyAndCollectionBounds() throws IOException {
+    JsonNode schema =
+        JSON.readTree(
+            java.nio.file.Files.readAllBytes(
+                java.nio.file.Path.of("../config/schema/server.schema.json")));
+    JsonNode family = schema.path("$defs").path("ColumnFamilySchema").path("properties");
+    assertEquals(32, family.path("name").path("maxLength").intValue());
+    String pattern = family.path("name").path("pattern").textValue();
+    for (String invalid : List.of("2data", "data.column", "a".repeat(33))) {
+      assertTrue(!invalid.matches(pattern));
+    }
+    assertTrue("a".repeat(32).matches(pattern));
+    assertEquals(1024, family.path("max_versions").path("maximum").intValue());
+    assertEquals(1024, family.path("min_versions").path("maximum").intValue());
+    assertEquals(
+        Integer.MAX_VALUE - 1,
+        family.path("ttl_seconds").path("oneOf").path(1).path("maximum").intValue());
+    assertEquals(32, schema.path("properties").path("table_groups").path("maxItems").intValue());
+    assertEquals(
+        1024,
+        schema
+            .path("$defs")
+            .path("SaltProfile")
+            .path("properties")
+            .path("bucket_count")
+            .path("maximum")
+            .intValue());
+  }
+
   private static void assertRecordSchema(JsonNode root, JsonNode schemaNode, Class<?> recordType) {
     JsonNode resolved = resolve(root, schemaNode);
     assertEquals("object", resolved.path("type").asText(), recordType.getSimpleName());

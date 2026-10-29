@@ -89,36 +89,41 @@ public final class StrictConfigurationJson {
         throw new IllegalArgumentException(
             "required configuration property is missing or null: " + name);
       }
-      if (component.getType().isRecord()) {
-        requireProperties(value, component.getType());
-      } else {
-        Class<?> elementType = recordListElementType(component);
-        if (elementType != null) {
-          requireRecordArray(value, elementType, name);
-        }
-      }
+      Class<?> elementType = listElementType(component);
+      if (elementType == null) requireValue(value, component.getType());
+      else requireArray(value, elementType);
     }
   }
 
-  private static Class<?> recordListElementType(RecordComponent component) {
+  private static Class<?> listElementType(RecordComponent component) {
     if (List.class.isAssignableFrom(component.getType())
         && component.getGenericType() instanceof ParameterizedType listType
-        && listType.getActualTypeArguments()[0] instanceof Class<?> elementType
-        && elementType.isRecord()) {
+        && listType.getActualTypeArguments()[0] instanceof Class<?> elementType) {
       return elementType;
     }
     return null;
   }
 
-  private static void requireRecordArray(
-      JsonNode value, Class<?> elementType, String propertyName) {
-    if (!value.isArray()) {
-      throw new IllegalArgumentException(
-          "configuration collection must be an array: " + propertyName);
+  private static void requireArray(JsonNode value, Class<?> elementType) {
+    if (!value.isArray())
+      throw new IllegalArgumentException("configuration collection must be an array");
+    for (JsonNode item : value) requireValue(item, elementType);
+  }
+
+  private static void requireValue(JsonNode value, Class<?> type) {
+    if (value == null || value.isNull())
+      throw new IllegalArgumentException("configuration value must not be null");
+    if (type.isRecord()) {
+      requireProperties(value, type);
+      return;
     }
-    for (JsonNode item : value) {
-      requireProperties(item, elementType);
-    }
+    boolean textType = type == String.class || type.isEnum();
+    boolean integerType = type == int.class || type == long.class;
+    boolean matches =
+        (textType && value.isTextual())
+            || (integerType && value.isIntegralNumber())
+            || (type == boolean.class && value.isBoolean());
+    if (!matches) throw new IllegalArgumentException("configuration value has the wrong JSON type");
   }
 
   private static String snakeCase(String value) {

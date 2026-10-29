@@ -21,28 +21,32 @@
       "minItems": 1,
       "items": {
         "$ref": "#/$defs/Listener"
-      }
+      },
+      "maxItems": 64
     },
     "hbase_profiles": {
       "type": "array",
       "minItems": 1,
       "items": {
         "$ref": "#/$defs/HBaseProfile"
-      }
+      },
+      "maxItems": 32
     },
     "salt_profiles": {
       "type": "array",
       "minItems": 1,
       "items": {
         "$ref": "#/$defs/SaltProfile"
-      }
+      },
+      "maxItems": 32
     },
     "table_groups": {
       "type": "array",
       "minItems": 1,
       "items": {
         "$ref": "#/$defs/TableGroup"
-      }
+      },
+      "maxItems": 32
     },
     "resources": {
       "$ref": "#/$defs/ResourceBudgets"
@@ -180,7 +184,7 @@
         "bucket_count": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 2147483647
+          "maximum": 1024
         },
         "salt_width_bytes": {
           "type": "integer",
@@ -189,10 +193,12 @@
         },
         "split_keys_hex": {
           "type": "array",
-          "maxItems": 2147483646,
+          "maxItems": 1023,
           "items": {
             "type": "string",
-            "pattern": "^[A-Fa-f0-9]+$"
+            "minLength": 2,
+            "maxLength": 8,
+            "pattern": "^(?:[0-9a-fA-F]{2}){1,4}$"
           }
         }
       },
@@ -318,8 +324,8 @@
         "table_name": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 255,
-          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$"
         },
         "schema_version": {
           "type": "integer",
@@ -335,14 +341,17 @@
           "minItems": 1,
           "items": {
             "$ref": "#/$defs/ColumnFamilySchema"
-          }
+          },
+          "maxItems": 8
         },
         "split_keys_hex": {
           "type": "array",
-          "maxItems": 2147483646,
+          "maxItems": 1023,
           "items": {
             "type": "string",
-            "pattern": "^[A-Fa-f0-9]+$"
+            "minLength": 2,
+            "maxLength": 8,
+            "pattern": "^(?:[0-9a-fA-F]{2}){1,4}$"
           }
         },
         "record_categories": {
@@ -350,14 +359,17 @@
           "minItems": 1,
           "items": {
             "$ref": "#/$defs/RecordCategory"
-          }
+          },
+          "maxItems": 7,
+          "uniqueItems": true
         },
         "identity_permissions": {
           "type": "array",
           "minItems": 1,
           "items": {
             "$ref": "#/$defs/IdentityPermission"
-          }
+          },
+          "maxItems": 16
         }
       }
     },
@@ -401,7 +413,9 @@
           "minItems": 1,
           "items": {
             "$ref": "#/$defs/TablePermission"
-          }
+          },
+          "maxItems": 4,
+          "uniqueItems": true
         }
       }
     },
@@ -419,17 +433,18 @@
         "name": {
           "type": "string",
           "minLength": 1,
-          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+          "maxLength": 32,
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,31}$"
         },
         "min_versions": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 2147483647
+          "maximum": 1024
         },
         "max_versions": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 2147483647
+          "maximum": 1024
         },
         "ttl_seconds": {
           "type": "integer",
@@ -439,7 +454,7 @@
             },
             {
               "minimum": 1,
-              "maximum": 2147483647
+              "maximum": 2147483646
             }
           ]
         },

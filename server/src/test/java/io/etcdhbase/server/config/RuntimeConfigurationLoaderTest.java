@@ -60,6 +60,47 @@ class RuntimeConfigurationLoaderTest {
   }
 
   @Test
+  void rejectsNumericBooleanAndCollectionCoercionIntoStrings() throws Exception {
+    rejects(tree -> ((ObjectNode) tree.path("listeners").path(0)).put("id", 123));
+    rejects(tree -> ((ObjectNode) tree.path("listeners").path(0)).put("id", true));
+    rejects(tree -> ((ObjectNode) tree.path("hbase_profiles").path(0)).put("namespace", 123));
+    rejects(
+        tree ->
+            ((com.fasterxml.jackson.databind.node.ArrayNode)
+                    tree.path("salt_profiles").path(0).path("split_keys_hex"))
+                .set(0, mapper.getNodeFactory().numberNode(1)));
+    rejects(
+        tree ->
+            ((com.fasterxml.jackson.databind.node.ArrayNode)
+                    tree.path("table_groups")
+                        .path(0)
+                        .path("system_table")
+                        .path("record_categories"))
+                .set(0, mapper.getNodeFactory().numberNode(1)));
+  }
+
+  @Test
+  void enforcesSharedColumnFamilyBoundsAndAllowsTheirValidBoundary() throws Exception {
+    for (String name : new String[] {"2data", "data.column", "a".repeat(33)}) {
+      rejects(tree -> family(tree).put("name", name));
+    }
+    rejects(tree -> family(tree).put("max_versions", 1025));
+    rejects(tree -> family(tree).put("min_versions", -1));
+    rejects(tree -> family(tree).put("ttl_seconds", Integer.MAX_VALUE));
+    var tree = mapper.readTree(example());
+    family(tree)
+        .put("name", "a".repeat(32))
+        .put("max_versions", 1024)
+        .put("ttl_seconds", Integer.MAX_VALUE - 1);
+    load(mapper.writeValueAsBytes(tree));
+  }
+
+  private static ObjectNode family(JsonNode tree) {
+    return (ObjectNode)
+        tree.path("table_groups").path(0).path("system_table").path("column_families").path(0);
+  }
+
+  @Test
   void refusesInvalidBudgetsUnknownOverridesAndSensitiveEchoes() throws Exception {
     for (String field :
         new String[] {
