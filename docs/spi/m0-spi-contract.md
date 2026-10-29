@@ -51,4 +51,4 @@ python3 scripts/verify/m0-spi.py
 ETCD_HBASE_JDK21_HOME="$JAVA_HOME" python3 scripts/verify/m0-spi.py --jar spi/target/spi-0.1.0-SNAPSHOT.jar
 ```
 
-边界入口检查八模块 POM 与生产源码，拒绝 SPI 的非 test 依赖、反向项目依赖和传输/存储类型泄露；打包后另用锁定 JDK 的 `jdeps` 检查实际 SPI JAR 仅依赖公开 JDK 模块。静态检查、第三方夹具、J04 的真实临时 HBase 认证及目标环境验收分别报告。
+边界入口检查八模块 POM 与生产源码，拒绝 SPI 的非 test 依赖、反向项目依赖和传输/存储类型泄露；打包后另用锁定 JDK 的 `jdeps` 检查实际 SPI JAR 仅依赖公开 JDK 模块。常用 Maven group/parent group 表达式按当前工程组解析，其他未解析坐标明确失败，不把它们当成外部库绕过检查。静态检查、第三方夹具、J04 的真实临时 HBase 认证及目标环境验收分别报告。

@@ -65,6 +65,22 @@ class BoundaryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             boundary.verify(self.root)
 
+    def test_unused_backend_dependencies_cannot_enter_core_or_grpc(self):
+        self.inject_dependency("core", "org.apache.hbase", "hbase-client")
+        with self.assertRaises(ValueError):
+            boundary.verify(self.root)
+        shutil.copyfile(boundary.ROOT / "core/pom.xml", self.root / "core/pom.xml")
+        self.inject_dependency("grpc", "org.apache.hadoop", "hadoop-common")
+        with self.assertRaises(ValueError):
+            boundary.verify(self.root)
+
+    def test_group_property_aliases_cannot_bypass_project_boundaries(self):
+        for group in ("${project.groupId}", "${project.parent.groupId}", "${pom.parent.groupId}", "${unresolvedGroup}"):
+            shutil.copyfile(boundary.ROOT / "core/pom.xml", self.root / "core/pom.xml")
+            self.inject_dependency("core", group, "protocol")
+            with self.subTest(group=group), self.assertRaises(ValueError):
+                boundary.verify(self.root)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,7 @@ J08 基于当前八个 Maven 模块及 J04–J07 的真实使用核对依赖方�
 | `spi` | 无；生产仅 JDK | 盐策略、后端身份及不可变 DTO。 |
 | `core` | `spi` | `RequestScope`、`BackendFailure`；后续内部领域与存储 port 的归属。 |
 | `hbase` | `core`、`spi` | 统一身份适配、HBase 工厂、探针及请求资源桥接；HBase 类型只经专属 API 暴露。 |
-| `grpc` | `protocol`、`core` | 真实注册方法、Header/Error 投影、请求 deadline/取消和有限结果分类。 |
+| `grpc` | `protocol`、`core`、`spi` | 真实注册方法、Header/Error 投影、请求 deadline/取消和有限结果分类。 |
 | `admin` | `hbase`、`spi` | 初始化计划、确认/应用和原型 CLI；不承担提交恢复或业务 handler。 |
 | `server` | `grpc`、`core`、`admin` | 严格运行配置、监听绑定、进程生命周期和有限指标装配；间接使用 HBase/SPI。 |
 | `testkit` | `protocol`、`spi` | 外部扩展契约验证；Go 驱动、原生 etcd 对照与 Java 互通工具。它不进入生产服务依赖。 |

@@ -19,6 +19,11 @@ MODULES = {
     "server": {"protocol", "spi", "core", "hbase", "grpc", "admin"},
     "testkit": {"protocol", "spi"},
 }
+FORBIDDEN_DEPENDENCIES = {
+    "protocol": ("org.apache.hbase", "org.apache.hadoop"),
+    "core": ("org.apache.hbase", "org.apache.hadoop", "io.grpc", "com.google.protobuf"),
+    "grpc": ("org.apache.hbase", "org.apache.hadoop"),
+}
 FORBIDDEN = {
     "spi": re.compile(r"\b(?:org\.apache\.(?:hadoop|hbase)|io\.grpc|com\.google\.protobuf|io\.etcdhbase\.(?:core|server|grpc|hbase|admin))\b"),
     "core": re.compile(r"\b(?:org\.apache\.(?:hadoop|hbase)|io\.grpc|com\.google\.protobuf|io\.etcdhbase\.(?:server|grpc|hbase|admin))\b"),
@@ -32,19 +37,29 @@ def dependencies(pom):
     return pom.findall("m:dependencies/m:dependency", NS) + pom.findall("m:profiles/m:profile/m:dependencies/m:dependency", NS)
 
 
+def coordinate(value):
+    for expression in ("${project.groupId}", "${project.parent.groupId}", "${pom.groupId}", "${pom.parent.groupId}"):
+        value = value.replace(expression, PROJECT_GROUP)
+    if "${" in value or not value:
+        raise ValueError("unresolved production dependency coordinate")
+    return value
+
+
 def inspect_dependencies(module, pom):
     count = 0
     for dependency in dependencies(pom):
         scope = dependency.findtext("m:scope", "compile", NS).strip()
+        if scope not in {"compile", "test", "provided", "runtime", "system", "import"}:
+            raise ValueError("unresolved dependency scope")
         if scope == "test":
             continue
         count += 1
-        group = dependency.findtext("m:groupId", "", NS).strip()
-        artifact = dependency.findtext("m:artifactId", "", NS).strip()
-        if group == "${project.groupId}":
-            group = PROJECT_GROUP
+        group = coordinate(dependency.findtext("m:groupId", "", NS).strip())
+        artifact = coordinate(dependency.findtext("m:artifactId", "", NS).strip())
         if module == "spi":
             raise ValueError("SPI must not declare non-test dependencies")
+        if any(group == prefix or group.startswith(prefix + ".") for prefix in FORBIDDEN_DEPENDENCIES.get(module, ())):
+            raise ValueError(f"{module} has a forbidden backend or transport dependency")
         if group == PROJECT_GROUP and artifact not in MODULES[module]:
             raise ValueError(f"{module} has a reversed project dependency")
     return count
@@ -52,6 +67,8 @@ def inspect_dependencies(module, pom):
 
 def verify(root=ROOT):
     parent = ET.parse(root / "pom.xml").getroot()
+    if parent.findtext("m:groupId", "", NS) != PROJECT_GROUP:
+        raise ValueError("project group coordinates require an explicit boundary review")
     configured = [item.text for item in parent.findall("m:modules/m:module", NS)]
     if len(configured) != len(MODULES) or set(configured) != set(MODULES):
         raise ValueError("M0 module inventory differs")
@@ -61,6 +78,8 @@ def verify(root=ROOT):
     sources, dependency_count = 0, 0
     for module in configured:
         pom = ET.parse(root / module / "pom.xml").getroot()
+        if pom.findtext("m:parent/m:groupId", "", NS) != PROJECT_GROUP or pom.findtext("m:groupId", PROJECT_GROUP, NS) != PROJECT_GROUP:
+            raise ValueError("module group coordinates require an explicit boundary review")
         dependency_count += inspect_dependencies(module, pom)
         java = sorted((root / module / "src/main/java").rglob("*.java"))
         if module == "spi" and not java:
