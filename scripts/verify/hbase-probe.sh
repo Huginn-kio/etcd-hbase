@@ -79,6 +79,39 @@ integration = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.prob
 if not integration.is_file() or int(ET.parse(integration).getroot().attrib.get("tests", "0")) != 1:
     raise SystemExit("J04 real HBase integration test must execute exactly once")
 output = "\n".join(item.text or "" for item in ET.parse(integration).getroot().iter("system-out"))
+secure_integration = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.probe.SecureHBaseAuthenticationIT.xml"
+if not secure_integration.is_file():
+    raise SystemExit("J04 real secure HBase integration report is required")
+secure_suite = ET.parse(secure_integration).getroot()
+if int(secure_suite.attrib.get("tests", "0")) != 6:
+    raise SystemExit("J04 secure HBase must execute all six integration scenarios")
+secure_output = "\n".join(item.text or "" for item in secure_suite.iter("system-out"))
+mechanisms = dict(re.findall(
+    r"secure-hbase authentication=(\S+) observed=(\S+) operations=put,get,cas,scan independentRead=true permissions=read-write status=passed",
+    secure_output))
+expected_mechanisms = {
+    "kerberos-password": "KERBEROS", "kerberos-keytab": "KERBEROS",
+    "kerberos-ticket-cache": "KERBEROS", "delegation-token": "TOKEN",
+    "custom-password-digest": "TOKEN",
+}
+if mechanisms != expected_mechanisms:
+    raise SystemExit("J04 secure HBase did not verify every actual authentication mechanism")
+negative_cases = set(re.findall(r"secure-hbase negative=(\S+) status=passed", secure_output))
+expected_negatives = {
+    "kerberos-password-and-permissions", "tampered-delegation-token",
+    "custom-password-and-permissions", "password-digest-on-standard-server", "simple-on-secure-server",
+}
+if negative_cases != expected_negatives:
+    raise SystemExit("J04 secure HBase authentication/permission negative cases are incomplete")
+child_logs = []
+for log in sorted((root / "hbase/target/failsafe-reports").glob("m0-hbase-cluster-*.log")):
+    retained = artifacts / log.relative_to(root)
+    retained.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(log, retained)
+    child_logs.append({"file": str(log.relative_to(root)), "sha256": hashlib.sha256(log.read_bytes()).hexdigest()})
+if len(child_logs) != 2:
+    raise SystemExit("J04 must retain both SIMPLE and secure HBase child-server logs")
+
 observed = re.search(r"hbase.version=(\S+) hbase.jvm=(\S+) client.jvm=(\S+)", output)
 if observed is None:
     raise SystemExit("J04 integration report must contain the observed HBase and JVM versions")
@@ -94,15 +127,17 @@ summary = {
                  "hbase_client": lock["hbase"]["public"]["version"],
                  "hadoop_client": lock["hbase"]["public"]["hadoopVersion"]},
     "dependency_lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
-    "backend": "temporary HBase; simple authentication; not target credentials",
+    "backend": "temporary HBase SIMPLE and Kerberos/ACL clusters; not target credentials",
     "authentication": {
-        "simple": "unified provider and real temporary HBase; development only, no target ACL proof",
-        "kerberos": "temporary KDC password/keytab/ticket-cache and official HBase GSSAPI exchange",
-        "delegation_token": "official Hadoop token encoding, bounded parsing and credential ownership",
-        "digest_password": "official HBase SASL client protocol fixture",
-        "custom_provider": "official registry loading and selector extension fixture",
+        "simple": "unified provider and real temporary HBase; development only",
+        "secure_mechanisms": mechanisms,
+        "secure_negative_cases": sorted(negative_cases),
+        "custom_password_digest": "real HBase test extension with its own method code; not target implementation",
         "target_hbase": "not_verified",
     },
+    "server_protobuf_runtime": lock["libraries"]["hbaseServerProtobuf"]["coordinate"],
+    "application_protobuf": lock["libraries"]["protobuf"]["javaCoordinate"],
+    "child_server_logs": child_logs,
     "target_hbase": "not_verified", "target_authentication": "not_verified",
 }
 (artifacts / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

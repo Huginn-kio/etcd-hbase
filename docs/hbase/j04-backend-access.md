@@ -26,12 +26,12 @@ J04 提供统一后端认证入口、有界身份连接管理和真实临时 HBa
 | 方式 | 入口与凭据 | 当前公开验证 |
 |---|---|---|
 | SIMPLE | 显式 `HBaseAuthenticators.simpleDevelopment()`，仅空密码、loopback ZooKeeper 和无认证/无授权开发配置；SIMPLE 不能证明所声称用户名的归属 | 统一 provider 连接真实临时 HBase，独立用户连接和 Get/Put/CAS/Scan；不是目标 ACL 证明 |
-| Kerberos 密码 | `kerberosPassword()`，提交完整 `principal@REALM` 和密码；独立 JAAS Subject，无全局登录用户替换 | 临时 KDC 密码成功/错误密码拒绝、身份隔离、官方 HBase GSSAPI client 真实 SASL 交互 |
-| Kerberos keytab | 受控 `KerberosUserContext.fromKeytab(principal, path)`，配合 `activateTrusted` | 临时 KDC 的真实 keytab 登录 |
-| Kerberos 票据缓存 | 受控 `KerberosUserContext.fromTicketCache(principal, path)`，配合 `activateTrusted` | 临时 KDC 的真实缓存登录，缓存身份不匹配时拒绝 |
-| HBase delegation token | `delegationToken(actualClusterId)`，secret 为标准 Hadoop URL 编码的既有 token | 官方编码 round-trip，owner/kind/service/expiry、长度边界、畸形输入和清理检查；没有真实集群签发/验签证据 |
-| 账号密码 DIGEST | 显式 `digestPassword(actualClusterId)`，仅面向实现相应密码校验语义的后端 | 官方 HBase DIGEST SASL client 与协议 fixture 的正确密码成功、错误密码拒绝；不是目标身份验收 |
-| 自定义 SASL/provider | 实现 `HBaseCredentialAuthenticator` 和有所有权的 `HBaseUserContext`，配合官方 HBase SASL provider/selector；自定义权限系统提供实际 RPC verifier | 官方 registry 装载、自定义 selector 选择及与内置 provider 共存的 fixture；具体扩展仍需对应后端验证 |
+| Kerberos 密码 | `kerberosPassword()`，提交完整 `principal@REALM` 和密码；独立 JAAS Subject，无全局登录用户替换 | 临时 KDC 与启用 ACL 的真实 HBase：服务端确认 `KERBEROS`，执行 Get/Put/CAS/Scan、独立连接读回；错误密码、只读与无权限账号被拒绝 |
+| Kerberos keytab | 受控 `KerberosUserContext.fromKeytab(principal, path)`，配合 `activateTrusted` | 临时 KDC 与真实 HBase：服务端确认 `KERBEROS`，完成上述操作及权限检查 |
+| Kerberos 票据缓存 | 受控 `KerberosUserContext.fromTicketCache(principal, path)`，配合 `activateTrusted` | 临时 KDC 生成缓存，真实 HBase 确认 `KERBEROS` 并完成上述操作；单测另覆盖缓存身份不匹配拒绝 |
+| HBase delegation token | `delegationToken(actualClusterId)`，secret 为标准 Hadoop URL 编码的既有 token | 通过真实 HBase 的 `TokenProvider` 签发，服务端确认 `TOKEN`，完成上述操作；篡改 token 被拒绝，长度/owner/kind/service/expiry 另有单测 |
+| 账号密码 DIGEST | 显式 `digestPassword(actualClusterId)`，仅面向实现相应密码校验语义的后端 | 真实 HBase 装载测试用独立 SASL 扩展，完成上述操作；错误密码、无权限账号被拒绝；标准 token provider 正确拒绝账号密码载体 |
+| 自定义 SASL/provider | 实现 `HBaseCredentialAuthenticator` 和有所有权的 `HBaseUserContext`，配合官方 HBase SASL provider/selector；自定义权限系统提供实际 RPC verifier | 上述账号密码测试扩展在真实 HBase 中与内置 Kerberos/token provider 共存；其他扩展仍需逐个验证 |
 
 标准 HBase 的 DIGEST 用于 delegation token，不能接受任意账号密码。`digestPassword` 和 `delegationToken` 是不同的凭据适配器，不能互相替代。两者都使用实际后端 cluster ID，且不获取或伪造服务器签发的 delegation token。
 
@@ -39,7 +39,9 @@ J04 提供统一后端认证入口、有界身份连接管理和真实临时 HBa
 
 Keytab/票据缓存是服务端受控身份来源，不能把“客户端提交一个用户名”当作借用这些凭据的授权。`activateTrusted(() -> KerberosUserContext.fromKeytab(...))` 只用于已获授权的初始化/后台激活；仍须经过相同的后端权限检查。网络 Authenticate 始终走客户端凭据验证路径。
 
-自定义 SASL 通过官方 `SaslClientAuthenticationProviders.EXTRA_PROVIDERS_KEY` 与 `SELECTOR_KEY` 配置。公开 HBase client 的实际连接使用进程级 provider registry，扩展类及统一 selector 必须在首个连接前配置；多 profile 的 selector 应同时识别内置和已安装扩展，不在运行期间 reset 全局 registry。凭据适配器可以增加新机制，不需要修改通用 SPI、gRPC 或封闭的认证枚举。
+自定义 SASL 通过官方 `SaslClientAuthenticationProviders.EXTRA_PROVIDERS_KEY` 与 `SELECTOR_KEY` 配置。当前锁定的 HBase 2.6.6 client 在 `AbstractRpcClient` 构造时根据连接配置创建 provider registry；扩展类与 selector 必须在创建对应连接前配置。selector 应同时识别内置和已安装扩展，不通过 reset 全局 registry 切换机制。凭据适配器可以增加新机制，不需要修改通用 SPI、gRPC 或封闭的认证枚举。
+
+账号密码集成测试为扩展分配独立的 SASL method code `93` 和 token kind `ETCDHBASE_TEST_PASSWORD_DIGEST`，只将该 kind 路由给测试扩展；内置 delegation-token provider 的 code `82` 不变。服务端使用生成的测试账号和固定测试密码验证 DIGEST-MD5，不接入目标账号数据库。扩展类、账号与凭据只存在于测试源码和临时目录，不进入运行制品。
 
 ## 3. 权限与凭据
 
@@ -49,6 +51,8 @@ Keytab/票据缓存是服务端受控身份来源，不能把“客户端提交�
 
 `HBaseFailures` 区分认证、权限、超时、取消、资源容量、不可用和未知失败。连接和身份上下文统一由 `HBaseBackendIdentityProvider` 持有；生产适配与临时探针使用同一套容量、超时、签发身份和关闭机制。开发模式只通过显式 `simpleDevelopment` 适配器进入统一路径。
 
+安全集群关闭 SIMPLE 回退，并用实际 SIMPLE 客户端 RPC 验证拒绝。在当前固定 client 中，服务端拒绝 RPC preamble 后，客户端只暴露 `ConnectionClosedException`，因此保留 `BACKEND_UNAVAILABLE` 分类；不能根据错误文本猜测认证原因。错误 Kerberos 密码、篡改 token 和错误 DIGEST 密码另有实际认证失败分类断言，权限不足也单独验证。
+
 ## 4. 验证入口与证据
 
 按项目工具链准备锁定的 Temurin JDK 21，设置 `ETCD_HBASE_JDK21_HOME`，运行：
@@ -57,16 +61,20 @@ Keytab/票据缓存是服务端受控身份来源，不能把“客户端提交�
 scripts/verify/hbase-probe.sh --profile public-local
 ```
 
-入口执行 Java 21 构建、认证与连接单测、真实临时 KDC / GSSAPI、DIGEST SASL 和独立 JVM 的真实临时 HBase。KDC 与 HBase 使用生成的测试身份/专用临时资源；测试不访问外部集群。服务器与客户端 classpath 分离，临时服务绑定 loopback。
+入口执行 Java 21 构建、认证与连接单测，以及 SIMPLE、安全两组独立 JVM 的真实临时 HBase。安全组在同一临时环境中启动 KDC、HBase Master/RegionServer、`AccessController` 和 `TokenProvider`，生成服务/测试用户的 keytab 与票据缓存，为专用表显式授权。测试不访问外部集群，临时服务绑定 loopback，HBase 数据和 WAL 使用本地文件系统。
+
+安全集成场景对每种机制调用服务端 `TokenProvider.WhoAmI`，断言实际用户名及 `KERBEROS` / `TOKEN`，再执行 Get/Put/CAS/Scan 和独立管理员连接读回。token/DIGEST 身份明确没有 Kerberos TGT，避免悄然改走 Kerberos 后误报通过。只读及无权限账号不能取得读写授权身份。
+
+测试服务端使用非 shaded 的 HBase 测试组件，其 ACL 存储路径依赖 protobuf 2.5.0 ABI。Maven 只在测试资源阶段将已锁定摘要的旧运行库复制到 `target/server-libs/`，子进程 classpath 排除应用 protobuf 后载入该文件；应用继续使用原 protobuf 4.36.2。测试日志实现同样仅为 test scope。不能用降级应用 protobuf 或关闭 ACL 掩盖服务端兼容问题。
 
 真实 HBase 场景覆盖统一 provider、不同身份连接、二进制 Put/Get、CAS 匹配/不匹配、有界 Scan、同表不同运行隔离、独立/重建连接读回、精确清理与关闭。操作有 client 超时，Scan 限定三行、缓存三行及结果大小；表及 mutation 使用 `SYNC_WAL`，不以重连读回证明 RegionServer 故障耐久性。
 
-超时、取消、阻塞登录、迟到连接、权限 RPC 中关闭、清理失败重试和伪造 handle 另有确定性单测。runner 拒绝零测试、失败、跳过及缺少认证套件，保留 JUnit XML、摘要及 SHA-256 到本地 `.artifacts/m0/j04/`；原始产物不进入仓库。
+超时、取消、阻塞登录、迟到连接、权限 RPC 中关闭、清理失败重试和伪造 handle 另有确定性单测。完整公开入口当前执行 48 项测试，其中 SIMPLE 集成 1 项、安全集成 6 项；runner 拒绝零测试、失败、跳过、缺少认证套件或实际机制/负例证据，保留 JUnit XML、服务端日志、摘要及 SHA-256 到本地 `.artifacts/m0/j04/`。临时 KDC/keytab/cache 随测试关闭清理，原始产物不进入仓库。
 
 client/Hadoop 版本来自依赖锁，服务端版本由临时环境采集。锁定用于可重复构建，不要求目标 HBase 与 client 同版本，也不要求目标服务端使用 JDK 21。候选通过不等于所有版本受支持，兼容边界参见 [HBase Java 支持矩阵](https://hbase.apache.org/docs/configuration/basic-prerequisites/)。
 
 ## 5. 目标环境待验证项
 
-公开验证不替代目标 HBase 验收。目标入口、实际认证/profile、cluster ID、专用表/列族权限、TLS/安全凭据引用及获批负例仍待提供；`--profile target` 明确返回非零状态。真实地址、账号、密码、token、证书、keytab 和票据内容不进入代码、示例或 PR。
+公开验证不替代目标 HBase 验收。目标入口、实际认证/profile、cluster ID、专用表/列族权限、TLS/安全凭据引用及获批负例仍待提供；`--profile target` 明确返回非零状态。公开临时环境未覆盖安全 HDFS、ZooKeeper SASL、TLS、代理用户、凭据续期或所有自定义发行版；HBase RPC 认证成功不表示这些组合也已验证。真实地址、账号、密码、token、证书、keytab 和票据内容不进入代码、示例或 PR。
 
 相关契约参见 [M0 设计](../specs/2026-10-10-m0-engineering-environment-protocol-design.md)、[开发计划](../../DEVELOPMENT_PLAN.md)、[HBase SASL provider API](https://hbase.apache.org/2.6/devapidocs/org/apache/hadoop/hbase/security/provider/package-summary.html) 和 [JDK 21 Kerberos LoginModule](https://docs.oracle.com/en/java/javase/21/docs/api/jdk.security.auth/com/sun/security/auth/module/Krb5LoginModule.html)。
