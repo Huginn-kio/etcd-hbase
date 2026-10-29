@@ -55,6 +55,9 @@ func inspectJSON(raw []byte) (map[string]struct{}, error) {
 	if !utf8.Valid(raw) {
 		return nil, errors.New("JSON is not valid UTF-8")
 	}
+	if err := validateUnicodeEscapes(raw); err != nil {
+		return nil, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	guard := jsonGuard{decoder: decoder}

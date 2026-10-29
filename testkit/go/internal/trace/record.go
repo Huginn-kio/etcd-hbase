@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -46,28 +47,10 @@ type StreamTerminal struct {
 }
 
 func (record Record) Validate() error {
-	if record.Schema != SchemaVersion {
-		return errors.New("unsupported trace schema")
+	if err := record.ValidateMetadata(); err != nil {
+		return err
 	}
-	if record.CaseID == "" || len(record.CaseID) > 128 || !safeIdentifier(record.CaseID) {
-		return errors.New("invalid case_id")
-	}
-	if record.Ordinal == 0 || record.Ordinal > 1<<53-1 {
-		return errors.New("ordinal must be a positive safe JSON integer")
-	}
-	service, method, found := strings.Cut(record.Method, "/")
-	if len(record.Method) > 256 || !found || service == "" || method == "" || strings.Contains(method, "/") || strings.ContainsAny(record.Method, " \t\r\n") {
-		return errors.New("invalid method path")
-	}
-	switch record.EvidenceScope {
-	case "transport", "transport-fixture", "native-etcd", "target-hbase":
-	default:
-		return errors.New("invalid evidence_scope")
-	}
-	elapsed, err := strconv.ParseUint(record.ElapsedNS, 10, 64)
-	if err != nil || strconv.FormatUint(elapsed, 10) != record.ElapsedNS {
-		return errors.New("elapsed_ns must be a canonical non-negative decimal string")
-	}
+
 	authMethod := strings.HasPrefix(record.Method, "etcdserverpb.Auth/")
 	if err := validateObject(record.Request, "request", false, authMethod); err != nil {
 		return err
@@ -101,7 +84,38 @@ func (record Record) Validate() error {
 	return nil
 }
 
+// ValidateMetadata validates routing and evidence labels before an RPC exists.
+func (record Record) ValidateMetadata() error {
+	if record.Schema != SchemaVersion {
+		return errors.New("unsupported trace schema")
+	}
+	if record.CaseID == "" || len(record.CaseID) > 128 || !safeIdentifier(record.CaseID) {
+		return errors.New("invalid case_id")
+	}
+	if record.Ordinal == 0 || record.Ordinal > 1<<53-1 {
+		return errors.New("ordinal must be a positive safe JSON integer")
+	}
+	if len(record.Method) > 256 || !methodPattern.MatchString(record.Method) {
+		return errors.New("invalid method path")
+	}
+	switch record.EvidenceScope {
+	case "transport", "transport-fixture", "native-etcd", "target-hbase":
+	default:
+		return errors.New("invalid evidence_scope")
+	}
+	elapsed, err := strconv.ParseUint(record.ElapsedNS, 10, 64)
+	if err != nil || strconv.FormatUint(elapsed, 10) != record.ElapsedNS {
+		return errors.New("elapsed_ns must be a canonical non-negative decimal string")
+	}
+	return nil
+}
+
+var methodPattern = regexp.MustCompile(`^[A-Za-z0-9_.]+/[A-Za-z0-9_]+$`)
+
 func safeIdentifier(value string) bool {
+	if value == "" || !((value[0] >= 'a' && value[0] <= 'z') || (value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= '0' && value[0] <= '9')) {
+		return false
+	}
 	for _, character := range value {
 		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_' || character == '.' {
 			continue

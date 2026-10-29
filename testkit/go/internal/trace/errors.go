@@ -117,7 +117,7 @@ func semanticKind(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "context/deadline-exceeded"
 	}
-	grpcStatus, ok := status.FromError(err)
+	grpcStatus, ok := originalStatus(err)
 	if ok && grpcStatus.Code() == codes.Canceled && grpcStatus.Message() == context.Canceled.Error() {
 		return "grpc/context-canceled"
 	}
@@ -125,6 +125,9 @@ func semanticKind(err error) string {
 		return "grpc/context-deadline-exceeded"
 	}
 	normalized := rpctypes.Error(err)
+	if ok {
+		normalized = rpctypes.Error(grpcStatus.Err())
+	}
 	for _, canonical := range canonicalErrors {
 		if errors.Is(err, canonical.value) || errors.Is(normalized, canonical.value) {
 			return canonical.kind
@@ -144,4 +147,34 @@ func validSemanticKind(kind string) bool {
 		}
 	}
 	return false
+}
+
+// grpc-go decorates a wrapped status with the outer error text. Walk a bounded
+// chain to recover the original wire status for whitelist classification only.
+func originalStatus(err error) (*status.Status, bool) {
+	pending := []error{err}
+	for inspected := 0; len(pending) > 0 && inspected < 64; inspected++ {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if current == nil {
+			continue
+		}
+		if provider, ok := current.(interface{ GRPCStatus() *status.Status }); ok {
+			value := provider.GRPCStatus()
+			return value, value != nil
+		}
+		switch wrapper := current.(type) {
+		case interface{ Unwrap() error }:
+			pending = append(pending, wrapper.Unwrap())
+		case interface{ Unwrap() []error }:
+			children := wrapper.Unwrap()
+			if len(children) > 64-len(pending) {
+				return nil, false
+			}
+			for index := len(children) - 1; index >= 0; index-- {
+				pending = append(pending, children[index])
+			}
+		}
+	}
+	return nil, false
 }

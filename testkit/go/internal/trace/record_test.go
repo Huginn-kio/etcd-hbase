@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -503,5 +504,56 @@ func TestSnapshotRejectsCyclicAndOversizedGraphs(t *testing.T) {
 	guard = protoGuard{bytes: maxRecordBytes / 2}
 	if err := guard.visit(reflect.ValueOf(&etcdserverpb.RangeRequest{Key: []byte("x")}), 0); err == nil {
 		t.Fatal("exhausted byte budget was accepted")
+	}
+}
+
+func TestWrappedGRPCStatusesRetainCanonicalIdentities(t *testing.T) {
+	for _, item := range []struct {
+		err  error
+		kind string
+	}{{rpctypes.ErrGRPCCompacted, "etcd/Compacted"}, {rpctypes.ErrGRPCFutureRev, "etcd/FutureRev"}} {
+		wrapped := fmt.Errorf("private-address-and-operation: %w", item.err)
+		classified := ClassifyError(wrapped)
+		if classified.SemanticKind != item.kind || classified.GRPCCode != "OutOfRange" || classified.ConsumerKind != "grpc-status" {
+			t.Fatalf("wrapped status lost identity: %#v", classified)
+		}
+		encoded, _ := json.Marshal(classified)
+		if bytes.Contains(encoded, []byte("private-address")) {
+			t.Fatal("outer error leaked into trace")
+		}
+	}
+}
+
+func TestTraceRejectsMetadataContainersButPreservesProtobufHeader(t *testing.T) {
+	for _, name := range []string{"metadata", "grpc_metadata", "headers", "trailers"} {
+		record := testRecord("unicode-privacy", 1)
+		record.Method = "etcdserverpb.Auth/Authenticate"
+		record.Request = json.RawMessage(`{"fields":{"` + name + `":{"x-user":"private-sentinel"}},"oneofs":{}}`)
+		var output bytes.Buffer
+		if err := WriteJSONL(&output, record); err == nil || output.Len() != 0 {
+			t.Fatalf("%s metadata entered trace", name)
+		}
+	}
+	record := testRecord("unicode-privacy", 1)
+	record.Response = json.RawMessage(`{"fields":{"header":{"fields":{"revision":"4"},"oneofs":{}}},"oneofs":{}}`)
+	if err := record.Validate(); err != nil {
+		t.Fatalf("protobuf ResponseHeader was rejected: %v", err)
+	}
+}
+
+func TestJSONUnicodeEscapesPreserveOnlyValidScalarValues(t *testing.T) {
+	for _, text := range []string{`"\ud800"`, `"\udc00"`, `"\ud800\u0041"`} {
+		record := testRecord("unicode-privacy", 1)
+		record.Request = json.RawMessage(`{"fields":{"cancelReason":` + text + `},"oneofs":{}}`)
+		if err := record.Validate(); err == nil {
+			t.Fatal("invalid Unicode surrogate was accepted")
+		}
+	}
+	for _, text := range []string{`"\ud83d\ude00"`, `"\ufffd"`, `"\\ud800"`} {
+		record := testRecord("unicode-privacy", 1)
+		record.Request = json.RawMessage(`{"fields":{"cancelReason":` + text + `},"oneofs":{}}`)
+		if err := record.Validate(); err != nil {
+			t.Fatalf("valid Unicode scalar rejected: %v", err)
+		}
 	}
 }

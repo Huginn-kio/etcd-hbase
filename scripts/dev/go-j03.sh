@@ -105,7 +105,8 @@ fi
 # Public verification does not inherit private Go mirrors, credentials or home configuration.
 export GOENV=off
 export GOAUTH=off
-export GOPROXY=https://proxy.golang.org,direct
+export GOPROXY=https://proxy.golang.org
+export GOVCS="*:off"
 export GOSUMDB=sum.golang.org
 export GOPRIVATE= GONOPROXY= GONOSUMDB= GOINSECURE=
 export GOTOOLCHAIN=local

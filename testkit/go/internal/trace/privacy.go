@@ -8,6 +8,10 @@ import (
 
 func isSensitiveName(name string) bool {
 	normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(name, "_", ""), "-", ""))
+	switch normalized {
+	case "metadata", "grpcmetadata", "headers", "requestheaders", "responseheaders", "trailers":
+		return true
+	}
 	for _, marker := range []string{"password", "token", "authorization", "credential", "secret", "privatekey", "username"} {
 		if strings.Contains(normalized, marker) {
 			return true
