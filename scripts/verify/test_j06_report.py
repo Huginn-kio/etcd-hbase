@@ -35,6 +35,16 @@ class EvidenceGateTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             report.inspect_reports(self.paths)
 
+    def test_excludes_stale_reports_from_modules_outside_this_reactor(self):
+        root = Path(self.directory.name)
+        poison = root / "testkit/target/surefire-reports/TEST-poison.xml"
+        poison.parent.mkdir(parents=True)
+        poison.write_text("not-a-current-report")
+        current = root / "core/target/surefire-reports/TEST-current.xml"
+        current.parent.mkdir(parents=True)
+        current.write_text("current-report-path")
+        self.assertEqual([current], report.collect_reports(root))
+
     def test_rejects_empty_skipped_failed_and_inconsistent_evidence(self):
         for field, value in (("tests", "0"), ("skipped", "1"), ("failures", "1"), ("errors", "1")):
             with self.subTest(field=field):

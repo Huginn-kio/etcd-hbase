@@ -2,9 +2,12 @@
 """Fail closed on missing, zero, skipped or failed J06 verification evidence."""
 import datetime
 import json
+import shutil
 from pathlib import Path
 import sys
 import xml.etree.ElementTree as ET
+
+MODULES = ("protocol", "spi", "core", "hbase", "grpc", "admin", "server")
 
 REQUIRED = {
     "io.etcdhbase.core.request.RequestScopeTest",
@@ -37,13 +40,22 @@ def inspect_reports(paths):
     return suites
 
 
+def collect_reports(root):
+    return [path for module in MODULES for kind in ("surefire-reports", "failsafe-reports")
+            for path in sorted((root / module / "target" / kind).glob("TEST-*.xml"))]
+
+
 def main():
     root = Path(__file__).resolve().parents[2]
     output = Path(sys.argv[1]).resolve()
-    paths = sorted(root.glob("*/target/surefire-reports/TEST-*.xml")) + sorted(root.glob("*/target/failsafe-reports/TEST-*.xml"))
+    paths = collect_reports(root)
     suites = inspect_reports(paths)
     if "j06-hbase realScannerClosed=true sharedConnectionPreserved=true readAfterCancel=true" not in (output / "maven.log").read_text():
         raise ValueError("real HBase request lifecycle evidence is missing")
+    for path in paths:
+        destination = output / "reports" / path.relative_to(root)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, destination)
     source = json.loads((output / "source.json").read_text())
     source.update({"phase": "J06", "scope": "public-local", "ended_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                    "tests": sum(suite["tests"] for suite in suites.values()), "failures": 0, "errors": 0, "skipped": 0,
