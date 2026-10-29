@@ -1,10 +1,13 @@
 package io.etcdhbase.hbase.probe;
 
+import io.etcdhbase.hbase.api.HBaseUserContext;
+import io.etcdhbase.hbase.identity.KerberosUserContext;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -30,6 +33,8 @@ public final class TemporaryHBaseClusterProcess implements AutoCloseable {
   private final String hbaseVersion;
   private final String jvmVersion;
   private final List<CompletableFuture<Void>> abandonedCreations = new ArrayList<>();
+  private String previousKerberosConfiguration;
+  private boolean ownsKerberosConfiguration;
 
   private TemporaryHBaseClusterProcess(
       Process process,
@@ -47,20 +52,32 @@ public final class TemporaryHBaseClusterProcess implements AutoCloseable {
   }
 
   public static TemporaryHBaseClusterProcess start() throws Exception {
+    return start(false);
+  }
+
+  public static TemporaryHBaseClusterProcess startSecure() throws Exception {
+    return start(true);
+  }
+
+  private static TemporaryHBaseClusterProcess start(boolean secure) throws Exception {
     Path directory = Files.createTempDirectory(Path.of("target"), "m0-hbase-cluster-");
     Path configurationFile = directory.resolve("hbase-site.xml");
     Path readinessFile = directory.resolve("ready.txt");
     Path failureFile = directory.resolve("startup-failure.txt");
     Path logFile = directory.resolve("server.log");
     List<String> command =
-        List.of(
-            Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-            "-cp",
-            unshadedServerClasspath(),
-            HBaseMiniClusterMain.class.getName(),
-            configurationFile.toString(),
-            readinessFile.toString(),
-            failureFile.toString());
+        new ArrayList<>(
+            List.of(
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-cp",
+                unshadedServerClasspath(),
+                HBaseMiniClusterMain.class.getName(),
+                configurationFile.toString(),
+                readinessFile.toString(),
+                failureFile.toString()));
+    if (secure) {
+      command.add("kerberos");
+    }
     Process process =
         new ProcessBuilder(command)
             .redirectErrorStream(true)
@@ -87,9 +104,24 @@ public final class TemporaryHBaseClusterProcess implements AutoCloseable {
             process, directory, configurationFile, logFile, fields[2], fields[3]);
     try {
       // cluster.start() completing does not prove that the first client registry RPC is ready.
-      cluster.waitForClientReadiness();
+      if (secure) {
+        cluster.previousKerberosConfiguration = System.getProperty("java.security.krb5.conf");
+        cluster.ownsKerberosConfiguration = true;
+        Configuration client = cluster.clientConfiguration();
+        System.setProperty(
+            "java.security.krb5.conf", client.get(TemporaryKerberosSecurity.PREFIX + "krb5"));
+        try (var user =
+            KerberosUserContext.fromKeytab(
+                "admin@" + client.get(TemporaryKerberosSecurity.PREFIX + "realm"),
+                Path.of(client.get(TemporaryKerberosSecurity.PREFIX + "admin.keytab")))) {
+          cluster.waitForClientReadiness(user);
+        }
+      } else {
+        cluster.waitForClientReadiness(null);
+      }
       return cluster;
     } catch (Exception readinessFailure) {
+      cluster.restoreKerberosConfiguration();
       process.destroyForcibly();
       try {
         process.waitFor(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -109,12 +141,15 @@ public final class TemporaryHBaseClusterProcess implements AutoCloseable {
     return configuration;
   }
 
-  private void waitForClientReadiness() throws IOException, InterruptedException {
+  private void waitForClientReadiness(HBaseUserContext user)
+      throws IOException, InterruptedException {
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(CLIENT_READY_TIMEOUT_SECONDS);
     Throwable lastFailure = null;
     while (System.nanoTime() < deadline) {
       CompletableFuture<AsyncConnection> creation =
-          ConnectionFactory.createAsyncConnection(clientConfiguration());
+          user == null
+              ? ConnectionFactory.createAsyncConnection(clientConfiguration())
+              : ConnectionFactory.createAsyncConnection(clientConfiguration(), user.user());
       try {
         try (AsyncConnection connection =
             creation.get(CLIENT_READY_ATTEMPT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
@@ -198,14 +233,26 @@ public final class TemporaryHBaseClusterProcess implements AutoCloseable {
                 + logFile);
       }
     } finally {
+      restoreKerberosConfiguration();
       if (process.isAlive()) {
         process.destroyForcibly();
       }
-      Files.deleteIfExists(configurationFile);
-      Files.deleteIfExists(directory.resolve("ready.txt"));
-      Files.deleteIfExists(directory.resolve("startup-failure.txt"));
-      Files.deleteIfExists(logFile);
-      Files.deleteIfExists(directory);
+      try (var paths = Files.walk(directory)) {
+        for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+          Files.deleteIfExists(path);
+        }
+      }
+    }
+  }
+
+  private void restoreKerberosConfiguration() {
+    if (ownsKerberosConfiguration) {
+      if (previousKerberosConfiguration == null) {
+        System.clearProperty("java.security.krb5.conf");
+      } else {
+        System.setProperty("java.security.krb5.conf", previousKerberosConfiguration);
+      }
+      ownsKerberosConfiguration = false;
     }
   }
 

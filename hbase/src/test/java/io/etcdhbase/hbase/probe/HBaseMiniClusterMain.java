@@ -14,7 +14,7 @@ public final class HBaseMiniClusterMain {
   private HBaseMiniClusterMain() {}
 
   public static void main(String[] args) throws Exception {
-    if (args.length != 3) {
+    if (args.length != 3 && args.length != 4) {
       throw new IllegalArgumentException(
           "expected hbase-site.xml, readiness file, and startup-failure file paths");
     }
@@ -33,6 +33,15 @@ public final class HBaseMiniClusterMain {
     configuration.set("hbase.regionserver.ipc.address", "127.0.0.1");
     configuration.set(
         "hbase.client.registry.impl", "org.apache.hadoop.hbase.client.ZKConnectionRegistry");
+    TemporaryKerberosSecurity security = null;
+    if (args.length == 4) {
+      if (!args[3].equals("kerberos")) {
+        throw new IllegalArgumentException("unknown temporary HBase security profile");
+      }
+      security =
+          TemporaryKerberosSecurity.start(
+              configuration, Path.of(args[0]).toAbsolutePath().getParent().resolve("security"));
+    }
     TestingHBaseClusterOption option =
         TestingHBaseClusterOption.builder()
             .conf(configuration)
@@ -90,7 +99,13 @@ public final class HBaseMiniClusterMain {
         throw new IllegalStateException("expected stop signal");
       }
     } finally {
-      cluster.stop();
+      try {
+        cluster.stop();
+      } finally {
+        if (security != null) {
+          security.close();
+        }
+      }
     }
   }
 }
