@@ -52,14 +52,20 @@ public final class TemporaryHBaseClusterProcess implements AutoCloseable {
   }
 
   public static TemporaryHBaseClusterProcess start() throws Exception {
-    return start(false);
+    return start(false, 1);
+  }
+
+  public static TemporaryHBaseClusterProcess start(int regionServers) throws Exception {
+    return start(false, regionServers);
   }
 
   public static TemporaryHBaseClusterProcess startSecure() throws Exception {
-    return start(true);
+    return start(true, 1);
   }
 
-  private static TemporaryHBaseClusterProcess start(boolean secure) throws Exception {
+  private static TemporaryHBaseClusterProcess start(boolean secure, int regionServers)
+      throws Exception {
+    HBaseMiniClusterMain.validateRegionServerCount(regionServers);
     Path directory = Files.createTempDirectory(Path.of("target"), "m0-hbase-cluster-");
     Path configurationFile = directory.resolve("hbase-site.xml");
     Path readinessFile = directory.resolve("ready.txt");
@@ -75,9 +81,8 @@ public final class TemporaryHBaseClusterProcess implements AutoCloseable {
                 configurationFile.toString(),
                 readinessFile.toString(),
                 failureFile.toString()));
-    if (secure) {
-      command.add("kerberos");
-    }
+    command.add(secure ? "kerberos" : "simple");
+    command.add(Integer.toString(regionServers));
     Process process =
         new ProcessBuilder(command)
             .redirectErrorStream(true)

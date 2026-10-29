@@ -14,11 +14,12 @@ public final class HBaseMiniClusterMain {
   private HBaseMiniClusterMain() {}
 
   public static void main(String[] args) throws Exception {
-    if (args.length != 3 && args.length != 4) {
+    if (args.length < 3 || args.length > 5) {
       throw new IllegalArgumentException(
-          "expected hbase-site.xml, readiness file, startup-failure file, and optional kerberos"
-              + " profile");
+          "expected configuration, readiness, failure files, optional simple/kerberos profile"
+              + " and region-server count");
     }
+    int regionServers = validateRegionServerCount(args.length == 5 ? Integer.parseInt(args[4]) : 1);
 
     Configuration configuration = HBaseConfiguration.create();
     configuration.setInt("hbase.master.info.port", -1);
@@ -35,19 +36,21 @@ public final class HBaseMiniClusterMain {
     configuration.set(
         "hbase.client.registry.impl", "org.apache.hadoop.hbase.client.ZKConnectionRegistry");
     TemporaryKerberosSecurity security = null;
-    if (args.length == 4) {
-      if (!args[3].equals("kerberos")) {
+    if (args.length >= 4) {
+      if (!args[3].equals("kerberos") && !args[3].equals("simple")) {
         throw new IllegalArgumentException("unknown temporary HBase security profile");
       }
-      security =
-          TemporaryKerberosSecurity.start(
-              configuration, Path.of(args[0]).toAbsolutePath().getParent().resolve("security"));
+      if (args[3].equals("kerberos")) {
+        security =
+            TemporaryKerberosSecurity.start(
+                configuration, Path.of(args[0]).toAbsolutePath().getParent().resolve("security"));
+      }
     }
     TestingHBaseClusterOption option =
         TestingHBaseClusterOption.builder()
             .conf(configuration)
             .numMasters(1)
-            .numRegionServers(1)
+            .numRegionServers(regionServers)
             .numDataNodes(0)
             .numZkServers(1)
             .useExternalDfs("file:///")
@@ -108,5 +111,12 @@ public final class HBaseMiniClusterMain {
         }
       }
     }
+  }
+
+  static int validateRegionServerCount(int count) {
+    if (count < 1 || count > 4) {
+      throw new IllegalArgumentException("temporary cluster requires 1..4 region servers");
+    }
+    return count;
   }
 }

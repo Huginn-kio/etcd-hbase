@@ -82,7 +82,10 @@
             <artifactId>maven-failsafe-plugin</artifactId>
             <configuration>
               <failIfNoTests>true</failIfNoTests>
-              <includes><include>**/InitializeTablesIT.java</include></includes>
+              <includes>
+                <include>**/InitializeTablesIT.java</include>
+                <include>**/SaltDistributionIT.java</include>
+              </includes>
               <forkedProcessTimeoutInSeconds>420</forkedProcessTimeoutInSeconds>
             </configuration>
             <executions>
