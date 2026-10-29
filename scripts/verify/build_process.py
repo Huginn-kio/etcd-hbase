@@ -1,9 +1,11 @@
 """Run owned build process groups with bounded cancellation and captured diagnostics."""
 from contextlib import contextmanager
 import os
+from contextlib import ExitStack
 from pathlib import Path
 import signal
 import subprocess
+import time
 
 
 @contextmanager
@@ -18,25 +20,35 @@ def termination_is_exception():
         signal.signal(signal.SIGTERM, previous)
 
 
-def stop_group(process):
+def stop_group(process, grace=5):
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        process.wait(timeout=5)
         return
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
+    deadline = time.monotonic() + grace
+    while True:
+        process.poll()  # Reap the leader, but check the group independently.
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, 0)
         except ProcessLookupError:
-            pass
-        process.wait(timeout=5)
+            break
+        if time.monotonic() >= deadline:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            break
+        time.sleep(0.05)
+    process.wait(timeout=5)
 
 
-def run_logged(command, log_path, cwd, timeout=1200, environment=None):
-    with Path(log_path).open("wb") as log, termination_is_exception():
+def run_logged(command, log_path, cwd, timeout=1200, environment=None, stderr_path=None):
+    with ExitStack() as resources, termination_is_exception():
+        log = resources.enter_context(Path(log_path).open("wb"))
+        errors = resources.enter_context(Path(stderr_path).open("wb")) if stderr_path else subprocess.STDOUT
         process = subprocess.Popen(command, cwd=cwd, env=environment, stdout=log,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
+                                   stderr=errors, start_new_session=True)
         try:
             code = process.wait(timeout=timeout)
             if code:

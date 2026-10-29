@@ -12,21 +12,10 @@ import subprocess
 import sys
 import uuid
 import xml.etree.ElementTree as ET
-from evidence import JAVA_MODULES, java_reports, require_unchanged_source
+from evidence import M0_JAVA_MODULES as MODULES, M0_REQUIRED_SUITES as REQUIRED, java_reports, require_unchanged_source
 from build_process import run_logged
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULES = (*JAVA_MODULES, "testkit")
-REQUIRED = {
-    "io.etcdhbase.protocol.ProtocolSourceLockTest", "io.etcdhbase.protocol.ProtocolWireContractTest",
-    "io.etcdhbase.protocol.ProtocolBinaryRoundTripTest", "io.etcdhbase.spi.salt.HashSaltStrategyTest",
-    "io.etcdhbase.core.request.RequestScopeTest", "io.etcdhbase.hbase.identity.HBaseBackendIdentityProviderTest",
-    "io.etcdhbase.hbase.probe.LocalHBaseProbeIT", "io.etcdhbase.hbase.probe.SecureHBaseAuthenticationIT",
-    "io.etcdhbase.admin.InitializeTablesIT", "io.etcdhbase.admin.SaltDistributionIT",
-    "io.etcdhbase.server.GoInteropIT", "io.etcdhbase.server.GeneralGoInteropIT",
-    "io.etcdhbase.server.ExternalProtocolIT", "io.etcdhbase.server.RequestLifecycleTest",
-    "io.etcdhbase.testkit.contract.IdentityProviderContractTest", "io.etcdhbase.testkit.contract.SaltStrategyContractTest",
-}
 
 
 def packaged_jars(root=ROOT):

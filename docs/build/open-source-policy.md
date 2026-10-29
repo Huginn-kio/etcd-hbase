@@ -15,10 +15,14 @@
 
 - 每项直接依赖和构建工具使用精确版本、公开来源、SHA-256 和选择理由；不得使用 `LATEST`、版本范围或第三方 SNAPSHOT。
 - 新增或升级依赖时更新 `build/dependency-lock.json`，运行 Maven dependency convergence，并检查上游 license/notice 文件及传递依赖变化。
-- 固定上游 proto tag/commit、原始文件摘要和许可证；生成物保留来源注释，不手工编辑生成代码。具体协议输入由对应工作包维护。
+- 固定上游 proto tag/commit、原始文件摘要和许可证；生成物保留来源注释，不手工编辑生成代码。具体协议输入由对应 J 任务维护。
 - `THIRD_PARTY_NOTICES.md` 当前是锁定工具和直接依赖的跟踪清单，不是完整传递依赖公告，也不构成项目许可声明。发布前须从最终发行依赖树生成并审查完整 SBOM 与 notices。
 - 公开 artifact 名称和发布目的地仍等待 I08；M0 不发布生产制品，也不写入私有仓库地址。
 
 ## 配置与日志
 
 公开示例只能使用可丢弃的本地配置。生产凭据由目标环境的受控身份系统提供；不得存入 Git、测试报告、Maven settings、命令行参数或日志。公开 CI 不使用目标环境密钥，也不以跳过集成检查的方式报告目标验收通过。
+
+## 可执行检查
+
+[J09 交付入口](j09-public-delivery.md) 在无目标凭据、扩展工程或私有包源的条件下执行两次完整构建、依赖/协议检查、真实运行包及镜像检查。许可与发布决定记录于 `build/release-decisions.json`；`scripts/verify/release-readiness.py --require-decisions` 只能检查决定是否完整，不授予发布权限。

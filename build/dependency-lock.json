@@ -396,5 +396,9 @@
     "javaRelease": "21.0.12.1+1",
     "source": "https://github.com/adoptium/containers",
     "registryManifest": "https://registry-1.docker.io/v2/library/eclipse-temurin/manifests/sha256:de07a7c89a9430922ee1db1e2f848d75533c7f8f2ab3e4ba5eb52cc4550cdb2a"
+  },
+  "actions": {
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/setup-java": "de7274f081f381c8f8158605e0321c36c376e2e6"
   }
 }

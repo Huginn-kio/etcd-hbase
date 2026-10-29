@@ -11,12 +11,16 @@
 
 ## 变更与 Pull Request
 
-1. 描述对应的 Jxx/WP 和行为边界；只纳入该变更所需的文件。
-2. PR 以仓库 `main` 为目标分支。依赖尚未合并的 PR 时，也以 `main` 为 base，并在描述中链接依赖 PR 和说明依赖内容。
+1. 按 J00、J01 等顺序描述对应的 Jxx；WP 仅作历史材料索引，并说明行为边界；只纳入该变更所需的文件。
+2. 推送前 fetch/rebase 最新上游 `main`，PR 提向上游 `main`、保留 fork 为 head。依赖尚未合并的 PR 时，也以 `main` 为 base，并在描述中链接依赖 PR、记录有效 base/head 比较链接，说明相对 `main` 的累计范围。
 3. 每项验证写明命令、运行环境和结果。区分公开构建、mock/fixture、真实 HBase 以及目标环境证据；没有运行的验证要标明原因。
 4. 编译成功只证明构建范围内的源代码可编译，不能代替协议互通、真实 HBase 行为或 M0 阶段验收。
 5. 若改动依赖、proto 来源或生成器，同步更新版本、来源、摘要及第三方许可信息，并说明是否影响已有数据格式或公开 API。
 6. 日志和 PR 附件中不得包含密码、token、密钥、完整业务 key 或未经脱敏的目标环境数据。
+
+所有 GitHub 说明、comment、review 和回复使用简体中文。源码、测试、脚本和 CI 修改遵守 [AGENTS.md](AGENTS.md) 的统一质量要求；feature 与 review 修正采用相同标准。区分作者自审、独立复核、维护者 review 和目标验收。
+
+完整公开验证与实际运行镜像见 [J09 交付说明](docs/build/j09-public-delivery.md)。默认 Maven `clean verify` 不包含全部 Go/运行镜像检查。
 
 ## Review 关注点
 

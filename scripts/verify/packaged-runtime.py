@@ -9,7 +9,7 @@ import socket
 import subprocess
 import time
 from runtime_probe import await_transport, probe_arguments
-from build_process import run_logged
+from build_process import run_logged, termination_is_exception
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -34,7 +34,7 @@ def verify(runtime, output):
     for name in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"):
         environment.pop(name, None)
     process = None
-    with (output / "server.log").open("wb") as log:
+    with (output / "server.log").open("wb") as log, termination_is_exception():
         try:
             process = subprocess.Popen([str(runtime / "etcd-hbase"), "--config", str(config_path)],
                                        cwd=runtime, env=environment, stdout=log, stderr=subprocess.STDOUT)

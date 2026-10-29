@@ -3,6 +3,9 @@
 import hashlib
 import importlib.util
 import json
+import os
+import signal
+import subprocess
 from pathlib import Path
 import shutil
 import sys
@@ -10,6 +13,7 @@ import tempfile
 import unittest
 import zipfile
 from runtime_probe import await_transport, check_observation
+from build_process import stop_group
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -100,6 +104,24 @@ class DeliveryTest(unittest.TestCase):
             await_transport([sys.executable, "-c", program, str(counter), json.dumps(self.observation())],
                             "fixture", self.root, timeout=2)
         self.assertEqual("1", counter.read_text(), "successful business response was retried")
+
+    def test_group_cleanup_does_not_confuse_leader_exit_with_descendant_exit(self):
+        pid_path = self.root / "child.pid"
+        child = "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready',flush=True); signal.pause()"
+        leader = "import subprocess,sys; from pathlib import Path; child=subprocess.Popen([sys.executable,'-c',sys.argv[2]],stdout=subprocess.PIPE); child.stdout.readline(); Path(sys.argv[1]).write_text(str(child.pid))"
+        process = subprocess.Popen([sys.executable, "-c", leader, str(pid_path), child], start_new_session=True)
+        try:
+            process.wait(timeout=5)
+            child_pid = int(pid_path.read_text())
+            stop_group(process, grace=0.2)
+            state = subprocess.run(["ps", "-p", str(child_pid), "-o", "stat="], capture_output=True, text=True).stdout.strip()
+            self.assertTrue(not state or state.startswith("Z"), "TERM-ignoring descendant survived cleanup")
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
 
 
 if __name__ == "__main__":

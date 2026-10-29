@@ -67,3 +67,16 @@ def require_unchanged_source(root, source):
     paths = git("ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")
     if any(path and not path.startswith(local_only) for path in paths):
         raise ValueError("uncommitted source exists outside local execution records")
+
+
+M0_JAVA_MODULES = (*JAVA_MODULES, "testkit")
+M0_REQUIRED_SUITES = {
+    "io.etcdhbase.protocol.ProtocolSourceLockTest", "io.etcdhbase.protocol.ProtocolWireContractTest",
+    "io.etcdhbase.protocol.ProtocolBinaryRoundTripTest", "io.etcdhbase.spi.salt.HashSaltStrategyTest",
+    "io.etcdhbase.core.request.RequestScopeTest", "io.etcdhbase.hbase.identity.HBaseBackendIdentityProviderTest",
+    "io.etcdhbase.hbase.probe.LocalHBaseProbeIT", "io.etcdhbase.hbase.probe.SecureHBaseAuthenticationIT",
+    "io.etcdhbase.admin.InitializeTablesIT", "io.etcdhbase.admin.SaltDistributionIT",
+    "io.etcdhbase.server.GoInteropIT", "io.etcdhbase.server.GeneralGoInteropIT",
+    "io.etcdhbase.server.ExternalProtocolIT", "io.etcdhbase.server.RequestLifecycleTest",
+    "io.etcdhbase.testkit.contract.IdentityProviderContractTest", "io.etcdhbase.testkit.contract.SaltStrategyContractTest",
+}
