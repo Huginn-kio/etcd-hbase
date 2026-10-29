@@ -556,7 +556,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J02。
   - 完成标准：固定 etcd v3.5.23、请求和结果格式；只允许已接受的 Count 差异，Lease ID 身份映射不能掩盖事件或版本错误。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=公开实现已完成，最终验证与评审进行中；负责人=Codex；完成日期=—；PR/commit=[PR #11](https://github.com/Reidddddd/etcd-hbase/pull/11)；验证入口=scripts/verify/j07.sh；范围=[Go 驱动与原生对照器](docs/testing/j07-protocol-oracle.md)；评审人/结论=作者自查及独立 agent 复核进行中，维护者待 review；完整 C01–C33 和目标 HBase 尚未验收。
 
 - [ ] **J08｜公开扩展 SPI 与内部 port 边界**
   - 依赖：J01 和初步需求基线；J00.2 完善时核对能力。

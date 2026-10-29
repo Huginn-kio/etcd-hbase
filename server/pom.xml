@@ -43,6 +43,16 @@
         </plugins>
       </build>
     </profile>
+    <profile>
+      <id>j07-wire</id>
+      <properties><j03.skipWire>false</j03.skipWire></properties>
+      <build><plugins><plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-failsafe-plugin</artifactId>
+        <configuration><failIfNoTests>true</failIfNoTests><includes>
+          <include>**/GeneralGoInteropIT.java</include><include>**/ExternalProtocolIT.java</include>
+        </includes></configuration>
+      </plugin></plugins></build>
+    </profile>
   </profiles>
   <dependencies>
     <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId></dependency>

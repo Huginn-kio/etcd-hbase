@@ -26,11 +26,11 @@ func equalWithCountAllowance(left, right map[string]any, leftScope, rightScope s
 		return false
 	}
 	leftCount, ok := leftFields["count"].(string)
-	if !ok || !canonicalUint64(leftCount) {
+	if !ok || !canonicalCount(leftCount) {
 		return false
 	}
 	rightCount, ok := rightFields["count"].(string)
-	if !ok || !canonicalUint64(rightCount) {
+	if !ok || !canonicalCount(rightCount) {
 		return false
 	}
 	nativeCount, targetCount := leftCount, rightCount
@@ -55,9 +55,9 @@ func equalWithCountAllowance(left, right map[string]any, leftScope, rightScope s
 	return reflect.DeepEqual(leftCopy, rightCopy)
 }
 
-func canonicalUint64(value string) bool {
-	parsed, err := strconv.ParseUint(value, 10, 64)
-	return err == nil && strconv.FormatUint(parsed, 10) == value
+func canonicalCount(value string) bool {
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	return err == nil && parsed >= 0 && strconv.FormatInt(parsed, 10) == value
 }
 
 func withoutResponse(record map[string]any) map[string]any {

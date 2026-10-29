@@ -25,13 +25,7 @@ func normalizeValue(value any, method string, baseRevision int64, ids map[string
 					return nil, fmt.Errorf("invalid revision field: %w", err)
 				}
 				if revision > 0 {
-					revision -= baseRevision
-					if revision < 0 {
-						return nil, fmt.Errorf("revision field %q precedes scenario baseline", key)
-					}
-				}
-				if child != "0" && revision >= 0 {
-					result[key] = "relative:" + strconv.FormatInt(revision, 10)
+					result[key] = "relative:" + strconv.FormatInt(revision-baseRevision, 10)
 				} else {
 					result[key] = strconv.FormatInt(revision, 10)
 				}
