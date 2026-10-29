@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
-from evidence import go_report, java_reports
+from evidence import go_report, java_reports, require_unchanged_source
 
 REQUIRED = {"io.etcdhbase.server.GeneralGoInteropIT", "io.etcdhbase.server.ExternalProtocolIT",
             "io.etcdhbase.server.BootstrapTest", "io.etcdhbase.core.request.RequestScopeTest"}
@@ -14,8 +14,7 @@ REQUIRED = {"io.etcdhbase.server.GeneralGoInteropIT", "io.etcdhbase.server.Exter
 def collect(root, output):
     paths, suites = java_reports(root, REQUIRED)
     source = json.loads((output / "source.json").read_text())
-    if source["tracked_dirty"]:
-        raise ValueError("final J07 evidence requires a frozen tracked checkout")
+    require_unchanged_source(root, source)
     tests = go_report(output / "go-test.jsonl")
     race = go_report(output / "go-race.jsonl")
     native = output / "native"

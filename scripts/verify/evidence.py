@@ -1,5 +1,6 @@
 """Read actual test evidence; missing, skipped and contradictory results fail closed."""
 import json
+import subprocess
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -53,3 +54,16 @@ def go_report(path):
         raise ValueError("missing Go packages or actual test events")
     return {"packages": sorted(packages), "passed_test_events": sum(len(items) for items in test_events.values()),
             "skipped": 0, "failed": 0}
+
+
+def require_unchanged_source(root, source):
+    def git(*arguments):
+        return subprocess.check_output(["git", "-C", str(root), *arguments])
+    if source["tracked_dirty"] or git("rev-parse", "HEAD").decode().strip() != source["checkout"]:
+        raise ValueError("verification source changed or started dirty")
+    if git("status", "--porcelain", "--untracked-files=no"):
+        raise ValueError("tracked source changed during verification")
+    local_only = ("docs/progress/", "docs/superpowers/", "scripts/verify/__pycache__/")
+    paths = git("ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")
+    if any(path and not path.startswith(local_only) for path in paths):
+        raise ValueError("uncommitted source exists outside local execution records")

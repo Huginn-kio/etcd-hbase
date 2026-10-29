@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Negative controls for shared Java/Go evidence readers."""
 import json
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
-from evidence import GO_MODULE, GO_PACKAGES, go_report, java_reports
+from evidence import GO_MODULE, GO_PACKAGES, go_report, java_reports, require_unchanged_source
 
 
 class EvidenceTest(unittest.TestCase):
@@ -44,6 +45,27 @@ class EvidenceTest(unittest.TestCase):
             write(damaged)
             with self.assertRaises(ValueError):
                 go_report(path)
+
+
+    def test_source_changes_and_untracked_code_invalidate_evidence(self):
+        def git(*arguments):
+            return subprocess.check_output(["git", "-C", str(self.root), *arguments], stderr=subprocess.DEVNULL).decode().strip()
+        git("init", "-q")
+        git("config", "user.name", "Evidence Fixture")
+        git("config", "user.email", "fixture@example.invalid")
+        path = self.root / "source.txt"
+        path.write_text("original")
+        git("add", "source.txt")
+        git("commit", "-qm", "fixture")
+        source = {"checkout": git("rev-parse", "HEAD"), "tracked_dirty": False}
+        require_unchanged_source(self.root, source)
+        path.write_text("changed")
+        with self.assertRaises(ValueError):
+            require_unchanged_source(self.root, source)
+        path.write_text("original")
+        (self.root / "untracked.py").write_text("uncommitted")
+        with self.assertRaises(ValueError):
+            require_unchanged_source(self.root, source)
 
 
 if __name__ == "__main__":
