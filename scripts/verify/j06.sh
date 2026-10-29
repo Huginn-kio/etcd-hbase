@@ -12,6 +12,7 @@ output=pathlib.Path(sys.argv[1])
 def git(*args): return subprocess.check_output(['git',*args],text=True).strip()
 (output/'source.json').write_text(json.dumps({'head':git('rev-parse','HEAD'), 'base':git('rev-parse','origin/main'), 'tracked_dirty':bool(git('status','--porcelain','--untracked-files=no')), 'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()},indent=2)+'\n')
 PY
+python3 scripts/verify/test_j06_report.py
 scripts/dev/mvn21.sh -B -ntp -pl server -am -Pj03-wire,j04-hbase-local clean verify > "$REPORT/maven.log" 2>&1 || {
   tail -n 70 "$REPORT/maven.log" >&2
   exit 1
