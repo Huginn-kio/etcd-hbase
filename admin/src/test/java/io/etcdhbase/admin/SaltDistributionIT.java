@@ -21,6 +21,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -48,6 +49,7 @@ class SaltDistributionIT {
   private static final int REGION_COUNT = 16;
   private static final int SERVER_COUNT = 3;
   private static final int BATCH_SIZE = 128;
+  private static final int ROW_COUNT = 2048;
   private static final byte[] FAMILY = Bytes.toBytes("d");
   private static final byte[] QUALIFIER = Bytes.toBytes("salt-probe");
   private static final byte[] VALUE = Bytes.toBytes("j05-salt-record");
@@ -187,26 +189,82 @@ class SaltDistributionIT {
   }
 
   @Test
-  void writesAndReadsOneBatchAcrossRealRegionsAndServers() throws Exception {
-    var identifiers =
-        IntStream.range(0, BATCH_SIZE).mapToObj(index -> Bytes.toBytes((long) index)).toList();
+  void saltingSpreadsSequentialAndCommonPrefixWritesInEveryBatch() throws Exception {
+    for (var workload : Workload.values()) {
+      verifyWorkload(workload);
+    }
+  }
+
+  private void verifyWorkload(Workload workload) throws Exception {
+    var identifiers = IntStream.range(0, ROW_COUNT).mapToObj(workload::identifier).toList();
     var saltedRows = identifiers.stream().map(this::saltedRow).toList();
     var beforeSalt = readWrites(saltedTable);
     var beforeControl = readWrites(unsaltedTable);
-    writeRows(saltedTable, saltedRows);
-    writeRows(unsaltedTable, identifiers);
-    assertDistribution(
-        distribution(beforeSalt, readWrites(saltedTable), saltedPlacement),
+    var previousSalt = beforeSalt;
+    var previousControl = beforeControl;
+    for (int offset = 0; offset < ROW_COUNT; offset += BATCH_SIZE) {
+      var saltedBatch = saltedRows.subList(offset, offset + BATCH_SIZE);
+      var controlBatch = identifiers.subList(offset, offset + BATCH_SIZE);
+      writeRows(saltedTable, saltedBatch);
+      writeRows(unsaltedTable, controlBatch);
+      var afterSalt = readWrites(saltedTable);
+      var afterControl = readWrites(unsaltedTable);
+      var salted = distribution(previousSalt, afterSalt, saltedPlacement);
+      assertDistribution(salted, BATCH_SIZE, REGION_COUNT, SERVER_COUNT);
+      assertTrue(
+          salted.regions().getLast() <= BATCH_SIZE / 4, "a batch concentrated in one region");
+      assertDistribution(
+          distribution(previousControl, afterControl, unsaltedPlacement), BATCH_SIZE, 1, 1);
+      assertReadBack(saltedTable, saltedBatch);
+      assertReadBack(unsaltedTable, controlBatch);
+      previousSalt = afterSalt;
+      previousControl = afterControl;
+    }
+    var salted = distribution(beforeSalt, previousSalt, saltedPlacement);
+    var control = distribution(beforeControl, previousControl, unsaltedPlacement);
+    assertDistribution(salted, ROW_COUNT, REGION_COUNT, SERVER_COUNT);
+    assertTrue(salted.regions().getFirst() >= ROW_COUNT / REGION_COUNT / 2);
+    assertTrue(salted.regions().getLast() <= 2L * ROW_COUNT / REGION_COUNT);
+    assertDistribution(control, ROW_COUNT, 1, 1);
+    reportWorkload(workload, salted, control);
+  }
+
+  private static void reportWorkload(Workload workload, Distribution salted, Distribution control) {
+    System.out.printf(
+        "j05-salt workload=%s rows=%d batch_size=%d batches=%d "
+            + "salted_region_writes=%s salted_server_writes=%s "
+            + "unsalted_region_writes=%s unsalted_server_writes=%s "
+            + "per_batch=true readback=true status=passed%n",
+        workload,
+        ROW_COUNT,
         BATCH_SIZE,
-        REGION_COUNT,
-        SERVER_COUNT);
+        ROW_COUNT / BATCH_SIZE,
+        salted.regions(),
+        salted.servers(),
+        control.regions(),
+        control.servers());
+  }
+
+  @Test
+  void repeatedUpdatesToOneLogicalKeyStayOnOneRegionAndServer() throws Exception {
+    byte[] row = saltedRow(Bytes.toBytes("/hot/single-record"));
+    var before = readWrites(saltedTable);
+    for (int updateIndex = 0; updateIndex < BATCH_SIZE; updateIndex++) {
+      await(
+          connection
+              .getTable(saltedTable)
+              .put(new Put(row).addColumn(FAMILY, QUALIFIER, Bytes.toBytes(updateIndex))),
+          OPERATION_TIMEOUT);
+    }
     assertDistribution(
-        distribution(beforeControl, readWrites(unsaltedTable), unsaltedPlacement),
-        BATCH_SIZE,
-        1,
-        1);
-    assertReadBack(saltedTable, saltedRows);
-    assertReadBack(unsaltedTable, identifiers);
+        distribution(before, readWrites(saltedTable), saltedPlacement), BATCH_SIZE, 1, 1);
+    var observed = await(connection.getTable(saltedTable).get(new Get(row)), OPERATION_TIMEOUT);
+    assertArrayEquals(row, observed.getRow());
+    assertArrayEquals(Bytes.toBytes(BATCH_SIZE - 1), observed.getValue(FAMILY, QUALIFIER));
+    System.out.printf(
+        "j05-salt workload=SINGLE_HOT_KEY updates=%d active_regions=1 active_servers=1 "
+            + "readback=true status=passed%n",
+        BATCH_SIZE);
   }
 
   private byte[] saltedRow(byte[] identifier) {
@@ -268,4 +326,18 @@ class SaltDistributionIT {
   private record Distribution(List<Long> regions, List<Long> servers) {}
 
   private record RegionWrites(ServerName server, long count) {}
+
+  private enum Workload {
+    SEQUENTIAL,
+    SHARED_DIRECTORY;
+
+    byte[] identifier(int index) {
+      return switch (this) {
+        case SEQUENTIAL -> Bytes.toBytes((long) index);
+        case SHARED_DIRECTORY ->
+            Bytes.toBytes(
+                String.format(Locale.ROOT, "/root/services/shared/instance/%016d", index));
+      };
+    }
+  }
 }
