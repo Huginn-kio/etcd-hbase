@@ -92,6 +92,24 @@ class IdentityProviderContractTest {
     }
   }
 
+  @Test
+  void invalidAndClosedCredentialsStillCompleteWithTheStableFailureType() {
+    try (var provider = new ExtensionProvider(null);
+        var closed = new BackendCredentials("fixture-user", new char[0]);
+        var oversized = new BackendCredentials("fixture-user", new char[65]);
+        var wrong = new BackendCredentials("wrong-user", "fixture-secret".toCharArray())) {
+      closed.close();
+      for (var credentials : java.util.List.of(closed, oversized, wrong)) {
+        var failure =
+            assertThrows(
+                CompletionException.class,
+                () -> provider.authenticate(credentials, SCOPE).toCompletableFuture().join());
+        assertEquals(
+            Reason.INVALID_CREDENTIALS, ((BackendIdentityException) failure.getCause()).reason());
+      }
+    }
+  }
+
   /**
    * A synchronous, bounded, CPU-only provider fixture. Real HBase authentication and its async
    * ownership checks remain in hbase; this fixture proves use of the public contract only.
@@ -114,7 +132,13 @@ class IdentityProviderContractTest {
         BackendCredentials credentials, AuthenticationScope scope) {
       if (closed) return failed(Reason.BACKEND_UNAVAILABLE);
       if (!SCOPE.equals(scope)) return failed(Reason.INSUFFICIENT_PERMISSION);
-      lastSecret = credentials.copySecret(64);
+      if (!credentials.principal().equals("fixture-user"))
+        return failed(Reason.INVALID_CREDENTIALS);
+      try {
+        lastSecret = credentials.copySecret(64);
+      } catch (IllegalArgumentException | IllegalStateException rejected) {
+        return failed(Reason.INVALID_CREDENTIALS);
+      }
       try {
         if (forcedFailure != null) return failed(forcedFailure);
         if (!Arrays.equals(lastSecret, "fixture-secret".toCharArray())) {
