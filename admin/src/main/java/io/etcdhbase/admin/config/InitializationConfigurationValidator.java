@@ -25,7 +25,7 @@ import java.util.Set;
 import java.util.function.Function;
 
 /** Validates only the init candidate and its physical table scope, without contacting HBase. */
-final class InitializationConfigurationValidator {
+public final class InitializationConfigurationValidator {
   private static final int MAX_PRE_SPLIT_REGIONS = 1024;
   private static final Set<RecordCategory> SYSTEM_CATEGORIES =
       EnumSet.of(
@@ -37,7 +37,7 @@ final class InitializationConfigurationValidator {
 
   private InitializationConfigurationValidator() {}
 
-  static void validate(InitializationConfiguration configuration) {
+  public static void validate(InitializationConfiguration configuration) {
     require(configuration.schemaVersion() == 1, "unsupported initialization schema version");
     Map<String, HBaseProfile> profiles = index(configuration.hbaseProfiles(), HBaseProfile::id);
     Map<String, SaltProfile> salts = index(configuration.saltProfiles(), SaltProfile::id);
