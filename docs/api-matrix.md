@@ -4,7 +4,7 @@
 
 本矩阵落实开发计划第 4 节的完整首版范围。直接调用、client 自动调用及需求承诺分别标注；未观察到业务调用不会移除已承诺功能。原已明确不支持的能力验收真实拒绝行为。M0 骨架尚未实现的 handler 返回 UNIMPLEMENTED，不能把本文的“首版支持”视为当前已支持。
 
-## 共用协议契约
+## 1 共用协议契约
 
 协议为 etcd v3.5.23 的 [rpc.proto][proto]，KV 字段为 [kv.proto][kvproto]，完整 method 路径和流形态记录在 [源码基线](baselines/j00-source-baseline.json)。
 
@@ -15,9 +15,11 @@
 - 所有桶在一个有效 ReadView 中完成一次 Range。多次独立 Range 没有自动共享快照，显式 revision 才选择同一逻辑历史。
 - 明确参数错误、认证/授权、资源预算、取消、deadline、后端失败和提交结果未知；失败不投影为空列表或成功。响应超预算不静默截断。
 
-## KV / Range / Txn
+## 2 KV / Range / Txn
 
 以下证据 Uxx 对应调用基线中的入口。Cxx 对应下文验收用例定义，均待 J07 及对应实现任务执行。
+
+**表 1 KV、Range 与 Txn 接口契约**
 
 | ID / wire RPC | 首版请求组合与支持边界 | 必须真实的响应与错误 | 调用依据 | 实现任务 / 用例 |
 |---|---|---|---|---|
@@ -39,7 +41,9 @@
 
 Range 的非 KEY 排序属于 J35 要逐项说明支持或明确拒绝的边界；首版不能静默用 key 排序代替 VERSION/CREATE/MOD/VALUE。Put 的 ignore_value/ignore_lease 非默认组合不属于已确定的调用组合，J30 必须明确支持或返回 UNIMPLEMENTED，不得忽略标志并普通写入。这些边界的最终选择在对应实现评审记录，不据此削减上表已承诺能力。
 
-## Count 已接受差异
+## 3 Count 已接受差异
+
+**表 2 Count 已接受差异与结果要求**
 
 | 请求 | 首版 Count | More / 结果要求 |
 |---|---|---|
@@ -50,9 +54,13 @@ Range 的非 KEY 排序属于 J35 要逐项说明支持或明确拒绝的边界�
 | 范围 CountOnly + Limit=1 | 真实存在性 0/1，Kvs 空 | More=false；不以随机数或缓存猜测存在性 |
 | 其他范围 CountOnly | 明确 UNIMPLEMENTED | 不发起准确全范围计数 |
 
-范围 CountOnly+Limit=1 可能与原生总数不同；只豁免这里的 Count，不豁免 More、revision、错误或任何其他字段。原生 [MVCC Count 路径][mvcc-count] 返回空 KVs，[Range 组装][range-response] 仅在返回 KVs 超过 Limit 时设置 More，因此本组合 More=false，即使匹配数大于一。C05 仍需执行运行对照；不能用普通 Range 的额外记录规则要求 CountOnly 再扫描第二条。消费者与迁移工具的区别见调用基线的 Count 审计。
+成功的有 Limit 普通 Range 和范围 CountOnly+Limit=1 都可能与原生匹配总数不同：前者要求目标 Count 等于本页 len(Kvs)，后者要求真实存在性 0/1。`testkit/count-policy.json` 的 schema 2 分别记录两项成功 Count 规则，C03/C05 是覆盖索引；对照器按请求语义识别，不把规则限制为 case 标签。仅允许 Count 转换，Kvs、More、Header、revision、错误及其他字段仍严格比较；双方成功但目标 Count 非法时，即使两侧 Count 相同也必须拒绝。失败观察不应用成功 Count 规则，response=null 时仍完整比较错误身份，同 code 的 FutureRev 与 Compacted 不能视为相同。
 
-## Lease / Watch
+原生 [MVCC Count 路径][mvcc-count] 对普通分页返回匹配总数，而 [Range 组装][range-response] 会截断 Kvs 并保留真实 More；CountOnly 返回空 KVs，仅在返回 Kvs 超过 Limit 时设置 More，因此 CountOnly+Limit=1 的 More=false，即使匹配数大于一。C03/C05 都需执行正反运行对照；不能用普通 Range 的额外记录规则要求 CountOnly 再扫描第二条。消费者与迁移工具的区别见调用基线的 Count 审计。
+
+## 4 Lease / Watch
+
+**表 3 Lease 与 Watch 接口契约**
 
 | ID / wire RPC | 请求与首版契约 | 响应、错误与联动 | 依据 | 实现任务 / 用例 |
 |---|---|---|---|---|
@@ -67,7 +75,9 @@ Range 的非 KEY 排序属于 J35 要逐项说明支持或明确拒绝的边界�
 
 CreatedNotify 是 Go client 对创建响应的交付选项，不是 WatchCreateRequest 的同名 wire 字段。服务必须发真实 created 响应，即使用户没有请求在 WatchChan 中观察它，client 仍用它建立 watchId。
 
-## Auth / 运维 / 明确不支持项
+## 5 Auth / 运维 / 明确不支持项
+
+**表 4 认证、运维与不支持能力的边界**
 
 | ID / wire RPC | 首版结果要求 | 依据及请求字段 | 实现任务 / 用例 |
 |---|---|---|---|
@@ -82,9 +92,11 @@ CreatedNotify 是 Go client 对创建响应的交付选项，不是 WatchCreateR
 
 A02 管理方法完整清单：AuthEnable、AuthDisable、AuthStatus、UserAdd、UserGet、UserList、UserDelete、UserChangePassword、UserGrantRole、UserRevokeRole、RoleAdd、RoleGet、RoleList、RoleDelete、RoleGrantPermission、RoleRevokePermission。其 protobuf 请求/响应字段随固定 descriptor 校验；映射范围和实际后端权限在 J51 附逐方法报告。本轮保留这一完整验收责任，不虚构目标环境能力。
 
-## 错误与重试验收
+## 6 错误与重试验收
 
 下表的 wire 描述以固定 [rpctypes/error.go][errors] 为准，实施时复制对应协议定义或建立可验证的投影，不能仅返回相同 gRPC code 的任意描述。
+
+**表 5 错误、重试与消费者验收要求**
 
 | ID | 情况 | gRPC / Go client 结果 | 消费者后果与任务 |
 |---|---|---|---|
@@ -97,9 +109,11 @@ A02 管理方法完整清单：AuthEnable、AuthDisable、AuthStatus、UserAdd�
 | E07 | 参数/重复 key/预算/未知方法 | InvalidArgument 对应原生校验；资源超限明确 ResourceExhausted；未支持 UNIMPLEMENTED | 原生 request-too-large 与服务资源预算分别验证；J03/J13/J32/J54 |
 | E08 | 取消/deadline/CAS 结果未知 | Canceled/DeadlineExceeded 或实际投影；发布后服务继续恢复，内部查询决定，不盲目重新发布 | Go client 对 mutable RPC 重试受限；J06/J23/J27 |
 
-## 验收用例定义（全部尚未执行）
+## 7 验收用例定义（全部尚未执行）
 
 J07 建立请求/结果驱动；对应功能阶段执行协议对照；M6 再执行真实消费者。每个结果记录固定版本、请求 bytes/参数、Kvs/元数据/Header、错误描述和客户端最终行为。只允许已接受 Count 差异、标识映射及已明确的后端管理映射，不用归一化掩盖顺序、遗漏或版本错误。
+
+**表 6 验收用例与首次完整行为验收**
 
 | 用例 | 请求场景与判据 | 首次完整行为验收 |
 |---|---|---|
@@ -142,3 +156,63 @@ J07 建立请求/结果驱动；对应功能阶段执行协议对照；M6 再执
 [errors]: https://github.com/etcd-io/etcd/blob/1cf4bc40111fd95d1e14a90a09a146357b15eb13/api/v3rpc/rpctypes/error.go
 [mvcc-count]: https://github.com/etcd-io/etcd/blob/1cf4bc40111fd95d1e14a90a09a146357b15eb13/server/mvcc/kvstore_txn.go#L139
 [range-response]: https://github.com/etcd-io/etcd/blob/1cf4bc40111fd95d1e14a90a09a146357b15eb13/server/etcdserver/apply.go#L412
+
+
+## 8 完整 gRPC 方法清单
+
+此清单核对固定 descriptor、请求/响应字段、Milvus 调用编号与实现任务；它是静态覆盖清单，不表示 C01–C33 完整业务验收通过。所有当前生产 handler 仍返回 `UNIMPLEMENTED`。
+
+**表 7 完整 gRPC 方法清单与 M0 拒绝边界**
+
+| RPC method | Request → response | Stream shape | First-release | usage_id | Tasks | Cases | M0 behavior / rejection |
+|---|---|---|---|---|---|---|---|
+| `etcdserverpb.Auth/AuthDisable` | `etcdserverpb.AuthDisableRequest` → `etcdserverpb.AuthDisableResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/AuthEnable` | `etcdserverpb.AuthEnableRequest` → `etcdserverpb.AuthEnableResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/AuthStatus` | `etcdserverpb.AuthStatusRequest` → `etcdserverpb.AuthStatusResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/Authenticate` | `etcdserverpb.AuthenticateRequest` → `etcdserverpb.AuthenticateResponse` | unary | supported | U09, U16 | J04, J50, J51 | C29, C30 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.Auth/RoleAdd` | `etcdserverpb.AuthRoleAddRequest` → `etcdserverpb.AuthRoleAddResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/RoleDelete` | `etcdserverpb.AuthRoleDeleteRequest` → `etcdserverpb.AuthRoleDeleteResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/RoleGet` | `etcdserverpb.AuthRoleGetRequest` → `etcdserverpb.AuthRoleGetResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/RoleGrantPermission` | `etcdserverpb.AuthRoleGrantPermissionRequest` → `etcdserverpb.AuthRoleGrantPermissionResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/RoleList` | `etcdserverpb.AuthRoleListRequest` → `etcdserverpb.AuthRoleListResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/RoleRevokePermission` | `etcdserverpb.AuthRoleRevokePermissionRequest` → `etcdserverpb.AuthRoleRevokePermissionResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/UserAdd` | `etcdserverpb.AuthUserAddRequest` → `etcdserverpb.AuthUserAddResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/UserChangePassword` | `etcdserverpb.AuthUserChangePasswordRequest` → `etcdserverpb.AuthUserChangePasswordResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/UserDelete` | `etcdserverpb.AuthUserDeleteRequest` → `etcdserverpb.AuthUserDeleteResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/UserGet` | `etcdserverpb.AuthUserGetRequest` → `etcdserverpb.AuthUserGetResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/UserGrantRole` | `etcdserverpb.AuthUserGrantRoleRequest` → `etcdserverpb.AuthUserGrantRoleResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/UserList` | `etcdserverpb.AuthUserListRequest` → `etcdserverpb.AuthUserListResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Auth/UserRevokeRole` | `etcdserverpb.AuthUserRevokeRoleRequest` → `etcdserverpb.AuthUserRevokeRoleResponse` | unary | conditional | — | J51 | C31 | 当前 M0：UNIMPLEMENTED；后续支持范围须经后端映射验收。 |
+| `etcdserverpb.Cluster/MemberAdd` | `etcdserverpb.MemberAddRequest` → `etcdserverpb.MemberAddResponse` | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.Cluster/MemberList` | `etcdserverpb.MemberListRequest` → `etcdserverpb.MemberListResponse` | unary | supported | U16 | J54, J67 | C28 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.Cluster/MemberPromote` | `etcdserverpb.MemberPromoteRequest` → `etcdserverpb.MemberPromoteResponse` | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.Cluster/MemberRemove` | `etcdserverpb.MemberRemoveRequest` → `etcdserverpb.MemberRemoveResponse` | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.Cluster/MemberUpdate` | `etcdserverpb.MemberUpdateRequest` → `etcdserverpb.MemberUpdateResponse` | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.KV/Compact` | `etcdserverpb.CompactionRequest` → `etcdserverpb.CompactionResponse` | unary | supported | — | J52 | C14 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.KV/DeleteRange` | `etcdserverpb.DeleteRangeRequest` → `etcdserverpb.DeleteRangeResponse` | unary | supported | U04, U11, U15 | J33, J43, J44 | C09, C10, C18, C27 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.KV/Put` | `etcdserverpb.PutRequest` → `etcdserverpb.PutResponse` | unary | supported | U04, U05, U12, U14, U15 | J30, J41, J66 | C01, C07, C08, C16, C24, C26, C27 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.KV/Range` | `etcdserverpb.RangeRequest` → `etcdserverpb.RangeResponse` | unary | supported | U01, U02, U03, U05, U07, U08, U09, U10, U13, U14, U15, U16 | J14, J15, J25, J34, J35, J36, J63 | C01, C02, C03, C04, C05, C06, C23, C26, C27, C28 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.KV/Txn` | `etcdserverpb.TxnRequest` → `etcdserverpb.TxnResponse` | unary | supported | U04, U05, U12, U13 | J31, J32, J41, J43, J44 | C11, C12, C13, C16, C24, C25 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.Lease/LeaseGrant` | `etcdserverpb.LeaseGrantRequest` → `etcdserverpb.LeaseGrantResponse` | unary | supported | U05 | J40 | C08, C15, C16 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.Lease/LeaseKeepAlive` | `etcdserverpb.LeaseKeepAliveRequest` → `etcdserverpb.LeaseKeepAliveResponse` | bidirectional-streaming | supported | U06 | J42 | C17 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.Lease/LeaseLeases` | `etcdserverpb.LeaseLeasesRequest` → `etcdserverpb.LeaseLeasesResponse` | unary | supported | — | J40 | C15 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.Lease/LeaseRevoke` | `etcdserverpb.LeaseRevokeRequest` → `etcdserverpb.LeaseRevokeResponse` | unary | supported | U06 | J41, J43 | C18 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.Lease/LeaseTimeToLive` | `etcdserverpb.LeaseTimeToLiveRequest` → `etcdserverpb.LeaseTimeToLiveResponse` | unary | supported | U06 | J40 | C15, C18 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.Maintenance/Alarm` | `etcdserverpb.AlarmRequest` → `etcdserverpb.AlarmResponse` | unary | mixed | U16 | J54 | C28, C32 | 当前 M0：UNIMPLEMENTED；后续仅实现已明确映射的操作。 |
+| `etcdserverpb.Maintenance/Defragment` | `etcdserverpb.DefragmentRequest` → `etcdserverpb.DefragmentResponse` | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.Maintenance/Downgrade` | `etcdserverpb.DowngradeRequest` → `etcdserverpb.DowngradeResponse` | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.Maintenance/Hash` | `etcdserverpb.HashRequest` → `etcdserverpb.HashResponse` | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.Maintenance/HashKV` | `etcdserverpb.HashKVRequest` → `etcdserverpb.HashKVResponse` | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.Maintenance/MoveLeader` | `etcdserverpb.MoveLeaderRequest` → `etcdserverpb.MoveLeaderResponse` | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.Maintenance/Snapshot` | `etcdserverpb.SnapshotRequest` → `etcdserverpb.SnapshotResponse` | server-streaming | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `etcdserverpb.Maintenance/Status` | `etcdserverpb.StatusRequest` → `etcdserverpb.StatusResponse` | unary | supported | — | J54, J67 | C32 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `etcdserverpb.Watch/Watch` | `etcdserverpb.WatchRequest` → `etcdserverpb.WatchResponse` | bidirectional-streaming | supported | U07, U08, U13 | J44, J45, J46, J47 | C19, C20, C21, C22 | 当前 M0：UNIMPLEMENTED；后续按协议交付真实结果与错误。 |
+| `v3lockpb.Lock/Lock` | external proto | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `v3lockpb.Lock/Unlock` | external proto | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `v3electionpb.Election/Campaign` | external proto | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `v3electionpb.Election/Proclaim` | external proto | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `v3electionpb.Election/Leader` | external proto | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `v3electionpb.Election/Observe` | external proto | server-streaming | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+| `v3electionpb.Election/Resign` | external proto | unary | unsupported | — | J54 | C33 | 当前 M0：UNIMPLEMENTED；首版明确不支持。 |
+
+这七项 Lock/Election 方法固定于 etcd v3.5.23，上游源文件路径记录在 `testkit/cases/m0-wire.json`；它们不属于已 vendored 的三个公共 API proto，当前明确返回 `UNIMPLEMENTED`。J07 还使用固定 Go server 模块生成的服务描述验证这七项方法的流形态。
