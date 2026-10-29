@@ -34,7 +34,7 @@ JAVA_HOME="$ETCD_HBASE_JDK21_HOME" .artifacts/m0/public/<run>/runtime/etcd-hbase
 
 默认开发配置绑定 loopback、使用动态端口，明确禁止把无认证模式作为公网服务。容器配置只把端口改为 2379，仍绑定 loopback；验证程序在容器网络命名空间内执行探针，不通过开放无认证端口完成测试。
 
-镜像来源、tag、index/platform digest、平台与 JRE vendor/patch 记录于 [dependency-lock.json](../../build/dependency-lock.json)。Dockerfile 固定 `linux/amd64` 平台 manifest。镜像只复制已验证运行目录；构建期间禁用网络，不从镜像内执行 Maven 或下载项目依赖。测试容器使用 UID/GID 65532、只读根文件系统、有限 tmpfs/内存/进程数、无外部网络及 capabilities，测试结束删除本次 UUID 标记的资源。镜像验证不执行 push 或部署。
+镜像来源、tag、index/platform digest、平台与 JRE vendor/patch 记录于 [dependency-lock.json](../../build/dependency-lock.json)。Dockerfile 固定 `linux/amd64` 平台 manifest。镜像只复制已验证运行目录；基础镜像拉取需要访问公开 registry；`--network none` 限制构建容器的网络，不从镜像内执行 Maven 或下载项目依赖。测试容器使用 UID/GID 65532、只读根文件系统、有限 tmpfs/内存/进程数、无外部网络及 capabilities，测试结束在 30 秒总预算内删除本次 UUID 标记的资源；外层取消宽限为 45 秒，给内层 JVM/容器清理留出时间。镜像验证不执行 push 或部署。
 
 ## 许可、发布与验收
 

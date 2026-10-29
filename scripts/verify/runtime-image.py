@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from build_process import run_logged, termination_is_exception
 from runtime_probe import await_transport, probe_arguments
@@ -31,12 +32,25 @@ class Docker:
     def cleanup(self, token):
         # Labels are assigned before create/build. Even a timed-out command with
         # an unknown outcome can only leave resources bearing this run's UUID.
+        deadline = time.monotonic() + 30
+        failures = []
         for kind in ("container", "image"):
-            identifiers = self.call([kind, "ls", "--quiet", "--all", "--filter", "label=etcd-hbase.m0.verify=" + token]).splitlines()
-            if any(not re.fullmatch(r"(?:sha256:)?[0-9a-f]{12,64}", value) for value in identifiers):
-                raise ValueError("Docker returned an invalid owned resource ID")
-            if identifiers:
-                self.call([kind, "rm", "--force", *identifiers], timeout=30)
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError("owned Docker cleanup exceeded its total budget")
+                identifiers = self.call([kind, "ls", "--quiet", "--all", "--filter", "label=etcd-hbase.m0.verify=" + token], timeout=remaining).splitlines()
+                if any(not re.fullmatch(r"(?:sha256:)?[0-9a-f]{12,64}", value) for value in identifiers):
+                    raise ValueError("Docker returned an invalid owned resource ID")
+                if identifiers:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ValueError("owned Docker cleanup exceeded its total budget")
+                    self.call([kind, "rm", "--force", *identifiers], timeout=remaining)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                failures.append(kind)
+        if failures:
+            raise ValueError("owned Docker resources could not be fully released within 30 seconds")
 
 
 def java_properties(output, lock):

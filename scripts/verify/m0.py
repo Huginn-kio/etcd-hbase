@@ -31,7 +31,7 @@ class PublicVerification:
         self.steps.append(record)
         try:
             code = run_logged(command, log, ROOT, timeout=timeout,
-                              environment=environment or self.environment, stderr_path=stderr)
+                              environment=environment or self.environment, stderr_path=stderr, termination_grace=45)
             record.update(exit_code=code, status="passed" if code == 0 else "unavailable" if unavailable and code == 2 else "failed")
             if record["status"] == "failed":
                 print("\n".join(log.read_text(errors="replace").splitlines()[-60:]), file=sys.stderr)

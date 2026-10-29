@@ -13,7 +13,7 @@ import tempfile
 import unittest
 import zipfile
 from runtime_probe import await_transport, check_observation
-from build_process import stop_group
+from build_process import run_logged, stop_group
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -72,9 +72,10 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual([server.resolve(), dependency.resolve()], [path for path, _ in ordered])
         colliding = self.jar(self.root / "other-group", "dependency.jar")
         test_jar = self.jar(self.root / "repository", "hbase-tests.jar")
+        testkit = self.jar(self.root / "repository", "testkit-0.1.0-SNAPSHOT.jar")
         legacy = self.jar(self.root / "repository", "protobuf-java-2.5.0.jar")
         for paths, hashes in (([server, dependency, colliding], expected), ([server, test_jar], expected),
-                              ([server, legacy], expected), ([server], {server.name: "wrong"}), ([dependency], expected)):
+                              ([server, legacy], expected), ([server, testkit], expected), ([server], {server.name: "wrong"}), ([dependency], expected)):
             with self.assertRaises(ValueError):
                 package.validate_runtime_jars(paths, hashes)
         output = self.root / "output"
@@ -122,6 +123,40 @@ class DeliveryTest(unittest.TestCase):
             except ProcessLookupError:
                 pass
             process.wait(timeout=5)
+
+    def test_outer_cancellation_allows_the_resource_owner_to_finish_cleanup(self):
+        pid_path = self.root / "child.pid"
+        marker = self.root / "cleanup.finished"
+        child = "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready',flush=True); signal.pause()"
+        owner = """import subprocess,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from build_process import termination_is_exception,stop_group
+with termination_is_exception():
+ child=subprocess.Popen([sys.executable,'-c',sys.argv[4]],stdout=subprocess.PIPE,start_new_session=True)
+ try:
+  child.stdout.readline()
+  Path(sys.argv[2]).write_text(str(child.pid))
+  time.sleep(60)
+ finally:
+  time.sleep(0.3)
+  stop_group(child,grace=0.05)
+  Path(sys.argv[3]).write_text('finished')
+"""
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_logged([sys.executable, "-c", owner, str(ROOT / "scripts/verify"), str(pid_path), str(marker), child],
+                           self.root / "owner.log", ROOT, timeout=2, termination_grace=2)
+            self.assertEqual("finished", marker.read_text())
+            child_pid = int(pid_path.read_text())
+            state = subprocess.run(["ps", "-p", str(child_pid), "-o", "stat="], capture_output=True, text=True).stdout.strip()
+            self.assertTrue(not state or state.startswith("Z"), "owned resource survived outer cancellation")
+        finally:
+            if pid_path.exists():
+                try:
+                    os.killpg(int(pid_path.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ def validate_runtime(output, build):
         raise ValueError("runtime manifest overstates its source or release status")
     entries = manifest["classpath_order"]
     names = [entry["file"] for entry in entries]
-    if len(set(names)) != len(names) or not names or any(Path(name).name != name or not name.endswith(".jar") or name.endswith("-tests.jar") or name == "protobuf-java-2.5.0.jar" for name in names):
+    if len(set(names)) != len(names) or not names or any(Path(name).name != name or not name.endswith(".jar") or name.endswith("-tests.jar") or name == "testkit.jar" or name.startswith("testkit-") or name == "protobuf-java-2.5.0.jar" for name in names):
         raise ValueError("runtime classpath contains invalid or duplicate entries")
     if (directory / "classpath.txt").read_text() != ":".join("lib/" + name for name in names) + "\n":
         raise ValueError("runtime classpath order differs from Maven staging")

@@ -43,7 +43,7 @@ def stop_group(process, grace=5):
     process.wait(timeout=5)
 
 
-def run_logged(command, log_path, cwd, timeout=1200, environment=None, stderr_path=None):
+def run_logged(command, log_path, cwd, timeout=1200, environment=None, stderr_path=None, termination_grace=5):
     with ExitStack() as resources, termination_is_exception():
         log = resources.enter_context(Path(log_path).open("wb"))
         errors = resources.enter_context(Path(stderr_path).open("wb")) if stderr_path else subprocess.STDOUT
@@ -52,8 +52,8 @@ def run_logged(command, log_path, cwd, timeout=1200, environment=None, stderr_pa
         try:
             code = process.wait(timeout=timeout)
             if code:
-                stop_group(process)
+                stop_group(process, grace=termination_grace)
             return code
         except BaseException:
-            stop_group(process)
+            stop_group(process, grace=termination_grace)
             raise

@@ -33,7 +33,7 @@ def validate_runtime_jars(paths, verified_projects):
             continue
         seen.add(source)
         name = source.name
-        if not source.is_file() or not JAR_NAME.fullmatch(name) or name.endswith("-tests.jar") or name == "protobuf-java-2.5.0.jar":
+        if not source.is_file() or not JAR_NAME.fullmatch(name) or name.endswith("-tests.jar") or name == "testkit.jar" or name.startswith("testkit-") or name == "protobuf-java-2.5.0.jar":
             raise ValueError("runtime classpath includes development, test, legacy or invalid entries")
         if name in names:
             raise ValueError("runtime classpath has colliding JAR filenames")

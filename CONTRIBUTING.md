@@ -6,7 +6,7 @@
 
 - 使用锁定的 Eclipse Temurin JDK 21.0.12.1+1 和 Maven Wrapper。版本、归档摘要与公开来源见 [`docs/build/m0-toolchain.md`](docs/build/m0-toolchain.md) 和 [`build/dependency-lock.json`](build/dependency-lock.json)。
 - 将 `ETCD_HBASE_JDK21_HOME` 指向该 JDK 的 home 目录，然后运行 `scripts/dev/mvn21.sh clean verify`。
-- 公开构建只需访问 Maven Central 和公开 JDK 下载源；不要求私有 Maven 仓库、扩展仓库或目标环境凭据。
+- 公开构建访问 Maven Central、锁定的公开 JDK/Go 下载源和 Go proxy/checksum 服务；镜像检查还需公开容器 registry；不要求私有 Maven 仓库、扩展仓库或目标环境凭据。
 - 不要提交生成的 toolchain 文件、构建输出、环境配置或任何凭据。目标环境参数通过受控的外部输入流程提供，不放入公开样例。
 
 ## 变更与 Pull Request
