@@ -86,17 +86,32 @@ public final class InitializationConfigurationLoader {
       }
       if (component.getType().isRecord()) {
         requireProperties(value, component.getType());
-      } else if (List.class.isAssignableFrom(component.getType())
-          && component.getGenericType() instanceof ParameterizedType parameterized
-          && parameterized.getActualTypeArguments()[0] instanceof Class<?> elementType
-          && elementType.isRecord()) {
-        if (!value.isArray()) {
-          throw new IllegalArgumentException("initialization collection must be an array: " + name);
-        }
-        for (JsonNode item : value) {
-          requireProperties(item, elementType);
+      } else {
+        Class<?> elementType = recordListElementType(component);
+        if (elementType != null) {
+          requireRecordArray(value, elementType, name);
         }
       }
+    }
+  }
+
+  private static Class<?> recordListElementType(RecordComponent component) {
+    if (List.class.isAssignableFrom(component.getType())
+        && component.getGenericType() instanceof ParameterizedType listType
+        && listType.getActualTypeArguments()[0] instanceof Class<?> elementType
+        && elementType.isRecord()) {
+      return elementType;
+    }
+    return null;
+  }
+
+  private static void requireRecordArray(JsonNode value, Class<?> elementType, String propertyName) {
+    if (!value.isArray()) {
+      throw new IllegalArgumentException(
+          "initialization collection must be an array: " + propertyName);
+    }
+    for (JsonNode item : value) {
+      requireProperties(item, elementType);
     }
   }
 

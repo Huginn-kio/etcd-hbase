@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.util.List;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.TableName;
 
@@ -109,17 +110,7 @@ public final class InitializeTablesCommand {
         || !plan.identityProviderId().equals(DEVELOPMENT_NO_AUTH_PROVIDER_ID)) {
       throw new MissingIdentityInputException();
     }
-    var configuration = HBaseConfiguration.create();
-    configuration.set("hbase.zookeeper.quorum", plan.hbaseProfile().quorum());
-    configuration.set("hbase.client.zookeeper.quorum", plan.hbaseProfile().quorum());
-    configuration.setInt("hbase.zookeeper.property.clientPort", plan.hbaseProfile().clientPort());
-    configuration.setInt(
-        "hbase.client.zookeeper.property.clientPort", plan.hbaseProfile().clientPort());
-    configuration.set(
-        "hbase.client.registry.impl", "org.apache.hadoop.hbase.client.ZKConnectionRegistry");
-    configuration.set("hbase.security.authentication", "simple");
-    configuration.set("hadoop.security.authentication", "simple");
-    configuration.setBoolean("hbase.security.authorization", false);
+    var configuration = localDevelopmentConfiguration(plan);
     var scope = new AuthenticationScope(plan.tableGroupId(), plan.hbaseProfile().id());
     // This explicit SIMPLE profile verifies reachability; secure callers supply a real J04 identity
     // to TableGroupInitializer.initialize. No credential mechanism is hardcoded into that API.
@@ -140,6 +131,21 @@ public final class InitializeTablesCommand {
       return TableGroupInitializer.initialize(
           plan, "sha256:" + plan.fingerprint(), identity, provider);
     }
+  }
+
+  static Configuration localDevelopmentConfiguration(TableGroupInitializationPlan plan) {
+    var configuration = HBaseConfiguration.create();
+    configuration.set("hbase.zookeeper.quorum", plan.hbaseProfile().quorum());
+    configuration.set("hbase.client.zookeeper.quorum", plan.hbaseProfile().quorum());
+    configuration.setInt("hbase.zookeeper.property.clientPort", plan.hbaseProfile().clientPort());
+    configuration.setInt(
+        "hbase.client.zookeeper.property.clientPort", plan.hbaseProfile().clientPort());
+    configuration.set(
+        "hbase.client.registry.impl", "org.apache.hadoop.hbase.client.ZKConnectionRegistry");
+    configuration.set("hbase.security.authentication", "simple");
+    configuration.set("hadoop.security.authentication", "simple");
+    configuration.setBoolean("hbase.security.authorization", false);
+    return configuration;
   }
 
   private static void printPlan(TableGroupInitializationPlan plan, PrintStream output) {

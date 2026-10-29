@@ -1,5 +1,6 @@
 package io.etcdhbase.admin;
 
+import static io.etcdhbase.admin.InitializationFixtures.plan;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -38,7 +39,7 @@ import org.junit.jupiter.api.Test;
 class TableGroupInitializerTest {
   @Test
   void resumesMatchingPartialCreationAndThenBecomesANoOp() throws Exception {
-    TableGroupInitializationPlan plan = plan("history-table.yaml", "m0_init_partial");
+    TableGroupInitializationPlan plan = plan("history-table.json", "m0_init_partial");
     InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
     admin.failOnCreateNumber = 2;
 
@@ -67,7 +68,7 @@ class TableGroupInitializerTest {
 
   @Test
   void refusesConflictingDescriptorsAndUnrelatedTablesWithoutModifyingThem() throws Exception {
-    TableGroupInitializationPlan plan = plan("history-table.yaml", "m0_init_conflict");
+    TableGroupInitializationPlan plan = plan("history-table.json", "m0_init_conflict");
     InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
     TableGroupInitializer.initialize(plan, admin);
     TableName firstTable = admin.descriptors.keySet().stream().findFirst().orElseThrow();
@@ -90,7 +91,7 @@ class TableGroupInitializerTest {
 
   @Test
   void acceptsBackendAddedDescriptorDefaultsWhenPlannedSchemaStillMatches() throws Exception {
-    TableGroupInitializationPlan plan = plan("history-table.yaml", "m0_init_backend_default");
+    TableGroupInitializationPlan plan = plan("history-table.json", "m0_init_backend_default");
     InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
     TableGroupInitializer.initialize(plan, admin);
     TableName firstTable = admin.descriptors.keySet().stream().findFirst().orElseThrow();
@@ -109,7 +110,7 @@ class TableGroupInitializerTest {
 
   @Test
   void refusesToExtendAPartialGroupThatAlreadyContainsRows() throws Exception {
-    TableGroupInitializationPlan plan = plan("history-table.yaml", "m0_init_nonempty");
+    TableGroupInitializationPlan plan = plan("history-table.json", "m0_init_nonempty");
     InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
     admin.failOnCreateNumber = 2;
     assertThrows(
@@ -126,7 +127,7 @@ class TableGroupInitializerTest {
 
   @Test
   void fullGroupRetryIgnoresOperationalRegionSplitsAndPreservesData() throws Exception {
-    TableGroupInitializationPlan plan = plan("history-table.yaml", "m0_init_split_full");
+    TableGroupInitializationPlan plan = plan("history-table.json", "m0_init_split_full");
     InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
     TableGroupInitializer.initialize(plan, admin);
     TableName tableName = TableName.valueOf(plan.namespace(), "system");
@@ -145,7 +146,7 @@ class TableGroupInitializerTest {
 
   @Test
   void partialGroupWithChangedRegionBoundariesCannotResume() throws Exception {
-    TableGroupInitializationPlan plan = plan("history-table.yaml", "m0_init_split_partial");
+    TableGroupInitializationPlan plan = plan("history-table.json", "m0_init_split_partial");
     InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
     admin.failOnCreateNumber = 2;
     assertThrows(
@@ -167,9 +168,9 @@ class TableGroupInitializerTest {
 
   @Test
   void mapsBothHistoryCandidatesIntoDistinctExplicitTableGroups() throws Exception {
-    TableGroupInitializationPlan separate = plan("history-table.yaml", "m0_init_separate");
+    TableGroupInitializationPlan separate = plan("history-table.json", "m0_init_separate");
     TableGroupInitializationPlan nativeVersions =
-        plan("native-cell-versions.yaml", "m0_init_native");
+        plan("native-cell-versions.json", "m0_init_native");
     InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
 
     TableGroupInitializer.initialize(separate, admin);
@@ -191,7 +192,7 @@ class TableGroupInitializerTest {
     TableGroupInitializationPlan local = TableGroupPlanFactory.create(configuration, "local", null);
     TableGroupInitializationPlan sibling =
         TableGroupPlanFactory.create(configuration, "sibling", null);
-    TableGroupInitializationPlan singleGroup = plan("history-table.yaml", "shared_namespace");
+    TableGroupInitializationPlan singleGroup = plan("history-table.json", "shared_namespace");
     InMemoryTableGroupAdmin admin = new InMemoryTableGroupAdmin();
     Set<String> expectedConfiguredTables =
         Stream.concat(
@@ -336,10 +337,6 @@ class TableGroupInitializerTest {
                     TableGroupInitializer.initialize(
                         plan, "sha256:" + plan.fingerprint(), otherGroup, forbidden))
             .reason());
-  }
-
-  private static TableGroupInitializationPlan plan(String name, String namespace) throws Exception {
-    return InitializationFixtures.plan(name.replace(".yaml", ".json"), namespace);
   }
 
   private static InitializationConfiguration configurationWithSiblingGroup(String namespace)
