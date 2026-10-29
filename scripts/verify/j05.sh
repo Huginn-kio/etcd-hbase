@@ -59,6 +59,49 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+def verify_write_counts(counts, size, total, active):
+    if (len(counts) != size or any(type(count) is not int or count < 0 for count in counts)
+            or sum(counts) != total or sum(count > 0 for count in counts) != active):
+        raise SystemExit("invalid actual region/server write distribution")
+
+
+def verify_salt_distribution(report):
+    suite = ET.parse(report).getroot()
+    cases = {case.attrib["name"] for case in suite.iter("testcase")}
+    if not {"saltingSpreadsSequentialAndCommonPrefixWritesInEveryBatch",
+            "repeatedUpdatesToOneLogicalKeyStayOnOneRegionAndServer"} <= cases:
+        raise SystemExit("both real multi-server salt distribution and hot-key cases must execute")
+    output = "\n".join(item.text or "" for item in suite.iter("system-out"))
+    pattern = (r"j05-salt workload=(SEQUENTIAL|SHARED_DIRECTORY) rows=(\d+) "
+               r"batch_size=(\d+) batches=(\d+) salted_region_writes=(\[[^\n]*?\]) "
+               r"salted_server_writes=(\[[^\n]*?\]) unsalted_region_writes=(\[[^\n]*?\]) "
+               r"unsalted_server_writes=(\[[^\n]*?\]) per_batch=true readback=true status=passed")
+    workloads = {}
+    for match in re.finditer(pattern, output):
+        workload, rows, batch, batches, *encoded = match.groups()
+        if workload in workloads or (int(rows), int(batch), int(batches)) != (2048, 128, 16):
+            raise SystemExit("salt distribution workloads must use the fixed bounded dataset")
+        salted_regions, salted_servers, control_regions, control_servers = map(json.loads, encoded)
+        for counts, size, active in ((salted_regions, 16, 16), (salted_servers, 3, 3),
+                                     (control_regions, 16, 1), (control_servers, 3, 1)):
+            verify_write_counts(counts, size, int(rows), active)
+        if min(salted_regions) < 64 or max(salted_regions) > 256:
+            raise SystemExit("the fixed workload has concentrated region writes")
+        workloads[workload] = {
+            "rows": int(rows), "batch_size": int(batch), "batches": int(batches),
+            "salted_region_writes": salted_regions, "salted_server_writes": salted_servers,
+            "unsalted_region_writes": control_regions, "unsalted_server_writes": control_servers,
+            "per_batch_distribution": True, "readback": True,
+        }
+    if set(workloads) != {"SEQUENTIAL", "SHARED_DIRECTORY"}:
+        raise SystemExit("both actual sequential and shared-directory salt workloads are required")
+    if ("j05-salt workload=SINGLE_HOT_KEY updates=128 active_regions=1 active_servers=1 "
+            "readback=true status=passed") not in output:
+        raise SystemExit("single-key updates must retain their actual one-region hotspot")
+    return {"workloads": workloads, "single_hot_key_updates": 128,
+            "scope": "disposable_multi_server_routing_only"}
+
+
 root, artifacts = map(Path, sys.argv[1:])
 totals = dict.fromkeys(("tests", "failures", "errors", "skipped"), 0)
 suites = []
@@ -90,7 +133,7 @@ for module in ("spi", "core", "hbase", "admin"):
 
 required_suites = {"HashSaltStrategyTest", "InitializationConfigurationLoaderTest", "TableGroupPlanFactoryTest",
                    "TableGroupInitializerTest", "HBaseOperationAwaiterTest", "InitializeTablesCommandTest",
-                   "InitializeTablesIT", "SecureHBaseAuthenticationIT", "LocalHBaseProbeIT"}
+                   "InitializeTablesIT", "SaltDistributionIT", "SecureHBaseAuthenticationIT", "LocalHBaseProbeIT"}
 observed_suites = {Path(suite["file"]).stem.rsplit(".", 1)[-1] for suite in suites}
 if not required_suites <= observed_suites:
     raise SystemExit("missing required salt, initialization or adjacent J04 suites")
@@ -114,8 +157,10 @@ required_markers = {
 }
 if any(marker not in output for marker in required_markers):
     raise SystemExit("J05 recovery, retained-data or secure identity evidence is missing")
-if len(server_logs) != 4:
-    raise SystemExit("J04 and J05 must retain both of their disposable server logs")
+distribution = verify_salt_distribution(
+    root / "admin/target/failsafe-reports/TEST-io.etcdhbase.admin.SaltDistributionIT.xml")
+if len(server_logs) != 5:
+    raise SystemExit("J04/J05 must retain all five logs, including the multi-server salt cluster")
 observed = re.search(r"j05-hbase server=(\S+) client.jvm=(\S+)", output)
 if observed is None or not observed[2].startswith("21."):
     raise SystemExit("missing observed HBase/Java 21 versions")
@@ -150,6 +195,7 @@ summary = {
     "suites": suites, "server_logs": server_logs, "layouts": layouts,
     "hbase_server": observed[1], "client_jvm": observed[2], "cli_plans": cli_plans,
     "salt_vectors": 8, "salt_split_keys": 15,
+    "salt_distribution": distribution,
     "target_salt": "not_verified", "target_identity": "not_verified",
     "history_layout_decision": "prototype_candidates_only",
     "permission_intents": "not_acl_grants", "runtime_bootstrap": "not_implemented",

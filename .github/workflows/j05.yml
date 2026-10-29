@@ -33,5 +33,5 @@ jobs:
           java-version: '21'
           jdk-file: ${{ runner.temp }}/j05-temurin-jdk.tar.gz
           cache: maven
-      - name: Verify salt vectors, confirmed initialization, recovery and real HBase identities
+      - name: Verify salt routing, confirmed initialization, recovery and real HBase identities
         run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" scripts/verify/j05.sh --scope public
