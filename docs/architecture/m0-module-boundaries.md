@@ -2,6 +2,10 @@
 
 J08 基于当前八个 Maven 模块及 J04–J07 的真实使用核对依赖方向。公共扩展与内部装配分别处理，避免把尚未稳定的存储/提交模型冻结为公开接口。
 
+## 1 当前模块与依赖
+
+**表 1 M0 模块、依赖与职责**
+
 | 模块 | 当前直接项目依赖 | 当前职责 |
 | --- | --- | --- |
 | `protocol` | 无 | 固定上游 proto、生成 Java/gRPC 和 descriptor/wire 守卫；生成类型不手改。 |
@@ -15,7 +19,7 @@ J08 基于当前八个 Maven 模块及 J04–J07 的真实使用核对依赖方�
 
 表中是当前直接项目依赖；外部库和 test 依赖仍按各 POM 与锁文件管理。`server` 当前通过 `admin` 复用 J05 配置 DTO/校验，不再定义另一套表组或盐模型。
 
-## 内部 port 与扩展边界
+## 2 内部 port 与扩展边界
 
 - `ReadView`、逻辑提交/发布状态、fencing、恢复水位等未来内部类型归 `core`，不进入 `spi`。本层不为尚无调用方的模型增加接口。
 - `grpc.RequestCompletionRecorder` 是内部装配 port，由 `server.RequestMetrics` 实现。其固定 method/outcome、trace ID、scope 与耗时不包含 key、账号、token 或原始后端异常；trace ID 不作为指标标签。
