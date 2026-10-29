@@ -78,11 +78,16 @@ def go_sum_entries() -> set[tuple[str, str, str]]:
     return entries
 
 
-def validate() -> int:
+def read_go_lock() -> dict[str, Any]:
     lock_document = read_json(LOCK_PATH)
     if not isinstance(lock_document, dict) or not isinstance(lock_document.get("go"), dict):
         raise LockError("dependency lock has no Go toolchain section")
-    lock = lock_document["go"]
+    return lock_document["go"]
+
+
+def locked_module_inventory(
+    lock: dict[str, Any],
+) -> tuple[dict[str, str], dict[str, Any]]:
     expected_versions = lock.get("moduleVersions", {})
     expected_checksums = lock.get("moduleChecksums", {})
     if not isinstance(expected_versions, dict) or not isinstance(expected_checksums, dict):
@@ -92,7 +97,10 @@ def validate() -> int:
     }
     if not expected_versions or set(expected_checksums) != expected_checksum_keys:
         raise LockError("moduleVersions and moduleChecksums do not describe the same modules")
+    return expected_versions, expected_checksums
 
+
+def validate_toolchain(lock: dict[str, Any]) -> None:
     go_mod = GO_MOD_PATH.read_text(encoding="utf-8")
     directives = {
         fields[0]: fields[1]
@@ -106,7 +114,10 @@ def validate() -> int:
     if directives.get("toolchain") is None and directives.get("go") != lock.get("version"):
         raise LockError("go.mod toolchain differs from the dependency lock")
 
-    actual_modules = module_graph()
+
+def validate_direct_modules(
+    actual_modules: dict[str, dict[str, Any]], expected_versions: dict[str, str]
+) -> None:
     unlocked_direct_modules = sorted(
         module
         for module, metadata in actual_modules.items()
@@ -120,22 +131,39 @@ def validate() -> int:
             + ", ".join(unlocked_direct_modules)
         )
 
+
+def validate_module_version(
+    module: str, expected_version: str, actual: dict[str, Any] | None
+) -> None:
+    if actual is None or actual.get("Version") != expected_version:
+        actual_version = actual.get("Version", "missing") if actual else "missing"
+        raise LockError(
+            f"{module} effective version is {actual_version}; expected {expected_version}"
+        )
+
+
+def validate_module_checksums(
+    module: str, version: str, checksums: Any, sums: set[tuple[str, str, str]]
+) -> None:
+    key = f"{module}@{version}"
+    if not isinstance(checksums, dict) or set(checksums) != {"module", "goMod"}:
+        raise LockError(f"{key} must lock module and go.mod checksums")
+    if (module, version, checksums["module"]) not in sums:
+        raise LockError(f"{key} module checksum differs from go.sum")
+    if (module, version + "/go.mod", checksums["goMod"]) not in sums:
+        raise LockError(f"{key} go.mod checksum differs from go.sum")
+
+
+def validate() -> int:
+    lock = read_go_lock()
+    expected_versions, expected_checksums = locked_module_inventory(lock)
+    validate_toolchain(lock)
+    actual_modules = module_graph()
+    validate_direct_modules(actual_modules, expected_versions)
     sums = go_sum_entries()
-    for module, expected_version in expected_versions.items():
-        actual = actual_modules.get(module)
-        if actual is None or actual.get("Version") != expected_version:
-            actual_version = actual.get("Version", "missing") if actual else "missing"
-            raise LockError(
-                f"{module} effective version is {actual_version}; expected {expected_version}"
-            )
-        key = f"{module}@{expected_version}"
-        checksums = expected_checksums.get(key)
-        if not isinstance(checksums, dict) or set(checksums) != {"module", "goMod"}:
-            raise LockError(f"{key} must lock module and go.mod checksums")
-        if (module, expected_version, checksums["module"]) not in sums:
-            raise LockError(f"{key} module checksum differs from go.sum")
-        if (module, expected_version + "/go.mod", checksums["goMod"]) not in sums:
-            raise LockError(f"{key} go.mod checksum differs from go.sum")
+    for module, version in expected_versions.items():
+        validate_module_version(module, version, actual_modules.get(module))
+        validate_module_checksums(module, version, expected_checksums.get(f"{module}@{version}"), sums)
     return len(expected_versions)
 
 

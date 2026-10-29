@@ -93,6 +93,36 @@ class GoModuleLockTest(unittest.TestCase):
             ):
                 go_module_lock.validate()
 
+    def test_lock_toolchain_and_checksums_fail_closed(self) -> None:
+        original = self.lock_path.read_text()
+        mutations = (
+            (lambda lock: lock.update(goDirectiveVersion="1.0"), "language version differs"),
+            (lambda lock: lock.update(version="1.0"), "toolchain differs"),
+            (lambda lock: lock.update(moduleChecksums={}), "do not describe the same modules"),
+            (lambda lock: lock["moduleChecksums"]["example.org/locked@v1.2.3"].update(module="wrong"),
+             "module checksum differs"),
+            (lambda lock: lock["moduleChecksums"]["example.org/locked@v1.2.3"].update(goMod="wrong"),
+             "go.mod checksum differs"),
+            (lambda lock: lock["moduleChecksums"]["example.org/locked@v1.2.3"].pop("goMod"),
+             "must lock module and go.mod checksums"),
+        )
+        graph = {"example.org/locked": {"Version": "v1.2.3"}}
+        for mutate, expected_error in mutations:
+            with self.subTest(expected_error=expected_error):
+                document = json.loads(original)
+                mutate(document["go"])
+                self.lock_path.write_text(json.dumps(document))
+                with patch.object(go_module_lock, "module_graph", return_value=graph):
+                    with self.assertRaisesRegex(go_module_lock.LockError, expected_error):
+                        go_module_lock.validate()
+
+    def test_missing_or_different_effective_module_version_is_rejected(self) -> None:
+        for graph in ({}, {"example.org/locked": {"Version": "v9.9.9"}}):
+            with self.subTest(graph=graph):
+                with patch.object(go_module_lock, "module_graph", return_value=graph):
+                    with self.assertRaisesRegex(go_module_lock.LockError, "effective version is"):
+                        go_module_lock.validate()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
