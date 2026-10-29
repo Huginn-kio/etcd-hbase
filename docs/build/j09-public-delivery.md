@@ -4,7 +4,7 @@ M0 当前提供配置校验、请求生命周期、协议骨架、HBase 基础�
 
 ## 公开完整验证
 
-使用 [锁定工具链](m0-toolchain.md) 配置 `ETCD_HBASE_JDK21_HOME` 后，在仓库根目录执行：
+需要 Python 3.11+ 和 POSIX 环境；公开 CI 使用 Ubuntu 24.04。使用 [锁定工具链](m0-toolchain.md) 配置 `ETCD_HBASE_JDK21_HOME` 后，在仓库根目录执行：
 
 ```bash
 scripts/verify/m0.sh --scope public

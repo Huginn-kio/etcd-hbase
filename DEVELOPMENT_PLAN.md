@@ -2,7 +2,7 @@
 
 > 文档版本：0.10（J06–J09 公开工程交付） · 更新日期：2026-10-29 · 开发基线：**JDK 21**
 >
-> 当前状态：开发计划及 M0 设计已批准，进入 M0。J03 已在 PR #7 批准合并，提供 gRPC 骨架、Header/Error 工厂及最小 Go/Java 验证；未实现业务仍返回 UNIMPLEMENTED。J04 的统一身份契约、连接工厂及多种认证的真实临时 HBase 验证已随 PR #8 批准合并；目标环境身份和权限尚未验收。J05 的公开盐候选、两种表布局及初始化原型已实现并通过公开验证，见 PR #9；PR #9 已批准合并，目标盐规则仍待输入。J06 的公开配置、请求生命周期和基础观测已随 PR #10 批准合并；J07/J08 公开工具与 SPI 契约已交付待正式评审；J09 公开构建及运行包正在完成验证。本文中的后续类、表结构和算法仍按任务逐项实现；勾选任务必须附实现、验证和评审证据。
+> 当前状态：开发计划及 M0 设计已批准，进入 M0。J03 已在 PR #7 批准合并，提供 gRPC 骨架、Header/Error 工厂及最小 Go/Java 验证；未实现业务仍返回 UNIMPLEMENTED。J04 的统一身份契约、连接工厂及多种认证的真实临时 HBase 验证已随 PR #8 批准合并；目标环境身份和权限尚未验收。J05 的公开盐候选、两种表布局及初始化原型已实现并通过公开验证，见 PR #9；PR #9 已批准合并，目标盐规则仍待输入。J06 的公开配置、请求生命周期和基础观测已随 PR #10 批准合并；J07/J08 公开工具与 SPI 契约已交付待正式评审；J09 已交付统一公开验证入口和实际运行包/镜像检查，许可及制品决定仍待输入。本文中的后续类、表结构和算法仍按任务逐项实现；勾选任务必须附实现、验证和评审证据。
 
 ## 1. 评审摘要
 
@@ -568,7 +568,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：已确认的开源交付要求；构建规则随 J01 完善，不等待 J00 完整审计。
   - 完成标准：维护者确认许可证；记录 LICENSE/NOTICE、协议与依赖来源要求；提供贡献/问题/变更模板，固定 artifact 命名与发布位置；建立仅使用公开依赖、占位配置及公开可获取资源的 CI 规则。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=公开实现进行中，发行输入待补；负责人=Codex；完成日期=—；PR/commit=[PR #13](https://github.com/Reidddddd/etcd-hbase/pull/13)；验证入口=scripts/verify/m0.sh --scope public、scripts/verify/report-index.py；使用与边界=[公开构建及运行包](docs/build/j09-public-delivery.md)；评审人/结论=两次完整构建、真实 JAR/classpath、Java 21 镜像与索引正在验证；I07/I08 记录为 waiting_input，不新增未经批准的项目 LICENSE/正式 NOTICE，不发布制品。
+  - 跟踪：状态=公开实现已交付，发行决定待输入；负责人=Codex；完成日期=—；PR/commit=[PR #13](https://github.com/Reidddddd/etcd-hbase/pull/13)；验证入口=scripts/verify/m0.sh --scope public、scripts/verify/report-index.py；使用与边界=[公开构建及运行包](docs/build/j09-public-delivery.md)；评审人/结论=作者自审和独立 agent 复核通过；c30210b 两轮各 190 项 Java、9 JAR 摘要一致、Go 普通/race 各 8 包90事件、原生两次/10负例及实际运行包通过；该 head 七组 CI 全成功，实际 Eclipse Adoptium 21.0.12.1+1-LTS 镜像以 65532:65532 运行、UNIMPLEMENTED/退出143/资源回收通过，实际 merge checkout 双亲已核对。本机缺 Docker 仍记录 partial。已承接 J07/J08 最新整改，最终组合 head 与验证结论随 PR #13 记录，维护者正式 review 待完成；I07/I08 记录为 waiting_input，不新增未经批准的项目 LICENSE/正式 NOTICE，不发布制品。
 
 **退出条件：** JDK 21 依赖和实际 HBase 认证可用，盐规则/预分区及目标已记录；Go client 最小协议/流/错误互通。原型不代表完整业务语义。公开 SPI、许可证/仓库规则及公共构建边界已评审。
 
