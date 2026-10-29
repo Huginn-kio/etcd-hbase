@@ -39,6 +39,41 @@ class MavenLockTest(unittest.TestCase):
         with self.assertRaisesRegex(maven_lock.LockError, "unsupported libraries entries"):
             maven_lock.validate_metadata(lock, ROOT / "pom.xml")
 
+    def test_hbase_testing_util_version_and_digest_are_enforced(self) -> None:
+        lock = copy.deepcopy(self.lock)
+        lock["libraries"]["hbaseTestingUtil"]["coordinate"] = (
+            "org.apache.hbase:hbase-testing-util:0.0.0-review-mismatch"
+        )
+        with self.assertRaisesRegex(maven_lock.LockError, "libraries.hbaseTestingUtil"):
+            maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+
+        artifacts = maven_lock.collect_artifacts(self.lock)
+        artifact = next(item for item in artifacts
+                        if item.coordinate == "org.apache.hbase:hbase-testing-util")
+        with tempfile.TemporaryDirectory(prefix="j04-lock-hbase-test-") as directory:
+            path = Path(directory) / artifact.relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"tampered HBase testing artifact")
+            with self.assertRaisesRegex(maven_lock.LockError, "SHA-256 mismatch"):
+                maven_lock.verify_artifacts([artifact], Path(directory), require_all=True)
+
+    def test_hadoop_minikdc_version_and_digest_are_enforced(self) -> None:
+        lock = copy.deepcopy(self.lock)
+        lock["libraries"]["hadoopMiniKdc"]["coordinate"] = (
+            "org.apache.hadoop:hadoop-minikdc:0.0.0-review-mismatch"
+        )
+        with self.assertRaisesRegex(maven_lock.LockError, "libraries.hadoopMiniKdc"):
+            maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+
+        artifact = next(item for item in maven_lock.collect_artifacts(self.lock)
+                        if item.coordinate == "org.apache.hadoop:hadoop-minikdc")
+        with tempfile.TemporaryDirectory(prefix="j04-lock-minikdc-") as directory:
+            path = Path(directory) / artifact.relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"tampered MiniKdc artifact")
+            with self.assertRaisesRegex(maven_lock.LockError, "SHA-256 mismatch"):
+                maven_lock.verify_artifacts([artifact], Path(directory), require_all=True)
+
     def test_javax_annotation_version_must_match_the_managed_dependency(self) -> None:
         lock = copy.deepcopy(self.lock)
         lock["libraries"]["javaxAnnotation"]["coordinate"] = (
@@ -46,6 +81,38 @@ class MavenLockTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(maven_lock.LockError, "libraries.javaxAnnotation"):
+            maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+
+    def test_isolated_server_and_test_logger_pins_and_digests_are_enforced(self) -> None:
+        for name in ("hbaseServerProtobuf", "slf4jTestLogger"):
+            lock = copy.deepcopy(self.lock)
+            coordinate = str(lock["libraries"][name]["coordinate"])
+            lock["libraries"][name]["coordinate"] = coordinate.rsplit(":", 1)[0] + ":0.0.0-review-mismatch"
+            with self.assertRaisesRegex(maven_lock.LockError, "libraries." + name):
+                maven_lock.validate_metadata(lock, ROOT / "pom.xml")
+            artifact = next(item for item in maven_lock.collect_artifacts(self.lock)
+                            if item.coordinate == coordinate.rsplit(":", 1)[0])
+            with tempfile.TemporaryDirectory(prefix="j04-test-runtime-lock-") as directory:
+                path = Path(directory) / artifact.relative_path
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"tampered isolated test artifact")
+                with self.assertRaisesRegex(maven_lock.LockError, "SHA-256 mismatch"):
+                    maven_lock.verify_artifacts([artifact], Path(directory), require_all=True)
+
+    def test_server_protobuf_copy_cannot_move_to_application_compile(self) -> None:
+        self.assert_pom_override_rejected("hbase/pom.xml", """
+  <build><plugins><plugin>
+    <groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId>
+    <executions><execution><id>stage-hbase-server-protobuf</id><phase>compile</phase>
+      <goals><goal>copy</goal></goals>
+    </execution></executions>
+  </plugin></plugins></build>
+""", "libraries.hbaseServerProtobuf must be staged only for tests")
+
+    def test_isolated_server_runtime_cannot_be_removed_from_the_lock(self) -> None:
+        lock = copy.deepcopy(self.lock)
+        del lock["libraries"]["hbaseServerProtobuf"]
+        with self.assertRaisesRegex(maven_lock.LockError, "libraries.hbaseServerProtobuf is required"):
             maven_lock.validate_metadata(lock, ROOT / "pom.xml")
 
     def test_javax_annotation_digest_is_included_in_artifact_verification(self) -> None:
