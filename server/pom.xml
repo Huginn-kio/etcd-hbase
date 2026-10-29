@@ -45,6 +45,11 @@
     </profile>
   </profiles>
   <dependencies>
+    <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId></dependency>
+    <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-simple</artifactId><scope>runtime</scope></dependency>
+    <dependency><groupId>io.etcdhbase</groupId><artifactId>admin</artifactId><version>${project.version}</version></dependency>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId></dependency>
+
     <dependency>
       <groupId>io.etcdhbase</groupId>
       <artifactId>grpc</artifactId>
