@@ -556,13 +556,13 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J02。
   - 完成标准：固定 etcd v3.5.23、请求和结果格式；只允许已接受的 Count 差异，Lease ID 身份映射不能掩盖事件或版本错误。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=公开实现已验证，CI 与正式评审进行中；负责人=Codex；完成日期=—；PR/commit=[PR #11](https://github.com/Reidddddd/etcd-hbase/pull/11)；验证入口=scripts/verify/j07.sh；范围=[Go 驱动与原生对照器](docs/testing/j07-protocol-oracle.md)；评审人/结论=003b47c 本地完整 183 项 Java、Go 普通/race 各 8 包90个通过事件、两次 native 和10种损坏样本通过；独立 agent 发现的输入/错误与冷缓存报告项已修复，最终 head CI及正式 review 待完成；完整 C01–C33 和目标 HBase 尚未验收。
+  - 跟踪：状态=公开实现已验证，CI 与正式评审进行中；负责人=Codex；完成日期=—；PR/commit=[PR #11](https://github.com/Reidddddd/etcd-hbase/pull/11)；验证入口=scripts/verify/j07.sh；范围=[Go 驱动与原生对照器](docs/testing/j07-protocol-oracle.md)；评审人/结论=003b47c 本地完整 183 项 Java、Go 普通/race 各 8 包90个通过事件、两次 native 和10种损坏样本通过；独立 agent 发现的输入/错误与冷缓存报告项已修复，最终 head 5f98d94 五组上游 CI 成功，独立 agent 无阻塞；已请求 Reidddddd，正式 review 待完成；完整 C01–C33 和目标 HBase 尚未验收。
 
 - [ ] **J08｜公开扩展 SPI 与内部 port 边界**
   - 依赖：J01 和初步需求基线；J00.2 完善时核对能力。
   - 完成标准：明确公开 API 最小范围、内部存储/提交模型边界及 provider ID/版本/生命周期；先验证盐/身份/连接和装配需求，再稳定配置/指标/绑定接口；内核不变量不能通过扩展绕过。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=公开契约实现及边界核对完成，验证/评审进行中；负责人=Codex；完成日期=—；PR/commit=[PR #12](https://github.com/Reidddddd/etcd-hbase/pull/12)；验证入口=scripts/verify/j08.sh；契约=[公开 SPI](docs/spi/m0-spi-contract.md)、[模块边界](docs/architecture/m0-module-boundaries.md)；评审人/结论=作者自查进行中，独立 agent 及维护者待 review；完整加载、发行兼容和升级归 J18/J19/J58。
 
 - [ ] **J09｜开源仓库规范、许可证与公开构建边界**
   - 依赖：已确认的开源交付要求；构建规则随 J01 完善，不等待 J00 完整审计。

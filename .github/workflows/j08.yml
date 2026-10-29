@@ -1,0 +1,37 @@
+name: J08 public SPI contracts and module boundaries
+
+on:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: j08-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spi-contracts:
+    name: 公开 SPI、模块边界与真实 HBase 回归
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Download the locked Temurin JDK
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/j08-temurin-jdk.tar.gz"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: jdkfile
+          java-version: '21'
+          jdk-file: ${{ runner.temp }}/j08-temurin-jdk.tar.gz
+          cache: maven
+      - name: 验证 J08 契约及已编译 SPI 边界
+        run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" scripts/verify/j08.sh
