@@ -132,6 +132,10 @@ class RequestLifecycleTest {
                       .withDeadlineAfter(2, TimeUnit.SECONDS)
                       .range(Rpc.RangeRequest.getDefaultInstance()));
       assertEquals(Status.Code.RESOURCE_EXHAUSTED, failure.getStatus().getCode());
+      assertEquals(
+          1,
+          fixture.completed.getCount(),
+          "a rejected request is not this admitted call's cleanup completion");
       call.cancel("private-client-reason", null);
       assertTrue(fixture.cleaned.await(2, TimeUnit.SECONDS));
       assertTrue(fixture.scope.get().isCancelled());
@@ -184,6 +188,8 @@ class RequestLifecycleTest {
     final CountDownLatch completed = new CountDownLatch(1);
     final CountDownLatch terminal = new CountDownLatch(1);
     final AtomicReference<RequestScope> scope = new AtomicReference<>();
+    final java.util.Set<RequestScope> admittedScopes =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
     final AtomicReference<Status> status = new AtomicReference<>();
     final java.util.concurrent.CompletableFuture<String> shared =
         new java.util.concurrent.CompletableFuture<>();
@@ -215,10 +221,11 @@ class RequestLifecycleTest {
               1024,
               (method, outcome, trace, request, elapsed) -> {
                 try {
-                  recordedCleanupFailures.set(request.cleanupFailureCount());
+                  if (admittedScopes.contains(request))
+                    recordedCleanupFailures.set(request.cleanupFailureCount());
                   recorder.recordCompletion(method, outcome, trace, request, elapsed);
                 } finally {
-                  if (request.isClosed()) completed.countDown();
+                  if (admittedScopes.contains(request) && request.isClosed()) completed.countDown();
                 }
               });
       server =
@@ -231,6 +238,7 @@ class RequestLifecycleTest {
                         Rpc.RangeRequest request, StreamObserver<Rpc.RangeResponse> response) {
                       var current = RequestScopeInterceptor.currentScope();
                       scope.set(current);
+                      admittedScopes.add(current);
                       current.registerCleanup(cleaned::countDown);
                       var tracked = current.track(shared.copy());
                       if (blockTrackedCallback && handlers.incrementAndGet() == 1) {
@@ -256,7 +264,9 @@ class RequestLifecycleTest {
                     @Override
                     public StreamObserver<Rpc.WatchRequest> watch(
                         StreamObserver<Rpc.WatchResponse> responses) {
-                      RequestScopeInterceptor.currentScope().registerCleanup(cleaned::countDown);
+                      var current = RequestScopeInterceptor.currentScope();
+                      admittedScopes.add(current);
+                      current.registerCleanup(cleaned::countDown);
                       return new StreamObserver<>() {
                         @Override
                         public void onNext(Rpc.WatchRequest request) {
