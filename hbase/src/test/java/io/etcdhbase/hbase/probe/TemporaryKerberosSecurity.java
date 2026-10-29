@@ -1,8 +1,14 @@
 package io.etcdhbase.hbase.probe;
 
+import io.etcdhbase.hbase.probe.auth.PasswordDigestSaslClientFixture;
+import io.etcdhbase.hbase.probe.auth.PasswordDigestSaslServerFixture;
+import io.etcdhbase.hbase.probe.auth.PasswordDigestSelectorFixture;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.security.provider.AuthenticationProviderSelector;
+import org.apache.hadoop.hbase.security.provider.SaslClientAuthenticationProviders;
+import org.apache.hadoop.hbase.security.provider.SaslServerAuthenticationProviders;
 import org.apache.hadoop.minikdc.MiniKdc;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.kerby.kerberos.kerb.client.KrbClient;
@@ -10,7 +16,7 @@ import org.apache.kerby.kerberos.kerb.client.KrbClient;
 /** Test-child-only KDC and server login; never used by a production identity provider. */
 final class TemporaryKerberosSecurity implements AutoCloseable {
   static final String PREFIX = "etcdhbase.test.security.";
-  static final String PASSWORD = "temporary-fixture-password";
+  static final String PASSWORD = PasswordDigestSaslServerFixture.FIXTURE_PASSWORD;
   private final MiniKdc kdc;
 
   private TemporaryKerberosSecurity(MiniKdc kdc) {
@@ -55,6 +61,16 @@ final class TemporaryKerberosSecurity implements AutoCloseable {
           "org.apache.hadoop.hbase.security.token.TokenProvider");
       configuration.setInt("hfile.format.version", 3);
       configuration.set(PREFIX + "realm", kdc.getRealm());
+      configuration.setStrings(
+          SaslServerAuthenticationProviders.EXTRA_PROVIDERS_KEY,
+          PasswordDigestSaslServerFixture.class.getName());
+      configuration.setStrings(
+          SaslClientAuthenticationProviders.EXTRA_PROVIDERS_KEY,
+          PasswordDigestSaslClientFixture.class.getName());
+      configuration.setClass(
+          SaslClientAuthenticationProviders.SELECTOR_KEY,
+          PasswordDigestSelectorFixture.class,
+          AuthenticationProviderSelector.class);
       configuration.set(PREFIX + "krb5", kdc.getKrb5conf().getAbsolutePath());
       configuration.set(PREFIX + "admin.keytab", adminKeytab.toString());
       configuration.set(PREFIX + "user.keytab", userKeytab.toString());

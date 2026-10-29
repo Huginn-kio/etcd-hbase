@@ -9,14 +9,15 @@ import org.apache.hadoop.hbase.testing.TestingHBaseCluster;
 import org.apache.hadoop.hbase.testing.TestingHBaseClusterOption;
 import org.apache.hadoop.hbase.util.VersionInfo;
 
-/** Child process entry point for a no-auth temporary server isolated from the shaded client. */
+/** Disposable SIMPLE or Kerberos HBase server, isolated from the application's client runtime. */
 public final class HBaseMiniClusterMain {
   private HBaseMiniClusterMain() {}
 
   public static void main(String[] args) throws Exception {
     if (args.length != 3 && args.length != 4) {
       throw new IllegalArgumentException(
-          "expected hbase-site.xml, readiness file, and startup-failure file paths");
+          "expected hbase-site.xml, readiness file, startup-failure file, and optional kerberos"
+              + " profile");
     }
 
     Configuration configuration = HBaseConfiguration.create();
