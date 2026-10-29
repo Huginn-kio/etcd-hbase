@@ -1,11 +1,15 @@
 package io.etcdhbase.server;
 
+import io.etcdhbase.grpc.RequestScopeInterceptor;
 import io.etcdhbase.grpc.service.AuthService;
 import io.etcdhbase.grpc.service.ClusterService;
 import io.etcdhbase.grpc.service.KvService;
 import io.etcdhbase.grpc.service.LeaseService;
 import io.etcdhbase.grpc.service.MaintenanceService;
 import io.etcdhbase.grpc.service.WatchService;
+import io.etcdhbase.server.config.ListenerAddress;
+import io.etcdhbase.server.config.RuntimeConfiguration;
+import io.etcdhbase.server.observability.RequestMetrics;
 import io.grpc.Server;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import java.io.IOException;
@@ -18,26 +22,70 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Starts the J03 protocol skeleton without loading storage or runtime-configuration providers. */
+/** Protocol skeleton with bounded request contexts; business handlers remain UNIMPLEMENTED. */
 public final class Bootstrap implements AutoCloseable {
   private static final Set<String> OPTIONS = Set.of("--bind-host", "--port", "--table-group");
   private static final String USAGE =
       "usage: j03-server.sh --bind-host <loopback> --port <0..65535> --table-group <id>";
 
   private final Server server;
+  private final java.util.concurrent.ScheduledThreadPoolExecutor deadlines;
+  private final RequestScopeInterceptor requests;
+  private final RequestMetrics metrics;
   private final BoundListener boundListener;
   private final AtomicBoolean closed = new AtomicBoolean();
 
-  private Bootstrap(Server server, ListenerBinding binding) {
+  private Bootstrap(
+      Server server,
+      String host,
+      String tableGroup,
+      java.util.concurrent.ScheduledThreadPoolExecutor deadlines,
+      RequestScopeInterceptor requests,
+      RequestMetrics metrics) {
     this.server = server;
-    this.boundListener =
-        new BoundListener(binding.bindHost(), server.getPort(), binding.tableGroupId());
+    this.boundListener = new BoundListener(host, server.getPort(), tableGroup);
+    this.deadlines = deadlines;
+    this.requests = requests;
+    this.metrics = metrics;
   }
 
   public static Bootstrap start(ListenerBinding binding) throws IOException {
     Objects.requireNonNull(binding, "binding");
+    return start(
+        binding.bindHost(),
+        binding.port(),
+        binding.tableGroupId(),
+        new RuntimeConfiguration.ResourceBudgets(65536, 64, 5000, 1048576, 2097152, 16, 0));
+  }
+
+  static Bootstrap startConfigured(
+      RuntimeConfiguration.Listener binding, RuntimeConfiguration.ResourceBudgets resources)
+      throws IOException {
+    String host = ListenerAddress.parse(binding.bindHost()).connectionName();
+    if (host.equals("localhost")) host = "127.0.0.1";
+    return start(host, binding.port(), binding.tableGroupId(), resources);
+  }
+
+  private static Bootstrap start(
+      String host, int port, String tableGroup, RuntimeConfiguration.ResourceBudgets resources)
+      throws IOException {
+    var deadlines =
+        new java.util.concurrent.ScheduledThreadPoolExecutor(
+            1, Thread.ofPlatform().daemon().name("grpc-request-deadline-", 0).factory());
+    deadlines.setRemoveOnCancelPolicy(true);
+    deadlines.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+    RequestMetrics metrics = new RequestMetrics();
+    var requests =
+        new RequestScopeInterceptor(
+            deadlines,
+            resources.maxConcurrentRequests(),
+            Duration.ofMillis(resources.requestDeadlineMs()),
+            resources.maxRequestBytes(),
+            metrics);
     Server server =
-        NettyServerBuilder.forAddress(new InetSocketAddress(binding.bindHost(), binding.port()))
+        NettyServerBuilder.forAddress(new InetSocketAddress(host, port))
+            .maxInboundMessageSize(resources.maxRpcBytes())
+            .intercept(requests)
             .addService(new KvService())
             .addService(new WatchService())
             .addService(new LeaseService())
@@ -47,11 +95,20 @@ public final class Bootstrap implements AutoCloseable {
             .build();
     try {
       server.start();
-      return new Bootstrap(server, binding);
-    } catch (IOException | RuntimeException failure) {
+      return new Bootstrap(server, host, tableGroup, deadlines, requests, metrics);
+    } catch (IOException | RuntimeException | Error failure) {
       server.shutdownNow();
+      deadlines.shutdownNow();
       throw failure;
     }
+  }
+
+  public int activeRequests() {
+    return requests.activeRequests();
+  }
+
+  public RequestMetrics metrics() {
+    return metrics;
   }
 
   public BoundListener boundListener() {
@@ -92,6 +149,8 @@ public final class Bootstrap implements AutoCloseable {
     } catch (InterruptedException interrupted) {
       server.shutdownNow();
       Thread.currentThread().interrupt();
+    } finally {
+      deadlines.shutdownNow();
     }
   }
 

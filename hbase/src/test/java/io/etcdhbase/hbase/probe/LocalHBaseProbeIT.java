@@ -125,6 +125,7 @@ class LocalHBaseProbeIT {
     assertNotSame(serviceConnection, bobConnection);
     BackendProbe.ProbeResult result = BackendProbe.execute(serviceConnection, tableName, runId);
     BackendProbe.verifyPersistedValue(bobConnection, tableName, runId);
+    verifyRequestScopedScannerCleanup(serviceProvider, alice, serviceConnection);
 
     assertTrue(result.rawBytesRoundTrip());
     assertTrue(result.compareAndMutateSucceeded());
@@ -157,6 +158,39 @@ class LocalHBaseProbeIT {
             + " independentRead=true reconnectRead=true runIsolation=true tableDurability=SYNC_WAL"
             + " mutationDurability=SYNC_WAL connectionOwner=unified-provider closed=true%n",
         cluster.hbaseVersion(), cluster.jvmVersion(), Runtime.version());
+  }
+
+  private void verifyRequestScopedScannerCleanup(
+      HBaseBackendIdentityProvider provider,
+      AuthorizedBackendIdentity identity,
+      AsyncConnection connection)
+      throws Exception {
+    var scope = io.etcdhbase.core.request.RequestScope.withTimeout(Duration.ofSeconds(10));
+    var request = new io.etcdhbase.hbase.connection.HBaseRequestContext(scope);
+    assertSame(connection, await(request.borrowConnection(provider, identity)));
+    var table = connection.getTable(tableName);
+    var scanner =
+        org.mockito.Mockito.spy(
+            table.getScanner(new org.apache.hadoop.hbase.client.Scan().setCaching(1).setLimit(2)));
+    try {
+      request.ownScanner(scanner);
+      var row = scanner.next();
+      assertFalse(row.isEmpty());
+      assertFalse(
+          await(
+                  request.execute(
+                      () -> table.get(new org.apache.hadoop.hbase.client.Get(row.getRow()))))
+              .isEmpty());
+      scope.cancel();
+      scope.close();
+      org.mockito.Mockito.verify(scanner, org.mockito.Mockito.times(1)).close();
+      assertFalse(connection.isClosed());
+      assertFalse(await(table.get(new org.apache.hadoop.hbase.client.Get(row.getRow()))).isEmpty());
+      System.out.println(
+          "j06-hbase realScannerClosed=true sharedConnectionPreserved=true readAfterCancel=true");
+    } finally {
+      scope.close();
+    }
   }
 
   private AsyncConnection openConnection() throws Exception {
