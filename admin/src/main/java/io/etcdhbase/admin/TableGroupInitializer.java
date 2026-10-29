@@ -100,16 +100,14 @@ public final class TableGroupInitializer {
             .map(name -> TableName.valueOf(plan.namespace(), name))
             .collect(Collectors.toUnmodifiableSet());
     if (actual.stream().anyMatch(name -> !permitted.contains(name))) {
-      throw new IllegalArgumentException(
-          "namespace contains tables outside the configured table scope");
+      throw new ConflictException(ConflictReason.NAMESPACE_SCOPE);
     }
   }
 
   private static void verifyDescriptor(PlannedHBaseTable table, TableGroupAdmin admin)
       throws Exception {
     if (!table.matches(admin.getDescriptor(table.descriptor().getTableName()))) {
-      throw new IllegalArgumentException(
-          "an existing table does not match the confirmed schema and profile");
+      throw new ConflictException(ConflictReason.TABLE_SCHEMA);
     }
   }
 
@@ -117,11 +115,10 @@ public final class TableGroupInitializer {
       throws Exception {
     TableName name = table.descriptor().getTableName();
     if (!table.matchesInitialRegions(admin.getRegions(name))) {
-      throw new IllegalArgumentException("an existing table has different region split boundaries");
+      throw new ConflictException(ConflictReason.INITIAL_SPLITS);
     }
     if (!admin.isEmpty(name)) {
-      throw new IllegalArgumentException(
-          "a partial table group contains data; refusing to add tables");
+      throw new ConflictException(ConflictReason.PARTIAL_DATA);
     }
   }
 
@@ -152,6 +149,33 @@ public final class TableGroupInitializer {
           plan.namespace(), created, plan.fingerprint(), failed);
     }
     return List.copyOf(created);
+  }
+
+  public enum ConflictReason {
+    NAMESPACE_SCOPE("namespace contains tables outside the configured table scope"),
+    TABLE_SCHEMA("an existing table does not match the confirmed schema and profile"),
+    INITIAL_SPLITS("an existing table has different region split boundaries"),
+    PARTIAL_DATA("a partial table group contains data; refusing to add tables");
+
+    private final String safeMessage;
+
+    ConflictReason(String safeMessage) {
+      this.safeMessage = safeMessage;
+    }
+  }
+
+  public static final class ConflictException extends IllegalArgumentException {
+    private static final long serialVersionUID = 1L;
+    private final ConflictReason reason;
+
+    private ConflictException(ConflictReason reason) {
+      super(reason.safeMessage);
+      this.reason = reason;
+    }
+
+    public ConflictReason reason() {
+      return reason;
+    }
   }
 
   public record InitializationResult(

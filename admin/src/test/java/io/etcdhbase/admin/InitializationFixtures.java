@@ -10,7 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 final class InitializationFixtures {
-  static final ObjectMapper JSON = new ObjectMapper();
+  private static final ObjectMapper JSON = new ObjectMapper();
 
   private InitializationFixtures() {}
 
