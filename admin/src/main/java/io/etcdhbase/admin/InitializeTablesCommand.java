@@ -2,6 +2,7 @@ package io.etcdhbase.admin;
 
 import static io.etcdhbase.admin.HBaseOperationAwaiter.OPERATION_TIMEOUT;
 import static io.etcdhbase.admin.HBaseOperationAwaiter.await;
+import static io.etcdhbase.spi.identity.BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID;
 
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
 import io.etcdhbase.admin.config.InitializationConfiguration.TableSchemaCandidate;
@@ -105,7 +106,7 @@ public final class InitializeTablesCommand {
   private static TableGroupInitializer.InitializationResult applyLocalDevelopment(
       TableGroupInitializationPlan plan) throws Exception {
     if (plan.hbaseProfile().authenticationMode() != AuthenticationMode.DEV_NO_AUTH
-        || !plan.identityProviderId().equals("dev-no-auth")) {
+        || !plan.identityProviderId().equals(DEVELOPMENT_NO_AUTH_PROVIDER_ID)) {
       throw new MissingIdentityInputException();
     }
     var configuration = HBaseConfiguration.create();

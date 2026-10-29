@@ -1,5 +1,7 @@
 package io.etcdhbase.admin.config;
 
+import static io.etcdhbase.spi.identity.BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID;
+
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
 import io.etcdhbase.admin.config.InitializationConfiguration.ColumnFamilySchema;
 import io.etcdhbase.admin.config.InitializationConfiguration.HBaseProfile;
@@ -56,7 +58,7 @@ public final class InitializationConfigurationValidator {
       require(group.historyLayout() != null, "history layout is required");
       if (profile.authenticationMode() == AuthenticationMode.DEV_NO_AUTH) {
         require(
-            group.identityProviderId().equals("dev-no-auth"),
+            group.identityProviderId().equals(DEVELOPMENT_NO_AUTH_PROVIDER_ID),
             "development profile requires the explicit dev-no-auth provider");
       }
       Set<String> groupTables = validateGroupTables(group, salt);

@@ -4,12 +4,16 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
 import java.util.HexFormat;
 import org.junit.jupiter.api.Test;
 
 class HashSaltStrategyTest {
+  private final HashSaltStrategy strategy = new HashSaltStrategy();
+  private final HexFormat hex = HexFormat.of();
+
   @Test
   void rejectsUnboundedSplitEnumerationAndUnsafeProviderIdentifiers() {
     assertThrows(
@@ -29,8 +33,7 @@ class HashSaltStrategyTest {
     assertArrayEquals(hex.parseHex("00ff"), splits.get(254));
     assertArrayEquals(hex.parseHex("0100"), splits.get(255));
     for (int index = 1; index < splits.size(); index++) {
-      org.junit.jupiter.api.Assertions.assertTrue(
-          Arrays.compareUnsigned(splits.get(index - 1), splits.get(index)) < 0);
+      assertTrue(Arrays.compareUnsigned(splits.get(index - 1), splits.get(index)) < 0);
     }
     assertThrows(UnsupportedOperationException.class, () -> splits.add(new byte[2]));
     byte[] first = strategy.salt(new byte[] {1});
@@ -38,9 +41,6 @@ class HashSaltStrategyTest {
     first[0] ^= (byte) 0xff;
     assertArrayEquals(expected, strategy.salt(new byte[] {1}));
   }
-
-  private final HashSaltStrategy strategy = new HashSaltStrategy();
-  private final HexFormat hex = HexFormat.of();
 
   @Test
   void matchesThePublicCrc32BucketVectors() {
