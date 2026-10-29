@@ -1,6 +1,7 @@
 package io.etcdhbase.hbase.error;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 import io.etcdhbase.core.error.BackendFailure;
 import java.io.IOException;

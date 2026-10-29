@@ -1,6 +1,9 @@
 package io.etcdhbase.hbase.identity;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 import io.etcdhbase.spi.identity.BackendCredentials;
 import java.util.Collection;

@@ -2,7 +2,7 @@
 
 J04 提供统一后端认证入口、有界身份连接管理和真实临时 HBase 探针。认证方式由显式选择的适配器决定，测试环境使用 DIGEST 不限制产品的认证范围。gRPC 业务方法继续按 J03 返回 `UNIMPLEMENTED`；etcd token/session、跨副本和身份轮换归 J50/J51。
 
-## 接入与授权边界
+## 1. 接入与授权边界
 
 `spi.identity` 仅依赖 JDK，提供可关闭的 `BackendCredentials`、不可变的 `AuthenticationScope` / `AuthorizedBackendIdentity` 及 `BackendIdentityProvider`。HBase `User`、UGI、Kerberos Subject、后端 token 和连接只存在于 HBase 层。
 
@@ -19,7 +19,9 @@ J04 提供统一后端认证入口、有界身份连接管理和真实临时 HBa
 
 保留的已授权上下文在 provider 关闭时释放；M0 的容量上限不替代 J50/J51 的会话过期、逐身份退役、凭据更新或 Kerberos 续期。
 
-## 认证方式
+## 2. 认证方式
+
+**表 1 后端认证方式与公开验证范围**
 
 | 方式 | 入口与凭据 | 当前公开验证 |
 |---|---|---|
@@ -39,7 +41,7 @@ Keytab/票据缓存是服务端受控身份来源，不能把“客户端提交�
 
 自定义 SASL 通过官方 `SaslClientAuthenticationProviders.EXTRA_PROVIDERS_KEY` 与 `SELECTOR_KEY` 配置。公开 HBase client 的实际连接使用进程级 provider registry，扩展类及统一 selector 必须在首个连接前配置；多 profile 的 selector 应同时识别内置和已安装扩展，不在运行期间 reset 全局 registry。凭据适配器可以增加新机制，不需要修改通用 SPI、gRPC 或封闭的认证枚举。
 
-## 权限与凭据
+## 3. 权限与凭据
 
 `HBaseAccessVerifiers.tablePermissions` 根据配置的每张表及所需 action，调用当前用户的真实 HBase `hasUserPermissions` RPC。每项都成功才发放授权身份；缺失、部分拒绝或不支持该 ACL RPC 时失败。自定义后端必须提供自己的实际权限 verifier，不能用“连接成功”或“读到空结果”替代表组读写权限证明。临时 SIMPLE 环境的 Get 只验证显式开发路径的可达性。
 
@@ -47,7 +49,7 @@ Keytab/票据缓存是服务端受控身份来源，不能把“客户端提交�
 
 `HBaseFailures` 区分认证、权限、超时、取消、资源容量、不可用和未知失败。原有 `OfficialHBaseConnectionFactory` 保留独立的有界连接缓存契约，适用于已验证身份；`DevelopmentIdentityProvider` 的 synthetic identity 仅用于显式开发无认证路径。
 
-## 验证入口与证据
+## 4. 验证入口与证据
 
 按项目工具链准备锁定的 Temurin JDK 21，设置 `ETCD_HBASE_JDK21_HOME`，运行：
 
@@ -63,7 +65,7 @@ scripts/verify/hbase-probe.sh --profile public-local
 
 client/Hadoop 版本来自依赖锁，服务端版本由临时环境采集。锁定用于可重复构建，不要求目标 HBase 与 client 同版本，也不要求目标服务端使用 JDK 21。候选通过不等于所有版本受支持，兼容边界参见 [HBase Java 支持矩阵](https://hbase.apache.org/docs/configuration/basic-prerequisites/)。
 
-## 目标环境待验证项
+## 5. 目标环境待验证项
 
 公开验证不替代目标 HBase 验收。目标入口、实际认证/profile、cluster ID、专用表/列族权限、TLS/安全凭据引用及获批负例仍待提供；`--profile target` 明确返回非零状态。真实地址、账号、密码、token、证书、keytab 和票据内容不进入代码、示例或 PR。
 
