@@ -112,6 +112,13 @@
       "repository": "https://repo.maven.apache.org/maven2",
       "sha256": "f47aeef86821e52b2b18758978bd045f03d722292e32e747082122c6228952e0",
       "reason": "Resolve native code-generator classifier for the build platform."
+    },
+    "maven-install-plugin": {
+      "version": "3.2.0",
+      "coordinate": "org.apache.maven.plugins:maven-install-plugin:3.2.0",
+      "repository": "https://repo.maven.apache.org/maven2",
+      "sha256": "6fd9d26eb6f473d123f6138bf54d5bae80466a84dab95ab5017590c010621e35",
+      "reason": "固定完整 verify 后本地安装的行为，以已验证 JAR 组装运行 classpath。"
     }
   },
   "libraries": {
@@ -378,5 +385,16 @@
     "https://repo.maven.apache.org/maven2/org/apache/hadoop/hadoop-common/3.4.3/hadoop-common-3.4.3.pom",
     "https://go.dev/doc/devel/release",
     "https://go.dev/dl/"
-  ]
+  ],
+  "runtimeImage": {
+    "reference": "eclipse-temurin:21.0.12.1_1-jre-noble@sha256:de07a7c89a9430922ee1db1e2f848d75533c7f8f2ab3e4ba5eb52cc4550cdb2a",
+    "platform": "linux/amd64",
+    "tag": "21.0.12.1_1-jre-noble",
+    "indexDigest": "sha256:cd35bb33859641c5374415826a5951845104093eaa401cbe9d3d9023444f1c13",
+    "platformDigest": "sha256:de07a7c89a9430922ee1db1e2f848d75533c7f8f2ab3e4ba5eb52cc4550cdb2a",
+    "javaVendor": "Eclipse Adoptium",
+    "javaRelease": "21.0.12.1+1",
+    "source": "https://github.com/adoptium/containers",
+    "registryManifest": "https://registry-1.docker.io/v2/library/eclipse-temurin/manifests/sha256:de07a7c89a9430922ee1db1e2f848d75533c7f8f2ab3e4ba5eb52cc4550cdb2a"
+  }
 }

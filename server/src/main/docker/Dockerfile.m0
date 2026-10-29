@@ -1,0 +1,9 @@
+FROM eclipse-temurin:21.0.12.1_1-jre-noble@sha256:de07a7c89a9430922ee1db1e2f848d75533c7f8f2ab3e4ba5eb52cc4550cdb2a
+
+WORKDIR /app
+COPY lib/ /app/lib/
+COPY --chmod=0644 classpath.txt runtime-dependencies.json release-status.json /app/
+COPY --chmod=0644 container.json /app/server.json
+COPY --chmod=0755 etcd-hbase /app/etcd-hbase
+USER 65532:65532
+ENTRYPOINT ["/app/etcd-hbase"]
