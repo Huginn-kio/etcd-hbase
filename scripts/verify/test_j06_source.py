@@ -44,6 +44,11 @@ class SourceManifestTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             source.capture(self.root, event)
 
+    def test_commit_message_text_cannot_add_fake_parent_headers(self):
+        self.git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "fixture\n\nparent " + "c" * 40)
+        metadata = source.capture(self.root)
+        self.assertEqual([self.head], metadata["parents"])
+
     def test_malformed_revision_is_rejected(self):
         with self.assertRaises(ValueError):
             source.capture(self.root, {"pull_request": {"base": {"sha": "untrusted-value"}, "head": {"sha": self.head}}})

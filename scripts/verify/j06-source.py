@@ -26,7 +26,7 @@ def revision(value):
 
 def capture(root, event=None):
     checkout = revision(git(root, "rev-parse", "HEAD"))
-    parents = [revision(line.split()[1]) for line in git(root, "cat-file", "-p", checkout).splitlines() if line.startswith("parent ")]
+    parents = [revision(line.split()[1]) for line in git(root, "cat-file", "-p", checkout).split("\n\n", 1)[0].splitlines() if line.startswith("parent ")]
     pull_request = event.get("pull_request") if event is not None else None
     if pull_request is not None:
         base = revision(pull_request["base"]["sha"])

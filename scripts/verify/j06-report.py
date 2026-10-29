@@ -57,10 +57,11 @@ def main():
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, destination)
     source = json.loads((output / "source.json").read_text())
-    source.update({"phase": "J06", "scope": "public-local", "ended_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    source.update({"phase": "J06", "scope": "public-local" if source.get("checkout_kind", "local") == "local" else "public-ci", "ended_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                    "tests": sum(suite["tests"] for suite in suites.values()), "failures": 0, "errors": 0, "skipped": 0,
                    "suites": suites, "unverified": ["target HBase identity/permissions/TLS", "B01", "I07/I08", "published commit recovery"]})
     (output / "summary.json").write_text(json.dumps(source, indent=2) + "\n")
+    print(json.dumps({key: source.get(key) for key in ("checkout", "pr_head", "base", "checkout_kind", "tests", "scope")}))
     print(f"J06 public verification passed: {source['tests']} tests, no failures/errors/skips; {output / 'summary.json'}")
 
 
