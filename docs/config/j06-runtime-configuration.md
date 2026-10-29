@@ -4,7 +4,7 @@
 
 加载顺序为文件、有限环境覆盖、完整校验。环境覆盖包括 `ETCD_HBASE_LISTENER_BIND_HOST`、`ETCD_HBASE_LISTENER_PORT`、`ETCD_HBASE_LISTENER_TABLE_GROUP_ID`（第一项 listener），以及资源字段对应的 `ETCD_HBASE_MAX_CONFIG_BYTES`、`ETCD_HBASE_MAX_CONCURRENT_REQUESTS`、`ETCD_HBASE_REQUEST_DEADLINE_MS`、`ETCD_HBASE_MAX_RPC_BYTES`、`ETCD_HBASE_MAX_REQUEST_BYTES`、`ETCD_HBASE_MAX_SCANNERS_PER_TABLE`、`ETCD_HBASE_MAX_QUEUED_REQUESTS`。覆盖后的值仍受同样验证；原始文件与覆盖项字节合计受配置预算约束。未知 `ETCD_HBASE_` 运行变量失败；已知工具链变量 `ETCD_HBASE_JDK21_HOME`、`ETCD_HBASE_MAVEN_REPOSITORY` 单独忽略。输入流由调用者关闭，错误不回显值或解析器原始异常。
 
-一个监听端点绑定一个表组。端口、host 和 profile 均不接受通配符；主机名不执行 DNS 校验。固定端口的等价 IP 字面形式、大小写及尾点主机名不能重复绑定；localhost 保守地与任意 loopback 地址判为重叠。不同的字面监听地址可以共用端口号，HBase 物理 profile 的保守作用域判定不用于折叠不同监听 socket。端口 0 只允许 loopback。同一物理 quorum/port/namespace 下，换 profile ID 不能绕过表名冲突检查。DEV_NO_AUTH 必须显式选择，listener 和全部 quorum 地址均须 loopback。其他身份只接受 env:// 或 secret:// 引用，不解析或记录凭据值。
+一个监听端点绑定一个表组。端口、host 和 profile 均不接受通配符；主机名不执行 DNS 校验。`bind_host` 的 253 字符预算针对原始输入，包含尾点或 IPv6 括号，在归一化之前校验，与公开 schema 一致；例如 253 字符的主机名不带尾点可接受，252 字符的主机名加一个尾点仍可接受，253 字符再加尾点则拒绝。固定端口的等价 IP 字面形式、大小写及尾点主机名不能重复绑定；localhost 保守地与任意 loopback 地址判为重叠。不同的字面监听地址可以共用端口号，HBase 物理 profile 的保守作用域判定不用于折叠不同监听 socket。端口 0 只允许 loopback。同一物理 quorum/port/namespace 下，换 profile ID 不能绕过表名冲突检查。DEV_NO_AUTH 必须显式选择，listener 和全部 quorum 地址均须 loopback。其他身份只接受 env:// 或 secret:// 引用，不解析或记录凭据值。
 
 ```sh
 scripts/verify/j06.sh

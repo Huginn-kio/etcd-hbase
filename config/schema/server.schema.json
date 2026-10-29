@@ -74,6 +74,7 @@
         },
         "bind_host": {
           "type": "string",
+          "description": "The 253-character budget applies to the raw input, including a trailing dot or IPv6 brackets.",
           "minLength": 1,
           "maxLength": 253,
           "not": {

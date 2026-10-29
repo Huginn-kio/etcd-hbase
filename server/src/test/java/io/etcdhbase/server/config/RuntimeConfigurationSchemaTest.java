@@ -1,10 +1,13 @@
 package io.etcdhbase.server.config;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.ParameterizedType;
@@ -13,8 +16,12 @@ import java.lang.reflect.Type;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 class RuntimeConfigurationSchemaTest {
   private static final ObjectMapper JSON = new ObjectMapper();
@@ -58,6 +65,49 @@ class RuntimeConfigurationSchemaTest {
             .path("bucket_count")
             .path("maximum")
             .intValue());
+  }
+
+  @ParameterizedTest(name = "raw listener host length case {index}")
+  @MethodSource("listenerHostLengthCases")
+  void schemaAndLoaderAgreeOnRawListenerHostLength(String host) throws Exception {
+    JsonNode schema =
+        JSON.readTree(
+            java.nio.file.Files.readAllBytes(
+                java.nio.file.Path.of("../config/schema/server.schema.json")));
+    JsonNode hostSchema = schema.path("$defs").path("Listener").path("properties").path("bind_host");
+    assertEquals(253, hostSchema.path("maxLength").intValue());
+    var configuration = JSON.readTree(RuntimeConfigurationLoaderTest.example());
+    ((ObjectNode) configuration.path("hbase_profiles").path(0))
+        .put("authentication_mode", "CREDENTIAL_REFERENCE")
+        .put("credential_reference", "env://TEST_REFERENCE");
+    ((ObjectNode) configuration.path("table_groups").path(0))
+        .put("identity_provider_id", "custom-provider");
+    ((ObjectNode) configuration.path("listeners").path(0))
+        .put("bind_host", host)
+        .put("port", 12345);
+    byte[] input = JSON.writeValueAsBytes(configuration);
+    var loader = new RuntimeConfigurationLoader();
+    int rawLength = host.codePointCount(0, host.length());
+    boolean schemaAccepts =
+        rawLength >= hostSchema.path("minLength").intValue()
+            && rawLength <= hostSchema.path("maxLength").intValue();
+    if (schemaAccepts) {
+      var loaded = loader.load(new ByteArrayInputStream(input), Map.of());
+      assertEquals(host, loaded.listeners().getFirst().bindHost());
+      return;
+    }
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> loader.load(new ByteArrayInputStream(input), Map.of()));
+  }
+
+  private static Stream<String> listenerHostLengthCases() {
+    return Stream.of(60, 61, 62)
+        .flatMap(
+            lastLabelLength -> {
+              String host = ("a".repeat(63) + ".").repeat(3) + "a".repeat(lastLabelLength);
+              return Stream.of(host, host + ".");
+            });
   }
 
   private static void assertRecordSchema(JsonNode root, JsonNode schemaNode, Class<?> recordType) {
