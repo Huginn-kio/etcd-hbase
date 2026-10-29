@@ -3,8 +3,10 @@ package io.etcdhbase.admin;
 import static io.etcdhbase.admin.HBaseOperationAwaiter.OPERATION_TIMEOUT;
 import static io.etcdhbase.admin.HBaseOperationAwaiter.await;
 import static io.etcdhbase.spi.identity.BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.etcdhbase.hbase.identity.HBaseAuthenticators;
@@ -23,12 +25,16 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.AsyncConnection;
+import org.apache.hadoop.hbase.client.Get;
+import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
+import org.apache.hadoop.hbase.util.Bytes;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -41,6 +47,10 @@ import org.junit.jupiter.api.Timeout;
 class SaltDistributionIT {
   private static final int REGION_COUNT = 16;
   private static final int SERVER_COUNT = 3;
+  private static final int BATCH_SIZE = 128;
+  private static final byte[] FAMILY = Bytes.toBytes("d");
+  private static final byte[] QUALIFIER = Bytes.toBytes("salt-probe");
+  private static final byte[] VALUE = Bytes.toBytes("j05-salt-record");
   private final HashSaltStrategy salt = new HashSaltStrategy();
   private TemporaryHBaseClusterProcess cluster;
   private HBaseBackendIdentityProvider provider;
@@ -177,13 +187,85 @@ class SaltDistributionIT {
   }
 
   @Test
-  void observesSixteenRealRegionsOnThreeIndependentServers() throws Exception {
-    assertEquals(SERVER_COUNT, servers.stream().map(ServerName::getPort).distinct().count());
-    assertEquals(SERVER_COUNT, saltedPlacement.values().stream().distinct().count());
-    assertEquals(SERVER_COUNT, unsaltedPlacement.values().stream().distinct().count());
-    assertEquals(REGION_COUNT, readWrites(saltedTable).size());
-    assertEquals(REGION_COUNT, readWrites(unsaltedTable).size());
+  void writesAndReadsOneBatchAcrossRealRegionsAndServers() throws Exception {
+    var identifiers =
+        IntStream.range(0, BATCH_SIZE).mapToObj(index -> Bytes.toBytes((long) index)).toList();
+    var saltedRows = identifiers.stream().map(this::saltedRow).toList();
+    var beforeSalt = readWrites(saltedTable);
+    var beforeControl = readWrites(unsaltedTable);
+    writeRows(saltedTable, saltedRows);
+    writeRows(unsaltedTable, identifiers);
+    assertDistribution(
+        distribution(beforeSalt, readWrites(saltedTable), saltedPlacement),
+        BATCH_SIZE,
+        REGION_COUNT,
+        SERVER_COUNT);
+    assertDistribution(
+        distribution(beforeControl, readWrites(unsaltedTable), unsaltedPlacement),
+        BATCH_SIZE,
+        1,
+        1);
+    assertReadBack(saltedTable, saltedRows);
+    assertReadBack(unsaltedTable, identifiers);
   }
+
+  private byte[] saltedRow(byte[] identifier) {
+    return Bytes.add(salt.salt(identifier), identifier);
+  }
+
+  private void writeRows(TableName table, List<byte[]> rows) throws Exception {
+    var mutations =
+        rows.stream().map(row -> new Put(row).addColumn(FAMILY, QUALIFIER, VALUE)).toList();
+    await(
+        CompletableFuture.allOf(
+            connection.getTable(table).put(mutations).toArray(CompletableFuture[]::new)),
+        OPERATION_TIMEOUT);
+  }
+
+  private void assertReadBack(TableName table, List<byte[]> rows) throws Exception {
+    var observed =
+        await(
+            connection.getTable(table).getAll(rows.stream().map(Get::new).toList()),
+            OPERATION_TIMEOUT);
+    assertEquals(rows.size(), observed.size());
+    for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+      assertArrayEquals(rows.get(rowIndex), observed.get(rowIndex).getRow());
+      assertArrayEquals(VALUE, observed.get(rowIndex).getValue(FAMILY, QUALIFIER));
+    }
+  }
+
+  private Distribution distribution(
+      Map<String, RegionWrites> before,
+      Map<String, RegionWrites> after,
+      Map<String, ServerName> placement) {
+    assertEquals(placement.keySet(), before.keySet());
+    assertEquals(before.keySet(), after.keySet());
+    List<Long> byRegion = new ArrayList<>();
+    Map<ServerName, Long> byServer = new HashMap<>();
+    for (var entry : placement.entrySet()) {
+      var previous = before.get(entry.getKey());
+      var current = after.get(entry.getKey());
+      assertEquals(entry.getValue(), previous.server());
+      assertEquals(entry.getValue(), current.server(), "region placement changed during sampling");
+      long delta = current.count() - previous.count();
+      assertTrue(delta >= 0, "a region counter must not reset during sampling");
+      byRegion.add(delta);
+      byServer.merge(current.server(), delta, Long::sum);
+    }
+    return new Distribution(
+        byRegion.stream().sorted().toList(),
+        servers.stream().map(server -> byServer.getOrDefault(server, 0L)).toList());
+  }
+
+  private static void assertDistribution(
+      Distribution observed, long writes, long activeRegions, long activeServers) {
+    assertEquals(writes, observed.regions().stream().mapToLong(Long::longValue).sum());
+    assertEquals(writes, observed.servers().stream().mapToLong(Long::longValue).sum());
+    assertEquals(activeRegions, observed.regions().stream().filter(count -> count > 0).count());
+    assertEquals(activeServers, observed.servers().stream().filter(count -> count > 0).count());
+  }
+
+  private record Distribution(List<Long> regions, List<Long> servers) {}
 
   private record RegionWrites(ServerName server, long count) {}
 }
