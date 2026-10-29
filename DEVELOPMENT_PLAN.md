@@ -550,7 +550,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J06.2** 基础日志/指标：请求、排队、提交、流和资源记录，凭据不进入日志或标签。
     - [ ] **J06.3** 请求上下文：deadline、取消传播与释放；已发布提交继续由服务恢复上下文持有。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=公开实现待评审；负责人=Codex；完成日期=—；PR/commit=[PR #10](https://github.com/Reidddddd/etcd-hbase/pull/10)；验证入口=scripts/verify/j06.sh；范围=[运行配置与请求生命周期](docs/config/j06-runtime-configuration.md)；评审人/结论=作者自查进行中，独立复核及正式 review 待完成；目标身份激活/TLS、已发布提交恢复仍归后续任务和目标验收。
+  - 跟踪：状态=公开实现已验证，待正式评审；负责人=Codex；完成日期=—；PR/commit=[PR #10](https://github.com/Reidddddd/etcd-hbase/pull/10)；验证入口=scripts/verify/j06.sh；范围=[运行配置与请求生命周期](docs/config/j06-runtime-configuration.md)；评审人/结论=作者自查与独立 agent 复核通过；0fb8a71 完整公开验证 172 项及 3 项报告门禁通过（0 失败/错误/跳过），当前 CI 与正式 review 待完成；目标身份激活/TLS、已发布提交恢复仍归后续任务和目标验收。
 
 - [ ] **J07｜原生 etcd 对照 testkit、Go 请求驱动与历史记录格式**
   - 依赖：J02。
