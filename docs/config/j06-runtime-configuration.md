@@ -19,6 +19,6 @@ RequestScope 使用 monotonic deadline；gRPC 采用客户端和服务端预算�
 
 J04 HBaseRequestContext 只取消请求持有的 future 和 scanner；借用连接时使用独立等待 future，不能关闭或取消 factory 的共享连接。HBase 已接受的 mutation 不因 future 取消而承诺回滚；已发布提交的恢复归 J27。清理任务数受仍持有的请求额度约束，清理 worker 有上限；进程关闭有界等待清理 drain，超时明确失败，保留已接管的清理任务。资源关闭钩子仍须及时返回。
 
-日志只包含有限方法类别、结果类别、时延、剩余预算和服务端生成 trace UUID。指标只使用方法/结果枚举，记录完成数、累计时延和 cleanup 失败数；准入中请求数从同一 semaphore 状态读取。key、账号、凭据、token、任意异常消息或表组名不作为标签。
+完成指标完整累加；成功、UNIMPLEMENTED、取消、deadline、参数/权限拒绝和容量拒绝等预期结果不逐条输出完成日志。后端异常或 cleanup 失败只输出限频 WARN 汇总，每个 listener 的 metrics 实例全局最多每 30 秒一条，携带累计完成/异常/清理失败计数和最近样本；不为成功路径增加逐条 DEBUG。日志只包含有限方法类别、结果类别、时延、剩余预算和服务端生成 trace UUID。指标只使用方法/结果枚举，记录完成数、累计时延和 cleanup 失败数；准入中请求数从同一 semaphore 状态读取。key、账号、凭据、token、任意异常消息或表组名不作为标签。
 
 验证覆盖实际 TCP gRPC 的取消、server deadline、准入拒绝、流累计字节上限、handler/观测失败，确定性清理竞态，以及真实临时 HBase 的 scanner close 和取消后共享连接读回。公开环境验证不替代目标认证、权限、TLS、B01 盐规则、许可证或制品发布决定。
