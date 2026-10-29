@@ -21,24 +21,43 @@ final class WireTraceAssertions {
   private WireTraceAssertions() {}
 
   static void assertWireTrace(Path tracePath) throws IOException {
-    List<JsonNode> records = new ArrayList<>();
-    String serializedTrace;
+    String serializedTrace = readTrace(tracePath);
+    Map<String, JsonNode> byCase = indexByCase(parseRecords(serializedTrace));
+    assertCaseOutcomes(byCase);
+    assertRangeRequests(byCase);
+    assertSkeletonWatch(byCase.get("wire-skeleton-watch"));
+    assertLeaseKeepAlive(byCase.get("wire-skeleton-lease-keepalive"));
+    assertWatchCancellation(byCase.get("wire-fixture-watch-cancel"));
+    assertTracePrivacy(serializedTrace);
+  }
+
+  private static String readTrace(Path tracePath) throws IOException {
     try (var lines = Files.lines(tracePath)) {
-      serializedTrace = String.join("\n", lines.toList());
+      return String.join("\n", lines.toList());
     }
+  }
+
+  private static List<JsonNode> parseRecords(String serializedTrace) throws IOException {
+    List<JsonNode> records = new ArrayList<>();
     for (String line : serializedTrace.lines().toList()) {
       if (!line.isBlank()) {
         records.add(JSON.readTree(line));
       }
     }
+    return records;
+  }
 
+  private static Map<String, JsonNode> indexByCase(List<JsonNode> records) {
     Map<String, JsonNode> byCase = new HashMap<>();
     for (JsonNode record : records) {
       byCase.put(record.path("case_id").asText(), record);
     }
     assertEquals(records.size(), byCase.size(), "duplicate wire cases");
     assertEquals(10, records.size(), "wire probe omitted an expected request/stream case");
+    return byCase;
+  }
 
+  private static void assertCaseOutcomes(Map<String, JsonNode> byCase) {
     assertRecord(byCase, "wire-skeleton-clientv3", "Unimplemented", "transport");
     assertRecord(byCase, "wire-skeleton-raw-range", "Unimplemented", "transport");
     assertRecord(byCase, "wire-skeleton-watch", "Unimplemented", "transport");
@@ -51,7 +70,9 @@ final class WireTraceAssertions {
         byCase, "wire-fixture-clientv3-retry-deadline", "DeadlineExceeded", "transport-fixture");
     assertRecord(
         byCase, "wire-fixture-raw-deadline-cancel", "DeadlineExceeded", "transport-fixture");
+  }
 
+  private static void assertRangeRequests(Map<String, JsonNode> byCase) {
     for (String caseId :
         List.of(
             "wire-skeleton-clientv3",
@@ -66,8 +87,9 @@ final class WireTraceAssertions {
       assertTrue(fields.path("key").isTextual(), caseId + " did not preserve the byte key");
       assertEquals("etcdserverpb.KV/Range", byCase.get(caseId).path("method").asText(), caseId);
     }
+  }
 
-    JsonNode watch = byCase.get("wire-skeleton-watch");
+  private static void assertSkeletonWatch(JsonNode watch) {
     JsonNode watchRequest =
         watch.path("request").path("fields").path("createRequest").path("fields");
     assertEquals("etcdserverpb.Watch/Watch", watch.path("method").asText());
@@ -75,14 +97,18 @@ final class WireTraceAssertions {
     assertEquals(Long.toString(EXPECTED_REVISION), watchRequest.path("startRevision").asText());
     assertEquals("grpc-status", watch.path("stream_terminal").path("kind").asText());
     assertEquals("Unimplemented", watch.path("stream_terminal").path("grpc_code").asText());
-    JsonNode keepAlive = byCase.get("wire-skeleton-lease-keepalive");
+  }
+
+  private static void assertLeaseKeepAlive(JsonNode keepAlive) {
     assertEquals("etcdserverpb.Lease/LeaseKeepAlive", keepAlive.path("method").asText());
     assertEquals(
         Long.toString(EXPECTED_REVISION),
         keepAlive.path("request").path("fields").path("ID").asText());
     assertEquals("grpc-status", keepAlive.path("stream_terminal").path("kind").asText());
     assertEquals("Unimplemented", keepAlive.path("stream_terminal").path("grpc_code").asText());
-    JsonNode cancelledWatch = byCase.get("wire-fixture-watch-cancel");
+  }
+
+  private static void assertWatchCancellation(JsonNode cancelledWatch) {
     JsonNode cancelledWatchRequest =
         cancelledWatch.path("request").path("fields").path("createRequest").path("fields");
     assertEquals("etcdserverpb.Watch/Watch", cancelledWatch.path("method").asText());
@@ -90,6 +116,9 @@ final class WireTraceAssertions {
     assertEquals(
         Long.toString(EXPECTED_REVISION), cancelledWatchRequest.path("startRevision").asText());
     assertEquals("context-deadline", cancelledWatch.path("stream_terminal").path("kind").asText());
+  }
+
+  private static void assertTracePrivacy(String serializedTrace) {
     assertFalse(
         serializedTrace.contains("password")
             || serializedTrace.contains("token")
