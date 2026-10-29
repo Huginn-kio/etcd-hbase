@@ -138,25 +138,35 @@ class SaltDistributionIT {
       moves.add(connection.getAdmin().move(region.getEncodedNameAsBytes(), server));
     }
     await(CompletableFuture.allOf(moves.toArray(CompletableFuture[]::new)), OPERATION_TIMEOUT);
+    awaitRegionPlacement(table, expected);
+    return Map.copyOf(expected);
+  }
+
+  private void awaitRegionPlacement(TableName table, Map<String, ServerName> expected)
+      throws Exception {
     long deadline = System.nanoTime() + OPERATION_TIMEOUT.toNanos();
     Map<String, ServerName> observed;
     do {
-      observed = new HashMap<>();
-      for (var server : servers) {
-        for (var region : await(connection.getAdmin().getRegions(server), OPERATION_TIMEOUT)) {
-          if (region.getTable().equals(table)) {
-            observed.put(region.getEncodedName(), server);
-          }
-        }
-      }
+      observed = readOnlinePlacement(table);
       if (expected.equals(observed)) {
-        return Map.copyOf(expected);
+        return;
       }
       // move acceptance can precede the Region becoming online; wait on that actual state.
       TimeUnit.MILLISECONDS.sleep(50);
     } while (System.nanoTime() < deadline);
     assertEquals(expected, observed, "region placement did not become ready before the deadline");
-    return Map.copyOf(expected);
+  }
+
+  private Map<String, ServerName> readOnlinePlacement(TableName table) throws Exception {
+    Map<String, ServerName> observed = new HashMap<>();
+    for (var server : servers) {
+      for (var region : await(connection.getAdmin().getRegions(server), OPERATION_TIMEOUT)) {
+        if (region.getTable().equals(table)) {
+          observed.put(region.getEncodedName(), server);
+        }
+      }
+    }
+    return observed;
   }
 
   private Map<String, RegionWrites> readWrites(TableName table) throws Exception {
