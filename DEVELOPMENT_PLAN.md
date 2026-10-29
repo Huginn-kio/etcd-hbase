@@ -540,7 +540,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J05.3** 初始化 CLI 原型：空表组创建、配置校验和重复操作保护；正式启动/恢复归 J55。
       - 公开原型：离线 plan、指纹确认 apply、同方案只读重复、匹配空表的部分恢复及冲突拒绝已通过真实临时 HBase 验证；支持调用者提供的 J04 授权身份，公开 CLI 当前装配显式本地无认证模式。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=待评审（公开范围已实现并验证，目标盐规则待输入）；负责人=Codex；完成日期=—；PR/commit=[PR #9](https://github.com/Reidddddd/etcd-hbase/pull/9)；验证入口=scripts/verify/j05.sh --scope public（a33460d 本地 95 项，0 失败/错误/跳过，包含 J04 认证回归、J05 真实初始化与多服务器盐分布；5 份服务器日志留存）；使用与边界=[初始化说明](docs/admin/j05-initialization.md)；评审人/结论=待 Reidddddd 正式评审；目标身份/TLS、B01 及 M0 最终验收保持开放。
+  - 跟踪：状态=待复核（公开范围已实现并验证，目标盐规则待输入）；负责人=Codex；完成日期=—；PR/commit=[PR #9](https://github.com/Reidddddd/etcd-hbase/pull/9)；验证入口=scripts/verify/j05.sh --scope public（5f30bfa 本地 104 项，0 失败/错误/跳过，包含 J04 认证回归、J05 真实初始化、loopback 别名的真实 CLI 回归与多服务器盐分布；5 份服务器日志留存）；使用与边界=[初始化说明](docs/admin/j05-initialization.md)；评审人/结论=已修复维护者提出的配置衔接、解析职责和测试命名反馈，待 Reidddddd 复核；目标身份/TLS、B01 及 M0 最终验收保持开放。
 
 - [ ] **J06｜配置 schema、日志、指标、deadline/取消上下文**
   - 依赖：J01。
