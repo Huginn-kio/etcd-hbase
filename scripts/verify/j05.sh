@@ -140,6 +140,7 @@ if not required_suites <= observed_suites:
 integration = ET.parse(root / "admin/target/failsafe-reports/TEST-io.etcdhbase.admin.InitializeTablesIT.xml").getroot()
 required_cases = {
     "actualCliCreatesBothLayoutsAndRepeatsWithoutChangingPersistedData",
+    "loopbackAliasesWorkForTheRealCliAndRetainPersistedData",
     "realPartialCreationResumesAndConfiguredSiblingsKeepTheirOwnDataAndDescriptors",
     "deletedRecordsDoNotMakeAPartialGroupPristineAgain",
     "suppliedKerberosIdentityProvisionsSchemasAndAnUnprivilegedIdentityIsRejected",
@@ -151,6 +152,7 @@ layouts = dict(re.findall(r"j05-real layout=(\S+) tables=(\d+) regions_per_table
 if layouts != {"SEPARATE_HISTORY_TABLE": "3", "NATIVE_CELL_VERSIONS": "2"}:
     raise SystemExit("both actual HBase layout/region/persistence checks are required")
 required_markers = {
+    "j05-real endpoints=loopback-aliases plan-and-apply=true repeated=true persisted=true status=passed",
     "j05-real recovery=partial-resume siblings-preserved=true status=passed",
     "j05-real recovery=deleted-records-refused raw-scan=true status=passed",
     "j05-real authentication=kerberos-keytab acl-enforced=true caller-owns-connection=true status=passed",

@@ -4,6 +4,7 @@ import static io.etcdhbase.admin.HBaseOperationAwaiter.OPERATION_TIMEOUT;
 import static io.etcdhbase.admin.HBaseOperationAwaiter.await;
 import static io.etcdhbase.spi.identity.BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID;
 
+import io.etcdhbase.admin.config.HBaseQuorum;
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
 import io.etcdhbase.admin.config.InitializationConfiguration.TableSchemaCandidate;
 import io.etcdhbase.admin.config.InitializationConfigurationLoader;
@@ -135,8 +136,9 @@ public final class InitializeTablesCommand {
 
   static Configuration localDevelopmentConfiguration(TableGroupInitializationPlan plan) {
     var configuration = HBaseConfiguration.create();
-    configuration.set("hbase.zookeeper.quorum", plan.hbaseProfile().quorum());
-    configuration.set("hbase.client.zookeeper.quorum", plan.hbaseProfile().quorum());
+    String quorum = HBaseQuorum.connectionString(plan.hbaseProfile());
+    configuration.set("hbase.zookeeper.quorum", quorum);
+    configuration.set("hbase.client.zookeeper.quorum", quorum);
     configuration.setInt("hbase.zookeeper.property.clientPort", plan.hbaseProfile().clientPort());
     configuration.setInt(
         "hbase.client.zookeeper.property.clientPort", plan.hbaseProfile().clientPort());

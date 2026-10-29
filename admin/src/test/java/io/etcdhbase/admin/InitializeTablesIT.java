@@ -135,6 +135,34 @@ class InitializeTablesIT {
   }
 
   @Test
+  void loopbackAliasesWorkForTheRealCliAndRetainPersistedData() throws Exception {
+    for (String alias : List.of("LOCALHOST", "localhost.")) {
+      String namespace = ownedNamespace("alias");
+      ObjectNode tree =
+          localConfiguration(
+              "native-cell-versions.json", namespace, localCluster.clientConfiguration());
+      ((ObjectNode) tree.withArray("hbase_profiles").get(0)).put("quorum", alias);
+      Path configuration = files.resolve(namespace + ".json");
+      Files.write(
+          configuration, new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsBytes(tree));
+      var plan = TableGroupPlanFactory.create(InitializationFixtures.load(tree), "local", null);
+      assertEquals(0, invokeCli("init", "plan", "--config", configuration.toString()).exitCode());
+      CommandResult created = applyCli(configuration, plan);
+      assertEquals(0, created.exitCode(), created.error());
+      assertTrue(created.output().contains("status=created"));
+      assertProvisioned(localOperator.connection(), plan);
+      putProbe(localOperator.connection(), plan);
+      CommandResult repeated = applyCli(configuration, plan);
+      assertEquals(0, repeated.exitCode(), repeated.error());
+      assertTrue(repeated.output().contains("status=already-provisioned"));
+      assertProbe(localOperator.connection(), plan);
+    }
+    System.out.println(
+        "j05-real endpoints=loopback-aliases plan-and-apply=true repeated=true persisted=true"
+            + " status=passed");
+  }
+
+  @Test
   void realPartialCreationResumesAndConfiguredSiblingsKeepTheirOwnDataAndDescriptors()
       throws Exception {
     String namespace = ownedNamespace("recovery");

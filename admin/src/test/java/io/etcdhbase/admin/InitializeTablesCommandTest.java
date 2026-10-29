@@ -1,11 +1,16 @@
 package io.etcdhbase.admin;
 
+import static io.etcdhbase.admin.HBaseOperationAwaiter.OPERATION_TIMEOUT;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.etcdhbase.hbase.identity.HBaseAuthenticators;
+import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
+import io.etcdhbase.spi.identity.AuthenticationScope;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -17,6 +22,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.hbase.TableName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 class InitializeTablesCommandTest {
   @TempDir private Path directory;
@@ -132,6 +139,69 @@ class InitializeTablesCommandTest {
     assertTrue(output.toString(StandardCharsets.UTF_8).isEmpty());
     assertTrue(error.toString(StandardCharsets.UTF_8).contains("missing-input"));
     assertFalse(error.toString(StandardCharsets.UTF_8).contains("private-marker"));
+  }
+
+  @ParameterizedTest
+  @CsvSource(
+      value = {
+        "LOCALHOST | localhost:2181",
+        "localhost. | localhost:2181",
+        "[0:0:0:0:0:0:0:1]:2281 | [::1]:2281",
+        "::1 | [::1]:2181",
+        "127.0.0.2:2282,LOCALHOST:2283 | 127.0.0.2:2282,localhost:2283",
+        "127.001.002.003 | 127.1.2.3:2181",
+        "[::ffff:127.0.0.2]:2282 | 127.0.0.2:2282"
+      },
+      delimiter = '|')
+  void configuredLoopbackAliasesReachTheRealProviderWithoutChangingEndpointMeaning(
+      String quorum, String expected) throws Exception {
+    ObjectNode tree = InitializationFixtures.example("history-table.json", "m0_cli");
+    ObjectNode profile = (ObjectNode) tree.withArray("hbase_profiles").get(0);
+    profile.put("quorum", quorum);
+    profile.put("client_port", 2181);
+    var plan = TableGroupPlanFactory.create(InitializationFixtures.load(tree), "local", null);
+    var configuration = InitializeTablesCommand.localDevelopmentConfiguration(plan);
+    var scope = new AuthenticationScope(plan.tableGroupId(), plan.hbaseProfile().id());
+    try (var provider =
+        assertDoesNotThrow(
+            () ->
+                new HBaseBackendIdentityProvider(
+                    plan.identityProviderId(),
+                    scope,
+                    configuration,
+                    HBaseAuthenticators.simpleDevelopment(),
+                    (connection, ignored) -> {
+                      throw new AssertionError("configuration validation must not contact HBase");
+                    },
+                    1,
+                    1,
+                    OPERATION_TIMEOUT))) {
+      assertEquals(plan.identityProviderId(), provider.providerId());
+      assertEquals(expected, configuration.get("hbase.zookeeper.quorum"));
+      assertEquals(expected, configuration.get("hbase.client.zookeeper.quorum"));
+      assertEquals(2181, configuration.getInt("hbase.zookeeper.property.clientPort", 0));
+      assertEquals(2181, configuration.getInt("hbase.client.zookeeper.property.clientPort", 0));
+    }
+  }
+
+  @Test
+  void invalidAndNonLoopbackEndpointsAreRejectedBeforeAnyApplyOperation() throws Exception {
+    for (String quorum :
+        List.of(
+            "remote.invalid",
+            "0.0.0.0",
+            "224.0.0.1",
+            "127.0.0.1,remote.invalid",
+            "localhost:0",
+            "localhost:65536",
+            "[::1%lo0]:2181",
+            "localhost,")) {
+      ObjectNode tree = InitializationFixtures.example("history-table.json", "m0_cli");
+      ((ObjectNode) tree.withArray("hbase_profiles").get(0)).put("quorum", quorum);
+      var result = run(planArguments(write(tree, "invalid-endpoint.json")), forbiddenApply());
+      assertEquals(2, result.exitCode(), result.error());
+      assertTrue(result.output().isEmpty());
+    }
   }
 
   private String write(String name) throws Exception {
