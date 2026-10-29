@@ -493,7 +493,7 @@ class HBaseBackendIdentityProviderTest {
     try {
       authenticate(provider, "alice").get(5, TimeUnit.SECONDS);
       var bobAuthentication = authenticate(provider, "bob");
-      // Close on the completion worker after Alice's finish and before Bob's trailing cleanup.
+      // Close from Bob's result callback after Alice has been verified.
       var closed =
           bobAuthentication.thenApply(
               ignored -> assertThrows(IllegalStateException.class, provider::close));
@@ -643,6 +643,214 @@ class HBaseBackendIdentityProviderTest {
   }
 
   @Test
+  void blockingTimeoutCallbackDoesNotDelayAnotherAuthenticationDeadline() throws Exception {
+    var verification = new CompletableFuture<Void>();
+    var verifying = new CountDownLatch(2);
+    var callbackEntered = new CountDownLatch(1);
+    var releaseCallback = new CountDownLatch(1);
+    var provider =
+        provider(
+            (credentials, scope) -> context(credentials.principal()),
+            (backend, scope) -> {
+              verifying.countDown();
+              return verification;
+            },
+            (configuration, user) ->
+                CompletableFuture.completedFuture(mock(AsyncConnection.class)),
+            Duration.ofSeconds(1),
+            2);
+    try {
+      var first = authenticate(provider, "alice");
+      first.whenComplete((identity, failure) -> blockCallback(callbackEntered, releaseCallback));
+      var second = authenticate(provider, "bob");
+      assertTrue(verifying.await(5, TimeUnit.SECONDS));
+      assertTrue(callbackEntered.await(5, TimeUnit.SECONDS));
+      var failure = assertThrows(ExecutionException.class, () -> second.get(2, TimeUnit.SECONDS));
+      assertEquals(
+          Reason.TIMEOUT,
+          assertInstanceOf(BackendIdentityException.class, failure.getCause()).reason());
+    } finally {
+      releaseCallback.countDown();
+      verification.complete(null);
+      provider.close();
+    }
+  }
+
+  @Test
+  void blockingFailureCallbackDoesNotDelayCleanupOrReleaseItsNotificationCapacity()
+      throws Exception {
+    var verification = new CompletableFuture<Void>();
+    var callbackEntered = new CountDownLatch(1);
+    var releaseCallback = new CountDownLatch(1);
+    var cleaned = new CountDownLatch(1);
+    var userContext = context("alice");
+    doAnswer(
+            invocation -> {
+              cleaned.countDown();
+              return null;
+            })
+        .when(userContext)
+        .close();
+    var verifications = new AtomicInteger();
+    var logins = new AtomicInteger();
+    var provider =
+        provider(
+            (credentials, scope) -> logins.getAndIncrement() == 0 ? userContext : context("alice"),
+            (backend, scope) ->
+                verifications.getAndIncrement() == 0
+                    ? verification
+                    : CompletableFuture.completedFuture(null),
+            (configuration, user) ->
+                CompletableFuture.completedFuture(mock(AsyncConnection.class)),
+            TIMEOUT);
+    try {
+      var result = authenticate(provider);
+      result.whenComplete((identity, failure) -> blockCallback(callbackEntered, releaseCallback));
+      verification.completeExceptionally(
+          new BackendIdentityException(Reason.INSUFFICIENT_PERMISSION));
+      assertTrue(callbackEntered.await(5, TimeUnit.SECONDS));
+      assertTrue(cleaned.await(2, TimeUnit.SECONDS), "result callbacks must not delay backend cleanup");
+      assertReason(Reason.INSUFFICIENT_PERMISSION, result);
+      assertReason(Reason.RESOURCE_LIMIT, authenticate(provider));
+      releaseCallback.countDown();
+      authenticateAfterCleanup(provider);
+    } finally {
+      releaseCallback.countDown();
+      verification.complete(null);
+      provider.close();
+    }
+  }
+
+  @Test
+  void blockingSuccessCallbackDoesNotDelayAnotherAuthenticationOrShutdown() throws Exception {
+    var verification = new CompletableFuture<Void>();
+    var callbackEntered = new CountDownLatch(1);
+    var releaseCallback = new CountDownLatch(1);
+    var verifications = new AtomicInteger();
+    var provider =
+        provider(
+            (credentials, scope) -> context(credentials.principal()),
+            (backend, scope) ->
+                verifications.getAndIncrement() == 0
+                    ? verification
+                    : CompletableFuture.completedFuture(null),
+            (configuration, user) ->
+                CompletableFuture.completedFuture(mock(AsyncConnection.class)),
+            TIMEOUT,
+            2);
+    var executor = Executors.newSingleThreadExecutor();
+    try {
+      var first = authenticate(provider, "alice");
+      first.thenRun(() -> blockCallback(callbackEntered, releaseCallback));
+      verification.complete(null);
+      assertTrue(callbackEntered.await(5, TimeUnit.SECONDS));
+      var second = authenticate(provider, "bob").get(2, TimeUnit.SECONDS);
+      provider.connectionFor(second).toCompletableFuture().get(2, TimeUnit.SECONDS);
+      executor.submit(provider::close).get(2, TimeUnit.SECONDS);
+    } finally {
+      releaseCallback.countDown();
+      verification.complete(null);
+      provider.close();
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
+  void blockingBackendCleanupDoesNotDelayFailureNotificationOrOtherDeadlines() throws Exception {
+    var verification = new CompletableFuture<Void>();
+    var cleanupEntered = new CountDownLatch(1);
+    var releaseCleanup = new CountDownLatch(1);
+    var connection = mock(AsyncConnection.class);
+    doAnswer(
+            invocation -> {
+              cleanupEntered.countDown();
+              releaseCleanup.await();
+              return null;
+            })
+        .when(connection)
+        .close();
+    var provider =
+        provider(
+            (credentials, scope) -> context(credentials.principal()),
+            (backend, scope) -> verification,
+            (configuration, user) ->
+                CompletableFuture.completedFuture(
+                    user.getName().equals("alice") ? connection : mock(AsyncConnection.class)),
+            Duration.ofSeconds(1),
+            2);
+    try {
+      var first = authenticate(provider, "alice");
+      verification.completeExceptionally(
+          new BackendIdentityException(Reason.INSUFFICIENT_PERMISSION));
+      assertTrue(cleanupEntered.await(5, TimeUnit.SECONDS));
+      assertReason(Reason.INSUFFICIENT_PERMISSION, first);
+      var second = authenticate(provider, "bob");
+      var failure = assertThrows(ExecutionException.class, () -> second.get(2, TimeUnit.SECONDS));
+      assertEquals(
+          Reason.TIMEOUT,
+          assertInstanceOf(BackendIdentityException.class, failure.getCause()).reason());
+    } finally {
+      releaseCleanup.countDown();
+      provider.close();
+    }
+  }
+
+  @Test
+  void notificationCapacityRejectsCredentialsAndTrustedActivationBeforeBackendWork()
+      throws Exception {
+    var verification = new CompletableFuture<Void>();
+    var callbackEntered = new CountDownLatch(1);
+    var releaseCallback = new CountDownLatch(1);
+    var authenticator = mock(HBaseCredentialAuthenticator.class);
+    when(authenticator.authenticate(any(), any()))
+        .thenAnswer(
+            invocation -> {
+              BackendCredentials credentials = invocation.getArgument(0);
+              return context(credentials.principal());
+            });
+    var trustedActivations = new AtomicInteger();
+    var provider =
+        new HBaseBackendIdentityProvider(
+            "backend-auth",
+            SCOPE,
+            secureConfiguration(),
+            authenticator,
+            (backend, scope) -> verification,
+            3,
+            1,
+            TIMEOUT,
+            (configuration, user) ->
+                CompletableFuture.completedFuture(mock(AsyncConnection.class)));
+    try {
+      var first = authenticate(provider);
+      var callback = first.thenRun(() -> blockCallback(callbackEntered, releaseCallback));
+      verification.complete(null);
+      assertTrue(callbackEntered.await(5, TimeUnit.SECONDS));
+      assertReason(Reason.RESOURCE_LIMIT, authenticate(provider, "bob"));
+      assertReason(
+          Reason.RESOURCE_LIMIT,
+          provider
+              .activateTrusted(
+                  () -> {
+                    trustedActivations.incrementAndGet();
+                    return context("operator");
+                  })
+              .toCompletableFuture());
+      verify(authenticator).authenticate(any(), any());
+      assertEquals(0, trustedActivations.get());
+      releaseCallback.countDown();
+      callback.get(5, TimeUnit.SECONDS);
+      authenticateAfterCleanup(provider);
+      verify(authenticator, times(2)).authenticate(any(), any());
+    } finally {
+      releaseCallback.countDown();
+      verification.complete(null);
+      provider.close();
+    }
+  }
+
+  @Test
   void simpleDevelopmentRejectsPasswordsAndInvalidPrincipalsWithoutOpeningConnections()
       throws Exception {
     var configuration = new Configuration(false);
@@ -750,6 +958,16 @@ class HBaseBackendIdentityProviderTest {
       HBaseBackendIdentityProvider provider, String principal) {
     try (var credentials = new BackendCredentials(principal, "password".toCharArray())) {
       return provider.authenticate(credentials, SCOPE).toCompletableFuture();
+    }
+  }
+
+  private static void blockCallback(CountDownLatch entered, CountDownLatch release) {
+    entered.countDown();
+    try {
+      release.await();
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new java.util.concurrent.CompletionException(interrupted);
     }
   }
 

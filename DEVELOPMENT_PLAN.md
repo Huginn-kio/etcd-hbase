@@ -527,7 +527,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J04.1** 确认实际认证机制与 BackendIdentityProvider/HBase 连接适配边界，记录跨副本与后台身份所需输入。
     - [ ] **J04.2** 完成基础连接及 Get/Put/CAS/Scan，记录身份隔离、认证失败、超时和关闭行为。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=待验证（公开临时环境已验证）；负责人=Codex；完成日期=—；PR/commit=[PR #8](https://github.com/Reidddddd/etcd-hbase/pull/8)；验证入口=scripts/verify/hbase-probe.sh --profile public-local（48 项，0 失败/错误/跳过）；范围=[后端接入说明](docs/hbase/j04-backend-access.md)；评审人/结论=待评审；真实临时 HBase 覆盖 SIMPLE、Kerberos（密码/keytab/票据缓存）、服务器签发的 delegation token、独立账号密码 DIGEST 测试扩展，验证服务端实际身份、ACL、Get/Put/CAS/Scan、独立读回及失败反例；目标身份、权限与 TLS 尚未验证。
+  - 跟踪：状态=待验证（公开临时环境已验证）；负责人=Codex；完成日期=—；PR/commit=[PR #8](https://github.com/Reidddddd/etcd-hbase/pull/8)；验证入口=scripts/verify/hbase-probe.sh --profile public-local（53 项，0 失败/错误/跳过）；范围=[后端接入说明](docs/hbase/j04-backend-access.md)；评审人/结论=Reidddddd：前置审查通过，正确性 P2 的超时通知隔离及有界准入修复待复核；真实临时 HBase 覆盖 SIMPLE、Kerberos（密码/keytab/票据缓存）、服务器签发的 delegation token、独立账号密码 DIGEST 测试扩展，验证服务端实际身份、ACL、Get/Put/CAS/Scan、独立读回及失败反例；目标身份、权限与 TLS 尚未验证。
 
 - [ ] **J05｜盐 profile、候选表配置与初始化 CLI 原型**
   - 依赖：B01 的编码输入；候选表配置不等待完整 B05 负载目标。

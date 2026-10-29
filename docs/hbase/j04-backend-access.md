@@ -51,6 +51,8 @@ Keytab/票据缓存是服务端受控身份来源，不能把“客户端提交�
 
 `HBaseFailures` 区分认证、权限、超时、取消、资源容量、不可用和未知失败。连接和身份上下文统一由 `HBaseBackendIdentityProvider` 持有；生产适配与临时探针使用同一套容量、超时、签发身份和关闭机制。开发模式只通过显式 `simpleDevelopment` 适配器进入统一路径。
 
+认证准入同时受两项容量约束：`maximumContexts` 限制保留身份及尚未完成清理的资源；`authenticationWorkers` 也限定尚未完成结果通知的认证数。每次准入预留一个独立的通知 worker，成功、失败或超时结果都在该执行器发布，调用方同步回调不占用 deadline 或内部完成线程。回调返回之前持续占用通知额度；满额时，普通认证和可信激活均立即返回 `RESOURCE_LIMIT`，不继续启动后端工作。失败资源清理独立推进，只有资源成功关闭且通知回调返回后才释放该上下文；关闭失败保留原有重试机制。
+
 安全集群关闭 SIMPLE 回退，并用实际 SIMPLE 客户端 RPC 验证拒绝。在当前固定 client 中，服务端拒绝 RPC preamble 后，客户端只暴露 `ConnectionClosedException`，因此保留 `BACKEND_UNAVAILABLE` 分类；不能根据错误文本猜测认证原因。错误 Kerberos 密码、篡改 token 和错误 DIGEST 密码另有实际认证失败分类断言，权限不足也单独验证。
 
 ## 4. 验证入口与证据
@@ -69,7 +71,7 @@ scripts/verify/hbase-probe.sh --profile public-local
 
 真实 HBase 场景覆盖统一 provider、不同身份连接、二进制 Put/Get、CAS 匹配/不匹配、有界 Scan、同表不同运行隔离、独立/重建连接读回、精确清理与关闭。操作有 client 超时，Scan 限定三行、缓存三行及结果大小；表及 mutation 使用 `SYNC_WAL`，不以重连读回证明 RegionServer 故障耐久性。
 
-超时、取消、阻塞登录、迟到连接、权限 RPC 中关闭、清理失败重试和伪造 handle 另有确定性单测。完整公开入口当前执行 48 项测试，其中 SIMPLE 集成 1 项、安全集成 6 项；runner 拒绝零测试、失败、跳过、缺少认证套件或实际机制/负例证据，保留 JUnit XML、服务端日志、摘要及 SHA-256 到本地 `.artifacts/m0/j04/`。临时 KDC/keytab/cache 随测试关闭清理，原始产物不进入仓库。
+超时、取消、阻塞登录、迟到连接、权限 RPC 中关闭、清理失败重试和伪造 handle 另有确定性单测。新增回归覆盖阻塞超时回调时另一请求仍及时超时、失败清理与成功通知互不阻塞、后端关闭阻塞时仍发布结果，以及通知额度不足时的准入拒绝和恢复。完整公开入口当前执行 53 项测试，其中 SIMPLE 集成 1 项、安全集成 6 项；runner 拒绝零测试、失败、跳过、缺少认证套件或实际机制/负例证据，保留 JUnit XML、服务端日志、摘要及 SHA-256 到本地 `.artifacts/m0/j04/`。临时 KDC/keytab/cache 随测试关闭清理，原始产物不进入仓库。
 
 client/Hadoop 版本来自依赖锁，服务端版本由临时环境采集。锁定用于可重复构建，不要求目标 HBase 与 client 同版本，也不要求目标服务端使用 JDK 21。候选通过不等于所有版本受支持，兼容边界参见 [HBase Java 支持矩阵](https://hbase.apache.org/docs/configuration/basic-prerequisites/)。
 

@@ -41,6 +41,11 @@ import org.apache.hadoop.hbase.security.User;
  * succeed before publication. The verified connection is then reused by that identity. No etcd
  * sessions or tokens are created here. Contexts remain bounded until provider close; per-session
  * retirement and renewal belong to the session/lifecycle layer.
+ *
+ * <p>At most {@code authenticationWorkers} accepted attempts may await result delivery. Each
+ * reserves an independent notification worker until synchronous caller callbacks return; other
+ * attempts fail promptly with {@link Reason#RESOURCE_LIMIT}. Retained identities and unfinished
+ * resource cleanup are additionally bounded by {@code maximumContexts}.
  */
 public final class HBaseBackendIdentityProvider
     implements BackendIdentityProvider, HBaseConnectionFactory {
@@ -57,11 +62,14 @@ public final class HBaseBackendIdentityProvider
   private final HBaseAccessVerifier verifier;
   private final ConnectionOpener opener;
   private final int maximumContexts;
+  private final int maximumNotifications;
   private final Duration timeout;
   private final Map<String, Attempt> contexts = new HashMap<>();
   private final ThreadPoolExecutor workers;
   private final ThreadPoolExecutor completions;
+  private final ThreadPoolExecutor notifications;
   private final ScheduledThreadPoolExecutor deadlines;
+  private int pendingNotifications;
   private volatile boolean closed;
 
   public HBaseBackendIdentityProvider(
@@ -117,9 +125,14 @@ public final class HBaseBackendIdentityProvider
     this.verifier = Objects.requireNonNull(verifier, "verifier");
     this.opener = Objects.requireNonNull(opener, "opener");
     this.maximumContexts = maximumContexts;
+    this.maximumNotifications = authenticationWorkers;
     this.timeout = timeout;
     workers = pool(authenticationWorkers, maximumContexts, "hbase-auth-");
     completions = pool(1, maximumContexts * 3, "hbase-auth-completion-");
+    // Reserve one notification slot before accepting backend work. A blocked caller callback must
+    // not occupy the thread reserved for another accepted attempt's result or deadline.
+    notifications =
+        pool(authenticationWorkers, authenticationWorkers, "hbase-auth-notification-");
     deadlines =
         new ScheduledThreadPoolExecutor(
             1, Thread.ofPlatform().daemon().name("hbase-auth-deadline-", 0).factory());
@@ -144,7 +157,7 @@ public final class HBaseBackendIdentityProvider
       if (!scope.equals(requestedScope)) {
         return rejected(Reason.INSUFFICIENT_PERMISSION);
       }
-      if (contexts.size() >= maximumContexts) {
+      if (contexts.size() >= maximumContexts || pendingNotifications >= maximumNotifications) {
         return rejected(Reason.RESOURCE_LIMIT);
       }
       BackendCredentials copy;
@@ -177,7 +190,7 @@ public final class HBaseBackendIdentityProvider
       if (closed) {
         return rejected(Reason.BACKEND_UNAVAILABLE);
       }
-      if (contexts.size() >= maximumContexts) {
+      if (contexts.size() >= maximumContexts || pendingNotifications >= maximumNotifications) {
         return rejected(Reason.RESOURCE_LIMIT);
       }
       return start(new Attempt(null, source));
@@ -187,6 +200,7 @@ public final class HBaseBackendIdentityProvider
   /** Called while holding gate, so accepted work is submitted before shutdown can start. */
   private CompletionStage<AuthorizedBackendIdentity> start(Attempt attempt) {
     contexts.put(attempt.reference, attempt);
+    pendingNotifications++;
     attempt.deadline =
         deadlines.schedule(
             () -> attempt.stop(Reason.TIMEOUT), timeout.toNanos(), TimeUnit.NANOSECONDS);
@@ -245,11 +259,19 @@ public final class HBaseBackendIdentityProvider
     shutdownWhenEmpty();
   }
 
+  private void releaseNotification(Attempt attempt) {
+    synchronized (gate) {
+      pendingNotifications--;
+    }
+    attempt.retireWhenFinished();
+  }
+
   private void shutdownWhenEmpty() {
     synchronized (gate) {
       if (closed && contexts.isEmpty()) {
         completions.shutdown();
         deadlines.shutdown();
+        notifications.shutdown();
       }
     }
   }
@@ -285,6 +307,9 @@ public final class HBaseBackendIdentityProvider
     boolean stopped;
     boolean workFinished;
     boolean cleaning;
+    boolean resourcesClosed;
+    boolean notificationScheduled;
+    boolean notificationFinished;
 
     Attempt(BackendCredentials credentials, Callable<? extends HBaseUserContext> userSource) {
       this.credentials = credentials;
@@ -293,6 +318,12 @@ public final class HBaseBackendIdentityProvider
           (ignored, failure) -> {
             if (result.isCancelled()) {
               stop(Reason.CANCELLED);
+              // Cancellation may arrive after finish has checked whether cleanup is necessary.
+              synchronized (this) {
+                if (!resourcesClosed) {
+                  completions.execute(this::cleanup);
+                }
+              }
             }
           });
     }
@@ -354,7 +385,7 @@ public final class HBaseBackendIdentityProvider
       AuthorizedBackendIdentity published = null;
       synchronized (this) {
         workFinished = true;
-        if (failure != null || closed) {
+        if (failure != null || closed || result.isCancelled()) {
           stopped = true;
         }
         if (!stopped) {
@@ -376,9 +407,9 @@ public final class HBaseBackendIdentityProvider
       }
       deadline.cancel(false);
       if (published != null) {
-        if (!result.complete(published)) {
-          stop(Reason.CANCELLED);
-        }
+        notifyResult(published, null);
+        // A ready identity is retained; cancellation and close own its eventual cleanup.
+        return;
       } else if (failure != null) {
         Reason reason =
             switch (HBaseFailures.classify(failure).category()) {
@@ -389,9 +420,9 @@ public final class HBaseBackendIdentityProvider
               case CANCELLED -> Reason.CANCELLED;
               default -> Reason.BACKEND_UNAVAILABLE;
             };
-        result.completeExceptionally(new BackendIdentityException(reason));
+        notifyResult(null, reason);
       } else {
-        result.completeExceptionally(new BackendIdentityException(Reason.CANCELLED));
+        notifyResult(null, Reason.CANCELLED);
       }
       cleanup();
     }
@@ -406,7 +437,48 @@ public final class HBaseBackendIdentityProvider
           loginWorker.interrupt();
         }
       }
-      result.completeExceptionally(new BackendIdentityException(reason));
+      notifyResult(null, reason);
+    }
+
+    private void notifyResult(AuthorizedBackendIdentity published, Reason reason) {
+      synchronized (this) {
+        if (notificationScheduled) {
+          return;
+        }
+        notificationScheduled = true;
+      }
+      notifications.execute(() -> deliverResult(published, reason));
+    }
+
+    private void deliverResult(AuthorizedBackendIdentity published, Reason reason) {
+      try {
+        synchronized (this) {
+          if (published != null && stopped) {
+            published = null;
+            reason = Reason.CANCELLED;
+          }
+        }
+        if (published == null) {
+          result.completeExceptionally(new BackendIdentityException(reason));
+        } else if (!result.complete(published)) {
+          stop(Reason.CANCELLED);
+          cleanup();
+        }
+      } finally {
+        synchronized (this) {
+          notificationFinished = true;
+        }
+        releaseNotification(this);
+      }
+    }
+
+    private void retireWhenFinished() {
+      synchronized (this) {
+        if (!resourcesClosed || !notificationFinished) {
+          return;
+        }
+      }
+      retire(this);
     }
 
     /** Retains capacity and credentials if a connection could not be closed; close() retries it. */
@@ -432,11 +504,12 @@ public final class HBaseBackendIdentityProvider
         // Keep the owned resources available for a later close retry, without publishing details.
       } finally {
         synchronized (this) {
+          resourcesClosed = success;
           cleaning = false;
         }
       }
       if (success) {
-        retire(this);
+        retireWhenFinished();
       }
       return success;
     }
