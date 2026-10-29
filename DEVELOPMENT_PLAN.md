@@ -1,8 +1,8 @@
 # etcd-hbase 开发计划与进度记录
 
-> 文档版本：0.7（J04 临时环境交付与已合并任务核对） · 更新日期：2026-10-28 · 开发基线：**JDK 21**
+> 文档版本：0.8（J05 公开盐与初始化原型） · 更新日期：2026-10-29 · 开发基线：**JDK 21**
 >
-> 当前状态：开发计划及 M0 设计已批准，进入 M0。J03 已在 PR #7 批准合并，提供 gRPC 骨架、Header/Error 工厂及最小 Go/Java 验证；未实现业务仍返回 UNIMPLEMENTED。J04 的身份契约、连接工厂、DIGEST 凭据载体与真实临时 HBase 探针由 PR #8 交付；目标环境身份和权限尚未验收。本文中的后续类、表结构和算法仍按任务逐项实现；勾选任务必须附实现、验证和评审证据。
+> 当前状态：开发计划及 M0 设计已批准，进入 M0。J03 已在 PR #7 批准合并，提供 gRPC 骨架、Header/Error 工厂及最小 Go/Java 验证；未实现业务仍返回 UNIMPLEMENTED。J04 的统一身份契约、连接工厂及多种认证的真实临时 HBase 验证已随 PR #8 批准合并；目标环境身份和权限尚未验收。J05 的公开盐候选、两种表布局及初始化原型已实现并通过公开验证，见 PR #9；目标盐规则与正式 review 仍待完成。本文中的后续类、表结构和算法仍按任务逐项实现；勾选任务必须附实现、验证和评审证据。
 
 ## 1. 评审摘要
 
@@ -527,17 +527,20 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J04.1** 确认实际认证机制与 BackendIdentityProvider/HBase 连接适配边界，记录跨副本与后台身份所需输入。
     - [ ] **J04.2** 完成基础连接及 Get/Put/CAS/Scan，记录身份隔离、认证失败、超时和关闭行为。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=待验证（公开临时环境已验证）；负责人=Codex；完成日期=—；PR/commit=[PR #8](https://github.com/Reidddddd/etcd-hbase/pull/8)；验证入口=scripts/verify/hbase-probe.sh --profile public-local（53 项，0 失败/错误/跳过）；范围=[后端接入说明](docs/hbase/j04-backend-access.md)；评审人/结论=Reidddddd：前置审查通过，正确性 P2 的超时通知隔离及有界准入修复待复核；真实临时 HBase 覆盖 SIMPLE、Kerberos（密码/keytab/票据缓存）、服务器签发的 delegation token、独立账号密码 DIGEST 测试扩展，验证服务端实际身份、ACL、Get/Put/CAS/Scan、独立读回及失败反例；目标身份、权限与 TLS 尚未验证。
+  - 跟踪：状态=待目标验证（公开交付已批准合并）；负责人=Codex；完成日期=—；PR/commit=[PR #8](https://github.com/Reidddddd/etcd-hbase/pull/8)，合并提交 dc081ab；验证入口=scripts/verify/hbase-probe.sh --profile public-local（合并前 53 项，0 失败/错误/跳过）；范围=[后端接入说明](docs/hbase/j04-backend-access.md)；评审人/结论=Reidddddd，APPROVED，超时通知隔离及有界准入修复已复核；真实临时 HBase 覆盖 SIMPLE、Kerberos（密码/keytab/票据缓存）、服务器签发的 delegation token、独立账号密码 DIGEST 测试扩展，验证服务端实际身份、ACL、Get/Put/CAS/Scan、独立读回及失败反例；目标身份、权限与 TLS 尚未验证。
 
 - [ ] **J05｜盐 profile、候选表配置与初始化 CLI 原型**
   - 依赖：B01 的编码输入；候选表配置不等待完整 B05 负载目标。
   - 完成标准：所有记录类型加盐，固定测试向量与预分区；输出独立 history 与原生 Cell 多版本候选表配置及建表原型，物理布局按 J11/J24/J25/J52 报告选择，rowkey 不加集群路由 ID。
   - 子任务 / 交付物（各项记录状态、负责人、日期、PR 与证据）：
     - [ ] **J05.1** 盐 profile：盐输入/编码、桶列表、版本和预分区边界，默认公开测试向量与扩展约束。
+      - 公开候选：CRC32-IEEE、16 桶、2 字节大端；Java 与 Python 独立核对 8 组向量及 15 个 split keys。3 个真实临时 RegionServer 下，两组各 2,048 条数据的逐批写入分散到 16 个 Region，实际服务端计数和读回通过；同边界无盐对照及单热 key 仍集中于一个 Region。B01 目标 profile 尚未确认，该验证不代表生产吞吐或消除单行热点。
     - [ ] **J05.2** 候选表配置：列族、版本/TTL/删除行为、schema 和表组配置；支持两种历史存储原型。
+      - 公开候选：独立 history 三表与原生 Cell 多版本两表配置；严格 JSON 校验、列族/版本/TTL/删除策略、权限意图和 namespace 表组隔离已实现。历史语义和布局选择继续由后续任务验证。
     - [ ] **J05.3** 初始化 CLI 原型：空表组创建、配置校验和重复操作保护；正式启动/恢复归 J55。
+      - 公开原型：离线 plan、指纹确认 apply、同方案只读重复、匹配空表的部分恢复及冲突拒绝已通过真实临时 HBase 验证；支持调用者提供的 J04 授权身份，公开 CLI 当前装配显式本地无认证模式。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=待复核（公开范围已实现并验证，目标盐规则待输入）；负责人=Codex；完成日期=—；PR/commit=[PR #9](https://github.com/Reidddddd/etcd-hbase/pull/9)；验证入口=scripts/verify/j05.sh --scope public（5f30bfa 本地 104 项，0 失败/错误/跳过，包含 J04 认证回归、J05 真实初始化、loopback 别名的真实 CLI 回归与多服务器盐分布；5 份服务器日志留存；后续布局采样职责拆分的盐探针与 CLI 定向 16 项通过）；使用与边界=[初始化说明](docs/admin/j05-initialization.md)；评审人/结论=已修复维护者提出的配置衔接、解析职责、盐探针布局采样和测试命名反馈，待 Reidddddd 复核；目标身份/TLS、B01 及 M0 最终验收保持开放。
 
 - [ ] **J06｜配置 schema、日志、指标、deadline/取消上下文**
   - 依赖：J01。
