@@ -8,8 +8,8 @@ import io.etcdhbase.core.storage.BatchWriteResult;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.StorageMetadata;
-import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.hbase.codec.RevisionTimestamp;
@@ -198,8 +198,8 @@ public final class HBaseRecordStore implements RecordStore {
   }
 
   @Override
-  public CompletableFuture<StoragePage> scan(ScanRequest scan) {
-    return new HBasePageReader(this, binding, scope, worker).read(scan);
+  public ScanOperation startScan(ScanRequest scan) {
+    return new HBasePageReader(this, binding, scope, worker).start(scan);
   }
 
   AsyncTable<?> table() {
