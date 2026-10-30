@@ -58,7 +58,6 @@ final class HBasePageReader {
     private boolean started;
     private boolean cancelled;
     private boolean completing;
-    private boolean closeStarted;
     private final CompletableFuture<Void> cleanupComplete = new CompletableFuture<>();
 
     PageTask(ScanRequest request) { this.request = request; }
@@ -205,8 +204,6 @@ final class HBasePageReader {
       boolean beforeStart;
       synchronized (this) {
         cancelled = true;
-        if (closeStarted) return;
-        closeStarted = true;
         owned = scanner;
         scanner = null;
         beforeStart = !started && !completing;
