@@ -2,12 +2,17 @@ package io.etcdhbase.core.scan;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.storage.StoragePage;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 class BudgetManagerTest {
@@ -15,6 +20,60 @@ class BudgetManagerTest {
   private static final BudgetManager.Limits GROUP = new BudgetManager.Limits(2, 2, 1, 1, 1, 2048, 4096);
   private static final BudgetManager.Limits REQUEST = new BudgetManager.Limits(1, 2, 1, 1, 1, 1024, 2048);
   private static final BudgetManager.Reservation MEMORY = new BudgetManager.Reservation(512, 512, 512, 512);
+
+  @Test
+  void invalidReadLimitsCannotConsumeAdmissionOrMemory() throws Exception {
+    var manager = new BudgetManager(GLOBAL, Map.of("alpha", GROUP), REQUEST);
+    try (var scope = RequestScope.withoutDeadline()) {
+      assertThrows(NullPointerException.class, () -> manager.admit("alpha", scope, MEMORY, null));
+      assertEquals(0, manager.snapshot().requests());
+      assertEquals(0, manager.snapshot().reservedBytes());
+      try (var account = manager.admit("alpha", scope, MEMORY)) {
+        assertTrue(account.isActive());
+        assertEquals(1, manager.snapshot().requests());
+      }
+    }
+    assertEquals(0, manager.snapshot().requests());
+    assertEquals(0, manager.snapshot().reservedBytes());
+  }
+
+  @Test
+  void readCompletionChecksAccountStateUnderTheChargingLock() throws Exception {
+    var manager = new BudgetManager(GLOBAL, Map.of("alpha", GROUP), REQUEST);
+    try (var scope = RequestScope.withoutDeadline()) {
+      var account = manager.admit("alpha", scope, MEMORY);
+      var observedActive = new CompletableFuture<Boolean>();
+      var finishCharge = new CountDownLatch(1);
+      var completion = new CompletableFuture<BackendFailure>();
+      Thread worker = Thread.ofPlatform().daemon().start(() -> {
+        observedActive.complete(account.isActive());
+        try {
+          finishCharge.await();
+          account.charge(new StoragePage.Cost(1, 32, 1));
+          completion.complete(null);
+        } catch (BackendFailure failure) {
+          completion.complete(failure);
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          completion.completeExceptionally(interrupted);
+        }
+      });
+      try {
+        assertTrue(observedActive.get(5, TimeUnit.SECONDS));
+        account.close();
+        finishCharge.countDown();
+        BackendFailure failure = completion.get(5, TimeUnit.SECONDS);
+        assertNotNull(failure, "an earlier active observation cannot authorize a later charge");
+        assertEquals(BackendFailure.Category.CANCELLED, failure.category());
+      } finally {
+        finishCharge.countDown();
+        worker.join(5000);
+        assertFalse(worker.isAlive());
+      }
+      assertEquals(0, manager.snapshot().requests());
+      assertEquals(0, manager.snapshot().reservedBytes());
+    }
+  }
 
   @Test
   void admissionIsAtomicAcrossGlobalGroupAndRequestLimits() throws Exception {

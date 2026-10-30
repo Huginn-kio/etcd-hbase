@@ -253,14 +253,15 @@ public final class ScanScheduler implements AutoCloseable {
       try {
         if (startFailure != null) { finish(null, startFailure); return; }
         boolean stopped;
-        synchronized (ScanScheduler.this) { stopped = stopRequested || !account.isActive(); }
+        synchronized (ScanScheduler.this) { stopped = stopRequested; }
         if (stopped) { finish(null, cancelled()); return; }
+        account.requireActive();
         ScanOperation opened = Objects.requireNonNull(source.startScan(request), "physical operation");
         boolean stop;
         synchronized (ScanScheduler.this) { physical = opened; stop = stopRequested; }
         opened.completion().whenComplete(this::finish);
         if (stop) stopPhysical(opened);
-      } catch (RuntimeException problem) {
+      } catch (BackendFailure | RuntimeException problem) {
         finish(null, problem);
       } catch (Error fatal) {
         finish(null, fatal);
@@ -275,7 +276,7 @@ public final class ScanScheduler implements AutoCloseable {
       synchronized (ScanScheduler.this) {
         if (finished) return;
         finished = true;
-        stopped = stopRequested || !account.isActive();
+        stopped = stopRequested;
         owned = resources;
         completed = physical;
         physical = null;
@@ -290,6 +291,7 @@ public final class ScanScheduler implements AutoCloseable {
       boolean retire = hasCleanupFailure(failure);
       if (retire) synchronized (ScanScheduler.this) { cleanupFailure = failure; }
       if (owned != null) owned.finishIo(retire);
+      if (failure == null && stopped) failure = cancelled();
       if (failure == null) {
         try {
           long retained = 0;
@@ -300,7 +302,6 @@ public final class ScanScheduler implements AutoCloseable {
           failure = invalid;
         }
       }
-      if (failure == null && stopped) failure = cancelled();
       if (failure != null) {
         synchronized (ScanScheduler.this) { startFailure = failure; }
         close();

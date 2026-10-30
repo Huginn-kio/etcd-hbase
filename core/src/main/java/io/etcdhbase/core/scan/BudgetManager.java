@@ -87,6 +87,7 @@ public final class BudgetManager {
   public Account admit(String groupId, RequestScope scope, Reservation reservation, ReadLimits readLimits) throws BackendFailure {
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(reservation, "reservation");
+    Objects.requireNonNull(readLimits, "readLimits");
     Account account;
     synchronized (this) {
       Group group = groups.get(groupId);
@@ -98,7 +99,7 @@ public final class BudgetManager {
       }
       global.admit(reservation.total());
       group.usage.admit(reservation.total());
-      account = new Account(groupId, group, scope, reservation, Objects.requireNonNull(readLimits, "readLimits"));
+      account = new Account(groupId, group, scope, reservation, readLimits);
     }
     account.registration = scope.registerScopedCleanup(account);
     return account;
@@ -163,6 +164,7 @@ public final class BudgetManager {
 
     void charge(StoragePage.Cost cost) throws BackendFailure {
       synchronized (BudgetManager.this) {
+        requireActive();
         boolean exceeds = cost.physicalRows() > readLimits.physicalRows() - physicalRows
             || cost.returnedCellBytes() > readLimits.cellBytes() - cellBytes
             || cost.scanRpcCalls() > readLimits.scanRpcCalls() - scanRpcCalls || pages >= readLimits.pages();
@@ -180,7 +182,7 @@ public final class BudgetManager {
     public Optional<Lease> tryAcquire(Work work) throws BackendFailure {
       Objects.requireNonNull(work, "work");
       synchronized (BudgetManager.this) {
-        checkOpen();
+        requireActive();
         if (!global.fits(globalLimits, work) || !group.usage.fits(group.limits, work) || !usage.fits(requestLimits, work)) {
           return Optional.empty();
         }
@@ -195,7 +197,7 @@ public final class BudgetManager {
       Objects.requireNonNull(kind, "kind");
       if (bytes < 0) throw new IllegalArgumentException("negative retained bytes");
       synchronized (BudgetManager.this) {
-        checkOpen();
+        requireActive();
         if (bytes > reservation.capacity(kind) - memory.get(kind)) return Optional.empty();
         memory.put(kind, memory.get(kind) + bytes);
         global.allocatedBytes += bytes;
@@ -205,10 +207,12 @@ public final class BudgetManager {
       }
     }
 
-    private void checkOpen() throws BackendFailure {
-      checkScope(scope);
-      if (closed) throw new BackendFailure(BackendFailure.Category.CANCELLED);
-      if (readExhausted) throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    void requireActive() throws BackendFailure {
+      synchronized (BudgetManager.this) {
+        checkScope(scope);
+        if (closed) throw new BackendFailure(BackendFailure.Category.CANCELLED);
+        if (readExhausted) throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+      }
     }
 
     private void releaseAdmissionIfDrained() {

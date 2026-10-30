@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.request.ManualRequestClock;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanCleanupFailure;
@@ -34,6 +35,89 @@ class ScanSchedulerTest {
   private static final BudgetManager.Limits LIMITS = new BudgetManager.Limits(8, 32, 1, 1, 1, 65536, 1_000_000);
   private static final BudgetManager.Reservation MEMORY = new BudgetManager.Reservation(8192, 512, 4096, 8192);
   private static final StoragePage EMPTY = new StoragePage(List.of(), true, new StoragePage.Cost(0, 0, 1));
+
+  @Test
+  void queuedDeadlineRemainsTimeoutWhenCapacityReturnsBeforeTheTimerRuns() throws Exception {
+    var budget = budget();
+    var physical = new ControlledSource();
+    var clock = new ManualRequestClock();
+    try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(30), Runnable::run, timer);
+        var firstScope = RequestScope.withoutDeadline(); var first = budget.admit("alpha", firstScope, MEMORY);
+        var timedScope = clock.scope(Duration.ofSeconds(10)); var timed = budget.admit("alpha", timedScope, MEMORY)) {
+      var active = scheduler.bind(physical, first).startScan(request(0));
+      var waiting = scheduler.bind(physical, timed).startScan(request(1));
+      assertEquals(1, physical.started.size());
+      clock.advance(Duration.ofSeconds(20));
+      physical.started.getFirst().result.complete(EMPTY);
+      assertFailureCategory(BackendFailure.Category.TIMEOUT, waiting);
+      assertEquals(1, physical.started.size(), "expired work must not start a scanner");
+      active.close();
+      assertEquals(0, budget.snapshot().scanners());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void successfulPhysicalCompletionAfterDeadlineCannotBecomeCancellation() throws Exception {
+    var budget = budget();
+    var physical = new ControlledSource();
+    var clock = new ManualRequestClock();
+    try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(30), Runnable::run, timer);
+        var scope = clock.scope(Duration.ofSeconds(10)); var account = budget.admit("alpha", scope, MEMORY)) {
+      var operation = scheduler.bind(physical, account).startScan(request(0));
+      clock.advance(Duration.ofSeconds(20));
+      physical.started.getFirst().result.complete(EMPTY);
+      assertFailureCategory(BackendFailure.Category.TIMEOUT, operation);
+      assertEquals(0, budget.snapshot().scanners());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void alreadyQueuedReadsKeepResourceLimitAfterAnotherReadExhaustsTheAccount() throws Exception {
+    var budget = budget();
+    var physical = new ControlledSource();
+    try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(30), Runnable::run, timer);
+        var scope = RequestScope.withoutDeadline(); var account = budget.admit("alpha", scope, MEMORY,
+            new BudgetManager.ReadLimits(32, 4096, 32, 1))) {
+      var source = scheduler.bind(physical, account);
+      var first = source.startScan(request(0));
+      var limitTrigger = source.startScan(request(1));
+      var waiting = source.startScan(request(2));
+      physical.started.getFirst().result.complete(EMPTY);
+      first.close();
+      assertEquals(2, physical.started.size());
+      physical.started.get(1).result.complete(EMPTY);
+      assertFailureCategory(BackendFailure.Category.RESOURCE_LIMIT, limitTrigger);
+      assertFailureCategory(BackendFailure.Category.RESOURCE_LIMIT, waiting);
+      assertEquals(2, physical.started.size(), "exhausted work must not start a replacement scanner");
+      assertEquals(0, budget.snapshot().scanners());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void explicitCancellationAndOriginalBackendFailureKeepTheirOwnMeaning() throws Exception {
+    for (boolean backendFailed : List.of(false, true)) {
+      var budget = budget();
+      var physical = new ControlledSource();
+      var clock = new ManualRequestClock();
+      try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(30), Runnable::run, timer);
+          var scope = clock.scope(Duration.ofSeconds(10)); var account = budget.admit("alpha", scope, MEMORY)) {
+        var operation = scheduler.bind(physical, account).startScan(request(0));
+        operation.close();
+        clock.advance(Duration.ofSeconds(20));
+        if (backendFailed) {
+          physical.started.getFirst().result.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        } else {
+          physical.started.getFirst().result.complete(EMPTY);
+        }
+        assertFailureCategory(backendFailed ? BackendFailure.Category.UNAVAILABLE : BackendFailure.Category.CANCELLED, operation);
+        assertEquals(0, budget.snapshot().scanners());
+        assertEquals(0, budget.snapshot().allocatedBytes());
+      }
+    }
+  }
 
   @Test
   void sixteenBucketsProgressWithOnePhysicalScannerAndNoHeldScannerPerHead() throws Exception {
@@ -169,6 +253,10 @@ class ScanSchedulerTest {
   }
 
   private static BudgetManager budget() { return new BudgetManager(LIMITS, Map.of("alpha", LIMITS, "beta", LIMITS), LIMITS); }
+  private static void assertFailureCategory(BackendFailure.Category expected, ScanOperation operation) {
+    var failure = assertThrows(CompletionException.class, () -> operation.completion().toCompletableFuture().join());
+    assertEquals(expected, ((BackendFailure) failure.getCause()).category());
+  }
   private static ScanRequest request(int bucket) {
     return new ScanRequest(bucket, KeyRange.all(), Optional.empty(), Long.MAX_VALUE, ReadProjection.METADATA, 1, 512, 32);
   }
