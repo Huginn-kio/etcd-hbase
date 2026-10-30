@@ -13,6 +13,7 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BucketCursor;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.ScanScheduler;
+import io.etcdhbase.core.scan.SortedMergeCursor;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -219,6 +220,43 @@ class M1StorageIT {
       assertFalse(connection.isClosed());
     }
     assertEquals(0, budget.snapshot().requests());
+  }
+
+  @Test
+  void globallySortedLimitMoreAndLightCountMatchBothFrozenHistoryLayouts() throws Exception {
+    var limits = new BudgetManager.Limits(2, 32, 1, 1, 1, 65536, 128L << 20);
+    for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
+      var binding = table(layout);
+      List<ByteKey> expected = new ArrayList<>();
+      try (var writing = RequestScope.withTimeout(Duration.ofSeconds(60))) {
+        var store = await(HBaseRecordStore.open(provider, identity, binding, writing, worker));
+        for (int index = 0; index < 40; index++) {
+          ByteKey key = ByteKey.copyOf(new byte[] {(byte) (index * 7), 0, (byte) 0xff});
+          await(store.put(live(key, 1, new byte[0])));
+          if (index % 5 == 0) await(store.put(StoredRecord.metadataOnly(key,
+              new StorageMetadata(1, 2, 1, 0, StorageMetadata.State.TOMBSTONE, 0))));
+          else expected.add(key);
+        }
+      }
+      expected.sort(ByteKey::compareTo);
+      for (int limit : List.of(0, 1, 31, 32, 33)) {
+        var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+        try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60));
+            var account = budget.admit("public", scope, new BudgetManager.Reservation(4 * 4096L, 4096, 64L << 20, 1L << 20));
+            var scheduler = new ScanScheduler(budget, Duration.ofSeconds(10))) {
+          var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+          try (var cursor = new SortedMergeCursor(scheduler.bind(store, account), new ScanRequest(0, KeyRange.all(), Optional.empty(),
+              Long.MAX_VALUE, ReadProjection.METADATA, 1, 4096, 256), 4, account, scope);
+              var page = await(cursor.read(limit))) {
+            var selected = limit == 0 ? expected : expected.stream().limit(limit).toList();
+            assertEquals(selected, page.records().stream().map(StoredRecord::key).toList());
+            assertEquals(selected.size(), page.count());
+            assertEquals(limit > 0 && expected.size() > limit, page.more());
+          }
+          assertEquals(0, budget.snapshot().allocatedBytes());
+        }
+      }
+    }
   }
 
   @Test

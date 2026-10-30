@@ -8,27 +8,27 @@ import sys
 import xml.etree.ElementTree as ET
 from evidence import java_reports, require_unchanged_source
 
-REQUIRED = {"io.etcdhbase.core.scan.BucketCursorTest",
-            "io.etcdhbase.hbase.storage.HBasePageReaderTest",
-            "io.etcdhbase.hbase.storage.M1StorageIT"}
-CURSOR_CASE = "cursorReopensAfterOnlyConsumedKeysAndCancelsWithoutClosingSharedConnections"
+REQUIRED = {12: {"io.etcdhbase.core.scan.BucketCursorTest",
+                 "io.etcdhbase.hbase.storage.HBasePageReaderTest", "io.etcdhbase.hbase.storage.M1StorageIT"},
+            13: {"io.etcdhbase.core.scan.BudgetManagerTest", "io.etcdhbase.core.scan.ScanSchedulerTest"},
+            14: {"io.etcdhbase.core.scan.SortedMergeCursorTest"}}
+CASES = {12: "cursorReopensAfterOnlyConsumedKeysAndCancelsWithoutClosingSharedConnections",
+         13: "onePhysicalScannerCanSupplyEveryBucketHeadWithoutClosingTheRequest",
+         14: "globallySortedLimitMoreAndLightCountMatchBothFrozenHistoryLayouts"}
 
 
 def collect(root, output, phase):
-    if phase not in {"J12", "J13"}:
+    if phase not in {"J" + str(number) for number in REQUIRED}:
         raise ValueError("unsupported M1 verification phase")
     source = json.loads((output / "source.json").read_text())
     require_unchanged_source(root, source)
-    required = set(REQUIRED)
-    if phase == "J13":
-        required.update({"io.etcdhbase.core.scan.BudgetManagerTest", "io.etcdhbase.core.scan.ScanSchedulerTest"})
+    through = int(phase[1:])
+    required = set().union(*(names for number, names in REQUIRED.items() if number <= through))
     paths, suites = java_reports(root, required, ("spi", "core", "hbase"))
     actual = ET.parse(root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.M1StorageIT.xml").getroot()
-    if CURSOR_CASE not in {case.get("name") for case in actual.iter("testcase")}:
-        raise ValueError("real cursor verification did not execute")
-    if phase == "J13" and "onePhysicalScannerCanSupplyEveryBucketHeadWithoutClosingTheRequest" not in {
-            case.get("name") for case in actual.iter("testcase")}:
-        raise ValueError("real single-scanner progress verification did not execute")
+    required_cases = {name for number, name in CASES.items() if number <= through}
+    if not required_cases <= {case.get("name") for case in actual.iter("testcase")}:
+        raise ValueError("required real M1 cases did not execute")
     for path in paths:
         destination = output / "reports" / path.relative_to(root)
         destination.parent.mkdir(parents=True, exist_ok=True)
