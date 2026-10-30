@@ -8,6 +8,7 @@ import io.etcdhbase.core.storage.BatchWriteResult;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
@@ -161,8 +162,8 @@ public final class HBaseRecordStore implements RecordStore {
   }
 
   @Override
-  public CompletableFuture<StoragePage> scan(ScanRequest scan) {
-    return new HBasePageReader(this, binding, scope, scanWorker).read(scan);
+  public ScanOperation startScan(ScanRequest scan) {
+    return new HBasePageReader(this, binding, scope, scanWorker).start(scan);
   }
 
   AsyncTable<?> table() {

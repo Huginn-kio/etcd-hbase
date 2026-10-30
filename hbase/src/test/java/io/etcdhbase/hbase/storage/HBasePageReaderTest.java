@@ -105,6 +105,22 @@ class HBasePageReaderTest {
   }
 
   @Test
+  void cancellingOneQueuedReadDoesNotCancelTheSharedScope() {
+    var tasks = new ArrayDeque<Runnable>();
+    try (var scope = RequestScope.withoutDeadline()) {
+      var operation = new HBasePageReader(store, binding, scope, tasks::add)
+          .start(request(KeyRange.all(), Optional.empty()));
+      operation.close();
+      operation.close();
+      tasks.remove().run();
+      assertFalse(scope.isClosed());
+      var failure = assertThrows(CompletionException.class, () -> operation.completion().toCompletableFuture().join());
+      assertEquals(BackendFailure.Category.CANCELLED, ((BackendFailure) failure.getCause()).category());
+      verify(store, never()).table();
+    }
+  }
+
+  @Test
   void fatalCleanupStillSettlesWaitersBeforePropagating() {
     doReturn(table).when(store).table();
     doReturn(scanner).when(table).getScanner(any(Scan.class));
@@ -141,10 +157,11 @@ class HBasePageReaderTest {
     }).when(scanner).close();
     var tasks = new ArrayDeque<Runnable>();
     try (var scope = RequestScope.withoutDeadline()) {
-      var result = new HBasePageReader(store, binding, scope, tasks::add).read(request(KeyRange.all(), Optional.empty()));
+      var operation = new HBasePageReader(store, binding, scope, tasks::add).start(request(KeyRange.all(), Optional.empty()));
+      var result = operation.completion().toCompletableFuture();
       var running = CompletableFuture.runAsync(tasks.remove());
       assertTrue(enteredNext.await(10, TimeUnit.SECONDS));
-      var cancelling = CompletableFuture.runAsync(scope::cancel);
+      var cancelling = CompletableFuture.runAsync(operation::close);
       try {
         assertTrue(enteredClose.await(10, TimeUnit.SECONDS));
         running.get(10, TimeUnit.SECONDS);
@@ -155,6 +172,7 @@ class HBasePageReaderTest {
         running.get(10, TimeUnit.SECONDS);
       }
       assertThrows(CompletionException.class, result::join);
+      assertFalse(scope.isClosed());
       verify(scanner).close();
     }
   }
