@@ -11,6 +11,8 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BucketCursor;
+import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -176,6 +178,47 @@ class M1StorageIT {
         assertFalse(connection.isClosed());
       }
     }
+  }
+
+  @Test
+  void onePhysicalScannerCanSupplyEveryBucketHeadWithoutClosingTheRequest() throws Exception {
+    var binding = table(StorageTableBinding.Layout.NATIVE);
+    var limits = new BudgetManager.Limits(2, 32, 1, 1, 1, 65536, 128L << 20);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(4 * 33024L, 4096, 64L << 20, 1L << 20);
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60));
+        var account = budget.admit("public", scope, reservation);
+        var scheduler = new ScanScheduler(budget, Duration.ofSeconds(10))) {
+      var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+      for (int index = 0; index < 40; index++) await(store.put(live(ByteKey.copyOf(new byte[] {(byte) index}), 1, new byte[0])));
+      var source = scheduler.bind(store, account);
+      List<BucketCursor> cursors = new ArrayList<>();
+      List<CompletableFuture<BucketCursor.Page>> pending = new ArrayList<>();
+      List<BudgetManager.Lease> heads = new ArrayList<>();
+      try {
+        for (int bucket = 0; bucket < 4; bucket++) {
+          var cursor = new BucketCursor(source, new ScanRequest(bucket, KeyRange.all(), Optional.empty(),
+              Long.MAX_VALUE, ReadProjection.METADATA, 1, 4096, 128), scope);
+          cursors.add(cursor);
+          pending.add(cursor.fetch());
+        }
+        for (var result : pending) {
+          try (var page = await(result)) {
+            var head = page.next().orElseThrow();
+            heads.add(account.tryRetain(BudgetManager.Memory.HEAD, head.retainedBytes()).orElseThrow());
+            assertEquals(0, budget.snapshot().scanners(), "head memory does not own a physical scanner");
+          }
+        }
+        assertEquals(4, heads.size());
+      } finally {
+        for (var cursor : cursors) cursor.close();
+        for (var head : heads) head.close();
+      }
+      assertEquals(0, budget.snapshot().allocatedBytes());
+      assertFalse(scope.isClosed());
+      assertFalse(connection.isClosed());
+    }
+    assertEquals(0, budget.snapshot().requests());
   }
 
   @Test

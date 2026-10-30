@@ -7,6 +7,7 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.ScanOperation;
+import io.etcdhbase.core.storage.ScanCleanupFailure;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.codec.StorageMessages;
@@ -201,8 +202,10 @@ final class HBasePageReader {
       // actual close, so a scheduler cannot release its physical permit while close still runs.
       cleanupComplete.whenComplete((ignored, cleanupFailure) -> {
         Throwable terminal = operationFailure;
-        if (terminal == null) terminal = cleanupFailure;
-        else if (cleanupFailure != null && terminal != cleanupFailure) terminal.addSuppressed(cleanupFailure);
+        if (cleanupFailure != null) {
+          terminal = new ScanCleanupFailure(cleanupFailure);
+          if (operationFailure != null && operationFailure != cleanupFailure) terminal.addSuppressed(operationFailure);
+        }
         if (terminal == null && (cancelledBeforeCompletion || scope.isClosed())) terminal = new CancellationException();
         if (terminal == null) outcome.complete(page);
         else outcome.completeExceptionally(HBaseFailures.classify(terminal));

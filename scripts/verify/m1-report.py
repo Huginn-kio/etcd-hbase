@@ -15,14 +15,20 @@ CURSOR_CASE = "cursorReopensAfterOnlyConsumedKeysAndCancelsWithoutClosingSharedC
 
 
 def collect(root, output, phase):
-    if phase != "J12":
+    if phase not in {"J12", "J13"}:
         raise ValueError("unsupported M1 verification phase")
     source = json.loads((output / "source.json").read_text())
     require_unchanged_source(root, source)
-    paths, suites = java_reports(root, REQUIRED, ("spi", "core", "hbase"))
+    required = set(REQUIRED)
+    if phase == "J13":
+        required.update({"io.etcdhbase.core.scan.BudgetManagerTest", "io.etcdhbase.core.scan.ScanSchedulerTest"})
+    paths, suites = java_reports(root, required, ("spi", "core", "hbase"))
     actual = ET.parse(root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.M1StorageIT.xml").getroot()
     if CURSOR_CASE not in {case.get("name") for case in actual.iter("testcase")}:
         raise ValueError("real cursor verification did not execute")
+    if phase == "J13" and "onePhysicalScannerCanSupplyEveryBucketHeadWithoutClosingTheRequest" not in {
+            case.get("name") for case in actual.iter("testcase")}:
+        raise ValueError("real single-scanner progress verification did not execute")
     for path in paths:
         destination = output / "reports" / path.relative_to(root)
         destination.parent.mkdir(parents=True, exist_ok=True)
