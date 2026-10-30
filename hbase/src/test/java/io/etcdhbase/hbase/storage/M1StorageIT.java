@@ -6,6 +6,11 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
@@ -38,11 +43,15 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CountDownLatch;
 import org.apache.hadoop.hbase.KeepDeletedCells;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.Waiter;
 import org.apache.hadoop.hbase.client.AsyncConnection;
+import org.apache.hadoop.hbase.client.AsyncTable;
+import org.apache.hadoop.hbase.client.ResultScanner;
+import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.CompactionState;
 import org.apache.hadoop.hbase.client.Get;
@@ -327,6 +336,50 @@ class M1StorageIT {
       await(account.termination().toCompletableFuture());
       assertEquals(0, budget.snapshot().allocatedBytes());
       assertFalse(connection.isClosed());
+    }
+  }
+
+  @Test
+  void cancelledPhysicalPageClosesTheObservedServerScannerBeforeLeaseExpiry() throws Exception {
+    var binding = table(StorageTableBinding.Layout.NATIVE);
+    var entered = new CountDownLatch(1);
+    var released = new CountDownLatch(1);
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60))) {
+      var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+      for (int index = 0; index < 128; index++) await(store.put(live(ByteKey.copyOf(new byte[] {(byte) index, 1}), 1, new byte[4096])));
+      AsyncTable<?> actual = store.table();
+      AsyncTable<?> observed = mock(AsyncTable.class);
+      doAnswer(invocation -> {
+        ResultScanner raw = actual.getScanner(invocation.getArgument(0, Scan.class));
+        ResultScanner wrapper = mock(ResultScanner.class);
+        doReturn(raw.getScanMetrics()).when(wrapper).getScanMetrics();
+        doAnswer(next -> {
+          var row = raw.next();
+          entered.countDown();
+          assertTrue(released.await(10, TimeUnit.SECONDS));
+          return row;
+        }).when(wrapper).next();
+        doAnswer(close -> { try { raw.close(); } finally { released.countDown(); } return null; }).when(wrapper).close();
+        return wrapper;
+      }).when(observed).getScanner(any(Scan.class));
+      var instrumented = spy(store);
+      doReturn(observed).when(instrumented).table();
+      var operation = instrumented.startScan(new ScanRequest(0, KeyRange.all(), Optional.empty(), Long.MAX_VALUE,
+          ReadProjection.FULL, 1, 8192, 256));
+      try {
+        assertTrue(entered.await(10, TimeUnit.SECONDS));
+        Waiter.waitFor(cluster.clientConfiguration(), 5000, 50, () -> cluster.scannerCount() > 0);
+        long start = System.nanoTime();
+        scope.cancel();
+        assertThrows(java.util.concurrent.ExecutionException.class, () -> await(operation.completion().toCompletableFuture()));
+        Waiter.waitFor(cluster.clientConfiguration(), 5000, 50, () -> cluster.scannerCount() == 0);
+        assertFalse(connection.isClosed());
+        System.out.println("m1-scanner-close remoteObservedOpen=true remoteObservedClosed=true localDrain=true elapsedMicros="
+            + TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start));
+      } finally {
+        released.countDown();
+        operation.close();
+      }
     }
   }
 

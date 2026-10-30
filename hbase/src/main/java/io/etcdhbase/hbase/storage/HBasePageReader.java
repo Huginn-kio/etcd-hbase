@@ -14,6 +14,7 @@ import io.etcdhbase.hbase.codec.StorageMessages;
 import io.etcdhbase.hbase.error.HBaseFailures;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -168,8 +169,14 @@ final class HBasePageReader {
     }
 
     private StoragePage page(List<StoredRecord> records, boolean exhausted, ResultScanner opened, long rows, long bytes) {
-      long rpcCalls = opened.getScanMetrics().countOfRPCcalls.get();
-      return new StoragePage(records, exhausted, new StoragePage.Cost(rows, bytes, rpcCalls));
+      var metrics = opened.getScanMetrics();
+      var observed = Map.of(StoragePage.Observation.SERVER_ROWS_SCANNED, metrics.countOfRowsScanned.get(),
+          StoragePage.Observation.BLOCK_BYTES_SCANNED, metrics.countOfBlockBytesScanned.get(),
+          StoragePage.Observation.FS_BYTES, metrics.bytesReadFromFs.get(),
+          StoragePage.Observation.BLOCK_CACHE_BYTES, metrics.bytesReadFromBlockCache.get(),
+          StoragePage.Observation.MEMSTORE_BYTES, metrics.bytesReadFromMemstore.get(),
+          StoragePage.Observation.SCANNER_RETRIES, metrics.countOfRPCRetries.get());
+      return new StoragePage(records, exhausted, new StoragePage.Cost(rows, bytes, metrics.countOfRPCcalls.get(), observed));
     }
 
     private void checkActive() throws TimeoutException {

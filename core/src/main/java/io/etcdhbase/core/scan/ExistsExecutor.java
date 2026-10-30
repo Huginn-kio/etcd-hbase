@@ -82,9 +82,7 @@ public final class ExistsExecutor implements AutoCloseable {
       boolean found;
       boolean exhausted;
       try (var page = arrived.page) {
-        cost = new StoragePage.Cost(Math.addExact(cost.physicalRows(), page.cost().physicalRows()),
-            Math.addExact(cost.returnedCellBytes(), page.cost().returnedCellBytes()),
-            Math.addExact(cost.scanRpcCalls(), page.cost().scanRpcCalls()));
+        cost = cost.plus(page.cost());
         found = page.next().filter(record -> record.metadata().state() == StorageMetadata.State.LIVE).isPresent();
         exhausted = page.exhausted();
       }

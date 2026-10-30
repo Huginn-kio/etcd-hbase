@@ -181,9 +181,7 @@ public final class SortedMergeCursor implements AutoCloseable {
     waiting = false;
     if (arrived.failure != null) throw unwrap(arrived.failure);
     try (var page = arrived.page) {
-      cost = new StoragePage.Cost(Math.addExact(cost.physicalRows(), page.cost().physicalRows()),
-          Math.addExact(cost.returnedCellBytes(), page.cost().returnedCellBytes()),
-          Math.addExact(cost.scanRpcCalls(), page.cost().scanRpcCalls()));
+      cost = cost.plus(page.cost());
       Optional<StoredRecord> candidate = page.next();
       exhausted[arrived.bucket] = page.exhausted();
       if (candidate.isEmpty()) return;

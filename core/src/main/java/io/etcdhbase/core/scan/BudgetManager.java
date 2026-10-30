@@ -55,7 +55,8 @@ public final class BudgetManager {
   }
 
   public record Snapshot(long requests, long queued, long operations, long scanners,
-      long cleanup, long queuedBytes, long reservedBytes, long allocatedBytes, long retiredScanners) {}
+      long cleanup, long queuedBytes, long reservedBytes, long allocatedBytes, long retiredScanners,
+      long peakScanners, long peakAllocatedBytes) {}
 
   public record ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages, long pointOperations) {
     public ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages) {
@@ -222,6 +223,9 @@ public final class BudgetManager {
         global.allocatedBytes += bytes;
         group.usage.allocatedBytes += bytes;
         usage.allocatedBytes += bytes;
+        global.peakAllocatedBytes = Math.max(global.peakAllocatedBytes, global.allocatedBytes);
+        group.usage.peakAllocatedBytes = Math.max(group.usage.peakAllocatedBytes, group.usage.allocatedBytes);
+        usage.peakAllocatedBytes = Math.max(usage.peakAllocatedBytes, usage.allocatedBytes);
         return Optional.of(new Lease(this, NO_WORK, kind, bytes));
       }
     }
@@ -323,6 +327,7 @@ public final class BudgetManager {
 
   private static final class Counters {
     long requests, queued, operations, scanners, cleanup, queuedBytes, reservedBytes, allocatedBytes, retiredScanners;
+    long peakScanners, peakAllocatedBytes;
 
     boolean canAdmit(Limits limits, long bytes) {
       return requests < limits.requests() && bytes <= limits.memoryBytes() - reservedBytes;
@@ -339,8 +344,10 @@ public final class BudgetManager {
       scanners += sign * (long) work.scanners();
       cleanup += sign * (long) work.cleanup();
       queuedBytes += sign * work.queuedBytes();
+      peakScanners = Math.max(peakScanners, scanners);
     }
     boolean empty() { return queued == 0 && operations == 0 && scanners == 0 && cleanup == 0 && allocatedBytes == 0; }
-    Snapshot snapshot() { return new Snapshot(requests, queued, operations, scanners, cleanup, queuedBytes, reservedBytes, allocatedBytes, retiredScanners); }
+    Snapshot snapshot() { return new Snapshot(requests, queued, operations, scanners, cleanup, queuedBytes, reservedBytes,
+        allocatedBytes, retiredScanners, peakScanners, peakAllocatedBytes); }
   }
 }
