@@ -14,11 +14,37 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
+import org.apache.hadoop.hbase.HConstants;
 import org.junit.jupiter.api.Test;
 
 class RowKeyCodecTest {
   private final RowKeyCodec current = new RowKeyCodec(new HashSaltStrategy(), RowKeyCodec.Shape.CURRENT);
   private final RowKeyCodec history = new RowKeyCodec(new HashSaltStrategy(), RowKeyCodec.Shape.HISTORY);
+
+  @Test
+  void rejectsOversizedKeysBeforeCopyingForRowsAndPhysicalBounds() {
+    ByteKey oversized = ByteKey.copyOf(new byte[20 * 1024 * 1024]);
+    for (RowKeyCodec codec : List.of(current, history)) {
+      EncodingAllocationAssertions.rejectsWithoutLargeCopy(() -> codec.encode(oversized, 1));
+      EncodingAllocationAssertions.rejectsWithoutLargeCopy(
+          () -> codec.physicalRange(0, KeyRange.point(oversized)));
+    }
+  }
+
+  @Test
+  void acceptsExactRowLimitAndRejectsRawLengthOrEscapingOverflow() {
+    for (RowKeyCodec codec : List.of(current, history)) {
+      int overhead = codec.saltProfile().saltWidthBytes() + 2
+          + (codec.shape() == RowKeyCodec.Shape.HISTORY ? Long.BYTES : 0);
+      byte[] original = new byte[HConstants.MAX_ROW_LENGTH - overhead];
+      Arrays.fill(original, (byte) 1);
+      assertEquals(HConstants.MAX_ROW_LENGTH, codec.encode(ByteKey.copyOf(original), 1).length);
+      original[0] = 0;
+      assertThrows(IllegalArgumentException.class, () -> codec.encode(ByteKey.copyOf(original), 1));
+      byte[] tooLong = Arrays.copyOf(original, original.length + 1);
+      assertThrows(IllegalArgumentException.class, () -> codec.encode(ByteKey.copyOf(tooLong), 1));
+    }
+  }
 
   @Test
   void providerWidthAndBucketChecksRemainAtEveryEncodingBoundary() {

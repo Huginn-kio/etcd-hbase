@@ -29,8 +29,8 @@ public final class StorageMessages {
   }
 
   public static byte[] value(StoredRecord record) {
+    if (record.metadata().valueLength() > MAX_VALUE_BYTES) throw invalid();
     byte[] value = record.value().orElseThrow(StorageMessages::invalid);
-    if (value.length > MAX_VALUE_BYTES) throw invalid();
     return StorageProtos.ValuePayload.newBuilder().setFormatVersion(FORMAT_VERSION)
         .setModificationRevision(record.metadata().modificationRevision())
         .setValue(ByteString.copyFrom(value)).build().toByteArray();

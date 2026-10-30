@@ -111,10 +111,13 @@ public final class RowKeyCodec {
   }
 
   private byte[] encodeKey(ByteKey key) {
-    byte[] original = key.bytes();
-    long length = (long) original.length + 2;
-    for (byte part : original) if (part == 0) length++;
+    long length = (long) key.length() + 2;
     int overhead = salt.profile().saltWidthBytes() + (shape == Shape.HISTORY ? Long.BYTES : 0);
+    if (length + overhead > HConstants.MAX_ROW_LENGTH) {
+      throw new IllegalArgumentException("encoded key exceeds the storage row limit");
+    }
+    byte[] original = key.bytes();
+    for (byte part : original) if (part == 0) length++;
     if (length + overhead > HConstants.MAX_ROW_LENGTH) {
       throw new IllegalArgumentException("encoded key exceeds the storage row limit");
     }

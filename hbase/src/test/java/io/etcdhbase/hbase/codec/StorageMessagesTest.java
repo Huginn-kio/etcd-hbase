@@ -15,6 +15,30 @@ import org.junit.jupiter.api.Test;
 
 class StorageMessagesTest {
   @Test
+  void rejectsOversizedValuesBeforeCopying() {
+    byte[] value = new byte[20 * 1024 * 1024];
+    var metadata = new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length);
+    var record = StoredRecord.live(ByteKey.empty(), metadata, value);
+    EncodingAllocationAssertions.rejectsWithoutLargeCopy(() -> StorageMessages.value(record));
+  }
+
+  @Test
+  void preservesExactValueLimitAndMissingValueRejection() {
+    byte[] value = new byte[StorageMessages.MAX_VALUE_BYTES];
+    var metadata = new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length);
+    var record = StoredRecord.live(ByteKey.empty(), metadata, value);
+    byte[] encoded = StorageMessages.value(record);
+    var decoded = StorageMessages.decode(ByteKey.empty(), StorageMessages.metadata(metadata), Optional.of(encoded));
+    assertArrayEquals(value, decoded.value().orElseThrow());
+    assertThrows(IllegalArgumentException.class,
+        () -> StorageMessages.value(StoredRecord.metadataOnly(ByteKey.empty(), metadata)));
+    var oversized = new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length + 1);
+    assertThrows(IllegalArgumentException.class, () -> StorageMessages.metadata(oversized));
+    assertThrows(IllegalArgumentException.class,
+        () -> StorageMessages.value(StoredRecord.live(ByteKey.empty(), oversized, new byte[value.length + 1])));
+  }
+
+  @Test
   void roundTripsEmptyLiveValuesAndDistinguishesTombstonesAndProjection() {
     var key = ByteKey.copyOf(new byte[] {0, (byte) 0xff});
     var live = StoredRecord.live(key, new StorageMetadata(1, 3, 2, 0, StorageMetadata.State.LIVE, 0), new byte[0]);
