@@ -35,13 +35,7 @@ public final class RowKeyCodec {
   }
 
   public int bucket(ByteKey key) {
-    byte[] prefix = checkedSalt(key);
-    long bucketNumber = 0;
-    for (byte part : prefix) bucketNumber = (bucketNumber << 8) | Byte.toUnsignedInt(part);
-    if (bucketNumber >= salt.profile().bucketCount()) {
-      throw new IllegalArgumentException("salt provider returned an unknown bucket");
-    }
-    return (int) bucketNumber;
+    return checkedBucket(salt.salt(key.bytes()));
   }
 
   public byte[] encode(ByteKey key, long revision) {
@@ -91,7 +85,13 @@ public final class RowKeyCodec {
   }
 
   private byte[] checkedSalt(ByteKey key) {
-    byte[] prefix = Objects.requireNonNull(salt.salt(key.bytes()), "salt prefix");
+    byte[] prefix = salt.salt(key.bytes());
+    checkedBucket(prefix);
+    return prefix;
+  }
+
+  private int checkedBucket(byte[] prefix) {
+    Objects.requireNonNull(prefix, "salt prefix");
     if (prefix.length != salt.profile().saltWidthBytes()) {
       throw new IllegalArgumentException("salt provider returned an invalid prefix width");
     }
@@ -100,7 +100,7 @@ public final class RowKeyCodec {
     if (bucketNumber >= salt.profile().bucketCount()) {
       throw new IllegalArgumentException("salt provider returned an unknown bucket");
     }
-    return prefix;
+    return (int) bucketNumber;
   }
 
   private ByteKey physicalBound(byte[] prefix, ByteKey key) {

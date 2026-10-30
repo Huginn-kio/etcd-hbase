@@ -9,6 +9,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
+import io.etcdhbase.spi.salt.SaltStrategy;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
@@ -18,6 +19,23 @@ import org.junit.jupiter.api.Test;
 class RowKeyCodecTest {
   private final RowKeyCodec current = new RowKeyCodec(new HashSaltStrategy(), RowKeyCodec.Shape.CURRENT);
   private final RowKeyCodec history = new RowKeyCodec(new HashSaltStrategy(), RowKeyCodec.Shape.HISTORY);
+
+  @Test
+  void providerWidthAndBucketChecksRemainAtEveryEncodingBoundary() {
+    for (byte[] invalid : List.of(new byte[1], new byte[] {0, 16})) {
+      SaltStrategy provider = new SaltStrategy() {
+        private final SaltProfile profile = new SaltProfile("synthetic", 1, 16, 2);
+        @Override public String id() { return profile.strategyId(); }
+        @Override public SaltProfile profile() { return profile; }
+        @Override public byte[] salt(byte[] identifier) { return invalid.clone(); }
+        @Override public List<byte[]> splitKeys() { throw new UnsupportedOperationException(); }
+      };
+      var codec = new RowKeyCodec(provider, RowKeyCodec.Shape.CURRENT);
+      assertThrows(IllegalArgumentException.class, () -> codec.bucket(ByteKey.empty()));
+      assertThrows(IllegalArgumentException.class, () -> codec.encode(ByteKey.empty(), 1));
+      assertThrows(IllegalArgumentException.class, () -> codec.decode(new byte[4]));
+    }
+  }
 
   @Test
   void matchesFixedVectorsAndRejectsMalformedOrWrongBucketRows() {
