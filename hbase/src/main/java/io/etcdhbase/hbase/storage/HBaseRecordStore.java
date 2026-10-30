@@ -175,6 +175,7 @@ public final class HBaseRecordStore implements RecordStore {
     byte[] family = binding.family();
     var metadataCell = row.getColumnLatestCell(family, METADATA);
     if (metadataCell == null) throw new IllegalArgumentException("stored row has no metadata");
+    StorageMessages.requireMetadataLength(metadataCell.getValueLength());
     byte[] metadataBytes = CellUtil.cloneValue(metadataCell);
     StorageMetadata metadata = StorageMessages.decodeMetadata(metadataBytes);
     long physicalRevision = decoded.revision().orElseGet(() -> RevisionTimestamp.revision(metadataCell.getTimestamp()));
@@ -186,6 +187,7 @@ public final class HBaseRecordStore implements RecordStore {
     if (valueCell == null || valueCell.getTimestamp() != metadataCell.getTimestamp()) {
       throw new IllegalArgumentException("missing or mismatched stored value version");
     }
+    StorageMessages.requireValuePayloadLength(valueCell.getValueLength());
     return StorageMessages.decode(decoded.key(), metadataBytes, Optional.of(CellUtil.cloneValue(valueCell)));
   }
 
