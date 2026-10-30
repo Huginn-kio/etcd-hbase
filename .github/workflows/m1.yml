@@ -27,4 +27,4 @@ jobs:
           jdk-file: ${{ runner.temp }}/m1-jdk.tar.gz
           cache: maven
       - name: 验证 M1 契约
-        run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" bash scripts/verify/m1.sh --through J13
+        run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" bash scripts/verify/m1.sh --through J14
