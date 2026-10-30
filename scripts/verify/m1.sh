@@ -3,14 +3,15 @@ set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$ROOT"
-if [[ $# != 2 || "$1" != --through || ! "$2" =~ ^J1[2-6]$ ]]; then
-  echo 'usage: m1.sh --through J12..J16' >&2
+if [[ $# != 2 || "$1" != --through || ! "$2" =~ ^J1[2-7]$ ]]; then
+  echo 'usage: m1.sh --through J12..J17' >&2
   exit 2
 fi
 PHASE="$2"
 REPORT="$ROOT/.artifacts/m1/$PHASE/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "$REPORT"
 python3 scripts/verify/test_evidence.py
+python3 scripts/verify/test_benchmark_evidence.py
 python3 scripts/verify/j06-source.py "$REPORT"
 python3 scripts/verify/source-frozen.py "$REPORT"
 scripts/dev/mvn21.sh -B -ntp -pl hbase -am clean verify -Pj11-hbase-local > "$REPORT/maven.log" 2>&1 || {
