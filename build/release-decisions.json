@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "I07": {
+    "state": "waiting_input",
+    "license_spdx": null,
+    "third_party_notice_reviewed": false,
+    "approval_reference": null
+  },
+  "I08": {
+    "state": "waiting_input",
+    "coordinates": null,
+    "publication_destination": null,
+    "authorization_rules": null,
+    "approval_reference": null
+  }
+}

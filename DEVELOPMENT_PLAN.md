@@ -1,8 +1,8 @@
 # etcd-hbase 开发计划与进度记录
 
-> 文档版本：0.9（J07 公开协议对照工具） · 更新日期：2026-10-29 · 开发基线：**JDK 21**
+> 文档版本：0.10（J06–J09 公开工程交付） · 更新日期：2026-10-30 · 开发基线：**JDK 21**
 >
-> 当前状态：开发计划及 M0 设计已批准，进入 M0。J03 已在 PR #7 批准合并，提供 gRPC 骨架、Header/Error 工厂及最小 Go/Java 验证；未实现业务仍返回 UNIMPLEMENTED。J04 的统一身份契约、连接工厂及多种认证的真实临时 HBase 验证已随 PR #8 批准合并；目标环境身份和权限尚未验收。J05 的公开盐候选、两种表布局及初始化原型已实现并通过公开验证，见 PR #9；PR #9 已批准合并，目标盐规则仍待输入。本文中的后续类、表结构和算法仍按任务逐项实现；勾选任务必须附实现、验证和评审证据。
+> 当前状态：开发计划及 M0 设计已批准，进入 M0。J03 已在 PR #7 批准合并，提供 gRPC 骨架、Header/Error 工厂及最小 Go/Java 验证；未实现业务仍返回 UNIMPLEMENTED。J04 的统一身份契约、连接工厂及多种认证的真实临时 HBase 验证已随 PR #8 批准合并；目标环境身份和权限尚未验收。J05 的公开盐候选、两种表布局及初始化原型已实现并通过公开验证，见 PR #9；PR #9 已批准合并，目标盐规则仍待输入。J06 的公开配置、请求生命周期和基础观测已随 PR #10 批准合并；J07 公开协议工具已随 PR #11 正式批准合并；J08 公开 SPI 契约与模块边界已随 PR #12 正式批准合并；J09 已交付统一公开验证入口和实际运行包/镜像检查，许可及制品决定仍待输入。本文中的后续类、表结构和算法仍按任务逐项实现；勾选任务必须附实现、验证和评审证据。
 
 ## 1. 评审摘要
 
@@ -546,11 +546,11 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J01。
   - 完成标准：配置非法时清晰失败；凭据不进入日志。
   - 子任务 / 交付物（各项记录状态、负责人、日期、PR 与证据）：
-    - [ ] **J06.1** 配置与启动：schema 校验、端口/表组绑定及非法配置错误。
+    - [x] **J06.1** 配置与启动：schema 校验、端口/表组绑定及非法配置错误。
     - [ ] **J06.2** 基础日志/指标：请求、排队、提交、流和资源记录，凭据不进入日志或标签。
     - [ ] **J06.3** 请求上下文：deadline、取消传播与释放；已发布提交继续由服务恢复上下文持有。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=公开实现已验证，待正式评审；负责人=Codex；完成日期=—；PR/commit=[PR #10](https://github.com/Reidddddd/etcd-hbase/pull/10)；验证入口=scripts/verify/j06.sh；范围=[运行配置与请求生命周期](docs/config/j06-runtime-configuration.md)；评审人/结论=作者自查与独立 agent 复核通过；0fb8a71 完整公开验证 172 项及 3 项报告门禁通过（0 失败/错误/跳过），当前 CI 与正式 review 待完成；目标身份激活/TLS、已发布提交恢复仍归后续任务和目标验收。
+  - 跟踪：状态=公开子交付已批准合并；负责人=Codex；完成日期=—；PR/commit=[PR #10](https://github.com/Reidddddd/etcd-hbase/pull/10)，合并提交 3439ac3；验证入口=scripts/verify/j06.sh；范围=[运行配置与请求生命周期](docs/config/j06-runtime-configuration.md)；评审人/结论=作者自审、独立 agent 复核与 Reidddddd 正式 APPROVED；最终 head be2a49f 的 CI 为 182 项 Java 与 7 项 Python 门禁，零失败/错误/跳过。已实现请求/准入/清理基础观测，完整提交/流指标归 J29，已发布提交的服务恢复上下文归 J27，目标身份/TLS 激活仍待相应任务；这些更广的子任务未因公开交付而整体勾选。
 
 - [ ] **J07｜原生 etcd 对照 testkit、Go 请求驱动与历史记录格式**
   - 依赖：J02。
@@ -562,13 +562,13 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J01 和初步需求基线；J00.2 完善时核对能力。
   - 完成标准：明确公开 API 最小范围、内部存储/提交模型边界及 provider ID/版本/生命周期；先验证盐/身份/连接和装配需求，再稳定配置/指标/绑定接口；内核不变量不能通过扩展绕过。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=公开契约及边界实现完成，已基于 J07 合并后的 main 重排，集成验证及正式评审待完成；负责人=Codex；完成日期=—；PR/commit=[PR #12](https://github.com/Reidddddd/etcd-hbase/pull/12)；验证入口=scripts/verify/j08.sh；契约=[公开 SPI](docs/spi/m0-spi-contract.md)、[模块边界](docs/architecture/m0-module-boundaries.md)；评审人/结论=作者自审与本 review chat 独立复核完成，文档 P3 已修复；原 head 52c98b7 的六组 CI 及93项 Java、5项 Python、JDK-only SPI 证据仅对应旧 base，最新 main 的集成结果按 PR 当前 head 记录；维护者正式第一、第二阶段尚未执行。完整加载、发行兼容和升级归 J18/J19/J58。
+  - 跟踪：状态=公开契约与工程边界子交付已正式批准合并；负责人=Codex；完成日期=—；PR/commit=[PR #12](https://github.com/Reidddddd/etcd-hbase/pull/12)，合并提交 eecc95e；验证入口=scripts/verify/j08.sh；契约=[公开 SPI](docs/spi/m0-spi-contract.md)、[模块边界](docs/architecture/m0-module-boundaries.md)；评审人/结论=作者自审、本 review chat 独立复核及 Reidddddd 两阶段复核完成，分支冲突、PR 描述追溯 P3 与集成待验证项已关闭，并对 head e607d52 正式 APPROVED。该已审版本六组 CI 成功，J08 为93项 Java、5项 Python、8模块/60生产源码/28生产依赖，实际 SPI JAR jdeps仅 java.base；各入口范围重叠不相加。完整加载、发行兼容和升级归 J18/J19/J58；目标身份/ACL/TLS、完整 Java/Milvus 与 M0 最终验收仍未完成。
 
 - [ ] **J09｜开源仓库规范、许可证与公开构建边界**
   - 依赖：已确认的开源交付要求；构建规则随 J01 完善，不等待 J00 完整审计。
   - 完成标准：维护者确认许可证；记录 LICENSE/NOTICE、协议与依赖来源要求；提供贡献/问题/变更模板，固定 artifact 命名与发布位置；建立仅使用公开依赖、占位配置及公开可获取资源的 CI 规则。
   - 验证层次：工程/环境；涉及客户端互通的部分另记 L2。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=公开实现已交付，发行决定待输入；负责人=Codex；完成日期=—；PR/commit=[PR #13](https://github.com/Reidddddd/etcd-hbase/pull/13)；验证入口=scripts/verify/m0.sh --scope public、scripts/verify/report-index.py；使用与边界=[公开构建及运行包](docs/build/j09-public-delivery.md)；评审人/结论=作者自审和独立 agent 复核通过；c30210b 两轮各 190 项 Java、9 JAR 摘要一致、Go 普通/race 各 8 包90事件、原生两次/10负例及实际运行包通过；该 head 七组 CI 全成功，实际 Eclipse Adoptium 21.0.12.1+1-LTS 镜像以 65532:65532 运行、UNIMPLEMENTED/退出143/资源回收通过，实际 merge checkout 双亲已核对。本机缺 Docker 仍记录 partial。已承接 J07/J08 最新整改，最终组合 head 与验证结论随 PR #13 记录，维护者正式 review 待完成；I07/I08 记录为 waiting_input，不新增未经批准的项目 LICENSE/正式 NOTICE，不发布制品。
 
 **退出条件：** JDK 21 依赖和实际 HBase 认证可用，盐规则/预分区及目标已记录；Go client 最小协议/流/错误互通。原型不代表完整业务语义。公开 SPI、许可证/仓库规则及公共构建边界已评审。
 

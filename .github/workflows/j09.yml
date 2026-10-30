@@ -1,0 +1,40 @@
+name: J09 public build and Java 21 runtime image
+
+on:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: j09-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  public-delivery:
+    name: 公开完整构建、实际运行包与镜像
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 下载固定 Temurin JDK
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/j09-temurin-jdk.tar.gz"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: jdkfile
+          java-version: '21'
+          jdk-file: ${{ runner.temp }}/j09-temurin-jdk.tar.gz
+      - name: 完整公开验证及索引复核
+        env:
+          ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
+        run: |
+          scripts/verify/m0.sh --scope public --artifact-root .artifacts/m0/public/ci
+          python3 scripts/verify/report-index.py --phase M0 --artifact-root .artifacts/m0/public/ci
