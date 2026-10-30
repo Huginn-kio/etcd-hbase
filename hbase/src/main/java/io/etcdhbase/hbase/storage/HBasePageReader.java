@@ -7,6 +7,7 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.ScanOperation;
+import io.etcdhbase.core.storage.ScanCleanupFailure;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.codec.StorageMessages;
@@ -224,7 +225,12 @@ final class HBasePageReader {
         if (terminal == null && scope.isDeadlineExceeded()) terminal = new TimeoutException();
         if (terminal == null && (cancelledBeforeCompletion || scope.isClosed())) terminal = new CancellationException();
         if (terminal == null) outcome.complete(page);
-        else outcome.completeExceptionally(HBaseFailures.classify(terminal));
+        else {
+          BackendFailure classified = HBaseFailures.classify(terminal);
+          // Retire failed cleanup capacity without replacing the original operation's cause.
+          if (cleanupFailure != null) classified.addSuppressed(new ScanCleanupFailure(cleanupFailure));
+          outcome.completeExceptionally(classified);
+        }
       });
       if (fatalCleanup != null) throw fatalCleanup;
     }

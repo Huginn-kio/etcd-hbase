@@ -6,7 +6,7 @@ import java.util.concurrent.CompletionStage;
 public interface ScanOperation extends AutoCloseable {
   CompletionStage<StoragePage> completion();
 
-  /** Requests cancellation; callers must still await completion before releasing I/O capacity. */
+  /** Cancels an unfinished read or releases its delivered page; I/O capacity follows completion. */
   @Override
   void close();
 }
