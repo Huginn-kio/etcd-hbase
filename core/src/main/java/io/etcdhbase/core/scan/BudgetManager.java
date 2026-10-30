@@ -55,9 +55,12 @@ public final class BudgetManager {
   public record Snapshot(long requests, long queued, long operations, long scanners,
       long cleanup, long queuedBytes, long reservedBytes, long allocatedBytes, long retiredScanners) {}
 
-  public record ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages) {
+  public record ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages, long pointOperations) {
+    public ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages) {
+      this(physicalRows, cellBytes, scanRpcCalls, pages, pages);
+    }
     public ReadLimits {
-      if (physicalRows < 1 || cellBytes < 1 || scanRpcCalls < 1 || pages < 1) throw new IllegalArgumentException("invalid read limits");
+      if (physicalRows < 1 || cellBytes < 1 || scanRpcCalls < 1 || pages < 1 || pointOperations < 1) throw new IllegalArgumentException("invalid read limits");
     }
   }
 
@@ -143,6 +146,7 @@ public final class BudgetManager {
     private boolean admissionReleased;
     private final ReadLimits readLimits;
     private long physicalRows, cellBytes, scanRpcCalls, pages;
+    private long pointReads;
     private boolean readExhausted;
 
     private Account(String groupId, Group group, RequestScope scope, Reservation reservation, ReadLimits readLimits) {
@@ -158,6 +162,17 @@ public final class BudgetManager {
     private BudgetManager owner() { return BudgetManager.this; }
     RequestScope scope() { return scope; }
     public Reservation reservation() { return reservation; }
+    public long pointReads() { synchronized (BudgetManager.this) { return pointReads; } }
+    void chargePoint() throws BackendFailure {
+      synchronized (BudgetManager.this) {
+        requireActive();
+        if (pointReads >= readLimits.pointOperations()) {
+          readExhausted = true;
+          throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+        }
+        pointReads++;
+      }
+    }
     public boolean isActive() {
       synchronized (BudgetManager.this) { return !closed && !readExhausted && !scope.isClosed() && !scope.isDeadlineExceeded(); }
     }

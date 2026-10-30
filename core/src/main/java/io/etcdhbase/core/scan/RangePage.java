@@ -12,16 +12,18 @@ public final class RangePage implements AutoCloseable {
   private final int count;
   private final boolean more;
   private final StoragePage.Cost cost;
+  private final long pointReads;
   private final RequestScope.ScopedCleanup registration;
   private boolean closed;
 
   RangePage(List<StoredRecord> records, List<BudgetManager.Lease> leases, boolean more,
-      StoragePage.Cost cost, RequestScope scope) {
+      StoragePage.Cost cost, long pointReads, RequestScope scope) {
     this.records = List.copyOf(records);
     this.leases = List.copyOf(leases);
     count = records.size();
     this.more = more;
     this.cost = cost;
+    this.pointReads = pointReads;
     registration = scope.registerScopedCleanup(this);
   }
 
@@ -32,6 +34,7 @@ public final class RangePage implements AutoCloseable {
   public int count() { return count; }
   public boolean more() { return more; }
   public StoragePage.Cost cost() { return cost; }
+  public long pointReads() { return pointReads; }
 
   @Override
   public void close() {

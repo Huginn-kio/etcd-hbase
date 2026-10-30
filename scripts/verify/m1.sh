@@ -3,8 +3,8 @@ set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$ROOT"
-if [[ $# != 2 || "$1" != --through || ! "$2" =~ ^J1[2-4]$ ]]; then
-  echo 'usage: m1.sh --through J12|J13|J14' >&2
+if [[ $# != 2 || "$1" != --through || ! "$2" =~ ^J1[2-5]$ ]]; then
+  echo 'usage: m1.sh --through J12..J15' >&2
   exit 2
 fi
 PHASE="$2"
