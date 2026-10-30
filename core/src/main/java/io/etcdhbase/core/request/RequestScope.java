@@ -12,6 +12,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.LongSupplier;
 
@@ -137,6 +138,41 @@ public final class RequestScope implements AutoCloseable {
       if (joinsClosingBatch) pendingCleanup++;
     }
     closeResource(resource, joinsClosingBatch);
+  }
+
+  /** Transfers one resource into a releasable owner; finished pages leave no retained registration. */
+  public ScopedCleanup registerScopedCleanup(AutoCloseable resource) {
+    var registration = new ScopedCleanup(Objects.requireNonNull(resource, "resource"));
+    registerCleanup(registration);
+    return registration;
+  }
+
+  int registeredResourceCount() {
+    synchronized (lock) {
+      return registrations.size();
+    }
+  }
+
+  public final class ScopedCleanup implements AutoCloseable {
+    private final AutoCloseable resource;
+    private final AtomicBoolean released = new AtomicBoolean();
+
+    private ScopedCleanup(AutoCloseable resource) {
+      this.resource = resource;
+    }
+
+    @Override
+    public void close() throws Exception {
+      if (!released.compareAndSet(false, true)) return;
+      try {
+        resource.close();
+      } finally {
+        synchronized (lock) {
+          cleanupOrder.remove(this);
+          registrations.remove(this);
+        }
+      }
+    }
   }
 
   /** Root-operation completion stops the request without replacing its original failure. */
