@@ -12,11 +12,13 @@ REQUIRED = {12: {"io.etcdhbase.core.scan.BucketCursorTest",
                  "io.etcdhbase.hbase.storage.HBasePageReaderTest", "io.etcdhbase.hbase.storage.M1StorageIT"},
             13: {"io.etcdhbase.core.scan.BudgetManagerTest", "io.etcdhbase.core.scan.ScanSchedulerTest"},
             14: {"io.etcdhbase.core.scan.SortedMergeCursorTest"},
-            15: {"io.etcdhbase.core.scan.ExistsExecutorTest", "io.etcdhbase.core.scan.PinnedValueReadTest"}}
+            15: {"io.etcdhbase.core.scan.ExistsExecutorTest", "io.etcdhbase.core.scan.PinnedValueReadTest"},
+            16: {"io.etcdhbase.core.scan.DirectRecordReaderTest"}}
 CASES = {12: "cursorReopensAfterOnlyConsumedKeysAndCancelsWithoutClosingSharedConnections",
          13: "onePhysicalScannerCanSupplyEveryBucketHeadWithoutClosingTheRequest",
          14: "globallySortedLimitMoreAndLightCountMatchBothFrozenHistoryLayouts",
-         15: "metadataExistsAvoidsUnselectedValuesAndFullResultsPinTheSelectedVersion"}
+         15: "metadataExistsAvoidsUnselectedValuesAndFullResultsPinTheSelectedVersion",
+         16: "directReaderDoesNotCacheAndRequestCancellationClosesRetainedResults"}
 
 
 def collect(root, output, phase):
