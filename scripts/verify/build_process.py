@@ -22,9 +22,20 @@ def termination_is_exception():
         signal.signal(signal.SIGTERM, previous)
 
 
+def _signal_group(process, signum):
+    try:
+        os.killpg(process.pid, signum)
+    except PermissionError:
+        # Darwin can report EPERM for a group containing only an unreaped zombie.
+        # Reap an exited leader and retry the OS check; a real denial still raises.
+        if process.poll() is None:
+            raise
+        os.killpg(process.pid, signum)
+
+
 def stop_group(process, grace=5):
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        _signal_group(process, signal.SIGTERM)
     except ProcessLookupError:
         process.wait(timeout=5)
         return
@@ -32,12 +43,12 @@ def stop_group(process, grace=5):
     while True:
         process.poll()  # Reap the leader, but check the group independently.
         try:
-            os.killpg(process.pid, 0)
+            _signal_group(process, 0)
         except ProcessLookupError:
             break
         if time.monotonic() >= deadline:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                _signal_group(process, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             break

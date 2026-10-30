@@ -2,7 +2,8 @@
 """Negative controls for release inputs, reproducibility, runtime classpaths and probes."""
 import hashlib
 import importlib.util
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
+import errno
 import io
 import json
 import os
@@ -12,6 +13,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import zipfile
@@ -33,6 +35,36 @@ package = load("package_runtime", "package-runtime.py")
 repro = load("reproducible", "maven-reproducible-build.py")
 image = load("runtime_image", "runtime-image.py")
 packaged = load("packaged_runtime", "packaged-runtime.py")
+
+
+@contextmanager
+def _controlled_process_group():
+    program = "import os,signal,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('ready',flush=True); sys.stdin.readline(); os._exit(0)"
+    process = subprocess.Popen([sys.executable, "-c", program], stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, start_new_session=True)
+    try:
+        if process.stdout.readline() != b"ready\n":
+            raise AssertionError("controlled process group did not become ready")
+        yield process
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        process.stdin.close()
+        process.stdout.close()
+
+
+def _finish_as_zombie(process):
+    process.stdin.write(b"exit\n")
+    process.stdin.flush()
+    deadline = time.monotonic() + 5
+    while True:
+        state = subprocess.run(["ps", "-p", str(process.pid), "-o", "stat="], capture_output=True, text=True)
+        if state.stdout.strip().startswith("Z"):
+            return
+        if state.stderr or time.monotonic() >= deadline:
+            raise AssertionError("owned unreaped exit was not observed: " + state.stderr)
+        time.sleep(0.01)
 
 
 class DeliveryTest(unittest.TestCase):
@@ -128,6 +160,50 @@ class DeliveryTest(unittest.TestCase):
             except ProcessLookupError:
                 pass
             process.wait(timeout=5)
+
+    def test_group_cleanup_reaps_an_already_exited_leader(self):
+        with _controlled_process_group() as process:
+            _finish_as_zombie(process)
+            stop_group(process, grace=0.2)
+            self.assertEqual(0, process.returncode)
+
+    def test_group_cleanup_handles_exit_between_poll_and_group_probe(self):
+        with _controlled_process_group() as process:
+            original_poll = process.poll
+            released = False
+
+            def poll_at_exit_boundary():
+                nonlocal released
+                result = original_poll()
+                if result is None and not released:
+                    released = True
+                    _finish_as_zombie(process)
+                return result
+
+            with mock.patch.object(process, "poll", side_effect=poll_at_exit_boundary):
+                stop_group(process, grace=0.2)
+            self.assertTrue(released, "owned exit did not occur in the intended window")
+            self.assertEqual(0, process.returncode)
+
+    def test_group_permission_denial_for_a_live_leader_is_preserved(self):
+        process = mock.Mock(pid=43210)
+        process.poll.return_value = None
+        error = PermissionError(errno.EPERM, "fixture group is not signalable")
+        with mock.patch("build_process.os.killpg", side_effect=error):
+            with self.assertRaises(PermissionError) as denied:
+                stop_group(process, grace=0.01)
+        self.assertIs(error, denied.exception)
+        process.wait.assert_not_called()
+
+    def test_group_permission_denial_after_leader_exit_is_preserved(self):
+        process = mock.Mock(pid=43210)
+        process.poll.return_value = 0
+        error = PermissionError(errno.EPERM, "fixture remaining group is not signalable")
+        with mock.patch("build_process.os.killpg", side_effect=error):
+            with self.assertRaises(PermissionError) as denied:
+                stop_group(process, grace=0.01)
+        self.assertIs(error, denied.exception)
+        process.wait.assert_not_called()
 
     def test_outer_cancellation_allows_the_resource_owner_to_finish_cleanup(self):
         pid_path = self.root / "child.pid"
