@@ -103,16 +103,20 @@ public final class ExistsExecutor implements AutoCloseable {
   private void finish(int count, Throwable failure) {
     if (terminal) return;
     terminal = true;
-    try {
-      if (cursor != null) cursor.close();
-      cursor = null;
-      if (registration != null) registration.close();
-    } catch (Exception cleanup) {
-      if (failure == null) failure = cleanup;
-      else if (failure != cleanup) failure.addSuppressed(cleanup);
+    Error fatal = failure instanceof Error error ? error : null;
+    var resources = new AutoCloseable[] {cursor, registration};
+    cursor = null;
+    for (var resource : resources) {
+      try { if (resource != null) resource.close(); }
+      catch (Exception | Error cleanup) {
+        if (failure == null) failure = cleanup;
+        else if (failure != cleanup) failure.addSuppressed(cleanup);
+        if (fatal == null && cleanup instanceof Error error) fatal = error;
+      }
     }
     if (failure == null) result.complete(new Result(count, cost));
     else result.completeExceptionally(failure);
+    if (fatal != null) throw fatal;
   }
 
   @Override public void close() { stopped.set(true); drain(); }
