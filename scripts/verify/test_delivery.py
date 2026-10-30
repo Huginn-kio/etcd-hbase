@@ -2,6 +2,8 @@
 """Negative controls for release inputs, reproducibility, runtime classpaths and probes."""
 import hashlib
 import importlib.util
+from contextlib import redirect_stdout
+import io
 import json
 import os
 import signal
@@ -11,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 from runtime_probe import await_transport, check_observation
 from build_process import run_logged, stop_group
@@ -28,6 +31,8 @@ def load(name, filename):
 release = load("release_readiness", "release-readiness.py")
 package = load("package_runtime", "package-runtime.py")
 repro = load("reproducible", "maven-reproducible-build.py")
+image = load("runtime_image", "runtime-image.py")
+packaged = load("packaged_runtime", "packaged-runtime.py")
 
 
 class DeliveryTest(unittest.TestCase):
@@ -157,6 +162,269 @@ with termination_is_exception():
                     os.killpg(int(pid_path.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+
+class RuntimeImageLifecycleTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.output = Path(directory.name) / "output"
+        self.runtime = Path(directory.name) / "runtime"
+        self.commands = []
+        self.token = None
+        self.built = False
+        self.created = False
+        self.failure = None
+        self.container_id = "c" * 64
+        self.image_id = "sha256:" + "d" * 64
+        self.console = self.enterContext(redirect_stdout(io.StringIO()))
+        self.enterContext(mock.patch.object(image.shutil, "which", return_value="docker"))
+        self.enterContext(mock.patch.object(image, "run_logged", side_effect=self.build))
+        self.enterContext(mock.patch.object(image.Docker, "call", autospec=True, side_effect=self.docker_call))
+        self.probe = self.enterContext(mock.patch.object(image, "await_transport", return_value={"attempts": 3}))
+
+    def build(self, command, log, cwd, **options):
+        if command[0].endswith("go-m0.sh"):
+            self.assertEqual("build", command[1])
+            Path(command[command.index("-o") + 1]).write_bytes(b"fixture probe")
+            return 0
+        self.assertEqual(["docker", "--context", "default", "build"], command[:4])
+        self.token = command[command.index("--label") + 1].split("=", 1)[1]
+        self.built = True
+        if self.failure == "build":
+            raise subprocess.TimeoutExpired(command, 600)
+        return 0
+
+    def docker_call(self, docker, arguments, log=None, timeout=30):
+        self.commands.append((arguments, timeout))
+        operation = arguments[0]
+        if operation == "info":
+            if self.failure == "info":
+                raise ValueError("fixture unavailable daemon")
+            return "fixture daemon"
+        if operation == "create":
+            self.assertEqual("etcd-hbase.m0.verify=" + self.token, arguments[arguments.index("--label") + 1])
+            self.created = True
+            if self.failure == "create":
+                raise subprocess.TimeoutExpired(arguments, timeout)
+            return self.container_id
+        if operation in ("container", "image") and arguments[1] == "ls":
+            self.assertEqual("label=etcd-hbase.m0.verify=" + self.token, arguments[-1])
+            resource_exists = self.created if operation == "container" else self.built
+            return (self.container_id if operation == "container" else self.image_id) if resource_exists else ""
+        if operation in ("container", "image") and arguments[1] == "rm":
+            self.assertFalse((self.output / "summary.json").exists(), "passed report preceded owned cleanup")
+            self.assertEqual([self.container_id if operation == "container" else self.image_id], arguments[3:])
+            if self.failure == "cleanup":
+                raise OSError("fixture removal failure")
+            if operation == "container":
+                self.created = False
+            else:
+                self.built = False
+            return ""
+        if operation == "inspect":
+            if arguments[2] == "{{.Config.User}}":
+                return "0:0" if self.failure == "user" else "65532:65532"
+            return "137" if self.failure == "exit" else "143"
+        if operation == "exec":
+            (docker.output / log).write_text("java.specification.version = 21\njava.runtime.version = 21.0.12.1+1-LTS\njava.vendor = Eclipse Adoptium\n")
+        if operation == "image" and arguments[1] == "inspect":
+            return self.image_id
+        if log and operation != "exec":
+            (docker.output / log).write_text("fixture log\n")
+        return ""
+
+    def assert_released_without_pass(self):
+        self.assertFalse(self.created)
+        self.assertFalse(self.built)
+        self.assertFalse((self.output / "summary.json").exists())
+
+    def test_success_reports_only_after_owned_resource_removal(self):
+        self.assertEqual(0, image.verify(self.runtime, self.output))
+        summary = json.loads((self.output / "summary.json").read_text())
+        lock = json.loads((ROOT / "build/dependency-lock.json").read_text())["runtimeImage"]
+        self.assertEqual({"status": "passed", "scope": "runtime-image-transport", "image_test_passed": True,
+                          "base": lock["reference"], "platform": "linux/amd64", "image_id": self.image_id,
+                          "user": "65532:65532", "read_only": True, "network": "none",
+                          "java": {"specification": "21", "runtime": "21.0.12.1+1-LTS", "vendor": "Eclipse Adoptium"},
+                          "grpc_code": "Unimplemented", "attempts": 3, "exit_code": 143,
+                          "backend_semantics_verified": False, "formal_image_published": False, "owned_resources_removed": True}, summary)
+        self.assertEqual(summary, json.loads(self.console.getvalue()))
+        self.assertFalse(self.created or self.built)
+
+    def test_missing_cli_is_unavailable_without_allocating_resources(self):
+        with mock.patch.object(image.shutil, "which", return_value=None):
+            self.assertEqual(2, image.verify(self.runtime, self.output))
+        self.assertEqual({"status": "unavailable", "reason": "docker-cli-unavailable", "image_test_passed": False},
+                         json.loads((self.output / "summary.json").read_text()))
+        self.assertEqual([], self.commands)
+
+    def test_unavailable_daemon_is_distinct_from_image_failure(self):
+        self.failure = "info"
+        self.assertEqual(2, image.verify(self.runtime, self.output))
+        self.assertEqual("default-local-docker-daemon-unavailable", json.loads((self.output / "summary.json").read_text())["reason"])
+        self.assertFalse(self.created or self.built)
+
+    def test_unknown_build_outcome_still_removes_labeled_image(self):
+        self.failure = "build"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            image.verify(self.runtime, self.output)
+        self.assert_released_without_pass()
+
+    def test_probe_preparation_failure_does_not_allocate_docker_resources(self):
+        with mock.patch.object(image, "run_logged", return_value=1):
+            with self.assertRaisesRegex(ValueError, "Linux runtime probe"):
+                image.verify(self.runtime, self.output)
+        self.assertEqual(["info"], [arguments[0] for arguments, _ in self.commands])
+        self.assert_released_without_pass()
+
+    def test_unknown_create_outcome_still_removes_labeled_container(self):
+        self.failure = "create"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            image.verify(self.runtime, self.output)
+        self.assert_released_without_pass()
+
+    def test_identity_rejection_still_releases_runtime(self):
+        self.failure = "user"
+        with self.assertRaisesRegex(ValueError, "unprivileged"):
+            image.verify(self.runtime, self.output)
+        self.assert_released_without_pass()
+
+    def test_forced_exit_is_rejected_even_after_container_stop(self):
+        self.failure = "exit"
+        with self.assertRaisesRegex(ValueError, "forced termination"):
+            image.verify(self.runtime, self.output)
+        self.assert_released_without_pass()
+
+    def test_probe_cancellation_releases_resources_and_propagates(self):
+        self.probe.side_effect = KeyboardInterrupt("fixture cancellation")
+        with self.assertRaises(KeyboardInterrupt):
+            image.verify(self.runtime, self.output)
+        self.assert_released_without_pass()
+
+    def test_cleanup_failure_cannot_form_passed_summary(self):
+        self.failure = "cleanup"
+        with self.assertRaisesRegex(ValueError, "could not be fully released"):
+            image.verify(self.runtime, self.output)
+        self.assertFalse((self.output / "summary.json").exists())
+        self.assertEqual(2, sum(arguments[1] == "rm" for arguments, _ in self.commands if arguments[0] in {"container", "image"}))
+
+    def test_cleanup_budget_is_shared_across_resource_types(self):
+        self.output.mkdir()
+        self.token, self.built, self.created = "fixture", True, True
+        with mock.patch.object(image.time, "monotonic", side_effect=[0, 10, 20, 29, 30.5]):
+            with self.assertRaisesRegex(ValueError, "30 seconds"):
+                image.Docker(self.output).cleanup(self.token)
+        self.assertEqual([20, 10, 1], [timeout for _, timeout in self.commands])
+        self.assertFalse(self.created)
+        self.assertTrue(self.built, "image removal exceeded the remaining cleanup budget")
+
+
+class PackagedRuntimeLifecycleTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir()
+        self.output = self.root / "output"
+        (self.runtime / "server.json").write_text(json.dumps({"listeners": [{"port": 0}]}))
+        self.write_server("signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(143))\nprint('listeners=1 data_readiness=UNIMPLEMENTED', flush=True)\nsignal.pause()\n")
+        self.processes = []
+        self.original_popen = subprocess.Popen
+        self.force_cleanup_timeout = False
+        self.enterContext(redirect_stdout(io.StringIO()))
+        self.enterContext(mock.patch.dict(os.environ, {"ETCD_HBASE_JDK21_HOME": "/fixture/jdk", "JAVA_TOOL_OPTIONS": "fixture", "JDK_JAVA_OPTIONS": "fixture", "_JAVA_OPTIONS": "fixture"}))
+        self.enterContext(mock.patch.object(packaged, "run_logged", return_value=0))
+        self.enterContext(mock.patch.object(packaged.subprocess, "Popen", side_effect=self.launch))
+        self.probe = self.enterContext(mock.patch.object(packaged, "await_transport", side_effect=self.observe))
+
+    def write_server(self, program):
+        path = self.runtime / "etcd-hbase"
+        path.write_text(f"#!{sys.executable}\nimport signal,sys\n" + program)
+        path.chmod(0o755)
+
+    def launch(self, command, **options):
+        self.assertEqual("/fixture/jdk", options["env"]["JAVA_HOME"])
+        for variable in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"):
+            self.assertNotIn(variable, options["env"])
+        process = self.original_popen(command, **options)
+        self.processes.append(process)
+        self.addCleanup(self.release_process, process)
+        if self.force_cleanup_timeout:
+            original_wait = process.wait
+            def wait(timeout=None):
+                if timeout == 15:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                return original_wait(timeout=timeout)
+            process.wait = wait
+        return process
+
+    def release_process(self, process):
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    def observe(self, command, case, output, alive):
+        self.assertTrue(alive(), "probe observed a process it did not own")
+        return {"attempts": 3}
+
+    def assert_stopped_without_pass(self):
+        self.assertEqual(1, len(self.processes))
+        self.assertIsNotNone(self.processes[0].poll())
+        self.assertFalse((self.output / "summary.json").exists())
+
+    def test_success_stops_owned_process_and_retains_summary(self):
+        summary = packaged.verify(self.runtime, self.output)
+        self.assertEqual({"scope": "packaged-transport", "started": True, "grpc_code": "Unimplemented", "attempts": 3,
+                          "exit_code": 143, "backend_semantics_verified": False}, summary)
+        self.assertEqual(summary, json.loads((self.output / "summary.json").read_text()))
+        self.assertEqual(143, self.processes[0].poll())
+
+    def test_early_process_exit_does_not_produce_passed_report(self):
+        self.write_server("raise SystemExit(17)\n")
+        with self.assertRaisesRegex(ValueError, "listener startup"):
+            packaged.verify(self.runtime, self.output)
+        self.assert_stopped_without_pass()
+        self.probe.assert_not_called()
+
+    def test_driver_preparation_failure_does_not_start_process(self):
+        with mock.patch.object(packaged, "run_logged", return_value=1):
+            with self.assertRaisesRegex(ValueError, "driver build failed"):
+                packaged.verify(self.runtime, self.output)
+        self.assertEqual([], self.processes)
+        self.assertFalse((self.output / "summary.json").exists())
+
+    def test_protocol_failure_stops_owned_process_and_propagates(self):
+        self.probe.side_effect = ValueError("fixture protocol failure")
+        with self.assertRaisesRegex(ValueError, "fixture protocol failure"):
+            packaged.verify(self.runtime, self.output)
+        self.assert_stopped_without_pass()
+
+    def test_bad_graceful_exit_is_not_rewritten_as_success(self):
+        self.write_server("signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(9))\nprint('listeners=1 data_readiness=UNIMPLEMENTED', flush=True)\nsignal.pause()\n")
+        with self.assertRaisesRegex(ValueError, "graceful shutdown"):
+            packaged.verify(self.runtime, self.output)
+        self.assert_stopped_without_pass()
+        self.assertEqual(9, self.processes[0].returncode)
+
+    def test_sigterm_during_observation_cleans_up_and_restores_handler(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        self.probe.side_effect = lambda *args, **kwargs: os.kill(os.getpid(), signal.SIGTERM)
+        with self.assertRaises(SystemExit) as cancelled:
+            packaged.verify(self.runtime, self.output)
+        self.assertEqual(143, cancelled.exception.code)
+        self.assertEqual(previous, signal.getsignal(signal.SIGTERM))
+        self.assert_stopped_without_pass()
+
+    def test_cleanup_escalates_for_term_ignoring_process(self):
+        self.write_server("signal.signal(signal.SIGTERM, signal.SIG_IGN)\nprint('listeners=1 data_readiness=UNIMPLEMENTED', flush=True)\nsignal.pause()\n")
+        self.force_cleanup_timeout = True
+        self.probe.side_effect = ValueError("fixture protocol failure")
+        with self.assertRaisesRegex(ValueError, "fixture protocol failure"):
+            packaged.verify(self.runtime, self.output)
+        self.assert_stopped_without_pass()
+        self.assertEqual(-signal.SIGKILL, self.processes[0].returncode)
 
 
 if __name__ == "__main__":

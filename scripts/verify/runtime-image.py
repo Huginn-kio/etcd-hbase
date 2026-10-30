@@ -64,21 +64,17 @@ def java_properties(output, lock):
     return {"specification": "21", "runtime": runtime, "vendor": vendor}
 
 
-def verify(runtime, output):
-    output.mkdir(parents=True, exist_ok=False)
+def _docker_unavailable_reason(docker):
     if shutil.which("docker") is None:
-        result = {"status": "unavailable", "reason": "docker-cli-unavailable", "image_test_passed": False}
-        (output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
-        print(json.dumps(result))
-        return 2
-    docker = Docker(output)
+        return "docker-cli-unavailable"
     try:
         docker.call(["info"], log="docker-info.log", timeout=15)
     except (ValueError, OSError, subprocess.SubprocessError):
-        result = {"status": "unavailable", "reason": "default-local-docker-daemon-unavailable", "image_test_passed": False}
-        (output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
-        print(json.dumps(result))
-        return 2
+        return "default-local-docker-daemon-unavailable"
+    return None
+
+
+def _prepare_image_probe(output):
     lock = json.loads((ROOT / "build/dependency-lock.json").read_text())["runtimeImage"]
     dockerfile = ROOT / "server/src/main/docker/Dockerfile.m0"
     if dockerfile.read_text().splitlines()[0] != "FROM " + lock["reference"] or lock["platform"] != "linux/amd64":
@@ -92,46 +88,81 @@ def verify(runtime, output):
                   output / "go-build.log", ROOT, timeout=300, environment=environment):
         raise ValueError("Linux runtime probe could not be built")
     driver.chmod(0o755)
+    return lock, dockerfile, probe_directory
+
+
+def _build_image(docker, runtime, lock, dockerfile, image, token):
+    if run_logged([*docker.prefix, "build", "--platform", lock["platform"], "--network", "none", "--pull",
+                   "--force-rm", "--label", "etcd-hbase.m0.verify=" + token, "--file", str(dockerfile), "--tag", image, str(runtime)],
+                  docker.output / "docker-build.log", ROOT, timeout=600):
+        raise ValueError("runtime image build failed")
+
+
+def _create_container(docker, image, probe_directory, token):
+    container = docker.call(["create", "--name", "etcd-hbase-m0-" + token,
+        "--label", "etcd-hbase.m0.verify=" + token, "--read-only", "--tmpfs", "/tmp:rw,exec,nosuid,size=64m", "--network", "none",
+        "--memory", "512m", "--pids-limit", "256", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges", "--mount", f"type=bind,src={probe_directory},dst=/verify,readonly", image])
+    if not re.fullmatch(r"[0-9a-f]{64}", container):
+        raise ValueError("Docker did not return an owned container ID")
+    return container
+
+
+def _observe_container(docker, container, image, lock, output):
+    docker.call(["start", container])
+    user = docker.call(["inspect", "--format", "{{.Config.User}}", container])
+    if user != "65532:65532":
+        raise ValueError("runtime image must run as the unprivileged configured user")
+    docker.call(["exec", container, "java", "-XshowSettings:properties", "-version"], log="java-version.log")
+    # java writes version/properties to stderr, retained in the bounded command log.
+    properties = (output / "java-version.log").read_text()
+    java = java_properties(properties, lock)
+    result = await_transport([*docker.prefix, "exec", container, "/verify/m0driver", *probe_arguments("m0-runtime-image", 2379)],
+                             "m0-runtime-image", output)
+    docker.call(["stop", "--time", "10", container], log="container-stop.log", timeout=20)
+    code = int(docker.call(["inspect", "--format", "{{.State.ExitCode}}", container]))
+    if code not in (0, 143):
+        raise ValueError("container did not stop before forced termination")
+    image_id = docker.call(["image", "inspect", "--format", "{{.Id}}", image])
+    docker.call(["logs", container], log="server.log")
+    return {"image_id": image_id, "user": user, "java": java, "attempts": result["attempts"], "exit_code": code}
+
+
+def _run_owned_image(docker, runtime, lock, dockerfile, probe_directory, output):
     token = uuid.uuid4().hex
     image = "etcd-hbase-m0-verify:" + token
-    container = None
-    summary = None
+    # Ownership starts before commands whose outcome may be unknown on failure.
     try:
-        if run_logged([*docker.prefix, "build", "--platform", lock["platform"], "--network", "none", "--pull",
-                       "--force-rm", "--label", "etcd-hbase.m0.verify=" + token, "--file", str(dockerfile), "--tag", image, str(runtime)], output / "docker-build.log", ROOT, timeout=600):
-            raise ValueError("runtime image build failed")
-        container = docker.call(["create", "--name", "etcd-hbase-m0-" + token,
-            "--label", "etcd-hbase.m0.verify=" + token, "--read-only", "--tmpfs", "/tmp:rw,exec,nosuid,size=64m", "--network", "none",
-            "--memory", "512m", "--pids-limit", "256", "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges", "--mount", f"type=bind,src={probe_directory},dst=/verify,readonly", image])
-        if not re.fullmatch(r"[0-9a-f]{64}", container):
-            raise ValueError("Docker did not return an owned container ID")
-        docker.call(["start", container])
-        user = docker.call(["inspect", "--format", "{{.Config.User}}", container])
-        if user != "65532:65532":
-            raise ValueError("runtime image must run as the unprivileged configured user")
-        docker.call(["exec", container, "java", "-XshowSettings:properties", "-version"], log="java-version.log")
-        # java writes version/properties to stderr, retained in the bounded command log.
-        properties = (output / "java-version.log").read_text()
-        java = java_properties(properties, lock)
-        result = await_transport([*docker.prefix, "exec", container, "/verify/m0driver", *probe_arguments("m0-runtime-image", 2379)],
-                                 "m0-runtime-image", output)
-        docker.call(["stop", "--time", "10", container], log="container-stop.log", timeout=20)
-        code = int(docker.call(["inspect", "--format", "{{.State.ExitCode}}", container]))
-        if code not in (0, 143):
-            raise ValueError("container did not stop before forced termination")
-        image_id = docker.call(["image", "inspect", "--format", "{{.Id}}", image])
-        docker.call(["logs", container], log="server.log")
-        summary = {"status": "passed", "scope": "runtime-image-transport", "image_test_passed": True,
-                   "base": lock["reference"], "platform": lock["platform"], "image_id": image_id,
-                   "user": user, "read_only": True, "network": "none", "java": java,
-                   "grpc_code": "Unimplemented", "attempts": result["attempts"], "exit_code": code,
-                   "backend_semantics_verified": False, "formal_image_published": False}
+        _build_image(docker, runtime, lock, dockerfile, image, token)
+        container = _create_container(docker, image, probe_directory, token)
+        return _observe_container(docker, container, image, lock, output)
     finally:
         docker.cleanup(token)
-    summary["owned_resources_removed"] = True
+
+
+def _image_summary(lock, observation):
+    return {"status": "passed", "scope": "runtime-image-transport", "image_test_passed": True,
+            "base": lock["reference"], "platform": lock["platform"], "image_id": observation["image_id"],
+            "user": observation["user"], "read_only": True, "network": "none", "java": observation["java"],
+            "grpc_code": "Unimplemented", "attempts": observation["attempts"], "exit_code": observation["exit_code"],
+            "backend_semantics_verified": False, "formal_image_published": False, "owned_resources_removed": True}
+
+
+def _write_summary(output, summary):
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary))
+
+
+def verify(runtime, output):
+    output.mkdir(parents=True, exist_ok=False)
+    docker = Docker(output)
+    reason = _docker_unavailable_reason(docker)
+    if reason:
+        _write_summary(output, {"status": "unavailable", "reason": reason, "image_test_passed": False})
+        return 2
+    lock, dockerfile, probe_directory = _prepare_image_probe(output)
+    observation = _run_owned_image(docker, runtime, lock, dockerfile, probe_directory, output)
+    _write_summary(output, _image_summary(lock, observation))
     return 0
 
 

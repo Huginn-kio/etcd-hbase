@@ -8,12 +8,14 @@ import subprocess
 import time
 
 
+def _terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
 @contextmanager
 def termination_is_exception():
     previous = signal.getsignal(signal.SIGTERM)
-    def terminate(signum, _frame):
-        raise SystemExit(128 + signum)
-    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGTERM, _terminate)
     try:
         yield
     finally:

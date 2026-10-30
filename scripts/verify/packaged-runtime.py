@@ -14,8 +14,7 @@ from build_process import run_logged, termination_is_exception
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def verify(runtime, output):
-    output.mkdir(parents=True, exist_ok=False)
+def _prepare_probe(runtime, output):
     jdk = os.environ.get("ETCD_HBASE_JDK21_HOME")
     if not jdk:
         raise ValueError("set the locked JDK home for packaged runtime verification")
@@ -33,37 +32,65 @@ def verify(runtime, output):
     environment = dict(os.environ, JAVA_HOME=jdk)
     for name in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"):
         environment.pop(name, None)
+    return driver, port, config_path, environment
+
+
+def _await_startup(process, output):
+    deadline = time.monotonic() + 30
+    while b"listeners=1 data_readiness=UNIMPLEMENTED" not in (output / "server.log").read_bytes():
+        if (output / "server.log").stat().st_size > 1 << 20:
+            raise ValueError("packaged JVM startup log exceeded its budget")
+        if process.poll() is not None or time.monotonic() >= deadline:
+            raise ValueError("packaged JVM did not report its owned listener startup")
+        time.sleep(0.05)
+
+
+def _stop_runtime(process):
+    process.send_signal(signal.SIGTERM)
+    process.wait(timeout=15)
+    if process.returncode not in (0, 143):
+        raise ValueError("packaged JVM did not finish graceful shutdown")
+
+
+def _cleanup_runtime(process):
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _run_owned_runtime(runtime, output, driver, port, config_path, environment):
     process = None
     with (output / "server.log").open("wb") as log, termination_is_exception():
         try:
             process = subprocess.Popen([str(runtime / "etcd-hbase"), "--config", str(config_path)],
                                        cwd=runtime, env=environment, stdout=log, stderr=subprocess.STDOUT)
-            deadline = time.monotonic() + 30
-            while b"listeners=1 data_readiness=UNIMPLEMENTED" not in (output / "server.log").read_bytes():
-                if (output / "server.log").stat().st_size > 1 << 20:
-                    raise ValueError("packaged JVM startup log exceeded its budget")
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    raise ValueError("packaged JVM did not report its owned listener startup")
-                time.sleep(0.05)
+            _await_startup(process, output)
             result = await_transport([str(driver), *probe_arguments("m0-packaged-runtime", port)],
                                      "m0-packaged-runtime", output, alive=lambda: process.poll() is None)
-            process.send_signal(signal.SIGTERM)
-            process.wait(timeout=15)
-            if process.returncode not in (0, 143):
-                raise ValueError("packaged JVM did not finish graceful shutdown")
+            _stop_runtime(process)
         finally:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-    summary = {"scope": "packaged-transport", "started": True, "grpc_code": "Unimplemented", "attempts": result["attempts"],
-               "exit_code": process.returncode, "backend_semantics_verified": False}
+            _cleanup_runtime(process)
+    return {"attempts": result["attempts"], "exit_code": process.returncode}
+
+
+def _write_summary(output, observation):
+    summary = {"scope": "packaged-transport", "started": True, "grpc_code": "Unimplemented", "attempts": observation["attempts"],
+               "exit_code": observation["exit_code"], "backend_semantics_verified": False}
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary))
     return summary
+
+
+def verify(runtime, output):
+    output.mkdir(parents=True, exist_ok=False)
+    driver, port, config_path, environment = _prepare_probe(runtime, output)
+    observation = _run_owned_runtime(runtime, output, driver, port, config_path, environment)
+    return _write_summary(output, observation)
 
 
 if __name__ == "__main__":

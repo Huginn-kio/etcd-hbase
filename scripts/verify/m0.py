@@ -19,19 +19,19 @@ PYTHON = sys.executable
 
 class PublicVerification:
     def __init__(self, output):
-        self.output = output
-        self.steps = []
-        self.environment = dict(os.environ, ETCD_HBASE_MAVEN_REPOSITORY=str(ROOT / ".artifacts/m0/j09/maven-repository"))
+        self._output = output
+        self._steps = []
+        self._environment = dict(os.environ, ETCD_HBASE_MAVEN_REPOSITORY=str(ROOT / ".artifacts/m0/j09/maven-repository"))
 
     def step(self, name, command, timeout=600, stdout=None, unavailable=False, environment=None):
         print(f"M0 {name}: running", flush=True)
-        log = self.output / (stdout or name + ".log")
-        stderr = self.output / (name + ".stderr.log") if stdout else None
+        log = self._output / (stdout or name + ".log")
+        stderr = self._output / (name + ".stderr.log") if stdout else None
         record = {"id": name, "status": "failed", "exit_code": 1, "log": log.name}
-        self.steps.append(record)
+        self._steps.append(record)
         try:
             code = run_logged(command, log, ROOT, timeout=timeout,
-                              environment=environment or self.environment, stderr_path=stderr, termination_grace=45)
+                              environment=environment or self._environment, stderr_path=stderr, termination_grace=45)
             record.update(exit_code=code, status="passed" if code == 0 else "unavailable" if unavailable and code == 2 else "failed")
             if record["status"] == "failed":
                 print("\n".join(log.read_text(errors="replace").splitlines()[-60:]), file=sys.stderr)
@@ -40,13 +40,13 @@ class PublicVerification:
                 raise ValueError("required public verification step failed: " + name)
             print(f"M0 {name}: {record['status']}", flush=True)
         finally:
-            (self.output / "steps.json").write_text(json.dumps(self.steps, indent=2) + "\n")
+            (self._output / "steps.json").write_text(json.dumps(self._steps, indent=2) + "\n")
 
     def python(self, name, script, *arguments, **options):
         self.step(name, [PYTHON, str(ROOT / "scripts/verify" / script), *map(str, arguments)], **options)
 
     def run(self):
-        output = self.output
+        output = self._output
         output.mkdir(parents=True, exist_ok=False)
         subprocess.run([PYTHON, str(ROOT / "scripts/verify/j06-source.py"), str(output)], cwd=ROOT, check=True)
         source = json.loads((output / "source.json").read_text())
@@ -60,7 +60,7 @@ class PublicVerification:
             self.step("module-verify", [go, "mod", "verify"])
             self.step("go-test", [go, "test", "-json", "./..."], stdout="go-test.jsonl")
             self.step("go-race", [go, "test", "-json", "-race", "./..."], stdout="go-race.jsonl",
-                      environment=dict(self.environment, GORACE="halt_on_error=1"))
+                      environment=dict(self._environment, GORACE="halt_on_error=1"))
             self.step("go-vet", [go, "vet", "./..."])
             self.step("native", [str(ROOT / "scripts/verify/native-oracle.sh"), "--artifact-root", str(output / "native")])
             self.python("api-matrix", "api-matrix.py", "--matrix", "docs/api-matrix.md", "--wire-contract", "protocol/baseline/wire-contract.json", "--cases", "testkit/cases/m0-wire.json")
