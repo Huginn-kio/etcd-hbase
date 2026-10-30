@@ -1,0 +1,25 @@
+syntax = "proto3";
+package etcdhbase.storage.v1;
+option java_package = "io.etcdhbase.hbase.storage.proto";
+option java_outer_classname = "StorageProtos";
+
+// Independent from the upstream etcd wire schema. Field numbers are persistent contracts.
+message RecordMetadata {
+  optional uint32 format_version = 1;
+  optional int64 create_revision = 2;
+  optional int64 modification_revision = 3;
+  optional int64 version = 4;
+  optional int64 lease_id = 5;
+  oneof state {
+    LiveValueRef live_value = 6;
+    bool tombstone = 7;
+  }
+}
+message LiveValueRef {
+  optional uint32 length = 1;
+}
+message ValuePayload {
+  optional uint32 format_version = 1;
+  optional int64 modification_revision = 2;
+  optional bytes value = 3;
+}
