@@ -14,6 +14,7 @@ import io.etcdhbase.core.scan.BucketCursor;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.core.scan.SortedMergeCursor;
+import io.etcdhbase.core.scan.ExistsExecutor;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -255,6 +256,49 @@ class M1StorageIT {
           }
           assertEquals(0, budget.snapshot().allocatedBytes());
         }
+      }
+    }
+  }
+
+  @Test
+  void metadataExistsAvoidsUnselectedValuesAndFullResultsPinTheSelectedVersion() throws Exception {
+    var limits = new BudgetManager.Limits(2, 32, 1, 1, 1, 65536, 128L << 20);
+    ByteKey first = ByteKey.copyOf(new byte[] {1});
+    ByteKey corrupt = ByteKey.copyOf(new byte[] {2});
+    for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
+      var binding = table(layout);
+      var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+      try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60));
+          var account = budget.admit("public", scope, new BudgetManager.Reservation(4 * 4096L, 4096, 64L << 20, 1L << 20));
+          var scheduler = new ScanScheduler(budget, Duration.ofSeconds(10))) {
+        var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+        await(store.put(live(first, 1, new byte[] {1})));
+        await(store.put(live(first, 2, new byte[] {2})));
+        await(store.put(live(corrupt, 1, new byte[] {9})));
+        await(connection.getTable(binding.table()).delete(new org.apache.hadoop.hbase.client.Delete(binding.codec().encode(corrupt, 1))
+            .addColumns(binding.family(), HBaseRecordStore.VALUE)));
+        assertEquals(1, await(ExistsExecutor.point(store, corrupt, 1, account)));
+        var template = new ScanRequest(0, KeyRange.all(), Optional.empty(), 1, ReadProjection.METADATA, 1, 4096, 256);
+        var source = scheduler.bind(store, account);
+        try (var exists = new ExistsExecutor(source, template, 4, scope)) {
+          assertEquals(1, await(exists.execute()).count());
+        }
+        try (var cursor = new SortedMergeCursor(source, template, 4, account, scope); var page = await(cursor.read(0))) {
+          assertEquals(2, page.count());
+          assertTrue(page.records().stream().noneMatch(StoredRecord::hasValue));
+          assertEquals(0, page.pointReads());
+        }
+        try (var cursor = SortedMergeCursor.values(store, source, template, 4, account, scope); var page = await(cursor.read(1))) {
+          assertEquals(1, page.count());
+          assertTrue(page.more());
+          assertEquals(1, page.pointReads());
+          assertArrayEquals(new byte[] {1}, page.records().getFirst().value().orElseThrow());
+          assertEquals(1, page.records().getFirst().metadata().modificationRevision());
+        }
+        try (var cursor = SortedMergeCursor.values(store, source, template, 4, account, scope)) {
+          assertThrows(java.util.concurrent.ExecutionException.class, () -> await(cursor.read(2)));
+        }
+        assertEquals(0, budget.snapshot().allocatedBytes());
       }
     }
   }

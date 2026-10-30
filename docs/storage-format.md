@@ -50,3 +50,9 @@ RowKey 格式 ID `ordered-zero-escape-v1`、表形态、列族和盐 strategy/ve
 `SortedMergeCursor` 在预留全部桶 head 空间后开始，固定每页一个逻辑记录，不按用户 Limit 增大预读。所有未耗尽桶取得 head/耗尽证据后，以无符号 ByteKey 最小堆选择结果。墓碑不参与计数；More 由额外一条可见结果或所有桶耗尽证明，失败/预算不足不能变成 More=false。普通 Count 是本次返回条数，不额外扫描准确总数。
 
 `RangePage` 持有最终输出的字节 lease，调用方或 RequestScope 关闭后释放；归并结束会释放 head 和物理游标。所有状态由一个有限 drain 循环维护，异步回调只发布一个完成槽，连续墓碑不递归压栈。跨桶重复或乱序报错。当前证明仅限冻结数据，重开不提供跨桶 MVCC 快照。
+
+## J15 投影与存在性
+
+所有归并 head 和 Exists 扫描只选择 `m`。范围存在性遇到首条活记录可结束；返回 0 必须确认所有相关桶耗尽。精确 key 使用一次 METADATA Get，逻辑墓碑为不存在，后端失败原样保持失败。结果不包含 KV，也不引入范围准确总数。
+
+完整返回值在选定 head 后按其 modificationRevision 发起 FULL Get，并核对 key、完整元数据和 value presence；缺失、错版或异常均使整个请求失败，不读取未选中记录的 value。点读取受同一操作/I/O 账本及请求总点访问上限约束，物理完成后才归还许可。RangePage 分别报告扫描 Cost 和应用点读取次数；点读取次数不冒充实际 RPC。M1 的版本绑定仅在冻结数据上验证，生产可见性等待 M2。

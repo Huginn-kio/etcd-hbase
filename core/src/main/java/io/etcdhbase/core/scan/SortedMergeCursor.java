@@ -5,6 +5,8 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.ScanSource;
+import io.etcdhbase.core.storage.ReadProjection;
+import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
@@ -34,6 +36,9 @@ public final class SortedMergeCursor implements AutoCloseable {
   private final AtomicBoolean stopRequested = new AtomicBoolean();
   private final AtomicInteger draining = new AtomicInteger();
   private final AtomicReference<Completion> completion = new AtomicReference<>();
+  private final AtomicReference<ValueCompletion> valueCompletion = new AtomicReference<>();
+  private final RecordStore valueStore;
+  private final long startingPointReads;
   // The drain loop alone mutates merge state; callbacks publish one bounded completion slot.
   private int initializing;
   private int refill = -1;
@@ -41,22 +46,39 @@ public final class SortedMergeCursor implements AutoCloseable {
   private volatile boolean terminal;
   private int limit;
   private ByteKey previous;
+  private Head selected;
   private StoragePage.Cost cost = new StoragePage.Cost(0, 0, 0);
 
   public SortedMergeCursor(ScanSource source, ScanRequest template, int bucketCount,
       BudgetManager.Account account, RequestScope scope) {
+    this(source, template, bucketCount, account, scope, null);
+  }
+
+  public static SortedMergeCursor values(RecordStore store, ScanSource source, ScanRequest template,
+      int bucketCount, BudgetManager.Account account, RequestScope scope) {
+    return new SortedMergeCursor(source, template, bucketCount, account, scope, java.util.Objects.requireNonNull(store, "store"));
+  }
+
+  private SortedMergeCursor(ScanSource source, ScanRequest template, int bucketCount,
+      BudgetManager.Account account, RequestScope scope, RecordStore valueStore) {
     if (bucketCount < 1 || bucketCount > 4096
         || account.reservation().heads() / bucketCount < template.maximumBytes()) {
       throw new IllegalArgumentException("all bucket heads require reserved memory before scanning");
     }
+    if (account.scope() != scope) throw new IllegalArgumentException("query scope must own its budget");
     this.account = account;
     this.scope = scope;
+    this.valueStore = valueStore;
+    startingPointReads = account.pointReads();
+    if (valueStore == null && template.projection() != ReadProjection.METADATA) {
+      throw new IllegalArgumentException("full values require a pinned value reader");
+    }
     heads = new Head[bucketCount];
     exhausted = new boolean[bucketCount];
     List<BucketCursor> opened = new ArrayList<>();
     for (int bucket = 0; bucket < bucketCount; bucket++) {
       opened.add(new BucketCursor(source, new ScanRequest(bucket, template.range(), template.after(),
-          template.revisionUpperBound(), template.projection(), 1, template.maximumBytes(), template.maximumPhysicalRows()), scope));
+          template.revisionUpperBound(), ReadProjection.METADATA, 1, template.maximumBytes(), template.maximumPhysicalRows()), scope));
     }
     buckets = List.copyOf(opened);
     registration = scope.registerScopedCleanup(this);
@@ -88,6 +110,7 @@ public final class SortedMergeCursor implements AutoCloseable {
 
   private boolean step() throws BackendFailure {
     Completion arrived = completion.getAndSet(null);
+    ValueCompletion value = valueCompletion.getAndSet(null);
     if (terminal) {
       if (arrived != null && arrived.page != null) arrived.page.close();
       return false;
@@ -98,6 +121,7 @@ public final class SortedMergeCursor implements AutoCloseable {
       return false;
     }
     if (arrived != null) accept(arrived);
+    if (value != null) acceptValue(value);
     if (waiting) return false;
     if (refill >= 0) {
       int bucket = refill;
@@ -113,14 +137,36 @@ public final class SortedMergeCursor implements AutoCloseable {
     Head head = heap.remove();
     if (previous != null && previous.compareTo(head.record.key()) >= 0) throw new IllegalStateException("duplicate or unordered bucket result");
     if (limit > 0 && output.size() == limit) { finish(true, null); return false; }
-    var lease = account.tryRetain(BudgetManager.Memory.OUTPUT, head.record.retainedBytes()).orElseThrow(SortedMergeCursor::resourceLimit);
+    long bytes = head.record.retainedBytes() + (valueStore == null ? 0 : head.record.metadata().valueLength());
+    var lease = account.tryRetain(BudgetManager.Memory.OUTPUT, bytes).orElseThrow(SortedMergeCursor::resourceLimit);
     outputLeases.add(lease);
-    output.add(head.record);
-    previous = head.record.key();
+    if (valueStore == null) append(head, head.record);
+    else {
+      selected = head;
+      waiting = true;
+      PointRead.get(valueStore, head.record.key(), head.record.metadata().modificationRevision(), ReadProjection.FULL, account)
+          .whenComplete((record, failure) -> { valueCompletion.set(new ValueCompletion(record, failure)); drain(); });
+    }
+    return true;
+  }
+
+  private void acceptValue(ValueCompletion arrived) throws BackendFailure {
+    waiting = false;
+    if (arrived.failure != null) throw unwrap(arrived.failure);
+    StoredRecord record = arrived.record.orElseThrow(() -> new IllegalStateException("selected value version is missing"));
+    if (!record.key().equals(selected.record.key()) || !record.metadata().equals(selected.record.metadata()) || !record.hasValue()) {
+      throw new IllegalStateException("value does not match selected metadata version");
+    }
+    append(selected, record);
+    selected = null;
+  }
+
+  private void append(Head head, StoredRecord record) {
+    output.add(record);
+    previous = record.key();
     heads[head.bucket] = null;
     head.lease.close();
     if (!exhausted[head.bucket]) refill = head.bucket;
-    return true;
   }
 
   private void fetch(int bucket) {
@@ -166,9 +212,11 @@ public final class SortedMergeCursor implements AutoCloseable {
     for (Head head : heads) if (head != null) head.lease.close();
     java.util.Arrays.fill(heads, null);
     heap.clear();
+    selected = null;
+    previous = null;
     RangePage response = null;
     if (failure == null) {
-      try { response = new RangePage(output, outputLeases, more, cost, scope); }
+      try { response = new RangePage(output, outputLeases, more, cost, account.pointReads() - startingPointReads, scope); }
       catch (RuntimeException | Error allocationFailure) { failure = allocationFailure; }
     }
     if (failure != null) for (var lease : outputLeases) lease.close();
@@ -196,4 +244,5 @@ public final class SortedMergeCursor implements AutoCloseable {
   private static BackendFailure resourceLimit() { return new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT); }
   private record Head(int bucket, StoredRecord record, BudgetManager.Lease lease) {}
   private record Completion(int bucket, BucketCursor.Page page, Throwable failure) {}
+  private record ValueCompletion(Optional<StoredRecord> record, Throwable failure) {}
 }

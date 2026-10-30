@@ -11,10 +11,12 @@ from evidence import java_reports, require_unchanged_source
 REQUIRED = {12: {"io.etcdhbase.core.scan.BucketCursorTest",
                  "io.etcdhbase.hbase.storage.HBasePageReaderTest", "io.etcdhbase.hbase.storage.M1StorageIT"},
             13: {"io.etcdhbase.core.scan.BudgetManagerTest", "io.etcdhbase.core.scan.ScanSchedulerTest"},
-            14: {"io.etcdhbase.core.scan.SortedMergeCursorTest"}}
+            14: {"io.etcdhbase.core.scan.SortedMergeCursorTest"},
+            15: {"io.etcdhbase.core.scan.ExistsExecutorTest", "io.etcdhbase.core.scan.PinnedValueReadTest"}}
 CASES = {12: "cursorReopensAfterOnlyConsumedKeysAndCancelsWithoutClosingSharedConnections",
          13: "onePhysicalScannerCanSupplyEveryBucketHeadWithoutClosingTheRequest",
-         14: "globallySortedLimitMoreAndLightCountMatchBothFrozenHistoryLayouts"}
+         14: "globallySortedLimitMoreAndLightCountMatchBothFrozenHistoryLayouts",
+         15: "metadataExistsAvoidsUnselectedValuesAndFullResultsPinTheSelectedVersion"}
 
 
 def collect(root, output, phase):
