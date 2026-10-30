@@ -95,6 +95,11 @@ public final class RowKeyCodec {
     if (prefix.length != salt.profile().saltWidthBytes()) {
       throw new IllegalArgumentException("salt provider returned an invalid prefix width");
     }
+    long bucketNumber = 0;
+    for (byte part : prefix) bucketNumber = (bucketNumber << 8) | Byte.toUnsignedInt(part);
+    if (bucketNumber >= salt.profile().bucketCount()) {
+      throw new IllegalArgumentException("salt provider returned an unknown bucket");
+    }
     return prefix;
   }
 

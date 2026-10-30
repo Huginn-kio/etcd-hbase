@@ -107,15 +107,15 @@ ByteKey 使用无符号逐字节字典序；相同前缀下短数组在前。构
 | `61 00` | `61 00 ff 00 00` |
 | `ff` | `ff 00 00` |
 
-候选物理行格式为 `bucket || formatVersion || recordKind || E(logicalIdentifier) || suffix`。盐置于最前以匹配预分区；formatVersion、类别和后缀由物理适配解释。复合标识逐字段编码并明确边界，不能拼接带歧义的字符串。
+J10 的 KV 专表物理行格式为 `bucket || E(key) || suffix`。盐置于最前以匹配预分区；RowKey 格式版本、形态和盐 profile 绑定在表元数据中，启动/装配时核对，不逐行携带版本或固定 KV 类别。运行中不混存多套编码，格式变化须显式迁移。system 表未来混存记录的类别隔离由所属任务设计，不能提前添加无实际用途的类别字节。复合标识逐字段编码并明确边界，不能拼接带歧义的字符串。
 
 KV 的盐输入使用完整逻辑 key 标识，所有 revision 使用同一桶；两种布局使用相同 KV 盐输入以支持同口径比较。记录类别隔离、逻辑输入版本、算法、桶列表、盐宽与字节编码均进入 profile 指纹。完整输入约定改变时使用新 profile/向量，不静默改变 J05 既有 profile 或替目标 B01 定值。范围规划枚举 profile 的桶，不能用前缀的哈希代替所有命中 key 的桶。
 
 独立 history 候选在 history 表的 key 后附固定宽度大端 revision，正数 revision 的编码顺序与数值顺序一致；latest/native KV 表使用无 revision 后缀的 key。点查只计算相应逻辑记录的一个桶，历史定位限定同 key 的版本范围。物理表绑定决定允许的行形态，解码器不能在两种格式间猜测回退。
 
-每个桶、格式和记录类别形成独立命名空间。逻辑有界范围的物理 start/stop 由同一 codec 转换；逻辑正无穷的物理 stop 是该命名空间的前缀结束位置，不能直接用 HBase 空 stop 扫入下一桶或其他类别。
+KV 专表中每个桶形成独立命名空间。逻辑有界范围的物理 start/stop 由同一 codec 转换；逻辑正无穷的物理 stop 是桶前缀的结束位置，不能直接用 HBase 空 stop 扫入下一桶。只有最后一个全 ff 桶的物理命名空间确实延伸到表尾时允许无穷 stop；表绑定保证该表没有其他类别或格式。
 
-编码长度包括盐、头部、转义膨胀、终止和版本后缀；检查总长后再分配。原始 key 长度合格不表示编码后合格。HBase 2.6.6 的行长限制及保留 timestamp 见 [HConstants](https://github.com/apache/hbase/blob/rel/2.6.6/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java)；J10 必须验证最坏转义膨胀及极值，不能承诺超出底层能力的 key 长度。
+编码长度包括盐、转义膨胀、终止和版本后缀；检查总长后再分配。原始 key 长度合格不表示编码后合格。HBase 2.6.6 的行长限制及保留 timestamp 见 [HConstants](https://github.com/apache/hbase/blob/rel/2.6.6/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java)；J10 必须验证最坏转义膨胀及极值，不能承诺超出底层能力的 key 长度。
 
 这些是新原型表的格式提议，不是已有数据的迁移许可。格式/profile 与表组元数据必须可核对；非空未知格式拒绝读取/写入。正式初始化、升级和重编码仍按 J55/J81 的兼容规则完成。
 
