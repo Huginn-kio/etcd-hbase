@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Negative checks for the new real-scenario evidence gate, independent of Maven execution."""
 import importlib.util
+import io
 import json
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import unittest
@@ -34,7 +36,11 @@ class J11EvidenceTest(unittest.TestCase):
                 stdout.text = ""
             ET.ElementTree(suite).write(target)
             counts = {"fixture": {"tests": len(cases), "failures": 0, "errors": 0, "skipped": 0}}
-            with patch.object(reporter, "require_unchanged_source"), patch.object(reporter, "java_reports", return_value=([target], counts)):
+            with (
+                patch.object(reporter, "require_unchanged_source"),
+                patch.object(reporter, "java_reports", return_value=([target], counts)),
+                redirect_stdout(io.StringIO()),
+            ):
                 reporter.collect(root, output)
             return json.loads((output / "summary.json").read_text())
 
