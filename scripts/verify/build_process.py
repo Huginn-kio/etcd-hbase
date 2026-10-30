@@ -22,38 +22,46 @@ def termination_is_exception():
         signal.signal(signal.SIGTERM, previous)
 
 
-def _signal_group(process, signum):
+def _signal_group(process, signum, deadline):
+    while True:
+        # Exit publication and group signaling are not atomic on Darwin. Neither
+        # a pending poll nor a reaped leader settles the state of the whole group.
+        process.poll()
+        try:
+            os.killpg(process.pid, signum)
+            return
+        except PermissionError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.05, remaining))
+
+
+def _terminate_group(process, deadline):
     try:
-        os.killpg(process.pid, signum)
+        _signal_group(process, signal.SIGTERM, deadline)
+        while True:
+            _signal_group(process, 0, deadline)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+    except ProcessLookupError:
+        return True
     except PermissionError:
-        # Darwin can report EPERM for a group containing only an unreaped zombie.
-        # Reap an exited leader and retry the OS check; a real denial still raises.
-        if process.poll() is None:
-            raise
-        os.killpg(process.pid, signum)
+        # An unresolved graceful phase still requires a real group KILL attempt.
+        return False
 
 
 def stop_group(process, grace=5):
-    try:
-        _signal_group(process, signal.SIGTERM)
-    except ProcessLookupError:
-        process.wait(timeout=5)
-        return
-    deadline = time.monotonic() + grace
-    while True:
-        process.poll()  # Reap the leader, but check the group independently.
+    grace_deadline = time.monotonic() + max(0, grace)
+    cleanup_deadline = grace_deadline + 5
+    if not _terminate_group(process, grace_deadline):
         try:
-            _signal_group(process, 0)
+            _signal_group(process, signal.SIGKILL, cleanup_deadline)
         except ProcessLookupError:
-            break
-        if time.monotonic() >= deadline:
-            try:
-                _signal_group(process, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            break
-        time.sleep(0.05)
-    process.wait(timeout=5)
+            pass
+    process.wait(timeout=min(5, max(0, cleanup_deadline - time.monotonic())))
 
 
 def run_logged(command, log_path, cwd, timeout=1200, environment=None, stderr_path=None, termination_grace=5):
@@ -64,9 +72,9 @@ def run_logged(command, log_path, cwd, timeout=1200, environment=None, stderr_pa
                                    stderr=errors, start_new_session=True)
         try:
             code = process.wait(timeout=timeout)
-            if code:
-                stop_group(process, grace=termination_grace)
-            return code
         except BaseException:
             stop_group(process, grace=termination_grace)
             raise
+        if code:
+            stop_group(process, grace=termination_grace)
+        return code

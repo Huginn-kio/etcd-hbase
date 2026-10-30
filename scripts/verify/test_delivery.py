@@ -185,26 +185,6 @@ class DeliveryTest(unittest.TestCase):
             self.assertTrue(released, "owned exit did not occur in the intended window")
             self.assertEqual(0, process.returncode)
 
-    def test_group_permission_denial_for_a_live_leader_is_preserved(self):
-        process = mock.Mock(pid=43210)
-        process.poll.return_value = None
-        error = PermissionError(errno.EPERM, "fixture group is not signalable")
-        with mock.patch("build_process.os.killpg", side_effect=error):
-            with self.assertRaises(PermissionError) as denied:
-                stop_group(process, grace=0.01)
-        self.assertIs(error, denied.exception)
-        process.wait.assert_not_called()
-
-    def test_group_permission_denial_after_leader_exit_is_preserved(self):
-        process = mock.Mock(pid=43210)
-        process.poll.return_value = 0
-        error = PermissionError(errno.EPERM, "fixture remaining group is not signalable")
-        with mock.patch("build_process.os.killpg", side_effect=error):
-            with self.assertRaises(PermissionError) as denied:
-                stop_group(process, grace=0.01)
-        self.assertIs(error, denied.exception)
-        process.wait.assert_not_called()
-
     def test_outer_cancellation_allows_the_resource_owner_to_finish_cleanup(self):
         pid_path = self.root / "child.pid"
         marker = self.root / "cleanup.finished"
@@ -238,6 +218,183 @@ with termination_is_exception():
                     os.killpg(int(pid_path.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+
+class ProcessGroupTimingTest(unittest.TestCase):
+    """Deterministic exit-publication and clock fixtures, not native errno evidence."""
+    def setUp(self):
+        self.elapsed = 0.0
+        self.enterContext(mock.patch("build_process.time.monotonic", side_effect=lambda: self.elapsed))
+        self.enterContext(mock.patch("build_process.time.sleep", side_effect=self.advance))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+
+    def advance(self, duration):
+        self.assertGreater(duration, 0, "cleanup retried without advancing its bounded clock")
+        self.elapsed += duration
+
+    def test_pending_exit_is_retried_for_each_group_operation(self):
+        for pending_signal in (signal.SIGTERM, 0, signal.SIGKILL):
+            with self.subTest(pending_signal=pending_signal):
+                self.elapsed = 0.0
+                denials = 0
+                pending_observations = []
+                process = mock.Mock(pid=43210)
+                process.wait.return_value = 0
+
+                def poll():
+                    result = None if denials < 3 else 0
+                    if denials:
+                        pending_observations.append(result)
+                    return result
+
+                def signal_group(pgid, signum):
+                    nonlocal denials
+                    self.assertEqual(process.pid, pgid)
+                    if signum == pending_signal:
+                        if denials < 3:
+                            denials += 1
+                            raise PermissionError(errno.EPERM, "fixture exit is not yet waitable")
+                        raise ProcessLookupError(errno.ESRCH, "fixture group has now disappeared")
+
+                process.poll.side_effect = poll
+                with mock.patch("build_process.os.killpg", side_effect=signal_group):
+                    stop_group(process, grace=0.2)
+                self.assertEqual(3, denials)
+                self.assertIn(None, pending_observations)
+                self.assertIn(0, pending_observations)
+                process.wait.assert_called_once()
+                self.assertLessEqual(self.elapsed, 5.2)
+
+    def test_pending_group_probe_leaves_time_for_forced_cleanup(self):
+        process = mock.Mock(pid=43210)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        operations = []
+
+        def signal_group(pgid, signum):
+            self.assertEqual(process.pid, pgid)
+            operations.append((signum, self.elapsed))
+            if signum == 0:
+                raise PermissionError(errno.EPERM, "fixture probe remains inconclusive")
+
+        with mock.patch("build_process.os.killpg", side_effect=signal_group):
+            stop_group(process, grace=0.2)
+        kills = [at for signum, at in operations if signum == signal.SIGKILL]
+        self.assertEqual(1, len(kills), "an inconclusive probe suppressed the real group KILL")
+        self.assertAlmostEqual(0.2, kills[0])
+        self.assertAlmostEqual(5.0, process.wait.call_args.kwargs["timeout"])
+
+    def test_cleanup_signals_and_final_wait_share_one_budget(self):
+        process = mock.Mock(pid=43210)
+        process.poll.return_value = None
+        denials = {signal.SIGTERM: 0, signal.SIGKILL: 0}
+        operations = []
+
+        def signal_group(pgid, signum):
+            self.assertEqual(process.pid, pgid)
+            operations.append((signum, self.elapsed))
+            if signum in denials and denials[signum] < 2:
+                denials[signum] += 1
+                raise PermissionError(errno.EPERM, "fixture transient signal refusal")
+
+        def wait(timeout):
+            self.elapsed += timeout
+            raise subprocess.TimeoutExpired("fixture leader", timeout)
+
+        process.wait.side_effect = wait
+        with mock.patch("build_process.os.killpg", side_effect=signal_group):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                stop_group(process, grace=0.2)
+        self.assertAlmostEqual(0.2, next(at for sig, at in operations if sig == signal.SIGKILL))
+        self.assertAlmostEqual(4.9, process.wait.call_args.kwargs["timeout"])
+        self.assertAlmostEqual(5.2, self.elapsed, "signal recovery restarted the cleanup budget")
+
+    def test_final_wait_keeps_its_five_second_cap_when_group_disappears_early(self):
+        process = mock.Mock(pid=43210)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with mock.patch("build_process.os.killpg", side_effect=ProcessLookupError(errno.ESRCH, "fixture gone")):
+            stop_group(process, grace=45)
+        process.wait.assert_called_once_with(timeout=5)
+
+    def test_final_wait_has_no_new_budget_after_the_force_deadline(self):
+        process = mock.Mock(pid=43210)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+
+        def signal_group(pgid, signum):
+            self.assertEqual(process.pid, pgid)
+            if signum == signal.SIGKILL:
+                self.elapsed = 5.3  # Model an OS operation returning after the deadline.
+
+        with mock.patch("build_process.os.killpg", side_effect=signal_group):
+            stop_group(process, grace=0.2)
+        process.wait.assert_called_once_with(timeout=0)
+
+    def test_group_permission_denial_is_preserved_for_live_and_exited_leaders(self):
+        for exit_code in (None, 0):
+            with self.subTest(exit_code=exit_code):
+                self.elapsed = 0.0
+                process = mock.Mock(pid=43210)
+                process.poll.return_value = exit_code
+                process.wait.side_effect = subprocess.TimeoutExpired("fixture leader", 0) if exit_code is None else None
+                process.wait.return_value = exit_code
+                error = PermissionError(errno.EPERM, "fixture group remains unsignalable")
+                operations = []
+
+                def deny(pgid, signum):
+                    self.assertEqual(process.pid, pgid)
+                    operations.append((signum, self.elapsed))
+                    raise error
+
+                with mock.patch("build_process.os.killpg", side_effect=deny):
+                    with self.assertRaises(PermissionError) as denied:
+                        stop_group(process, grace=0.2)
+                self.assertIs(error, denied.exception)
+                self.assertAlmostEqual(0.2, next(at for sig, at in operations if sig == signal.SIGKILL))
+                self.assertAlmostEqual(5.2, self.elapsed)
+                process.wait.assert_not_called()
+
+    def test_nonzero_exit_does_not_restart_failed_cleanup(self):
+        process = mock.Mock()
+        process.wait.return_value = 7
+        error = PermissionError(errno.EPERM, "fixture cleanup was refused")
+        with mock.patch("build_process.subprocess.Popen", return_value=process):
+            with mock.patch("build_process.stop_group", side_effect=error) as cleanup:
+                with self.assertRaises(PermissionError) as denied:
+                    run_logged(["fixture"], self.root / "build.log", ROOT)
+        self.assertIs(error, denied.exception)
+        cleanup.assert_called_once_with(process, grace=5)
+
+    def test_recovered_transition_preserves_the_original_timeout(self):
+        process = mock.Mock(pid=43210)
+        original = subprocess.TimeoutExpired("fixture build", 1)
+        process.wait.side_effect = [original, 0]
+        process.poll.side_effect = [None, None, None, 0]
+        refused = PermissionError(errno.EPERM, "fixture exit publication is pending")
+        gone = ProcessLookupError(errno.ESRCH, "fixture group disappeared")
+        with mock.patch("build_process.subprocess.Popen", return_value=process):
+            with mock.patch("build_process.os.killpg", side_effect=[refused, refused, refused, gone]):
+                with self.assertRaises(subprocess.TimeoutExpired) as expired:
+                    run_logged(["fixture"], self.root / "build.log", ROOT, timeout=1, termination_grace=0.2)
+        self.assertIs(original, expired.exception)
+        self.assertAlmostEqual(0.15, self.elapsed)
+
+    def test_persistent_cleanup_denial_keeps_the_timeout_as_context(self):
+        process = mock.Mock(pid=43210)
+        original = subprocess.TimeoutExpired("fixture build", 1)
+        process.wait.side_effect = original
+        process.poll.return_value = None
+        error = PermissionError(errno.EPERM, "fixture permission remains denied")
+        with mock.patch("build_process.subprocess.Popen", return_value=process):
+            with mock.patch("build_process.os.killpg", side_effect=error):
+                with self.assertRaises(PermissionError) as denied:
+                    run_logged(["fixture"], self.root / "build.log", ROOT, timeout=1, termination_grace=0.2)
+        self.assertIs(error, denied.exception)
+        self.assertIs(original, denied.exception.__context__)
+        self.assertAlmostEqual(5.2, self.elapsed)
 
 
 class RuntimeImageLifecycleTest(unittest.TestCase):
