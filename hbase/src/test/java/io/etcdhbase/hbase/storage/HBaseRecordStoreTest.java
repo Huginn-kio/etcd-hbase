@@ -3,14 +3,20 @@ package io.etcdhbase.hbase.storage;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 import com.google.protobuf.CodedOutputStream;
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
@@ -20,6 +26,7 @@ import io.etcdhbase.hbase.codec.StorageMessages;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
+import io.etcdhbase.spi.salt.SaltStrategy;
 import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Proxy;
 import java.util.List;
@@ -34,7 +41,9 @@ import org.apache.hadoop.hbase.client.AsyncTable;
 import org.apache.hadoop.hbase.client.AsyncTableBuilder;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Result;
+import org.apache.hadoop.hbase.client.Scan;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 class HBaseRecordStoreTest {
   @Test
@@ -115,6 +124,64 @@ class HBaseRecordStoreTest {
     }
   }
 
+  @Test
+  void historyRejectsAnOversizedRawKeyBeforeCallingTheSaltProvider() {
+    assertHistoryKeyRejectedBeforeSalting(new byte[20 * 1024 * 1024]);
+  }
+
+  @Test
+  void historyRejectsEscapeExpansionBeforeCallingTheSaltProvider() {
+    assertHistoryKeyRejectedBeforeSalting(new byte[20_000]);
+  }
+
+  @Test
+  void historyKeepsTheEncodedUpperRevisionAndReversedSameKeyBounds() {
+    var binding = new StorageTableBinding(TableName.valueOf("synthetic"), new byte[] {'d'},
+        StorageTableBinding.Layout.HISTORY, new HashSaltStrategy());
+    ByteKey key = ByteKey.copyOf(new byte[] {0x61, 0});
+    var record = StoredRecord.live(key, metadata(1, StorageMetadata.State.LIVE), new byte[] {7});
+    byte[] rowKey = binding.codec().encode(key, 1);
+    var row = Result.create(List.of(
+        new KeyValue(rowKey, binding.family(), HBaseRecordStore.METADATA, 0,
+            StorageMessages.metadata(record.metadata())),
+        new KeyValue(rowKey, binding.family(), HBaseRecordStore.VALUE, 0,
+            StorageMessages.value(record))));
+    try (var scope = RequestScope.withoutDeadline()) {
+      var store = decoder(binding, scope);
+      var table = store.table();
+      doReturn(CompletableFuture.completedFuture(List.of(row))).when(table).scanAll(any(Scan.class));
+      var result = store.get(key, 3, ReadProjection.FULL).join().orElseThrow();
+      assertEquals(key, result.key());
+      assertEquals(record.metadata(), result.metadata());
+      assertArrayEquals(new byte[] {7}, result.value().orElseThrow());
+      var scan = ArgumentCaptor.forClass(Scan.class);
+      verify(table).scanAll(scan.capture());
+      assertTrue(scan.getValue().isReversed());
+      assertArrayEquals(binding.codec().encode(key, 3), scan.getValue().getStartRow());
+      assertArrayEquals(binding.codec().physicalRange(binding.codec().bucket(key),
+          KeyRange.point(key)).lowerInclusive().orElseThrow().bytes(),
+          scan.getValue().getStopRow());
+    }
+  }
+
+  private static void assertHistoryKeyRejectedBeforeSalting(byte[] keyBytes) {
+    var salt = mock(SaltStrategy.class);
+    doReturn(new HashSaltStrategy().profile()).when(salt).profile();
+    doThrow(new AssertionError("oversized history key reached the salt provider"))
+        .when(salt).salt(any(byte[].class));
+    var binding = new StorageTableBinding(TableName.valueOf("synthetic"), new byte[] {'d'},
+        StorageTableBinding.Layout.HISTORY, salt);
+    try (var scope = RequestScope.withoutDeadline()) {
+      var store = decoder(binding, scope);
+      var key = ByteKey.copyOf(keyBytes);
+      var failure = assertThrows(CompletionException.class,
+          () -> store.get(key, Long.MAX_VALUE, ReadProjection.METADATA).join());
+      var backend = assertInstanceOf(BackendFailure.class, failure.getCause());
+      assertInstanceOf(IllegalArgumentException.class, backend.getCause());
+      verify(salt, never()).salt(any(byte[].class));
+    }
+  }
+
   private static StorageTableBinding binding() {
     return new StorageTableBinding(TableName.valueOf("synthetic"), new byte[] {'d'},
         StorageTableBinding.Layout.CURRENT, new HashSaltStrategy());
@@ -162,6 +229,9 @@ class HBaseRecordStoreTest {
     doReturn(CompletableFuture.completedFuture(connection)).when(factory).connectionFor(identity);
     doReturn(admin).when(connection).getAdmin();
     doReturn(CompletableFuture.completedFuture(binding.descriptor())).when(admin).getDescriptor(binding.table());
+    AsyncTableBuilder<?> builder = mock(AsyncTableBuilder.class, RETURNS_SELF);
+    doReturn(builder).when(connection).getTableBuilder(binding.table());
+    doReturn(mock(AsyncTable.class)).when(builder).build();
     return HBaseRecordStore.open(factory, identity, binding, scope, Runnable::run).join();
   }
 

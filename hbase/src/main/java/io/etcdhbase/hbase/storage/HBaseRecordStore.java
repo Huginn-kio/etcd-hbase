@@ -82,8 +82,9 @@ public final class HBaseRecordStore implements RecordStore {
 
   private CompletableFuture<Optional<StoredRecord>> getHistory(ByteKey key, long upper, ReadProjection projection) {
     return execute(() -> {
+      byte[] startRow = binding.codec().encode(key, upper);
       KeyRange physical = binding.codec().physicalRange(binding.codec().bucket(key), KeyRange.point(key));
-      var scan = new Scan().withStartRow(binding.codec().encode(key, upper), true)
+      var scan = new Scan().withStartRow(startRow, true)
           .withStopRow(physical.lowerInclusive().orElseThrow().bytes(), false).setReversed(true)
           .setLimit(1).setCaching(1).setMaxResultSize(StorageMessages.MAX_VALUE_BYTES + 8192L)
           .addColumn(binding.family(), METADATA);
