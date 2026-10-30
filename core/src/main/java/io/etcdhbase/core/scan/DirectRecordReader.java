@@ -39,9 +39,10 @@ public final class DirectRecordReader implements RecordReader {
     }
     var owner = new CompletableFuture<PointResult>();
     var response = owner.copy();
-    response.whenComplete((ignored, failure) -> {
-      if (response.isCancelled()) owner.thenAccept(PointResult::close);
-    });
+    owner.thenAccept(actual -> response.whenComplete((delivered, failure) -> {
+      // Cancellation, timeout or a caller-supplied fallback may win before the real result arrives.
+      if (actual != delivered) actual.close();
+    }));
     CompletableFuture<Optional<StoredRecord>> operation;
     try { operation = PointRead.get(store, key, upper, projection, account); }
     catch (Error fatal) {
