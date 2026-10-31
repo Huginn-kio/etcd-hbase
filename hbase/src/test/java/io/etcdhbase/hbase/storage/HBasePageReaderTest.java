@@ -10,6 +10,7 @@ import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 
 import io.etcdhbase.core.bytes.ByteKey;
@@ -29,6 +30,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.AsyncTable;
@@ -37,6 +39,8 @@ import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.metrics.ScanMetrics;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class HBasePageReaderTest {
   private final HBaseRecordStore store = mock(HBaseRecordStore.class);
@@ -156,6 +160,100 @@ class HBasePageReaderTest {
       }
       assertThrows(CompletionException.class, result::join);
       verify(scanner).close();
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void scopeWaitsForALateScannerAndCountsItsCloseFailure(boolean closeFails) throws Exception {
+    var creationEntered = new CountDownLatch(1);
+    var creationReleased = new CountDownLatch(1);
+    var cancellationEntered = new CountDownLatch(1);
+    var closeEntered = new CountDownLatch(1);
+    var closeReleased = new CountDownLatch(1);
+    doReturn(table).when(store).table();
+    doAnswer(invocation -> {
+      creationEntered.countDown();
+      assertTrue(creationReleased.await(10, TimeUnit.SECONDS));
+      return scanner;
+    }).when(table).getScanner(any(Scan.class));
+    doAnswer(invocation -> {
+      closeEntered.countDown();
+      assertTrue(closeReleased.await(10, TimeUnit.SECONDS));
+      if (closeFails) throw new IllegalStateException("synthetic late close failure");
+      return null;
+    }).when(scanner).close();
+    var tasks = new ArrayDeque<Runnable>();
+    try (var scope = RequestScope.withoutDeadline()) {
+      var result = new HBasePageReader(store, binding, scope, tasks::add)
+          .read(request(KeyRange.all(), Optional.empty()));
+      var running = CompletableFuture.runAsync(tasks.remove());
+      assertTrue(creationEntered.await(10, TimeUnit.SECONDS));
+      var cancelling = CompletableFuture.runAsync(() -> scope.cancelAsync(cleanup -> {
+        cancellationEntered.countDown();
+        cleanup.run();
+      }));
+      try {
+        assertTrue(cancellationEntered.await(10, TimeUnit.SECONDS));
+        assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone(), "scanner creation is still active");
+        assertFalse(result.isDone());
+        creationReleased.countDown();
+        assertTrue(closeEntered.await(10, TimeUnit.SECONDS));
+        assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone(), "late scanner close is still active");
+        assertFalse(result.isDone());
+      } finally {
+        creationReleased.countDown();
+        closeReleased.countDown();
+        cancelling.get(10, TimeUnit.SECONDS);
+        running.get(10, TimeUnit.SECONDS);
+      }
+      assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+      assertEquals(closeFails ? 1 : 0, scope.cleanupFailureCount());
+      var failure = assertThrows(CompletionException.class, result::join);
+      assertEquals(closeFails ? BackendFailure.Category.UNKNOWN : BackendFailure.Category.CANCELLED,
+          ((BackendFailure) failure.getCause()).category());
+      verify(scanner).close();
+    }
+  }
+
+  @Test
+  void aDeadlineReachedDuringCloseRejectsThePageAfterActualCleanup() {
+    var expired = new AtomicBoolean();
+    try (var scope = spy(RequestScope.withoutDeadline())) {
+      doAnswer(invocation -> expired.get()).when(scope).isDeadlineExceeded();
+      doReturn(table).when(store).table();
+      doReturn(scanner).when(table).getScanner(any(Scan.class));
+      doReturn(new ScanMetrics()).when(scanner).getScanMetrics();
+      doAnswer(invocation -> {
+        expired.set(true);
+        return null;
+      }).when(scanner).close();
+      var result = new HBasePageReader(store, binding, scope, Runnable::run)
+          .read(request(KeyRange.all(), Optional.empty()));
+      var failure = assertThrows(CompletionException.class, result::join);
+      assertEquals(BackendFailure.Category.TIMEOUT, ((BackendFailure) failure.getCause()).category());
+      assertTrue(expired.get());
+      assertFalse(scope.isClosed(), "deadline does not require a separate cancellation thread");
+      verify(scanner).close();
+    }
+  }
+
+  @Test
+  void cancellationDuringFailedScannerCreationStillCompletesCleanup() {
+    try (var scope = RequestScope.withoutDeadline()) {
+      doReturn(table).when(store).table();
+      doAnswer(invocation -> {
+        scope.cancel();
+        assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+        throw new IllegalStateException("synthetic scanner creation failure");
+      }).when(table).getScanner(any(Scan.class));
+      var result = new HBasePageReader(store, binding, scope, Runnable::run)
+          .read(request(KeyRange.all(), Optional.empty()));
+      var failure = assertThrows(CompletionException.class, result::join);
+      assertEquals(BackendFailure.Category.UNKNOWN, ((BackendFailure) failure.getCause()).category());
+      assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+      assertEquals(0, scope.cleanupFailureCount());
+      verify(scanner, never()).close();
     }
   }
 }

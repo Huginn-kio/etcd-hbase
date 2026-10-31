@@ -5,7 +5,14 @@ import java.util.Objects;
 import java.util.Optional;
 
 public record BatchWriteResult(int index, State state, Optional<BackendFailure> failure) {
-  public enum State { SUCCEEDED, FAILED, UNKNOWN }
+  public enum State {
+    /** The physical write was confirmed, not a global transaction commit. */
+    SUCCEEDED,
+    /** No backend call started, or the write was definitively rejected. */
+    FAILED,
+    /** A client invocation started, but its write outcome could not be confirmed. */
+    UNKNOWN
+  }
 
   public BatchWriteResult {
     Objects.requireNonNull(state, "state");

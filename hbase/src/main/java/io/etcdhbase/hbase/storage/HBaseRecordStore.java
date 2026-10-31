@@ -24,6 +24,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
@@ -44,14 +45,14 @@ public final class HBaseRecordStore implements RecordStore {
   private final AsyncConnection connection;
   private final StorageTableBinding binding;
   private final RequestScope scope;
-  private final Executor scanWorker;
+  private final Executor worker;
 
   private HBaseRecordStore(AsyncConnection connection, StorageTableBinding binding,
-      RequestScope scope, Executor scanWorker) {
+      RequestScope scope, Executor worker) {
     this.connection = connection;
     this.binding = binding;
     this.scope = scope;
-    this.scanWorker = scanWorker;
+    this.worker = worker;
   }
 
   public static CompletableFuture<HBaseRecordStore> open(HBaseConnectionFactory factory,
@@ -73,7 +74,7 @@ public final class HBaseRecordStore implements RecordStore {
         var get = new Get(binding.codec().encode(key, 1)).setTimeRange(0, upper)
             .addColumn(binding.family(), METADATA);
         if (projection == ReadProjection.FULL) get.addColumn(binding.family(), VALUE);
-        return table().get(get).thenApply(row -> row.isEmpty() ? Optional.empty() : Optional.of(decode(row, projection)));
+        return table().get(get).thenCompose(row -> decodeAsync(row, projection));
       } catch (java.io.IOException failure) {
         return CompletableFuture.failedFuture(failure);
       }
@@ -89,21 +90,27 @@ public final class HBaseRecordStore implements RecordStore {
           .setLimit(1).setCaching(1).setMaxResultSize(StorageMessages.MAX_VALUE_BYTES + 8192L)
           .addColumn(binding.family(), METADATA);
       if (projection == ReadProjection.FULL) scan.addColumn(binding.family(), VALUE);
-      return table().scanAll(scan).thenApply(rows -> rows.isEmpty() ? Optional.empty() : Optional.of(decode(rows.getFirst(), projection)));
+      return table().scanAll(scan).thenCompose(rows ->
+          decodeAsync(rows.isEmpty() ? Result.EMPTY_RESULT : rows.getFirst(), projection));
     });
+  }
+
+  private CompletableFuture<Optional<StoredRecord>> decodeAsync(Result row, ReadProjection projection) {
+    try {
+      checkActive();
+      if (row.isEmpty()) return CompletableFuture.completedFuture(Optional.empty());
+      return CompletableFuture.supplyAsync(() -> {
+        checkActive();
+        return Optional.of(decode(row, projection));
+      }, worker);
+    } catch (RejectedExecutionException rejected) {
+      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT, rejected));
+    }
   }
 
   @Override
   public CompletableFuture<Void> put(StoredRecord record) {
-    return execute(() -> {
-      Put put = mutation(record);
-      if (binding.layout() != StorageTableBinding.Layout.HISTORY) return table().put(put);
-      var condition = CheckAndMutate.newBuilder(put.getRow()).ifNotExists(binding.family(), METADATA).build(put);
-      return table().checkAndMutate(condition).thenApply(result -> {
-        if (!result.isSuccess()) throw new ImmutableHistoryConflict();
-        return null;
-      });
-    });
+    return new WriteAttempt().write(record);
   }
 
   @Override
@@ -133,23 +140,48 @@ public final class HBaseRecordStore implements RecordStore {
     List<CompletableFuture<BatchWriteResult>> pending = new ArrayList<>(snapshot.size());
     for (int index = 0; index < snapshot.size(); index++) {
       int inputIndex = index;
-      pending.add(put(snapshot.get(index)).handle((ignored, failure) -> outcome(inputIndex, failure)));
+      var attempt = new WriteAttempt();
+      pending.add(attempt.write(snapshot.get(index))
+          .handle((ignored, failure) -> attempt.outcome(inputIndex, failure)));
     }
     return CompletableFuture.allOf(pending.toArray(CompletableFuture[]::new))
         .thenApply(ignored -> pending.stream().map(CompletableFuture::join).toList());
   }
 
-  private static BatchWriteResult outcome(int index, Throwable failure) {
-    if (failure == null) return new BatchWriteResult(index, BatchWriteResult.State.SUCCEEDED, Optional.empty());
-    BackendFailure classified = HBaseFailures.classify(failure);
-    if (classified.getCause() instanceof ImmutableHistoryConflict) {
-      return new BatchWriteResult(index, BatchWriteResult.State.FAILED, Optional.of(classified));
+  /** Owns one client invocation and the certainty of its batch outcome. */
+  private final class WriteAttempt {
+    private volatile boolean backendInvoked;
+
+    private CompletableFuture<Void> write(StoredRecord record) {
+      return execute(() -> {
+        Put put = mutation(record);
+        AsyncTable<?> requestTable = table();
+        if (binding.layout() != StorageTableBinding.Layout.HISTORY) {
+          backendInvoked = true;
+          return requestTable.put(put);
+        }
+        var condition = CheckAndMutate.newBuilder(put.getRow())
+            .ifNotExists(binding.family(), METADATA).build(put);
+        backendInvoked = true;
+        return requestTable.checkAndMutate(condition).thenApply(result -> {
+          if (!result.isSuccess()) throw new ImmutableHistoryConflict();
+          return null;
+        });
+      });
     }
-    var state = switch (classified.category()) {
-      case TIMEOUT, CANCELLED, UNAVAILABLE, UNKNOWN -> BatchWriteResult.State.UNKNOWN;
-      default -> BatchWriteResult.State.FAILED;
-    };
-    return new BatchWriteResult(index, state, Optional.of(classified));
+
+    private BatchWriteResult outcome(int index, Throwable failure) {
+      if (failure == null) return new BatchWriteResult(index, BatchWriteResult.State.SUCCEEDED, Optional.empty());
+      BackendFailure classified = HBaseFailures.classify(failure);
+      if (!backendInvoked || classified.getCause() instanceof ImmutableHistoryConflict) {
+        return new BatchWriteResult(index, BatchWriteResult.State.FAILED, Optional.of(classified));
+      }
+      var state = switch (classified.category()) {
+        case TIMEOUT, CANCELLED, UNAVAILABLE, UNKNOWN -> BatchWriteResult.State.UNKNOWN;
+        default -> BatchWriteResult.State.FAILED;
+      };
+      return new BatchWriteResult(index, state, Optional.of(classified));
+    }
   }
 
   private static final class ImmutableHistoryConflict extends IllegalStateException {
@@ -162,7 +194,7 @@ public final class HBaseRecordStore implements RecordStore {
 
   @Override
   public CompletableFuture<StoragePage> scan(ScanRequest scan) {
-    return new HBasePageReader(this, binding, scope, scanWorker).read(scan);
+    return new HBasePageReader(this, binding, scope, worker).read(scan);
   }
 
   AsyncTable<?> table() {
@@ -179,8 +211,11 @@ public final class HBaseRecordStore implements RecordStore {
     StorageMessages.requireMetadataLength(metadataCell.getValueLength());
     byte[] metadataBytes = CellUtil.cloneValue(metadataCell);
     StorageMetadata metadata = StorageMessages.decodeMetadata(metadataBytes);
-    long physicalRevision = decoded.revision().orElseGet(() -> RevisionTimestamp.revision(metadataCell.getTimestamp()));
-    if (physicalRevision != metadata.modificationRevision()) throw new IllegalArgumentException("row/metadata revision mismatch");
+    long physicalRevision = RevisionTimestamp.revision(metadataCell.getTimestamp());
+    if (physicalRevision != metadata.modificationRevision()
+        || decoded.revision().isPresent() && decoded.revision().getAsLong() != physicalRevision) {
+      throw new IllegalArgumentException("row/metadata revision mismatch");
+    }
     if (projection == ReadProjection.METADATA || metadata.state() == StorageMetadata.State.TOMBSTONE) {
       return StoredRecord.metadataOnly(decoded.key(), metadata);
     }
@@ -203,21 +238,24 @@ public final class HBaseRecordStore implements RecordStore {
   }
 
   private <T> CompletableFuture<T> execute(Supplier<CompletableFuture<T>> operation) {
-    if (scope.isDeadlineExceeded()) return CompletableFuture.failedFuture(HBaseFailures.classify(new TimeoutException()));
-    if (scope.isClosed()) return CompletableFuture.failedFuture(HBaseFailures.classify(new CancellationException()));
     CompletableFuture<T> backend;
     try {
+      checkActive();
       backend = operation.get();
     } catch (RuntimeException failure) {
       return CompletableFuture.failedFuture(HBaseFailures.classify(failure));
     }
-    // Authority ends at the bounded backend callback, not when a dependent future is cancelled.
-    // This preserves physical-operation accounting for writes whose outcome may be unknown.
+    // Completion follows backend work and queued decoding, not cancellation of a dependent
+    // future. Writes accepted by HBase may still have an unknown outcome.
     return backend.handle((value, failure) -> {
       if (failure != null) throw new CompletionException(HBaseFailures.classify(failure));
-      if (scope.isDeadlineExceeded()) throw new CompletionException(HBaseFailures.classify(new TimeoutException()));
-      if (scope.isClosed()) throw new CompletionException(HBaseFailures.classify(new CancellationException()));
+      checkActive();
       return value;
     }).copy();
+  }
+
+  private void checkActive() {
+    if (scope.isDeadlineExceeded()) throw new CompletionException(HBaseFailures.classify(new TimeoutException()));
+    if (scope.isClosed()) throw new CompletionException(HBaseFailures.classify(new CancellationException()));
   }
 }

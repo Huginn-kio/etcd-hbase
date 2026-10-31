@@ -142,7 +142,13 @@ public final class RequestScope implements AutoCloseable {
 
   /** Transfers one resource into a releasable owner; finished pages leave no retained registration. */
   public ScopedCleanup registerScopedCleanup(AutoCloseable resource) {
-    var registration = new ScopedCleanup(Objects.requireNonNull(resource, "resource"));
+    return registerScopedCleanup(resource, CompletableFuture.completedFuture(null));
+  }
+
+  /** The resource initiates cleanup; actualCompletion must settle after all physical cleanup ends. */
+  public ScopedCleanup registerScopedCleanup(AutoCloseable resource, CompletionStage<Void> actualCompletion) {
+    var registration = new ScopedCleanup(Objects.requireNonNull(resource, "resource"),
+        Objects.requireNonNull(actualCompletion, "actualCompletion"));
     registerCleanup(registration);
     return registration;
   }
@@ -155,11 +161,13 @@ public final class RequestScope implements AutoCloseable {
 
   public final class ScopedCleanup implements AutoCloseable {
     private final AutoCloseable resource;
+    private final CompletionStage<Void> actualCompletion;
     private final AtomicBoolean closeStarted = new AtomicBoolean();
     private final CompletableFuture<Void> closeCompletion = new CompletableFuture<>();
 
-    private ScopedCleanup(AutoCloseable resource) {
+    private ScopedCleanup(AutoCloseable resource, CompletionStage<Void> actualCompletion) {
       this.resource = resource;
+      this.actualCompletion = actualCompletion;
     }
 
     @Override
@@ -172,15 +180,21 @@ public final class RequestScope implements AutoCloseable {
         failure = problem;
         throw problem;
       } finally {
-        synchronized (lock) {
-          cleanupOrder.remove(this);
-          registrations.remove(this);
-        }
-        // A duplicate close does not wait, including when this resource re-enters its scope.
-        // Publish actual completion outside the state lock so scope callbacks may re-enter.
-        if (failure == null) closeCompletion.complete(null);
-        else closeCompletion.completeExceptionally(failure);
+        Throwable synchronousFailure = failure;
+        actualCompletion.whenComplete((ignored, completionFailure) ->
+            completeClose(synchronousFailure == null ? completionFailure : synchronousFailure));
       }
+    }
+
+    private void completeClose(Throwable failure) {
+      synchronized (lock) {
+        cleanupOrder.remove(this);
+        registrations.remove(this);
+      }
+      // Duplicate closes never wait, including reentrant scope cleanup. Only the physical
+      // completion detaches this registration, and callbacks run outside the state lock.
+      if (failure == null) closeCompletion.complete(null);
+      else closeCompletion.completeExceptionally(failure);
     }
   }
 

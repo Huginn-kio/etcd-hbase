@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -40,7 +41,7 @@ final class HBasePageReader {
 
   CompletableFuture<StoragePage> read(ScanRequest request) {
     var task = new PageTask(request);
-    task.registration = scope.registerScopedCleanup(task);
+    task.registration = scope.registerScopedCleanup(task, task.cleanupComplete);
     try {
       worker.execute(task);
     } catch (RejectedExecutionException rejected) {
@@ -58,7 +59,10 @@ final class HBasePageReader {
     private boolean started;
     private boolean cancelled;
     private boolean completing;
-    private final CompletableFuture<Void> cleanupComplete = new CompletableFuture<>();
+    private final CompletableFuture<Void> ownedScannerCloseComplete = new CompletableFuture<>();
+    private final CompletableFuture<Void> executionComplete = new CompletableFuture<>();
+    private final CompletableFuture<Void> cleanupComplete =
+        CompletableFuture.allOf(ownedScannerCloseComplete, executionComplete);
 
     PageTask(ScanRequest request) { this.request = request; }
 
@@ -76,10 +80,12 @@ final class HBasePageReader {
         if (physical.isEmpty()) page = new StoragePage(List.of(), true, new StoragePage.Cost(0, 0, 0));
         else {
           ResultScanner opened = store.table().getScanner(scan(physical));
+          boolean closeLateScanner;
           synchronized (this) {
-            if (cancelled) opened.close();
-            else scanner = opened;
+            closeLateScanner = cancelled;
+            if (!closeLateScanner) scanner = opened;
           }
+          if (closeLateScanner) closeLateScanner(opened);
           checkActive();
           page = collect(opened);
         }
@@ -90,6 +96,15 @@ final class HBasePageReader {
         throw fatal;
       } finally {
         finish(page, failure);
+      }
+    }
+
+    private void closeLateScanner(ResultScanner opened) {
+      try {
+        opened.close();
+      } catch (RuntimeException | Error failure) {
+        executionComplete.completeExceptionally(failure);
+        throw failure;
       }
     }
 
@@ -185,12 +200,17 @@ final class HBasePageReader {
         else if (failure != fatal) failure.addSuppressed(fatal);
       }
       Throwable operationFailure = failure;
+      executionComplete.complete(null);
       // A scope may already be closing the scanner on another thread. Completion follows the
       // actual close, so a scheduler cannot release its physical permit while close still runs.
       cleanupComplete.whenComplete((ignored, cleanupFailure) -> {
+        if (cleanupFailure instanceof CompletionException wrapped && wrapped.getCause() != null) {
+          cleanupFailure = wrapped.getCause();
+        }
         Throwable terminal = operationFailure;
         if (terminal == null) terminal = cleanupFailure;
         else if (cleanupFailure != null && terminal != cleanupFailure) terminal.addSuppressed(cleanupFailure);
+        if (terminal == null && scope.isDeadlineExceeded()) terminal = new TimeoutException();
         if (terminal == null && scope.isClosed()) terminal = new CancellationException();
         if (terminal == null) outcome.complete(page);
         else outcome.completeExceptionally(HBaseFailures.classify(terminal));
@@ -210,12 +230,15 @@ final class HBasePageReader {
       }
       try {
         if (owned != null) owned.close();
-        cleanupComplete.complete(null);
+        ownedScannerCloseComplete.complete(null);
       } catch (RuntimeException | Error failure) {
-        cleanupComplete.completeExceptionally(failure);
+        ownedScannerCloseComplete.completeExceptionally(failure);
         throw failure;
       }
-      if (beforeStart) outcome.completeExceptionally(HBaseFailures.classify(new CancellationException()));
+      if (beforeStart) {
+        executionComplete.complete(null);
+        outcome.completeExceptionally(HBaseFailures.classify(new CancellationException()));
+      }
     }
   }
 

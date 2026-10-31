@@ -148,6 +148,59 @@ class ScopedCleanupTest {
     assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
   }
 
+  @Test
+  void aSeparatePhysicalCompletionRetainsItsRegistrationUntilCleanupReallyEnds() throws Exception {
+    var closed = new AtomicInteger();
+    var physicalCompletion = new CompletableFuture<Void>();
+    try (var scope = RequestScope.withoutDeadline()) {
+      var registration = scope.registerScopedCleanup(closed::incrementAndGet, physicalCompletion);
+      registration.close();
+      registration.close();
+      assertEquals(1, closed.get());
+      assertEquals(1, scope.registeredResourceCount());
+      scope.cancel();
+      assertFalse(physicalCompletion.isCancelled());
+      assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+      physicalCompletion.complete(null);
+      assertEquals(0, scope.registeredResourceCount());
+      assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+      assertEquals(0, scope.cleanupFailureCount());
+    }
+  }
+
+  @Test
+  void aDeferredPhysicalFailureIsCountedOnce() throws Exception {
+    var physicalCompletion = new CompletableFuture<Void>();
+    try (var scope = RequestScope.withoutDeadline()) {
+      var registration = scope.registerScopedCleanup(() -> {}, physicalCompletion);
+      scope.cancel();
+      registration.close();
+      assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+      assertEquals(0, scope.cleanupFailureCount());
+      physicalCompletion.completeExceptionally(new IllegalStateException("synthetic deferred close failure"));
+      registration.close();
+      assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+      assertEquals(1, scope.cleanupFailureCount());
+      assertEquals(0, scope.registeredResourceCount());
+    }
+  }
+
+  @Test
+  void lateDeferredCleanupStillJoinsTheClosingBatch() {
+    var physicalCompletion = new CompletableFuture<Void>();
+    var pendingBatch = new AtomicReference<Runnable>();
+    var closed = new AtomicInteger();
+    var scope = RequestScope.withoutDeadline();
+    scope.closeAsync(pendingBatch::set);
+    scope.registerScopedCleanup(closed::incrementAndGet, physicalCompletion);
+    pendingBatch.get().run();
+    assertEquals(1, closed.get());
+    assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+    physicalCompletion.complete(null);
+    assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+    assertEquals(0, scope.registeredResourceCount());
+  }
+
   private static void close(RequestScope.ScopedCleanup registration) {
     try {
       registration.close();
