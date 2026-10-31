@@ -2,6 +2,7 @@ package io.etcdhbase.hbase.storage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -25,6 +26,7 @@ import io.etcdhbase.hbase.codec.StorageMessages;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import java.util.ArrayDeque;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
@@ -168,7 +170,6 @@ class HBasePageReaderTest {
   void scopeWaitsForALateScannerAndCountsItsCloseFailure(boolean closeFails) throws Exception {
     var creationEntered = new CountDownLatch(1);
     var creationReleased = new CountDownLatch(1);
-    var cancellationEntered = new CountDownLatch(1);
     var closeEntered = new CountDownLatch(1);
     var closeReleased = new CountDownLatch(1);
     doReturn(table).when(store).table();
@@ -189,12 +190,10 @@ class HBasePageReaderTest {
           .read(request(KeyRange.all(), Optional.empty()));
       var running = CompletableFuture.runAsync(tasks.remove());
       assertTrue(creationEntered.await(10, TimeUnit.SECONDS));
-      var cancelling = CompletableFuture.runAsync(() -> scope.cancelAsync(cleanup -> {
-        cancellationEntered.countDown();
-        cleanup.run();
-      }));
+      var cancelling = CompletableFuture.runAsync(scope::cancel);
       try {
-        assertTrue(cancellationEntered.await(10, TimeUnit.SECONDS));
+        // The registered close must have run before the scanner is allowed to arrive.
+        cancelling.get(10, TimeUnit.SECONDS);
         assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone(), "scanner creation is still active");
         assertFalse(result.isDone());
         creationReleased.countDown();
@@ -212,6 +211,36 @@ class HBasePageReaderTest {
       var failure = assertThrows(CompletionException.class, result::join);
       assertEquals(closeFails ? BackendFailure.Category.UNKNOWN : BackendFailure.Category.CANCELLED,
           ((BackendFailure) failure.getCause()).category());
+      verify(scanner).close();
+    }
+  }
+
+  @Test
+  void cancellationBeforeScannerOwnershipTransferPreservesItsFailure() {
+    var cleanupTasks = new ArrayDeque<Runnable>();
+    var closeFailure = new IllegalStateException("synthetic close failure after cancellation");
+    doReturn(table).when(store).table();
+    doThrow(closeFailure).when(scanner).close();
+    try (var scope = RequestScope.withoutDeadline()) {
+      doAnswer(invocation -> {
+        scope.cancelAsync(cleanupTasks::add);
+        return scanner;
+      }).when(table).getScanner(any(Scan.class));
+      var result = new HBasePageReader(store, binding, scope, Runnable::run)
+          .read(request(KeyRange.all(), Optional.empty()));
+      try {
+        assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+        var failure = assertThrows(CompletionException.class, result::join);
+        var backend = assertInstanceOf(BackendFailure.class, failure.getCause());
+        assertEquals(BackendFailure.Category.CANCELLED, backend.category());
+        var cancellation = assertInstanceOf(CancellationException.class, backend.getCause());
+        assertTrue(java.util.List.of(cancellation.getSuppressed()).contains(closeFailure),
+            "the cleanup failure must remain observable without replacing the original cancellation");
+      } finally {
+        cleanupTasks.remove().run();
+      }
+      assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+      assertEquals(1, scope.cleanupFailureCount());
       verify(scanner).close();
     }
   }
