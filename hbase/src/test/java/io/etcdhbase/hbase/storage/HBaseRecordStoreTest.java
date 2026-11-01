@@ -366,6 +366,68 @@ class HBaseRecordStoreTest {
     }
   }
 
+  @ParameterizedTest
+  @EnumSource(StorageTableBinding.Layout.class)
+  void batchAcknowledgementsSurviveRequestTerminationBeforeOrAfterCompletion(StorageTableBinding.Layout layout) {
+    for (boolean expired : new boolean[] {false, true}) {
+      for (boolean stopBeforeAcknowledgement : new boolean[] {false, true}) {
+        try (var scope = spy(RequestScope.withoutDeadline())) {
+          var store = decoder(binding(layout), scope);
+          Runnable acknowledge = pendingSuccessfulWrite(store.table(), layout);
+          var record = StoredRecord.live(ByteKey.empty(), metadata(1, StorageMetadata.State.LIVE), new byte[] {1});
+          var result = store.putBatch(List.of(record));
+          assertFalse(result.isDone(), "an invocation alone does not confirm the physical write");
+          if (stopBeforeAcknowledgement) stop(scope, expired);
+          acknowledge.run();
+          if (!stopBeforeAcknowledgement) stop(scope, expired);
+          var outcome = result.join().getFirst();
+          assertEquals(BatchWriteResult.State.SUCCEEDED, outcome.state(),
+              layout + "/expired=" + expired + "/stopBeforeAcknowledgement=" + stopBeforeAcknowledgement);
+          assertTrue(outcome.failure().isEmpty());
+        }
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(StorageTableBinding.Layout.class)
+  void singleWritesStillCheckRequestTerminationAfterAcknowledgement(StorageTableBinding.Layout layout) {
+    for (boolean expired : new boolean[] {false, true}) {
+      try (var scope = spy(RequestScope.withoutDeadline())) {
+        var store = decoder(binding(layout), scope);
+        Runnable acknowledge = pendingSuccessfulWrite(store.table(), layout);
+        var record = StoredRecord.live(ByteKey.empty(), metadata(1, StorageMetadata.State.LIVE), new byte[] {1});
+        var result = store.put(record);
+        stop(scope, expired);
+        assertFalse(result.isDone(), "request termination cannot release an in-flight backend operation");
+        acknowledge.run();
+        var failure = assertThrows(CompletionException.class, result::join);
+        var backend = assertInstanceOf(BackendFailure.class, failure.getCause());
+        assertEquals(expired ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED,
+            backend.category());
+      }
+    }
+  }
+
+  @Test
+  void historyConditionMismatchRemainsFailedWhenTheRequestStops() {
+    for (boolean expired : new boolean[] {false, true}) {
+      try (var scope = spy(RequestScope.withoutDeadline())) {
+        var store = decoder(binding(StorageTableBinding.Layout.HISTORY), scope);
+        var table = store.table();
+        var backend = new CompletableFuture<CheckAndMutateResult>();
+        doReturn(backend).when(table).checkAndMutate(any(CheckAndMutate.class));
+        var record = StoredRecord.live(ByteKey.empty(), metadata(1, StorageMetadata.State.LIVE), new byte[] {1});
+        var result = store.putBatch(List.of(record));
+        stop(scope, expired);
+        backend.complete(new CheckAndMutateResult(false, null));
+        var outcome = result.join().getFirst();
+        assertEquals(BatchWriteResult.State.FAILED, outcome.state());
+        assertEquals("immutable history row already exists", outcome.failure().orElseThrow().getCause().getMessage());
+      }
+    }
+  }
+
   @Test
   void anExplicitBackendPermissionRejectionRemainsFailed() {
     try (var scope = RequestScope.withoutDeadline()) {
@@ -481,6 +543,22 @@ class HBaseRecordStoreTest {
     var pending = new CompletableFuture<Void>();
     doReturn(pending).when(table).put(any(Put.class));
     return pending;
+  }
+
+  private static Runnable pendingSuccessfulWrite(AsyncTable<?> table, StorageTableBinding.Layout layout) {
+    if (layout == StorageTableBinding.Layout.HISTORY) {
+      var pending = new CompletableFuture<CheckAndMutateResult>();
+      doReturn(pending).when(table).checkAndMutate(any(CheckAndMutate.class));
+      return () -> pending.complete(new CheckAndMutateResult(true, null));
+    }
+    var pending = new CompletableFuture<Void>();
+    doReturn(pending).when(table).put(any(Put.class));
+    return () -> pending.complete(null);
+  }
+
+  private static void stop(RequestScope scope, boolean expired) {
+    if (expired) doReturn(true).when(scope).isDeadlineExceeded();
+    else scope.cancel();
   }
 
   private static Result observedRow(Result row, AtomicReference<Thread> decodedOn) {

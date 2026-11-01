@@ -150,30 +150,35 @@ public final class HBaseRecordStore implements RecordStore {
 
   /** Owns one client invocation and the certainty of its batch outcome. */
   private final class WriteAttempt {
-    private volatile boolean backendInvoked;
+    private enum Phase { PREPARING, INVOKED, ACKNOWLEDGED }
+
+    private volatile Phase phase = Phase.PREPARING;
 
     private CompletableFuture<Void> write(StoredRecord record) {
       return execute(() -> {
         Put put = mutation(record);
         AsyncTable<?> requestTable = table();
         if (binding.layout() != StorageTableBinding.Layout.HISTORY) {
-          backendInvoked = true;
-          return requestTable.put(put);
+          phase = Phase.INVOKED;
+          return requestTable.put(put).thenRun(() -> phase = Phase.ACKNOWLEDGED);
         }
         var condition = CheckAndMutate.newBuilder(put.getRow())
             .ifNotExists(binding.family(), METADATA).build(put);
-        backendInvoked = true;
-        return requestTable.checkAndMutate(condition).thenApply(result -> {
+        phase = Phase.INVOKED;
+        return requestTable.checkAndMutate(condition).thenAccept(result -> {
           if (!result.isSuccess()) throw new ImmutableHistoryConflict();
-          return null;
+          phase = Phase.ACKNOWLEDGED;
         });
       });
     }
 
     private BatchWriteResult outcome(int index, Throwable failure) {
-      if (failure == null) return new BatchWriteResult(index, BatchWriteResult.State.SUCCEEDED, Optional.empty());
+      // Request termination may reject delivery in execute(), but cannot erase a physical acknowledgement.
+      if (phase == Phase.ACKNOWLEDGED) {
+        return new BatchWriteResult(index, BatchWriteResult.State.SUCCEEDED, Optional.empty());
+      }
       BackendFailure classified = HBaseFailures.classify(failure);
-      if (!backendInvoked || classified.getCause() instanceof ImmutableHistoryConflict) {
+      if (phase == Phase.PREPARING || classified.getCause() instanceof ImmutableHistoryConflict) {
         return new BatchWriteResult(index, BatchWriteResult.State.FAILED, Optional.of(classified));
       }
       var state = switch (classified.category()) {
