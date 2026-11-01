@@ -26,8 +26,10 @@
 
 ## 口径与复现
 
-`returnedPhysicalRows` 是 client 实际收到的 HBase Result 行，`returnedCellBytes` 是返回 Cell 序列化大小。`observedServerCounters` 单列页完成时可见的服务端 ROWS_SCANNED、BLOCK_BYTES_SCANNED、FS/block-cache/MemStore 字节及 scanner retry 计数；这些不等于物理磁盘 IO，也不覆盖晚到统计。跨 client/server 版本为 0 的计数可能没有上报，不能推成没有 IO。m/v 同列族的列投影不保证文件块层的 value IO 隔离。
+`returnedPhysicalRows` 和 `returnedCellBytes` 仅统计扫描页返回给 client 的 HBase Result 行及 Cell 序列化字节，口径为 scan-only；机器摘要通过 `scan_only_metrics` 标明这两个字段。本组场景的扫描阶段均采用元数据投影。`observedServerCounters` 单列扫描页完成时可见的服务端 ROWS_SCANNED、BLOCK_BYTES_SCANNED、FS/block-cache/MemStore 字节及 scanner retry 计数；这些不等于物理磁盘 IO，也不覆盖晚到统计。跨 client/server 版本为 0 的计数可能没有上报，不能推成没有 IO。m/v 同列族的列投影不保证文件块层的 value IO 隔离。
 
-`applicationPointReads` 单列选定 value 的 Get 次数，不冒充实际 RPC。请求总读预算、队列公平性和取消竞争由相应契约测试覆盖；公开 SIMPLE 临时环境另通过真实 scanner map 观察打开和取消后关闭，不能推广成目标认证/TLS或其他 client 的关闭证明。J11 单独提供 minor/major compaction 与保留配置证据。
+`applicationPointReads` 仅为后取选定版本 value 的应用层点读次数。点读返回的 Result 行、Cell 序列化字节及完整 RPC 未采集，机器摘要在 `uncollected` 中保留这些缺口；扫描字段不包含点读结果，也不使用逻辑 value 长度代填物理 Cell 字节。请求总读预算、队列公平性和取消竞争由相应契约测试覆盖；公开 SIMPLE 临时环境另通过真实 scanner map 观察打开和取消后关闭，不能推广成目标认证/TLS或其他 client 的关闭证明。J11 单独提供 minor/major compaction 与保留配置证据。
+
+每条原始 benchmark 记录中的 `returnedPhysicalRows`、`returnedCellBytes`、`observedScanRpcCalls`、`applicationPointReads` 和 `observedServerCounters` 均为三个样本的累计值；上表扫描 RPC 均值为累计值除以样本数。`returnedPerSample` 是每个样本的返回条数，`peakLeasedBytes` 和 `peakLocalScannerPermits` 是三个样本中的最大峰值。时延 p50/p95/p99 按三个样本计算，p95/p99 均为最大值；累计读取量、lease 峰值与时延分位数分别解读。
 
 执行 `bash scripts/verify/m1.sh --through J17`；门禁要求真实 suite、冻结摘要、完整矩阵、所有 oracle 与资源边界，缺失/重复/失败/跳过均拒绝。JSON 摘要和原始日志在本地验证目录，CI 打印脱敏的合成计数。B05 负载/容量输入、目标身份/权限/TLS、JVM/direct-memory 峰值及完整物理 IO 尚待验证；当前不声明容量验收通过。

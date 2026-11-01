@@ -42,6 +42,9 @@ def collect(stdout):
             raise ValueError("logical oracle evidence changed")
         for name in ("returnedPhysicalRows", "returnedCellBytes", "observedScanRpcCalls", "applicationPointReads", "peakLeasedBytes", "p50Micros", "p95Micros", "p99Micros"):
             integer(row[name])
+        if row["returnedPerSample"] > 0 and (row["returnedPhysicalRows"] < row["samples"] * row["returnedPerSample"]
+                                             or row["returnedCellBytes"] == 0 or row["peakLeasedBytes"] == 0):
+            raise ValueError("positive result contradicts scan cost")
         if row["peakLocalScannerPermits"] != 1 or row["peakLeasedBytes"] > (66 << 20) + (row["buckets"] + 1) * 16384:
             raise ValueError("declared application resource bound exceeded")
         if not row["p50Micros"] <= row["p95Micros"] <= row["p99Micros"]:
@@ -53,5 +56,8 @@ def collect(stdout):
         for value in row["observedServerCounters"].values():
             integer(value)
     return {"digest": DIGEST, "profiles": profiles, "cases": rows,
+            "scan_only_metrics": ["returnedPhysicalRows", "returnedCellBytes"],
             "capacity_accepted": False, "missing_input": "B05",
-            "uncollected": ["complete META, point, close and late RPC counts", "physical disk IO", "JVM/direct-memory peak", "target workload"]}
+            "uncollected": ["point-read returned Result rows and serialized Cell bytes",
+                            "complete META, point, close and late RPC counts", "physical disk IO",
+                            "JVM/direct-memory peak", "target workload"]}
