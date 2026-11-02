@@ -55,12 +55,14 @@ public final class BudgetManager {
   public record Snapshot(long requests, long queued, long operations, long scanners,
       long cleanup, long queuedBytes, long reservedBytes, long allocatedBytes, long retiredScanners) {}
 
-  public record ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages) {
+  public record ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages, long pointOperations) {
     public ReadLimits {
-      if (physicalRows < 1 || cellBytes < 1 || scanRpcCalls < 1 || pages < 1) throw new IllegalArgumentException("invalid read limits");
+      if (physicalRows < 1 || cellBytes < 1 || scanRpcCalls < 1 || pages < 1 || pointOperations < 1) throw new IllegalArgumentException("invalid read limits");
     }
   }
 
+  private static final long DEFAULT_PAGE_LIMIT = 65_536;
+  private static final long DEFAULT_POINT_OPERATION_LIMIT = 65_536;
   private static final Work NO_WORK = new Work(0, 0, 0, 0, 0);
   private final Limits globalLimits;
   private final Limits requestLimits;
@@ -81,7 +83,8 @@ public final class BudgetManager {
   }
 
   public Account admit(String groupId, RequestScope scope, Reservation reservation) throws BackendFailure {
-    return admit(groupId, scope, reservation, new ReadLimits(1_000_000, 1L << 30, 100_000, 65_536));
+    return admit(groupId, scope, reservation,
+        new ReadLimits(1_000_000, 1L << 30, 100_000, DEFAULT_PAGE_LIMIT, DEFAULT_POINT_OPERATION_LIMIT));
   }
 
   public Account admit(String groupId, RequestScope scope, Reservation reservation, ReadLimits readLimits) throws BackendFailure {
@@ -143,6 +146,7 @@ public final class BudgetManager {
     private boolean admissionReleased;
     private final ReadLimits readLimits;
     private long physicalRows, cellBytes, scanRpcCalls, pages;
+    private long pointReads;
     private boolean readExhausted;
 
     private Account(String groupId, Group group, RequestScope scope, Reservation reservation, ReadLimits readLimits) {
@@ -158,6 +162,17 @@ public final class BudgetManager {
     private BudgetManager owner() { return BudgetManager.this; }
     RequestScope scope() { return scope; }
     public Reservation reservation() { return reservation; }
+    public long pointReads() { synchronized (BudgetManager.this) { return pointReads; } }
+    void chargePoint() throws BackendFailure {
+      synchronized (BudgetManager.this) {
+        requireActive();
+        if (pointReads >= readLimits.pointOperations()) {
+          readExhausted = true;
+          throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+        }
+        pointReads++;
+      }
+    }
     public boolean isActive() {
       synchronized (BudgetManager.this) { return !closed && !readExhausted && !scope.isClosed() && !scope.isDeadlineExceeded(); }
     }
