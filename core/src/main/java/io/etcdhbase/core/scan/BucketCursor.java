@@ -3,9 +3,9 @@ package io.etcdhbase.core.scan;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
-import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.ScanOperation;
+import io.etcdhbase.core.storage.ScanSource;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.util.List;
@@ -18,7 +18,7 @@ import java.util.concurrent.CompletableFuture;
 public final class BucketCursor implements AutoCloseable {
   public enum State { IDLE, FETCHING, PAGE_READY, PAUSED, EXHAUSTED, FAILED, CLOSED }
 
-  private final RecordStore store;
+  private final ScanSource store;
   private final ScanRequest template;
   private final RequestScope scope;
   private final RequestScope.ScopedCleanup registration;
@@ -30,7 +30,7 @@ public final class BucketCursor implements AutoCloseable {
   private CompletableFuture<Page> pending;
   private Page outstanding;
 
-  public BucketCursor(RecordStore store, ScanRequest template, RequestScope scope) {
+  public BucketCursor(ScanSource store, ScanRequest template, RequestScope scope) {
     this.store = Objects.requireNonNull(store, "store");
     this.template = Objects.requireNonNull(template, "template");
     this.scope = Objects.requireNonNull(scope, "scope");
@@ -66,7 +66,7 @@ public final class BucketCursor implements AutoCloseable {
         synchronized (this) {
           if (activeRead == read) activeRead = null;
         }
-        receive(result, request, page, problem);
+        receive(result, request, read, page, problem);
       });
       if (stop) read.close();
     } catch (RuntimeException problem) {
@@ -88,33 +88,50 @@ public final class BucketCursor implements AutoCloseable {
     if (state == State.PAUSED) state = State.IDLE;
   }
 
-  private void receive(CompletableFuture<Page> result, ScanRequest request, StoragePage source, Throwable problem) {
+  private void receive(CompletableFuture<Page> result, ScanRequest request, ScanOperation read, StoragePage source, Throwable problem) {
     if (problem != null) {
-      fail(result, problem);
+      failRead(result, read, problem);
       return;
     }
     try {
       validate(source, request);
     } catch (RuntimeException invalid) {
-      fail(result, invalid);
+      failRead(result, read, invalid);
       return;
     }
     Page page = null;
     synchronized (this) {
       if (state != State.CLOSED && !scope.isClosed()) {
-        page = new Page(source);
+        page = new Page(source, read);
         outstanding = page;
         state = State.PAGE_READY;
       }
     }
     if (page == null) {
-      result.completeExceptionally(cancelled());
+      try {
+        read.close();
+      } finally {
+        result.completeExceptionally(cancelled());
+      }
       return;
     }
     if (!result.complete(page)) page.close();
     synchronized (this) {
       if (pending == result) pending = null;
     }
+  }
+
+  private void failRead(CompletableFuture<Page> result, ScanOperation read, Throwable problem) {
+    try {
+      read.close();
+    } catch (RuntimeException | Error cleanupFailure) {
+      if (cleanupFailure != problem) problem.addSuppressed(cleanupFailure);
+      if (cleanupFailure instanceof Error fatal) {
+        fail(result, problem);
+        throw fatal;
+      }
+    }
+    fail(result, problem);
   }
 
   private static void validate(StoragePage page, ScanRequest request) {
@@ -150,7 +167,8 @@ public final class BucketCursor implements AutoCloseable {
       outstanding = null;
       if (state == State.CLOSED || state == State.FAILED) return;
       if (consumed.isPresent()) checkpoint = consumed;
-      state = exhausted ? State.EXHAUSTED : pauseRequested ? State.PAUSED : State.IDLE;
+      if (exhausted) state = State.EXHAUSTED;
+      else state = pauseRequested ? State.PAUSED : State.IDLE;
       if (pending != null && pending.isDone()) pending = null;
     }
     if (exhausted) releaseRegistration();
@@ -201,13 +219,15 @@ public final class BucketCursor implements AutoCloseable {
     private List<StoredRecord> records;
     private final boolean sourceExhausted;
     private final StoragePage.Cost cost;
+    private ScanOperation read;
     private int position;
     private boolean closed;
 
-    private Page(StoragePage source) {
+    private Page(StoragePage source, ScanOperation read) {
       records = source.records();
       sourceExhausted = source.exhausted();
       cost = source.cost();
+      this.read = read;
     }
 
     public synchronized Optional<StoredRecord> next() {
@@ -227,14 +247,21 @@ public final class BucketCursor implements AutoCloseable {
     public void close() {
       Optional<ByteKey> consumed;
       boolean exhausted;
+      ScanOperation ownedRead;
       synchronized (this) {
         if (closed) return;
         closed = true;
         consumed = position == 0 ? Optional.empty() : Optional.of(records.get(position - 1).key());
         exhausted = sourceExhausted && position == records.size();
         records = List.of();
+        ownedRead = read;
+        read = null;
       }
-      release(this, consumed, exhausted);
+      try {
+        ownedRead.close();
+      } finally {
+        release(this, consumed, exhausted);
+      }
     }
 
     private void requireOpen() {
