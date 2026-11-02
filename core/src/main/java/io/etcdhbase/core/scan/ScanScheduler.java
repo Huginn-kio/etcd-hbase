@@ -233,6 +233,7 @@ public final class ScanScheduler implements AutoCloseable {
     private ScanOperation physical;
     private Throwable startFailure;
     private boolean running;
+    private boolean finishStarted;
     private boolean finished;
     private boolean stopRequested;
     private boolean disposed;
@@ -271,8 +272,8 @@ public final class ScanScheduler implements AutoCloseable {
       boolean stopped;
       ScanOperation completed;
       synchronized (ScanScheduler.this) {
-        if (finished) return;
-        finished = true;
+        if (finishStarted) return;
+        finishStarted = true;
         stopped = stopRequested;
         owned = resources;
         completed = physical;
@@ -281,9 +282,9 @@ public final class ScanScheduler implements AutoCloseable {
       try {
         if (completed != null) completed.close();
       } catch (RuntimeException | Error cleanupFailure) {
-        var terminal = new ScanCleanupFailure(cleanupFailure);
-        if (failure != null) terminal.addSuppressed(failure);
-        failure = terminal;
+        var cleanupMarker = new ScanCleanupFailure(cleanupFailure);
+        if (failure == null) failure = cleanupMarker;
+        else failure.addSuppressed(cleanupMarker);
       }
       boolean retire = hasCleanupFailure(failure);
       if (retire) synchronized (ScanScheduler.this) { cleanupFailure = failure; }
@@ -299,13 +300,13 @@ public final class ScanScheduler implements AutoCloseable {
           failure = invalid;
         }
       }
-      if (failure != null) {
-        synchronized (ScanScheduler.this) { startFailure = failure; }
-        close();
-        result.completeExceptionally(failure);
-      } else {
-        result.complete(page);
+      synchronized (ScanScheduler.this) {
+        if (failure == null && stopRequested) failure = cancelled();
+        if (failure != null) startFailure = failure;
+        finished = true;
       }
+      if (failure != null) close();
+      else result.complete(page);
       pump();
     }
 

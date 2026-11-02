@@ -2,6 +2,7 @@ package io.etcdhbase.core.scan;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -26,6 +27,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.ScheduledFuture;
@@ -275,6 +277,134 @@ class ScanSchedulerTest {
       timer.expireAll();
       assertThrows(CompletionException.class, () -> waiting.completion().toCompletableFuture().join());
       assertEquals(1, physical.started.size());
+      scheduler.close();
+      var termination = assertThrows(CompletionException.class,
+          () -> scheduler.termination().toCompletableFuture().join());
+      assertSame(failure, termination.getCause());
+    }
+  }
+
+  @Test
+  void closeFailureIsSuppressedOnKnownBackendFailureAndStillRetiresCapacity() throws Exception {
+    var budget = budget();
+    var physical = new ControlledSource();
+    var closeFailure = new IllegalStateException("synthetic close failure");
+    physical.closeFailure = closeFailure;
+    var timeout = new BackendFailure(BackendFailure.Category.TIMEOUT);
+    try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1), Runnable::run, timer);
+        var scope = RequestScope.withoutDeadline(); var account = budget.admit("alpha", scope, MEMORY)) {
+      var source = scheduler.bind(physical, account);
+      var failed = source.startScan(request(0));
+      physical.started.getFirst().result.completeExceptionally(timeout);
+
+      var delivered = assertThrows(CompletionException.class, () -> failed.completion().toCompletableFuture().join());
+      assertTrue(physical.started.getFirst().closed);
+      assertSame(timeout, delivered.getCause());
+      assertEquals(BackendFailure.Category.TIMEOUT, ((BackendFailure) delivered.getCause()).category());
+      assertEquals(1, delivered.getSuppressed().length);
+      assertTrue(delivered.getSuppressed()[0] instanceof ScanCleanupFailure);
+      assertSame(closeFailure, delivered.getSuppressed()[0].getCause());
+      assertEquals(1, budget.snapshot().retiredScanners());
+      assertEquals(1, budget.snapshot().scanners());
+
+      var waiting = source.startScan(request(1));
+      timer.expireAll();
+      assertFailureCategory(BackendFailure.Category.TIMEOUT, waiting);
+      assertEquals(1, physical.started.size(), "retired capacity must not start a replacement scanner");
+
+      scheduler.close();
+      var termination = assertThrows(CompletionException.class,
+          () -> scheduler.termination().toCompletableFuture().join());
+      assertSame(timeout, termination.getCause());
+      assertEquals(1, termination.getSuppressed().length);
+      assertTrue(termination.getSuppressed()[0] instanceof ScanCleanupFailure);
+      assertSame(closeFailure, termination.getSuppressed()[0].getCause());
+    }
+  }
+
+  @Test
+  void schedulerCloseWaitsForInProgressPhysicalCleanupBeforeTermination() throws Exception {
+    var budget = budget();
+    var physical = new ControlledSource();
+    var closeFailure = new IllegalStateException("synthetic close failure");
+    var timeout = new BackendFailure(BackendFailure.Category.TIMEOUT);
+    var closeStarted = new CountDownLatch(1);
+    var releaseClose = new CountDownLatch(1);
+    physical.closeFailure = closeFailure;
+    physical.closeStarted = closeStarted;
+    physical.releaseClose = releaseClose;
+    try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1), Runnable::run, timer);
+        var scope = RequestScope.withoutDeadline(); var account = budget.admit("alpha", scope, MEMORY)) {
+      var failed = scheduler.bind(physical, account).startScan(request(0));
+      var completing = Thread.ofPlatform().start(() -> physical.started.getFirst().result.completeExceptionally(timeout));
+      try {
+        assertTrue(closeStarted.await(5, TimeUnit.SECONDS));
+        scheduler.close();
+        assertFalse(failed.completion().toCompletableFuture().isDone());
+        assertFalse(scheduler.termination().toCompletableFuture().isDone());
+      } finally {
+        releaseClose.countDown();
+        completing.join(TimeUnit.SECONDS.toMillis(5));
+      }
+
+      assertFalse(completing.isAlive(), "physical completion callback must finish");
+      var delivered = assertThrows(CompletionException.class, () -> failed.completion().toCompletableFuture().join());
+      assertSame(timeout, delivered.getCause());
+      assertEquals(1, delivered.getSuppressed().length);
+      assertTrue(delivered.getSuppressed()[0] instanceof ScanCleanupFailure);
+      assertSame(closeFailure, delivered.getSuppressed()[0].getCause());
+      assertEquals(1, budget.snapshot().retiredScanners());
+      assertEquals(1, budget.snapshot().scanners());
+
+      var termination = assertThrows(CompletionException.class,
+          () -> scheduler.termination().toCompletableFuture().join());
+      assertSame(timeout, termination.getCause());
+      assertEquals(1, termination.getSuppressed().length);
+      assertTrue(termination.getSuppressed()[0] instanceof ScanCleanupFailure);
+      assertSame(closeFailure, termination.getSuppressed()[0].getCause());
+    }
+  }
+
+  @Test
+  void closeFailureAfterSuccessfulReadIsReportedAndRetiresCapacity() throws Exception {
+    var budget = budget();
+    var physical = new ControlledSource();
+    var closeFailure = new IllegalStateException("synthetic close failure");
+    physical.closeFailure = closeFailure;
+    try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1), Runnable::run, timer);
+        var scope = RequestScope.withoutDeadline(); var account = budget.admit("alpha", scope, MEMORY)) {
+      var operation = scheduler.bind(physical, account).startScan(request(0));
+      physical.started.getFirst().result.complete(EMPTY);
+
+      var delivered = assertThrows(CompletionException.class,
+          () -> operation.completion().toCompletableFuture().join());
+      assertTrue(delivered.getCause() instanceof ScanCleanupFailure);
+      assertSame(closeFailure, delivered.getCause().getCause());
+      assertEquals(1, budget.snapshot().retiredScanners());
+      assertEquals(1, budget.snapshot().scanners());
+      scheduler.close();
+      var termination = assertThrows(CompletionException.class,
+          () -> scheduler.termination().toCompletableFuture().join());
+      assertSame(delivered.getCause(), termination.getCause());
+    }
+  }
+
+  @Test
+  void normalPhysicalCloseKeepsSuccessfulReadAndTermination() throws Exception {
+    var budget = budget();
+    var physical = new ControlledSource();
+    try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1), Runnable::run, timer);
+        var scope = RequestScope.withoutDeadline(); var account = budget.admit("alpha", scope, MEMORY)) {
+      var operation = scheduler.bind(physical, account).startScan(request(0));
+      physical.started.getFirst().result.complete(EMPTY);
+
+      assertSame(EMPTY, operation.completion().toCompletableFuture().join());
+      assertEquals(0, budget.snapshot().retiredScanners());
+      operation.close();
+      scheduler.close();
+      assertEquals(0, budget.snapshot().scanners());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+      assertNull(scheduler.termination().toCompletableFuture().join());
     }
   }
 
@@ -289,8 +419,11 @@ class ScanSchedulerTest {
 
   private static final class ControlledSource implements ScanSource {
     final List<Operation> started = new ArrayList<>();
+    RuntimeException closeFailure;
+    CountDownLatch closeStarted;
+    CountDownLatch releaseClose;
     @Override public ScanOperation startScan(ScanRequest request) {
-      var operation = new Operation(request.bucket());
+      var operation = new Operation(request.bucket(), closeFailure, closeStarted, releaseClose);
       started.add(operation);
       return operation;
     }
@@ -299,10 +432,30 @@ class ScanSchedulerTest {
   private static final class Operation implements ScanOperation {
     final CompletableFuture<StoragePage> result = new CompletableFuture<>();
     final int bucket;
+    final RuntimeException closeFailure;
+    final CountDownLatch closeStarted;
+    final CountDownLatch releaseClose;
     boolean closed;
-    Operation(int bucket) { this.bucket = bucket; }
+    Operation(int bucket, RuntimeException closeFailure, CountDownLatch closeStarted, CountDownLatch releaseClose) {
+      this.bucket = bucket;
+      this.closeFailure = closeFailure;
+      this.closeStarted = closeStarted;
+      this.releaseClose = releaseClose;
+    }
     @Override public CompletionStage<StoragePage> completion() { return result.minimalCompletionStage(); }
-    @Override public void close() { closed = true; }
+    @Override public void close() {
+      closed = true;
+      if (closeStarted != null) closeStarted.countDown();
+      if (releaseClose != null) {
+        try {
+          if (!releaseClose.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("physical close was not released");
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("physical close was interrupted", interrupted);
+        }
+      }
+      if (closeFailure != null) throw closeFailure;
+    }
   }
 
   private static final class ManualTimer extends ScheduledThreadPoolExecutor {
