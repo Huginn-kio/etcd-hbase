@@ -45,7 +45,7 @@ RowKey 格式 ID `ordered-zero-escape-v1`、表形态、列族和盐 strategy/ve
 
 这些是应用账本的约束，不是 JVM 总内存或服务端 scanner 总数证明。实际装配必须按最大记录、protobuf/解码复制、client 缓存及在途超调配置 IO 分区；未经目标 client 验证的 profile 不宣称内存预算验收。原始 RecordStore 是底层原型 port；查询必须经调度和结果所有权路径，不能从直接扫描调用推导全局资源受控。
 
-## J14 全局归并
+## 3. J14 全局归并
 
 `SortedMergeCursor` 在预留全部桶 head 空间后开始，固定每页一个逻辑记录，不按用户 Limit 增大预读。所有未耗尽桶取得 head/耗尽证据后，以无符号 ByteKey 最小堆选择结果。墓碑不参与计数；More 由额外一条可见结果或所有桶耗尽证明，失败/预算不足不能变成 More=false。普通 Count 是本次返回条数，不额外扫描准确总数。
 
