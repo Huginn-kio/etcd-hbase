@@ -78,15 +78,23 @@ public final class DirectRecordReader implements RecordReader {
   /** Settles the public operation with its original failure before propagating fatal cleanup errors. */
   private static Error settleFailureAfterCleanup(CompletableFuture<PointResult> owner, Throwable failure,
       AutoCloseable cleanup) {
-    Error fatal = failure instanceof Error error ? error : null;
+    Throwable primary = unwrap(failure);
+    Error fatal = primary instanceof Error error ? error : null;
     try {
       cleanup.close();
     } catch (Exception | Error cleanupFailure) {
-      if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+      if (cleanupFailure != primary) primary.addSuppressed(cleanupFailure);
       if (fatal == null && cleanupFailure instanceof Error error) fatal = error;
     }
-    owner.completeExceptionally(failure);
+    owner.completeExceptionally(primary);
     return fatal;
+  }
+
+  private static Throwable unwrap(Throwable failure) {
+    while (failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null) {
+      failure = failure.getCause();
+    }
+    return failure;
   }
 
   private void validate(Optional<StoredRecord> record, ByteKey key, long upper, ReadProjection projection) throws BackendFailure {
