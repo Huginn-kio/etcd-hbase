@@ -33,10 +33,12 @@ import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 
 class SortedMergeCursorDeadlineTest {
+  private static final long DEADLINE_NANOS = TimeUnit.MINUTES.toNanos(1);
+
   @Test
   void deadlineCrossingDuringFinalPageCleanupRejectsSuccessAndReleasesOutput() throws Exception {
     var clock = new ControlledClock();
-    var scope = new RequestScope(10, clock);
+    var scope = new RequestScope(DEADLINE_NANOS, clock);
     var budget = budget();
     var source = new DelayedSource(clock::expire);
     try (scope; var account = budget.admit("public", scope, reservation());
@@ -61,7 +63,7 @@ class SortedMergeCursorDeadlineTest {
   @Test
   void sameMergeCompletesBeforeDeadlineAndTransfersPageOwnership() throws Exception {
     var clock = new ControlledClock();
-    var scope = new RequestScope(10, clock);
+    var scope = new RequestScope(DEADLINE_NANOS, clock);
     var budget = budget();
     var source = new DelayedSource(() -> {});
     try (scope; var account = budget.admit("public", scope, reservation());
@@ -111,7 +113,7 @@ class SortedMergeCursorDeadlineTest {
 
     @Override
     public long getAsLong() {
-      return expired.get() ? 10 : 0;
+      return expired.get() ? DEADLINE_NANOS : 0;
     }
 
     void expire() { expired.set(true); }
