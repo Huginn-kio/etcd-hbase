@@ -46,31 +46,47 @@ public final class DirectRecordReader implements RecordReader {
     CompletableFuture<Optional<StoredRecord>> operation;
     try { operation = PointRead.get(store, key, upper, projection, account); }
     catch (Error fatal) {
-      output.close();
-      owner.completeExceptionally(fatal);
-      throw fatal;
+      throw settleFailureAfterCleanup(owner, fatal, output);
     }
     operation.whenComplete((record, failure) -> {
+      if (failure != null) {
+        Error fatal = settleFailureAfterCleanup(owner, failure, output);
+        if (fatal != null) throw fatal;
+        return;
+      }
       PointResult result = null;
       try {
-        if (failure != null) { output.close(); owner.completeExceptionally(failure); return; }
         validate(record, key, upper, projection);
         account.requireActive();
         result = new PointResult(record, output, account.scope());
         account.requireActive();
         owner.complete(result);
       } catch (BackendFailure | RuntimeException invalid) {
-        if (result != null) result.close();
-        else output.close();
-        owner.completeExceptionally(invalid);
+        Error fatal = settleFailureAfterCleanup(owner, invalid, cleanupFor(result, output));
+        if (fatal != null) throw fatal;
       } catch (Error fatal) {
-        if (result != null) result.close();
-        else output.close();
-        owner.completeExceptionally(fatal);
-        throw fatal;
+        throw settleFailureAfterCleanup(owner, fatal, cleanupFor(result, output));
       }
     });
     return response;
+  }
+
+  private static AutoCloseable cleanupFor(PointResult result, BudgetManager.Lease output) {
+    return result == null ? output : result;
+  }
+
+  /** Settles the public operation with its original failure before propagating fatal cleanup errors. */
+  private static Error settleFailureAfterCleanup(CompletableFuture<PointResult> owner, Throwable failure,
+      AutoCloseable cleanup) {
+    Error fatal = failure instanceof Error error ? error : null;
+    try {
+      cleanup.close();
+    } catch (Exception | Error cleanupFailure) {
+      if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+      if (fatal == null && cleanupFailure instanceof Error error) fatal = error;
+    }
+    owner.completeExceptionally(failure);
+    return fatal;
   }
 
   private void validate(Optional<StoredRecord> record, ByteKey key, long upper, ReadProjection projection) throws BackendFailure {

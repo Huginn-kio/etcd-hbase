@@ -19,9 +19,11 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class DirectRecordReaderTest {
+  private static final int OUTPUT_RELEASE_AFTER_POINT_READ_LEASES = 3;
   private enum EarlyCompletion { CANCELLED, TIMED_OUT, FALLBACK }
 
   @Test
@@ -119,6 +121,70 @@ class DirectRecordReaderTest {
     }
   }
 
+  @Test
+  void outputCleanupFailureDoesNotLeaveInvalidResultPending() {
+    var requested = ExistsExecutorTest.live(1, 16).key();
+    var mismatched = ExistsExecutorTest.live(2, 16);
+    var store = new FrozenRecordStore(List.of(List.of(mismatched)));
+    store.pending = CompletableFuture.completedFuture(Optional.of(mismatched));
+    var budget = SortedMergeCursorTest.budget();
+    var cleanupFailure = failOnOutputRelease(budget);
+    try (var scope = RequestScope.withoutDeadline();
+        var account = budget.admit("public", scope, SortedMergeCursorTest.memory(1, 1024))) {
+      var response = new DirectRecordReader(store, account, 1024).read(requested, 7, ReadProjection.FULL);
+
+      assertTrue(response.isDone(), "cleanup failure must not strand the public response");
+      var observed = assertThrows(CompletionException.class, response::join);
+      var primary = assertInstanceOf(IllegalStateException.class, observed.getCause());
+      assertSuppressedCleanupFailure(primary, cleanupFailure);
+      assertFalse(scope.isClosed());
+      assertEquals(0, budget.snapshot().operations());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void outputCleanupFailureDoesNotReplaceBackendFailure() {
+    var store = new FrozenRecordStore(List.of(List.of()));
+    store.pending = new CompletableFuture<>();
+    var budget = SortedMergeCursorTest.budget();
+    var cleanupFailure = failOnOutputRelease(budget);
+    try (var scope = RequestScope.withoutDeadline();
+        var account = budget.admit("public", scope, SortedMergeCursorTest.memory(1, 1024))) {
+      var response = new DirectRecordReader(store, account, 1024).read(ByteKey.empty(), 7, ReadProjection.METADATA);
+      var backendFailure = new IllegalStateException("synthetic backend failure");
+      store.pending.completeExceptionally(backendFailure);
+
+      assertTrue(response.isDone(), "cleanup failure must not strand the public response");
+      var observed = assertThrows(CompletionException.class, response::join);
+      assertSame(backendFailure, observed.getCause());
+      assertSuppressedCleanupFailure(backendFailure, cleanupFailure);
+      assertFalse(scope.isClosed());
+      assertEquals(0, budget.snapshot().operations());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void outputCleanupFailureDoesNotMaskFatalStartupError() {
+    var record = ExistsExecutorTest.live(1, 16);
+    var store = new FrozenRecordStore(List.of(List.of(record)));
+    var budget = SortedMergeCursorTest.budget();
+    var cleanupFailure = failOnOutputRelease(budget);
+    try (var scope = RequestScope.withoutDeadline();
+        var account = budget.admit("public", scope, SortedMergeCursorTest.memory(1, 1024))) {
+      var reader = new DirectRecordReader(store, account, 1024);
+      store.fatal = true;
+
+      var observed = assertThrows(AssertionError.class,
+          () -> reader.read(record.key(), 7, ReadProjection.FULL));
+      assertEquals("synthetic fatal backend startup", observed.getMessage());
+      assertSuppressedCleanupFailure(observed, cleanupFailure);
+      assertFalse(scope.isClosed());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
   private static void assertAbandonedLateResultClosed(EarlyCompletion completion) throws Exception {
     var record = ExistsExecutorTest.live(1, 16);
     var store = new FrozenRecordStore(List.of(List.of(record)));
@@ -157,5 +223,19 @@ class DirectRecordReaderTest {
       case FALLBACK -> assertNull(response.completeOnTimeout(null, 0, TimeUnit.NANOSECONDS)
           .get(10, TimeUnit.SECONDS));
     }
+  }
+
+  private static AssertionError failOnOutputRelease(BudgetManager budget) {
+    var releaseNotifications = new AtomicInteger();
+    var cleanupFailure = new AssertionError("synthetic output release notification");
+    budget.onRelease(() -> {
+      if (releaseNotifications.incrementAndGet() == OUTPUT_RELEASE_AFTER_POINT_READ_LEASES) throw cleanupFailure;
+    });
+    return cleanupFailure;
+  }
+
+  private static void assertSuppressedCleanupFailure(Throwable primary, AssertionError cleanupFailure) {
+    assertEquals(1, primary.getSuppressed().length);
+    assertSame(cleanupFailure, primary.getSuppressed()[0]);
   }
 }
