@@ -57,7 +57,7 @@ RowKey 格式 ID `ordered-zero-escape-v1`、表形态、列族和盐 strategy/ve
 
 完整返回值在选定 head 后按其 modificationRevision 发起 FULL Get，并核对 key、完整元数据和 value presence；缺失、错版或异常均使整个请求失败，不读取未选中记录的 value。点读取受同一操作/I/O 账本及请求总点访问上限约束，物理完成后才归还许可。RangePage 分别报告扫描 Cost 和应用点读取次数；点读取次数不冒充实际 RPC。M1 的版本绑定仅在冻结数据上验证，生产可见性等待 M2。
 
-## J16 直接访问边界
+## 5. J16 直接访问边界
 
 内部 `RecordReader` 当前只有 `DirectRecordReader`，每次接受的点查询都调用绑定的 RecordStore，没有缓存或共享请求表。`PointResult` 持有输出上限的 lease，消费后必须关闭；RequestScope 也会关闭未消费结果。取消返回 future 不取消底层 producer，不提前释放操作/I/O；被放弃的已完成结果会关闭。Account.termination 单独表示停止后所有实际资源已归还，不能用调用方 future 已取消替代。
 
