@@ -66,8 +66,13 @@ public final class SortedMergeCursor implements AutoCloseable {
     if (limit < 0) return CompletableFuture.failedFuture(new IllegalArgumentException("limit must not be negative"));
     if (!started.compareAndSet(false, true)) return CompletableFuture.failedFuture(new IllegalStateException("merge already started"));
     this.limit = limit;
+    var delivery = new CompletableFuture<RangePage>();
+    result.whenComplete((response, failure) -> {
+      if (failure != null) delivery.completeExceptionally(failure);
+      else if (!delivery.complete(response)) response.close();
+    });
     drain();
-    return result.copy();
+    return delivery;
   }
 
   private void drain() {
@@ -180,7 +185,13 @@ public final class SortedMergeCursor implements AutoCloseable {
       if (failure == null) failure = cleanup;
       else failure.addSuppressed(cleanup);
     }
-    if (failure == null && scope.isClosed()) failure = new BackendFailure(BackendFailure.Category.CANCELLED);
+    if (failure == null) {
+      boolean deadlineExceeded = scope.isDeadlineExceeded();
+      if (scope.isClosed() || deadlineExceeded) {
+        failure = new BackendFailure(deadlineExceeded
+            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+      }
+    }
     if (failure != null) {
       if (response != null) response.close();
       result.completeExceptionally(failure);

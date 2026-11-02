@@ -126,6 +126,47 @@ class SortedMergeCursorTest {
   }
 
   @Test
+  void cancelledDeliveryWaitsForPhysicalCompletionAndReleasesAnUnreceivedResponse() throws Exception {
+    var source = new DelayedSource();
+    var budget = budget();
+    try (var scope = RequestScope.withoutDeadline(); var account = budget.admit("public", scope, memory(1, 4096));
+        var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1));
+        var cursor = new SortedMergeCursor(scheduler.bind(source, account), template(), 1, account, scope)) {
+      var pending = cursor.read(1);
+      assertTrue(pending.cancel(true));
+      assertEquals(1, budget.snapshot().scanners(), "cancel must not settle the physical read early");
+
+      source.pending.getFirst().complete(new StoragePage(List.of(record(new byte[] {1}, false)), true,
+          new StoragePage.Cost(1, 257, 1)));
+      cursor.close();
+
+      assertTrue(pending.isCancelled());
+      assertEquals(0, budget.snapshot().scanners());
+      assertEquals(0, budget.snapshot().allocatedBytes(), "an unreceived RangePage must release OUTPUT on delivery rejection");
+      assertFalse(scope.isClosed());
+    }
+  }
+
+  @Test
+  void closingCursorDoesNotReclaimAnAlreadyDeliveredPage() throws Exception {
+    var record = record(new byte[] {1}, false);
+    var source = new FrozenScanSource(List.of(List.of(record)));
+    var budget = budget();
+    try (var scope = RequestScope.withoutDeadline(); var account = budget.admit("public", scope, memory(1, 4096));
+        var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1));
+        var cursor = new SortedMergeCursor(scheduler.bind(source, account), template(), 1, account, scope)) {
+      var page = cursor.read(1).join();
+      cursor.close();
+
+      assertEquals(List.of(record.key()), page.records().stream().map(StoredRecord::key).toList());
+      assertEquals(record.retainedBytes(), budget.snapshot().allocatedBytes(),
+          "the caller owns the delivered response until it closes the page");
+      page.close();
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
   void longRunsOfTombstonesUseBoundedContinuationRatherThanRecursiveCallbacks() throws Exception {
     List<StoredRecord> records = new ArrayList<>();
     for (int index = 0; index < 5000; index++) records.add(record(new byte[] {(byte) (index >>> 8), (byte) index}, true));
