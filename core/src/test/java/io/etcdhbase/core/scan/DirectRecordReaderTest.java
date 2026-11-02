@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.StoredRecord;
@@ -158,6 +159,35 @@ class DirectRecordReaderTest {
       var observed = assertThrows(CompletionException.class, response::join);
       assertSame(backendFailure, observed.getCause());
       assertSuppressedCleanupFailure(backendFailure, cleanupFailure);
+      assertFalse(scope.isClosed());
+      assertEquals(0, budget.snapshot().operations());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void completionWrapperSuppressedFailureSurvivesUnwrap() throws Exception {
+    var store = new FrozenRecordStore(List.of(List.of()));
+    store.pending = new CompletableFuture<>();
+    var budget = SortedMergeCursorTest.budget();
+    var outputCleanupFailure = failOnOutputRelease(budget);
+    try (var scope = RequestScope.withoutDeadline();
+        var account = budget.admit("public", scope, SortedMergeCursorTest.memory(1, 1024))) {
+      var response = new DirectRecordReader(store, account, 1024).read(ByteKey.empty(), 7, ReadProjection.METADATA);
+      var backendFailure = new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+      var producerFailure = new CompletionException(backendFailure);
+      var upstreamCleanupFailure = new AssertionError("synthetic upstream cleanup notification");
+      producerFailure.addSuppressed(upstreamCleanupFailure);
+
+      store.pending.completeExceptionally(producerFailure);
+
+      assertTrue(response.isDone(), "the public response must settle after cleanup");
+      var observed = assertThrows(CompletionException.class, response::join);
+      assertSame(backendFailure, observed.getCause());
+      var suppressed = backendFailure.getSuppressed();
+      assertEquals(2, suppressed.length);
+      assertSame(upstreamCleanupFailure, suppressed[0]);
+      assertSame(outputCleanupFailure, suppressed[1]);
       assertFalse(scope.isClosed());
       assertEquals(0, budget.snapshot().operations());
       assertEquals(0, budget.snapshot().allocatedBytes());

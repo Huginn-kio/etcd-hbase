@@ -9,6 +9,7 @@ import io.etcdhbase.core.storage.StoredRecord;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /** No cache or coalescing: each accepted read uses its bound, authorized backend port. */
 public final class DirectRecordReader implements RecordReader {
@@ -91,10 +92,27 @@ public final class DirectRecordReader implements RecordReader {
   }
 
   private static Throwable unwrap(Throwable failure) {
-    while (failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null) {
-      failure = failure.getCause();
+    while (failure instanceof CompletionException && failure.getCause() != null) {
+      Throwable cause = failure.getCause();
+      transferSuppressed(failure, cause);
+      failure = cause;
     }
     return failure;
+  }
+
+  // CompletionException is a transport wrapper; its cleanup diagnostics must survive unwrapping.
+  private static void transferSuppressed(Throwable wrapper, Throwable cause) {
+    for (Throwable suppressed : wrapper.getSuppressed()) {
+      if (suppressed == cause) continue;
+      boolean alreadyPresent = false;
+      for (Throwable existing : cause.getSuppressed()) {
+        if (existing == suppressed) {
+          alreadyPresent = true;
+          break;
+        }
+      }
+      if (!alreadyPresent) cause.addSuppressed(suppressed);
+    }
   }
 
   private void validate(Optional<StoredRecord> record, ByteKey key, long upper, ReadProjection projection) throws BackendFailure {
