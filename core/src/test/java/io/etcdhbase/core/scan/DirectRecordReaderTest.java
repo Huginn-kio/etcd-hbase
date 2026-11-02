@@ -19,11 +19,10 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 
 class DirectRecordReaderTest {
-  private static final int OUTPUT_RELEASE_AFTER_POINT_READ_LEASES = 3;
   private enum EarlyCompletion { CANCELLED, TIMED_OUT, FALLBACK }
 
   @Test
@@ -226,10 +225,13 @@ class DirectRecordReaderTest {
   }
 
   private static AssertionError failOnOutputRelease(BudgetManager budget) {
-    var releaseNotifications = new AtomicInteger();
+    var thrown = new AtomicBoolean();
     var cleanupFailure = new AssertionError("synthetic output release notification");
     budget.onRelease(() -> {
-      if (releaseNotifications.incrementAndGet() == OUTPUT_RELEASE_AFTER_POINT_READ_LEASES) throw cleanupFailure;
+      var snapshot = budget.snapshot();
+      if (snapshot.allocatedBytes() == 0 && snapshot.operations() == 0 && thrown.compareAndSet(false, true)) {
+        throw cleanupFailure;
+      }
     });
     return cleanupFailure;
   }
