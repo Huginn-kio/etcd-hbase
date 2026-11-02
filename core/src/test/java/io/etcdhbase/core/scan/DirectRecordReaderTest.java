@@ -9,11 +9,15 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
+import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.StoredRecord;
+import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -190,6 +194,41 @@ class DirectRecordReaderTest {
       assertSame(outputCleanupFailure, suppressed[1]);
       assertFalse(scope.isClosed());
       assertEquals(0, budget.snapshot().operations());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void cleanupErrorFromActualSchedulerSurvivesPointReadUnwrap() throws Exception {
+    var limits = new BudgetManager.Limits(4, 4, 1, 1, 1, 4096, 8192);
+    var budget = new BudgetManager(limits, Map.of("alpha", limits, "beta", limits), limits);
+    var reservation = new BudgetManager.Reservation(512, 512, 512, 1024);
+    var store = new FrozenRecordStore(List.of(List.of()));
+    store.pending = new CompletableFuture<>();
+    var backendFailure = new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    var scanStartFailure = new AssertionError("synthetic scan-start failure");
+    try (var pointScope = RequestScope.withoutDeadline();
+        var pointAccount = budget.admit("alpha", pointScope, reservation);
+        var scanScope = RequestScope.withoutDeadline();
+        var scanAccount = budget.admit("beta", scanScope, reservation);
+        var scheduler = new ScanScheduler(budget, Duration.ofMinutes(1))) {
+      var response = new DirectRecordReader(store, pointAccount, 1024)
+          .read(ByteKey.empty(), 7, ReadProjection.METADATA);
+      var queued = scheduler.bind(request -> { throw scanStartFailure; }, scanAccount)
+          .startScan(new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
+              ReadProjection.METADATA, 1, 512, 32));
+
+      assertEquals(1, budget.snapshot().queued());
+      store.pending.completeExceptionally(new CompletionException(backendFailure));
+
+      assertTrue(response.isDone(), "the public response must settle after scheduler cleanup fails");
+      var observed = assertThrows(CompletionException.class, response::join);
+      assertSame(backendFailure, observed.getCause());
+      assertSuppressedCleanupFailure(backendFailure, scanStartFailure);
+      assertTrue(queued.completion().toCompletableFuture().isCompletedExceptionally());
+      assertEquals(0, budget.snapshot().queued());
+      assertEquals(0, budget.snapshot().operations());
+      assertEquals(0, budget.snapshot().scanners());
       assertEquals(0, budget.snapshot().allocatedBytes());
     }
   }
