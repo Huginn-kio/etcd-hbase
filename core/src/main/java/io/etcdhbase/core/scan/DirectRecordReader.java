@@ -77,9 +77,13 @@ public final class DirectRecordReader implements RecordReader {
     if (record.isEmpty()) return;
     var value = record.get();
     if (value.retainedBytes() > maximumResultBytes) throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
-    if (!value.key().equals(key) || value.metadata().modificationRevision() > upper
-        || projection == ReadProjection.METADATA && value.hasValue()
-        || projection == ReadProjection.FULL && value.metadata().state() == StorageMetadata.State.LIVE && !value.hasValue()) {
+    boolean keyOrRevisionMismatch =
+        !value.key().equals(key) || value.metadata().modificationRevision() > upper;
+    boolean metadataProjectionMismatch = projection == ReadProjection.METADATA && value.hasValue();
+    boolean liveFullProjectionMismatch = projection == ReadProjection.FULL
+        && value.metadata().state() == StorageMetadata.State.LIVE && !value.hasValue();
+    boolean projectionMismatch = metadataProjectionMismatch || liveFullProjectionMismatch;
+    if (keyOrRevisionMismatch || projectionMismatch) {
       throw new IllegalStateException("point result violates its requested version or projection");
     }
   }
