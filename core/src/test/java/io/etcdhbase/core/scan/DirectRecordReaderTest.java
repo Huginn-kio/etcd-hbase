@@ -122,7 +122,7 @@ class DirectRecordReaderTest {
   }
 
   @Test
-  void outputCleanupFailureDoesNotLeaveInvalidResultPending() {
+  void outputCleanupFailureDoesNotLeaveInvalidResultPending() throws Exception {
     var requested = ExistsExecutorTest.live(1, 16).key();
     var mismatched = ExistsExecutorTest.live(2, 16);
     var store = new FrozenRecordStore(List.of(List.of(mismatched)));
@@ -144,7 +144,7 @@ class DirectRecordReaderTest {
   }
 
   @Test
-  void outputCleanupFailureDoesNotReplaceBackendFailure() {
+  void outputCleanupFailureDoesNotReplaceBackendFailure() throws Exception {
     var store = new FrozenRecordStore(List.of(List.of()));
     store.pending = new CompletableFuture<>();
     var budget = SortedMergeCursorTest.budget();
@@ -166,7 +166,7 @@ class DirectRecordReaderTest {
   }
 
   @Test
-  void outputCleanupFailureDoesNotMaskFatalStartupError() {
+  void outputCleanupFailureDoesNotMaskFatalStartupError() throws Exception {
     var record = ExistsExecutorTest.live(1, 16);
     var store = new FrozenRecordStore(List.of(List.of(record)));
     var budget = SortedMergeCursorTest.budget();
