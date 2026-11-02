@@ -46,20 +46,17 @@ public final class ScanScheduler implements AutoCloseable {
   private Throwable cleanupFailure;
 
   public ScanScheduler(BudgetManager budget, Duration maximumQueueWait) {
-    this(budget, checkedQueueWait(maximumQueueWait), cleanupExecutor(budget), timerExecutor(), true);
+    this(budget, checkedQueueWaitNanos(maximumQueueWait), cleanupExecutor(budget), timerExecutor(), true);
   }
 
   ScanScheduler(BudgetManager budget, Duration maximumQueueWait, Executor cleanup, ScheduledExecutorService timer) {
-    this(budget, maximumQueueWait, cleanup, timer, false);
+    this(budget, checkedQueueWaitNanos(maximumQueueWait), cleanup, timer, false);
   }
 
-  private ScanScheduler(BudgetManager budget, Duration maximumQueueWait, Executor cleanup,
+  private ScanScheduler(BudgetManager budget, long queueWaitNanos, Executor cleanup,
       ScheduledExecutorService timer, boolean ownsExecutors) {
     this.budget = Objects.requireNonNull(budget, "budget");
-    if (maximumQueueWait.isZero() || maximumQueueWait.isNegative() || maximumQueueWait.compareTo(Duration.ofMinutes(5)) > 0) {
-      throw new IllegalArgumentException("queue wait must be positive and at most five minutes");
-    }
-    queueWaitNanos = maximumQueueWait.toNanos();
+    this.queueWaitNanos = queueWaitNanos;
     this.cleanup = Objects.requireNonNull(cleanup, "cleanup");
     this.timer = Objects.requireNonNull(timer, "timer");
     this.ownsExecutors = ownsExecutors;
@@ -408,11 +405,11 @@ public final class ScanScheduler implements AutoCloseable {
   private static BackendFailure resourceLimit() { return new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT); }
   private static BackendFailure cancelled() { return new BackendFailure(BackendFailure.Category.CANCELLED); }
 
-  private static Duration checkedQueueWait(Duration wait) {
+  private static long checkedQueueWaitNanos(Duration wait) {
     if (wait.isZero() || wait.isNegative() || wait.compareTo(Duration.ofMinutes(5)) > 0) {
       throw new IllegalArgumentException("queue wait must be positive and at most five minutes");
     }
-    return wait;
+    return wait.toNanos();
   }
 
   private static ThreadPoolExecutor cleanupExecutor(BudgetManager budget) {
