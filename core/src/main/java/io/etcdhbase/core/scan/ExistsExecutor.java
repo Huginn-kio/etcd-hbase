@@ -27,9 +27,13 @@ public final class ExistsExecutor implements AutoCloseable {
   private final RequestScope.ScopedCleanup registration;
   private final CompletableFuture<Result> result = new CompletableFuture<>();
   private final AtomicBoolean started = new AtomicBoolean();
-  private final AtomicBoolean stopped = new AtomicBoolean();
+  private final AtomicBoolean stopRequested = new AtomicBoolean();
+  private final Object outcomeLock = new Object();
   private final AtomicInteger draining = new AtomicInteger();
   private final AtomicReference<Completion> completion = new AtomicReference<>();
+  // Registration release invokes its resource again; keep that self-close distinct from a stop.
+  private boolean releasingRegistration;
+  private boolean outcomeFinalized;
   private BucketCursor cursor;
   private int bucket;
   private boolean waiting;
@@ -42,7 +46,7 @@ public final class ExistsExecutor implements AutoCloseable {
     this.template = template;
     this.bucketCount = bucketCount;
     this.scope = scope;
-    registration = scope.registerScopedCleanup(this);
+    registration = scope.registerScopedCleanup(this::closeFromScope);
   }
 
   public static CompletableFuture<Integer> point(RecordStore store, ByteKey key, long upper,
@@ -70,7 +74,7 @@ public final class ExistsExecutor implements AutoCloseable {
 
   private boolean step() throws BackendFailure {
     Completion arrived = completion.getAndSet(null);
-    if (terminal || stopped.get() || scope.isClosed() || scope.isDeadlineExceeded()) {
+    if (terminal || stopRequested.get() || scope.isClosed() || scope.isDeadlineExceeded()) {
       if (arrived != null && arrived.page != null) arrived.page.close();
       if (!terminal) finish(0, new BackendFailure(scope.isDeadlineExceeded()
           ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
@@ -104,22 +108,53 @@ public final class ExistsExecutor implements AutoCloseable {
     if (terminal) return;
     terminal = true;
     Error fatal = failure instanceof Error error ? error : null;
-    var resources = new AutoCloseable[] {cursor, registration};
+    var activeCursor = cursor;
     cursor = null;
-    for (var resource : resources) {
-      try { if (resource != null) resource.close(); }
-      catch (Exception | Error cleanup) {
-        if (failure == null) failure = cleanup;
-        else if (failure != cleanup) failure.addSuppressed(cleanup);
-        if (fatal == null && cleanup instanceof Error error) fatal = error;
+    try { if (activeCursor != null) activeCursor.close(); }
+    catch (Exception | Error cleanup) {
+      if (failure == null) failure = cleanup;
+      else if (failure != cleanup) failure.addSuppressed(cleanup);
+      if (fatal == null && cleanup instanceof Error error) fatal = error;
+    }
+    synchronized (outcomeLock) { releasingRegistration = true; }
+    try { if (registration != null) registration.close(); }
+    catch (Exception | Error cleanup) {
+      if (failure == null) failure = cleanup;
+      else if (failure != cleanup) failure.addSuppressed(cleanup);
+      if (fatal == null && cleanup instanceof Error error) fatal = error;
+    } finally {
+      synchronized (outcomeLock) { releasingRegistration = false; }
+    }
+    synchronized (outcomeLock) {
+      if (failure == null && (stopRequested.get() || scope.isClosed() || scope.isDeadlineExceeded())) {
+        failure = new BackendFailure(scope.isDeadlineExceeded()
+            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
       }
+      outcomeFinalized = true;
     }
     if (failure == null) result.complete(new Result(count, cost));
     else result.completeExceptionally(failure);
     if (fatal != null) throw fatal;
   }
 
-  @Override public void close() { stopped.set(true); drain(); }
+  @Override public void close() {
+    requestStop();
+    drain();
+  }
+
+  private void closeFromScope() {
+    synchronized (outcomeLock) {
+      if (releasingRegistration || outcomeFinalized) return;
+      stopRequested.set(true);
+    }
+    drain();
+  }
+
+  private void requestStop() {
+    synchronized (outcomeLock) {
+      if (!outcomeFinalized) stopRequested.set(true);
+    }
+  }
   private static BackendFailure unwrap(Throwable failure) {
     while (failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null) failure = failure.getCause();
     return failure instanceof BackendFailure backend ? backend : new BackendFailure(BackendFailure.Category.UNKNOWN, failure);
