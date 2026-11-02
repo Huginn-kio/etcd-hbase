@@ -19,33 +19,35 @@ import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 
 class SortedMergeCursorDeadlineTest {
   @Test
-  void deadlineCrossingDuringFinalHeadCleanupRejectsSuccessAndReleasesOutput() throws Exception {
+  void deadlineCrossingDuringFinalPageCleanupRejectsSuccessAndReleasesOutput() throws Exception {
     var clock = new ControlledClock();
     var scope = new RequestScope(10, clock);
     var budget = budget();
-    var source = new DelayedSource();
+    var source = new DelayedSource(clock::expire);
     try (scope; var account = budget.admit("public", scope, reservation());
         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1));
         var cursor = new SortedMergeCursor(scheduler.bind(source, account), template(), 1, account, scope)) {
       var result = cursor.read(1);
       source.pending.getFirst().complete(page(record(new byte[] {1}), false));
+      source.awaitSecondRead();
       assertEquals(2, source.pending.size(), "the first result requires a refill before proving More");
 
-      // The fourth deadline read is the final success-boundary check after HEAD cleanup.
-      clock.expireOnRead(clock.reads() + 4);
+      // Closing the completed backend page advances the manual clock during final cleanup.
       source.pending.getLast().complete(page(record(new byte[] {2}), true));
 
       var failure = assertThrows(CompletionException.class, result::join);
@@ -61,12 +63,13 @@ class SortedMergeCursorDeadlineTest {
     var clock = new ControlledClock();
     var scope = new RequestScope(10, clock);
     var budget = budget();
-    var source = new DelayedSource();
+    var source = new DelayedSource(() -> {});
     try (scope; var account = budget.admit("public", scope, reservation());
         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1));
         var cursor = new SortedMergeCursor(scheduler.bind(source, account), template(), 1, account, scope)) {
       var result = cursor.read(1);
       source.pending.getFirst().complete(page(record(new byte[] {1}), false));
+      source.awaitSecondRead();
       source.pending.getLast().complete(page(record(new byte[] {2}), true));
 
       var response = result.join();
@@ -104,28 +107,42 @@ class SortedMergeCursorDeadlineTest {
   }
 
   private static final class ControlledClock implements LongSupplier {
-    private final AtomicInteger reads = new AtomicInteger();
-    private volatile int expirationRead = Integer.MAX_VALUE;
+    private final AtomicBoolean expired = new AtomicBoolean();
 
     @Override
     public long getAsLong() {
-      return reads.incrementAndGet() >= expirationRead ? 10 : 0;
+      return expired.get() ? 10 : 0;
     }
 
-    int reads() { return reads.get(); }
-    void expireOnRead(int read) { expirationRead = read; }
+    void expire() { expired.set(true); }
   }
 
   private static final class DelayedSource implements ScanSource {
-    private final List<CompletableFuture<StoragePage>> pending = new ArrayList<>();
+    private final List<CompletableFuture<StoragePage>> pending = new CopyOnWriteArrayList<>();
+    private final CountDownLatch secondReadStarted = new CountDownLatch(1);
+    private final Runnable onSecondReadClose;
+
+    private DelayedSource(Runnable onSecondReadClose) {
+      this.onSecondReadClose = onSecondReadClose;
+    }
+
+    private void awaitSecondRead() throws InterruptedException {
+      assertTrue(secondReadStarted.await(5, TimeUnit.SECONDS), "cursor did not start the required refill");
+    }
 
     @Override
     public ScanOperation startScan(ScanRequest request) {
       var completion = new CompletableFuture<StoragePage>();
       pending.add(completion);
+      int scan = pending.size();
+      if (scan == 2) secondReadStarted.countDown();
+      var closed = new AtomicBoolean();
       return new ScanOperation() {
         @Override public CompletionStage<StoragePage> completion() { return completion.minimalCompletionStage(); }
-        @Override public void close() {}
+        @Override
+        public void close() {
+          if (closed.compareAndSet(false, true) && scan == 2) onSecondReadClose.run();
+        }
       };
     }
   }
