@@ -38,13 +38,13 @@ public final class SortedMergeCursor implements AutoCloseable {
   private final AtomicReference<Completion> completion = new AtomicReference<>();
   private final AtomicReference<ValueCompletion> valueCompletion = new AtomicReference<>();
   private final RecordStore valueStore;
-  private final long startingPointReads;
   // The drain loop alone mutates merge state; callbacks publish one bounded completion slot.
   private int initializing;
   private int refill = -1;
   private boolean waiting;
   private volatile boolean terminal;
   private int limit;
+  private long pagePointReads;
   private ByteKey previous;
   private Head selected;
   private StoragePage.Cost cost = new StoragePage.Cost(0, 0, 0);
@@ -69,7 +69,6 @@ public final class SortedMergeCursor implements AutoCloseable {
     this.account = account;
     this.scope = scope;
     this.valueStore = valueStore;
-    startingPointReads = account.pointReads();
     if (valueStore == null && template.projection() != ReadProjection.METADATA) {
       throw new IllegalArgumentException("full values require a pinned value reader");
     }
@@ -162,6 +161,7 @@ public final class SortedMergeCursor implements AutoCloseable {
     if (!record.key().equals(selected.record.key()) || !record.metadata().equals(selected.record.metadata()) || !record.hasValue()) {
       throw new IllegalStateException("value does not match selected metadata version");
     }
+    pagePointReads++;
     append(selected, record);
     selected = null;
   }
@@ -221,7 +221,7 @@ public final class SortedMergeCursor implements AutoCloseable {
     previous = null;
     RangePage response = null;
     if (failure == null) {
-      try { response = new RangePage(output, outputLeases, more, cost, account.pointReads() - startingPointReads, scope); }
+      try { response = new RangePage(output, outputLeases, more, cost, pagePointReads, scope); }
       catch (RuntimeException | Error allocationFailure) { failure = allocationFailure; }
     }
     if (failure != null) for (var lease : outputLeases) lease.close();

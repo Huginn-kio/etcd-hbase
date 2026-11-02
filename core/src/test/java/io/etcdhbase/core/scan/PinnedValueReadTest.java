@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import java.time.Duration;
@@ -12,6 +13,24 @@ import java.util.concurrent.CompletionException;
 import org.junit.jupiter.api.Test;
 
 class PinnedValueReadTest {
+  @Test
+  void metadataPageDoesNotIncludeAnIndependentPointReadFromTheSharedAccount() throws Exception {
+    var key = ByteKey.copyOf(new byte[] {1});
+    var store = new FrozenRecordStore(List.of(List.of(ExistsExecutorTest.live(1, 8192))));
+    var budget = SortedMergeCursorTest.budget();
+    try (var scope = RequestScope.withoutDeadline();
+        var account = budget.admit("public", scope, SortedMergeCursorTest.memory(1, 32768));
+        var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1));
+        var cursor = new SortedMergeCursor(scheduler.bind(store, account),
+            SortedMergeCursorTest.template(), 1, account, scope)) {
+      assertEquals(1, ExistsExecutor.point(store, key, 7, account).join());
+      try (var page = cursor.read(1).join()) {
+        assertEquals(0, page.pointReads());
+        assertEquals(1, account.pointReads());
+      }
+    }
+  }
+
   @Test
   void valuesAreFetchedOnlyForSelectedResultsAndPinnedToTheHeadVersion() throws Exception {
     var store = new FrozenRecordStore(List.of(List.of(ExistsExecutorTest.live(1, 8192)), List.of(ExistsExecutorTest.live(2, 8192))));
