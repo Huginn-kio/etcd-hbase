@@ -7,6 +7,8 @@ import java.util.EnumMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 
 /** Single ledger for global/group/request admission, work and reserved memory lanes. */
 public final class BudgetManager {
@@ -148,6 +150,7 @@ public final class BudgetManager {
     private long physicalRows, cellBytes, scanRpcCalls, pages;
     private long pointReads;
     private boolean readExhausted;
+    private final CompletableFuture<Void> drained = new CompletableFuture<>();
 
     private Account(String groupId, Group group, RequestScope scope, Reservation reservation, ReadLimits readLimits) {
       this.groupId = groupId;
@@ -162,6 +165,7 @@ public final class BudgetManager {
     private BudgetManager owner() { return BudgetManager.this; }
     RequestScope scope() { return scope; }
     public Reservation reservation() { return reservation; }
+    public CompletionStage<Void> termination() { return drained.minimalCompletionStage(); }
     public long pointReads() { synchronized (BudgetManager.this) { return pointReads; } }
     void chargePoint() throws BackendFailure {
       synchronized (BudgetManager.this) {
@@ -239,6 +243,12 @@ public final class BudgetManager {
       group.usage.reservedBytes -= reservation.total();
     }
 
+    private void signalDrain() {
+      boolean finished;
+      synchronized (BudgetManager.this) { finished = admissionReleased; }
+      if (finished) drained.complete(null);
+    }
+
     @Override
     public void close() {
       synchronized (BudgetManager.this) {
@@ -251,6 +261,7 @@ public final class BudgetManager {
       } catch (Exception cleanupFailure) {
         throw new IllegalStateException("budget registration cleanup failed", cleanupFailure);
       } finally {
+        signalDrain();
         changed();
       }
     }
@@ -290,6 +301,7 @@ public final class BudgetManager {
         }
         account.releaseAdmissionIfDrained();
       }
+      account.signalDrain();
       if (notify) changed();
     }
 

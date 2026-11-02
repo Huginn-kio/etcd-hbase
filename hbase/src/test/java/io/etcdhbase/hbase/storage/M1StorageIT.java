@@ -12,6 +12,7 @@ import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BucketCursor;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.scan.DirectRecordReader;
 import io.etcdhbase.core.scan.ExistsExecutor;
 import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.core.scan.SortedMergeCursor;
@@ -341,6 +342,32 @@ class M1StorageIT {
         }
         assertEquals(0, budget.snapshot().allocatedBytes());
       }
+    }
+  }
+
+  @Test
+  void directReaderDoesNotCacheAndRequestCancellationClosesRetainedResults() throws Exception {
+    var binding = table(StorageTableBinding.Layout.CURRENT);
+    var limits = new BudgetManager.Limits(2, 8, 1, 1, 1, 65536, 128L << 20);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(30));
+        var account = budget.admit("public", scope, new BudgetManager.Reservation(4096, 4096, 64L << 20, 1L << 20))) {
+      var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+      ByteKey key = ByteKey.copyOf(new byte[] {1});
+      await(store.put(live(key, 1, new byte[] {1})));
+      var reader = new DirectRecordReader(store, account, 1L << 20);
+      try (var first = await(reader.read(key, Long.MAX_VALUE, ReadProjection.FULL))) {
+        assertArrayEquals(new byte[] {1}, first.record().orElseThrow().value().orElseThrow());
+      }
+      await(store.put(live(key, 2, new byte[] {2})));
+      var second = await(reader.read(key, Long.MAX_VALUE, ReadProjection.FULL));
+      assertArrayEquals(new byte[] {2}, second.record().orElseThrow().value().orElseThrow());
+      assertEquals(2, account.pointReads());
+      scope.cancel();
+      assertThrows(IllegalStateException.class, second::record);
+      await(account.termination().toCompletableFuture());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+      assertFalse(connection.isClosed());
     }
   }
 

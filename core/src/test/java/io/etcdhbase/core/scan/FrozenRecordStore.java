@@ -18,6 +18,8 @@ final class FrozenRecordStore implements RecordStore {
   final List<Get> gets = new ArrayList<>();
   private final List<StoredRecord> records;
   boolean mismatch;
+  boolean fatal;
+  CompletableFuture<Optional<StoredRecord>> pending;
 
   FrozenRecordStore(List<List<StoredRecord>> buckets) {
     scans = new FrozenScanSource(buckets);
@@ -26,6 +28,8 @@ final class FrozenRecordStore implements RecordStore {
   @Override public ScanOperation startScan(ScanRequest request) { return scans.startScan(request); }
   @Override public CompletableFuture<Optional<StoredRecord>> get(ByteKey key, long upper, ReadProjection projection) {
     gets.add(new Get(key, upper, projection));
+    if (fatal) throw new AssertionError("synthetic fatal backend startup");
+    if (pending != null) return pending;
     var selected = records.stream().filter(record -> record.key().equals(key) && record.metadata().modificationRevision() <= upper).findFirst();
     if (mismatch) selected = Optional.empty();
     return CompletableFuture.completedFuture(projection == ReadProjection.METADATA
