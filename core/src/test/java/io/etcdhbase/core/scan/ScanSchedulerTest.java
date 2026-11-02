@@ -83,7 +83,7 @@ class ScanSchedulerTest {
     var physical = new ControlledSource();
     try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(30), Runnable::run, timer);
         var scope = RequestScope.withoutDeadline(); var account = budget.admit("alpha", scope, MEMORY,
-            new BudgetManager.ReadLimits(32, 4096, 32, 1))) {
+            new BudgetManager.ReadLimits(32, 4096, 32, 1, 1))) {
       var source = scheduler.bind(physical, account);
       var first = source.startScan(request(0));
       var limitTrigger = source.startScan(request(1));
@@ -220,7 +220,7 @@ class ScanSchedulerTest {
     var physical = new ControlledSource();
     try (var timer = new ManualTimer(); var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1), Runnable::run, timer);
         var scope = RequestScope.withoutDeadline(); var account = budget.admit("alpha", scope, MEMORY,
-            new BudgetManager.ReadLimits(32, 1024, 1, 1))) {
+            new BudgetManager.ReadLimits(32, 1024, 1, 1, 1))) {
       var source = scheduler.bind(physical, account);
       var first = source.startScan(request(0));
       var queued = source.startScan(request(1));

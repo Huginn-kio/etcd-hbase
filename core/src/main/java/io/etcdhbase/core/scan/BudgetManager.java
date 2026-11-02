@@ -56,14 +56,13 @@ public final class BudgetManager {
       long cleanup, long queuedBytes, long reservedBytes, long allocatedBytes, long retiredScanners) {}
 
   public record ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages, long pointOperations) {
-    public ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages) {
-      this(physicalRows, cellBytes, scanRpcCalls, pages, pages);
-    }
     public ReadLimits {
       if (physicalRows < 1 || cellBytes < 1 || scanRpcCalls < 1 || pages < 1 || pointOperations < 1) throw new IllegalArgumentException("invalid read limits");
     }
   }
 
+  private static final long DEFAULT_PAGE_LIMIT = 65_536;
+  private static final long DEFAULT_POINT_OPERATION_LIMIT = 65_536;
   private static final Work NO_WORK = new Work(0, 0, 0, 0, 0);
   private final Limits globalLimits;
   private final Limits requestLimits;
@@ -84,7 +83,8 @@ public final class BudgetManager {
   }
 
   public Account admit(String groupId, RequestScope scope, Reservation reservation) throws BackendFailure {
-    return admit(groupId, scope, reservation, new ReadLimits(1_000_000, 1L << 30, 100_000, 65_536));
+    return admit(groupId, scope, reservation,
+        new ReadLimits(1_000_000, 1L << 30, 100_000, DEFAULT_PAGE_LIMIT, DEFAULT_POINT_OPERATION_LIMIT));
   }
 
   public Account admit(String groupId, RequestScope scope, Reservation reservation, ReadLimits readLimits) throws BackendFailure {
