@@ -37,7 +37,7 @@ RowKey 格式 ID `ordered-zero-escape-v1`、表形态、列族和盐 strategy/ve
 
 `ScanOperation.close()` 请求停止单个物理页，`completion()` 在本地 scanner 和回调清理后结算。调用方取消自己的 future 不改变该权威完成信号；调度许可必须等待它结算。游标关闭不会关闭共享请求或连接。真实临时 HBase 的冻结数据验证覆盖两种历史布局、部分消费、重开及共享连接继续可用。远端 scanner 的关闭确认/lease 收敛不由本地 close 返回值代替。
 
-## J13 扫描预算
+## 2. J13 扫描预算
 
 `BudgetManager` 在一个锁内检查全局、预配置表组和请求的工作额度。请求准入预留 head、page、在途 I/O、output 四个内存分区；head/output 不能借走至少一页的进展空间。配额不足明确拒绝，扫描排队另受数量、字节和等待时间上限约束。`ScanScheduler` 在表组和请求之间轮转有限页，源操作保持非阻塞；请求总物理行、返回 Cell 字节、扫描 RPC 和页数都有上限。
 
