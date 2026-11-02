@@ -11,5 +11,9 @@ public interface RecordStore {
   CompletableFuture<Void> put(StoredRecord record);
   CompletableFuture<Boolean> compareAndSet(ByteKey key, Optional<StorageMetadata> expected, StoredRecord replacement);
   CompletableFuture<List<BatchWriteResult>> putBatch(List<StoredRecord> records);
-  CompletableFuture<StoragePage> scan(ScanRequest request);
+  ScanOperation startScan(ScanRequest request);
+
+  default CompletableFuture<StoragePage> scan(ScanRequest request) {
+    return startScan(request).completion().toCompletableFuture();
+  }
 }

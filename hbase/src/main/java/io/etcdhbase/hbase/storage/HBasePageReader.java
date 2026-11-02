@@ -6,6 +6,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.codec.StorageMessages;
@@ -16,6 +17,7 @@ import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -40,18 +42,22 @@ final class HBasePageReader {
   }
 
   CompletableFuture<StoragePage> read(ScanRequest request) {
+    return start(request).completion().toCompletableFuture();
+  }
+
+  ScanOperation start(ScanRequest request) {
     var task = new PageTask(request);
-    task.registration = scope.registerScopedCleanup(task, task.cleanupComplete);
+    task.registration = scope.registerScopedCleanup(task::closeResources, task.cleanupComplete);
     try {
       worker.execute(task);
     } catch (RejectedExecutionException rejected) {
       task.finish(null, new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT, rejected));
     }
     // Caller cancellation cannot complete the authoritative cleanup future early.
-    return task.outcome.copy();
+    return task;
   }
 
-  private final class PageTask implements Runnable, AutoCloseable {
+  private final class PageTask implements Runnable, ScanOperation {
     private final ScanRequest request;
     private final CompletableFuture<StoragePage> outcome = new CompletableFuture<>();
     private RequestScope.ScopedCleanup registration;
@@ -65,6 +71,9 @@ final class HBasePageReader {
         CompletableFuture.allOf(ownedScannerCloseComplete, executionComplete);
 
     PageTask(ScanRequest request) { this.request = request; }
+
+    @Override
+    public CompletionStage<StoragePage> completion() { return outcome.minimalCompletionStage(); }
 
     @Override
     public void run() {
@@ -184,7 +193,9 @@ final class HBasePageReader {
     }
 
     private void finish(StoragePage page, Throwable original) {
+      boolean cancelledBeforeCompletion;
       synchronized (this) {
+        cancelledBeforeCompletion = cancelled;
         completing = true;
       }
       Throwable failure = original;
@@ -211,7 +222,7 @@ final class HBasePageReader {
         if (terminal == null) terminal = cleanupFailure;
         else if (cleanupFailure != null && terminal != cleanupFailure) terminal.addSuppressed(cleanupFailure);
         if (terminal == null && scope.isDeadlineExceeded()) terminal = new TimeoutException();
-        if (terminal == null && scope.isClosed()) terminal = new CancellationException();
+        if (terminal == null && (cancelledBeforeCompletion || scope.isClosed())) terminal = new CancellationException();
         if (terminal == null) outcome.complete(page);
         else outcome.completeExceptionally(HBaseFailures.classify(terminal));
       });
@@ -220,6 +231,16 @@ final class HBasePageReader {
 
     @Override
     public void close() {
+      try {
+        registration.close();
+      } catch (RuntimeException failure) {
+        throw failure;
+      } catch (Exception failure) {
+        throw new IllegalStateException("scan registration cleanup failed", failure);
+      }
+    }
+
+    private void closeResources() {
       ResultScanner owned;
       boolean beforeStart;
       synchronized (this) {

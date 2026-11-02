@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BucketCursor;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -130,6 +131,92 @@ class M1StorageIT {
       scope.cancel();
       assertFalse(connection.isClosed());
     }
+  }
+
+  @Test
+  void cursorResumesFromConsumedKeysForBothLayoutsAndKeepsSharedResourcesOpen() throws Exception {
+    for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
+      assertLayoutCursorResumesAfterPartialPage(layout);
+    }
+  }
+
+  private static void assertLayoutCursorResumesAfterPartialPage(StorageTableBinding.Layout layout) throws Exception {
+    var binding = table(layout);
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60))) {
+      var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+      List<ByteKey> expected = writeCursorFixture(store);
+      List<ByteKey> observed = readAllBucketsAfterPartialPage(store, scope);
+      assertEquals(expected.stream().sorted().toList(), observed.stream().sorted().toList());
+      assertEquals(expected.size(), observed.stream().distinct().count());
+      assertClosingCursorLeavesSharedResourcesAvailable(store, scope, expected.getFirst());
+    }
+  }
+
+  private static List<ByteKey> writeCursorFixture(HBaseRecordStore store) throws Exception {
+    List<ByteKey> expected = new ArrayList<>();
+    for (int index = 0; index < 40; index++) {
+      ByteKey key = ByteKey.copyOf(new byte[] {0, (byte) index, (byte) 0xff});
+      expected.add(key);
+      await(store.put(live(key, 1, new byte[] {(byte) index})));
+    }
+    return expected;
+  }
+
+  private static List<ByteKey> readAllBucketsAfterPartialPage(HBaseRecordStore store, RequestScope scope)
+      throws Exception {
+    List<ByteKey> observed = new ArrayList<>();
+    for (int bucket = 0; bucket < SALT.profile().bucketCount(); bucket++) {
+      observed.addAll(readBucketAfterPartialPage(store, scope, bucket));
+    }
+    return observed;
+  }
+
+  private static List<ByteKey> readBucketAfterPartialPage(HBaseRecordStore store, RequestScope scope, int bucket)
+      throws Exception {
+    var request = new ScanRequest(bucket, KeyRange.all(), Optional.empty(), Long.MAX_VALUE,
+        ReadProjection.METADATA, 3, 4096, 128);
+    List<ByteKey> observed = new ArrayList<>();
+    try (var cursor = new BucketCursor(store, request, scope)) {
+      boolean firstPage = true;
+      while (cursor.state() != BucketCursor.State.EXHAUSTED) {
+        var result = cursor.fetch();
+        if (firstPage) {
+          cursor.pause();
+          observed.addAll(consumeFirstPageRecord(result));
+        } else {
+          observed.addAll(consumeRemainingPageRecords(result));
+        }
+        cursor.resume();
+        firstPage = false;
+      }
+    }
+    return observed;
+  }
+
+  private static List<ByteKey> consumeFirstPageRecord(CompletableFuture<BucketCursor.Page> result) throws Exception {
+    try (var page = await(result)) {
+      return page.next().map(record -> List.of(record.key())).orElseGet(List::of);
+    }
+  }
+
+  private static List<ByteKey> consumeRemainingPageRecords(CompletableFuture<BucketCursor.Page> result)
+      throws Exception {
+    List<ByteKey> observed = new ArrayList<>();
+    try (var page = await(result)) {
+      Optional<StoredRecord> record;
+      while ((record = page.next()).isPresent()) observed.add(record.get().key());
+    }
+    return observed;
+  }
+
+  private static void assertClosingCursorLeavesSharedResourcesAvailable(HBaseRecordStore store, RequestScope scope,
+      ByteKey existingKey) throws Exception {
+    var cursor = new BucketCursor(store, new ScanRequest(0, KeyRange.all(), Optional.empty(),
+        Long.MAX_VALUE, ReadProjection.METADATA, 1, 4096, 128), scope);
+    cursor.close();
+    assertFalse(scope.isClosed());
+    assertTrue(await(store.get(existingKey, 1, ReadProjection.FULL)).isPresent());
+    assertFalse(connection.isClosed());
   }
 
   @Test
