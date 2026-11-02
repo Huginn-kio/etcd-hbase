@@ -11,7 +11,7 @@ from evidence import java_reports, require_unchanged_source
 REQUIRED = {"io.etcdhbase.core.scan.BucketCursorTest",
             "io.etcdhbase.hbase.storage.HBasePageReaderTest",
             "io.etcdhbase.hbase.storage.M1StorageIT"}
-CURSOR_CASE = "cursorReopensAfterOnlyConsumedKeysAndCancelsWithoutClosingSharedConnections"
+CURSOR_CASE = "cursorResumesFromConsumedKeysForBothLayoutsAndKeepsSharedResourcesOpen"
 
 
 def collect(root, output, phase):
