@@ -3,7 +3,6 @@ package io.etcdhbase.hbase.storage;
 import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
-import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.hbase.codec.CommitControlMessages;
@@ -11,12 +10,9 @@ import io.etcdhbase.hbase.connection.HBaseRequestContext;
 import io.etcdhbase.hbase.error.HBaseFailures;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.util.Arrays;
-import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.client.AsyncConnection;
@@ -140,61 +136,7 @@ public final class HBaseCommitControlStore implements CommitControlStore {
 
   private static <T> CompletableFuture<T> startRequest(
       RequestScope scope, Supplier<CompletableFuture<T>> operation) {
-    try {
-      if (scope.isDeadlineExceeded()) throw new TimeoutException();
-      if (scope.isClosed()) throw new CancellationException();
-      return bindRequestToProducer(scope, operation);
-    } catch (Exception failure) {
-      return CompletableFuture.failedFuture(HBaseFailures.classify(failure));
-    }
-  }
-
-  /** Keeps producer completion independent from the caller's cancellable result future. */
-  static <T> CompletableFuture<T> bindRequestToProducer(
-      RequestScope scope, Supplier<CompletableFuture<T>> startProducer) {
-    var request = new CompletableFuture<T>();
-    var actualCompletion = new CompletableFuture<Void>();
-    var registration = scope.registerScopedCleanup(
-        () -> request.completeExceptionally(new BackendFailure(scope.isDeadlineExceeded()
-            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED)),
-        actualCompletion);
-    if (scope.isClosed()) {
-      actualCompletion.complete(null);
-      closeRegistration(registration, request);
-      return request;
-    }
-    CompletableFuture<T> producer;
-    try {
-      producer = Objects.requireNonNull(startProducer.get(), "producer");
-    } catch (Exception failure) {
-      request.completeExceptionally(HBaseFailures.classify(failure));
-      actualCompletion.complete(null);
-      closeRegistration(registration, request);
-      return request;
-    }
-    producer.whenComplete((value, failure) -> {
-      if (failure != null) {
-        request.completeExceptionally(HBaseFailures.classify(failure));
-      } else if (scope.isDeadlineExceeded()) {
-        request.completeExceptionally(new BackendFailure(BackendFailure.Category.TIMEOUT));
-      } else if (scope.isClosed()) {
-        request.completeExceptionally(new BackendFailure(BackendFailure.Category.CANCELLED));
-      } else {
-        request.complete(value);
-      }
-      actualCompletion.complete(null);
-      closeRegistration(registration, request);
-    });
-    return request;
-  }
-
-  private static void closeRegistration(RequestScope.ScopedCleanup registration,
-      CompletableFuture<?> request) {
-    try {
-      registration.close();
-    } catch (Exception failureToClose) {
-      request.completeExceptionally(HBaseFailures.classify(failureToClose));
-    }
+    return HBaseRequestCompletion.startRequest(scope, operation);
   }
 
   private static <T> CompletableFuture<T> failed(Throwable failure) {

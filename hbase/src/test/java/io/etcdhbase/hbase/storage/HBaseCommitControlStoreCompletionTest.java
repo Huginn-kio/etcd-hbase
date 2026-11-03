@@ -20,7 +20,7 @@ class HBaseCommitControlStoreCompletionTest {
     CompletableFuture<Boolean> hbaseCas = new CompletableFuture<>();
     CompletableFuture<Boolean> dependent = hbaseCas.thenApply(Boolean::booleanValue);
     CompletableFuture<Boolean> request =
-        HBaseCommitControlStore.bindRequestToProducer(scope, () -> dependent);
+        HBaseRequestCompletion.bindRequestToProducer(scope, () -> dependent);
 
     assertTrue(scope.cancel());
     BackendFailure cancelled = assertInstanceOf(BackendFailure.class,
@@ -43,7 +43,7 @@ class HBaseCommitControlStoreCompletionTest {
     assertTrue(scope.cancel());
     var started = new AtomicBoolean();
 
-    CompletableFuture<Boolean> request = HBaseCommitControlStore.bindRequestToProducer(
+    CompletableFuture<Boolean> request = HBaseRequestCompletion.startRequest(
         scope, () -> {
           started.set(true);
           return CompletableFuture.completedFuture(true);

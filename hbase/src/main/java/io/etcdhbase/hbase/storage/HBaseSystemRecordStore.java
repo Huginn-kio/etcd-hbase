@@ -14,7 +14,6 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.client.AsyncConnection;
 import org.apache.hadoop.hbase.client.AsyncTable;
@@ -45,7 +44,8 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
       RequestScope scope) {
     var context = new HBaseRequestContext(scope);
     return context.borrowConnection(factory, identity).thenCompose(connection ->
-        context.execute(() -> connection.getAdmin().getDescriptor(binding.table()))
+        HBaseRequestCompletion.startRequest(scope,
+            () -> connection.getAdmin().getDescriptor(binding.table()))
             .thenApply(descriptor -> {
               binding.validate(descriptor);
               return new HBaseSystemRecordStore(connection, binding);
@@ -107,7 +107,8 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
     }
     byte[] bytes = result.getValue(binding.family(), VALUE);
     if (bytes == null) throw new IllegalArgumentException("system record is missing its value");
-    return Optional.of(ByteKey.copyOf(checkedValue(bytes)));
+    validateValueLength(bytes.length);
+    return Optional.of(ByteKey.copyOf(bytes));
   }
 
   private Put put(byte[] row, byte[] value) {
@@ -118,36 +119,28 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
   private <T> CompletableFuture<T> execute(
       RequestScope scope,
       java.util.function.Function<AsyncTable<?>, CompletableFuture<T>> operation) {
-    CompletableFuture<T> backend;
-    try {
-      if (scope.isDeadlineExceeded()) throw new TimeoutException();
-      if (scope.isClosed()) throw new java.util.concurrent.CancellationException();
+    return HBaseRequestCompletion.startRequest(scope, () -> {
       long timeout = Math.max(1, Math.min(TimeUnit.SECONDS.toNanos(30), scope.remainingDeadlineNanos()));
       AsyncTable<?> table = connection.getTableBuilder(binding.table())
           .setOperationTimeout(timeout, TimeUnit.NANOSECONDS)
           .setRpcTimeout(timeout, TimeUnit.NANOSECONDS).build();
-      backend = operation.apply(table);
-    } catch (Exception failure) {
-      return CompletableFuture.failedFuture(HBaseFailures.classify(failure));
-    }
-    return scope.track(backend).handle((value, failure) -> {
-      if (failure != null) throw new CompletionException(HBaseFailures.classify(failure));
-      if (scope.isDeadlineExceeded()) throw new CompletionException(
-          new BackendFailure(BackendFailure.Category.TIMEOUT));
-      if (scope.isClosed()) throw new CompletionException(
-          new BackendFailure(BackendFailure.Category.CANCELLED));
-      return value;
-    }).copy();
+      return operation.apply(table);
+    });
   }
 
   private static byte[] checkedValue(ByteKey value) {
-    return checkedValue(value.bytes());
+    validateValueLength(value.length());
+    return value.bytes();
   }
 
   private static byte[] checkedValue(byte[] value) {
-    if (value.length == 0 || value.length > MAX_RECORD_BYTES) {
+    validateValueLength(value.length);
+    return value.clone();
+  }
+
+  private static void validateValueLength(int length) {
+    if (length == 0 || length > MAX_RECORD_BYTES) {
       throw new IllegalArgumentException("system record value exceeds its storage budget");
     }
-    return value.clone();
   }
 }
