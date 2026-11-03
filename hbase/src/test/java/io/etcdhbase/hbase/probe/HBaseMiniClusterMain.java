@@ -5,10 +5,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.testing.TestingHBaseCluster;
 import org.apache.hadoop.hbase.testing.TestingHBaseClusterOption;
 import org.apache.hadoop.hbase.util.VersionInfo;
-import org.apache.hadoop.hbase.regionserver.HRegionServer;
 
 /** Disposable SIMPLE or Kerberos HBase server, isolated from the application's client runtime. */
 public final class HBaseMiniClusterMain {

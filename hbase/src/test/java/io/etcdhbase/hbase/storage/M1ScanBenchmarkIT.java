@@ -15,6 +15,7 @@ import io.etcdhbase.core.scan.SortedMergeCursor;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.StoragePage;
+import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.codec.RowKeyCodec;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
@@ -22,9 +23,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.util.VersionInfo;
@@ -40,7 +43,7 @@ class M1ScanBenchmarkIT {
   void frozenDatasetMatchesTheOracleAcrossLayoutsBucketsAndFlushStates() throws Exception {
     FrozenScanDataset dataset = FrozenScanDataset.create();
     try (var environment = M1TestEnvironment.start(3)) {
-      assertEquals(3, await(environment.connection.getAdmin().getRegionServers()).size());
+      assertEquals(3, await(environment.connection().getAdmin().getRegionServers()).size());
       for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
         for (int buckets : List.of(1, 4, 16)) runProfile(environment, dataset, layout, buckets);
       }
@@ -51,10 +54,25 @@ class M1ScanBenchmarkIT {
       StorageTableBinding.Layout layout, int bucketCount) throws Exception {
     var salt = new HashSaltStrategy(new SaltProfile(HashSaltStrategy.STRATEGY_ID, 1, bucketCount, 2));
     var binding = binding(layout, salt);
-    environment.create(binding, splits(binding.codec(), dataset.keys()));
     var latest = layout == StorageTableBinding.Layout.HISTORY ? binding(StorageTableBinding.Layout.CURRENT, salt) : null;
+    prepareProfileTables(environment, dataset, binding, latest);
+    List<Long> writeNanos = writeProfileMutations(environment, dataset, binding, latest);
+    var distribution = bucketDistribution(dataset, binding.codec(), bucketCount);
+    var hotRegions = observeHotRegions(environment, dataset, binding);
+    assertEquals(1, hotRegions.size(), "salt cannot distribute revisions of one fixed logical key");
+    printProfileSummary(dataset, layout, bucketCount, latest, writeNanos, distribution, hotRegions.size());
+    runProfileScenarios(environment, dataset, binding, bucketCount, latest);
+  }
+
+  private static void prepareProfileTables(M1TestEnvironment environment, FrozenScanDataset dataset,
+      StorageTableBinding binding, StorageTableBinding latest) throws Exception {
+    environment.create(binding, splits(binding.codec(), dataset.keys()));
     if (latest != null) environment.create(latest, splits(latest.codec(), dataset.keys()));
-    assertEquals(REGIONS, await(environment.connection.getAdmin().getRegions(binding.table())).size());
+    assertEquals(REGIONS, await(environment.connection().getAdmin().getRegions(binding.table())).size());
+  }
+
+  private static List<Long> writeProfileMutations(M1TestEnvironment environment, FrozenScanDataset dataset,
+      StorageTableBinding binding, StorageTableBinding latest) throws Exception {
     List<Long> writeNanos = new ArrayList<>();
     try (var scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
       var store = environment.store(binding, scope);
@@ -66,30 +84,52 @@ class M1ScanBenchmarkIT {
         writeNanos.add(System.nanoTime() - start);
       }
     }
+    return writeNanos;
+  }
+
+  private static BucketDistribution bucketDistribution(FrozenScanDataset dataset, RowKeyCodec codec, int bucketCount) {
     int[] uniqueBuckets = new int[bucketCount];
     int[] writeBuckets = new int[bucketCount];
-    for (var key : dataset.keys()) uniqueBuckets[binding.codec().bucket(key)]++;
-    for (var mutation : dataset.mutations()) writeBuckets[binding.codec().bucket(mutation.key())]++;
-    var hotRegions = new java.util.HashSet<String>();
+    for (var key : dataset.keys()) uniqueBuckets[codec.bucket(key)]++;
+    for (var mutation : dataset.mutations()) writeBuckets[codec.bucket(mutation.key())]++;
+    return new BucketDistribution(uniqueBuckets, writeBuckets);
+  }
+
+  private static Set<String> observeHotRegions(M1TestEnvironment environment, FrozenScanDataset dataset,
+      StorageTableBinding binding) throws Exception {
+    Set<String> hotRegions = new HashSet<>();
     for (var mutation : dataset.mutations()) {
-      if (mutation.key().equals(dataset.hotKey())) hotRegions.add(await(environment.connection.getRegionLocator(binding.table())
+      if (mutation.key().equals(dataset.hotKey())) hotRegions.add(await(environment.connection().getRegionLocator(binding.table())
           .getRegionLocation(binding.codec().encode(mutation.key(), mutation.metadata().modificationRevision()))).getRegion().getEncodedName());
     }
-    assertEquals(1, hotRegions.size(), "salt cannot distribute revisions of one fixed logical key");
+    return hotRegions;
+  }
+
+  private static void printProfileSummary(FrozenScanDataset dataset, StorageTableBinding.Layout layout, int bucketCount,
+      StorageTableBinding latest, List<Long> writeNanos, BucketDistribution distribution, int hotRegionCount) {
     System.out.printf(java.util.Locale.ROOT,
         "m1-profile {\"layout\":\"%s\",\"buckets\":%d,\"seed\":%d,\"digest\":\"%s\",\"logicalKeys\":%d,\"mutations\":%d,\"applicationPutCalls\":%d,\"regionsPerTable\":%d,\"tables\":%d,\"servers\":3,\"uniqueKeysPerBucket\":%s,\"writesPerBucket\":%s,\"hotObservedRegions\":%d,\"writeP50Micros\":%d,\"writeP95Micros\":%d,\"clientHBase\":\"%s\",\"java\":\"%s\"}%n",
         layout, bucketCount, FrozenScanDataset.SEED, dataset.digest(), dataset.keys().size(), dataset.mutations().size(),
         dataset.mutations().size() * (latest == null ? 1 : 2), REGIONS, latest == null ? 1 : 2,
-        Arrays.toString(uniqueBuckets), Arrays.toString(writeBuckets), hotRegions.size(), percentile(writeNanos, 50) / 1000,
+        Arrays.toString(distribution.uniqueKeys()), Arrays.toString(distribution.writes()), hotRegionCount, percentile(writeNanos, 50) / 1000,
         percentile(writeNanos, 95) / 1000, VersionInfo.getVersion(), Runtime.version());
+  }
+
+  private static void runProfileScenarios(M1TestEnvironment environment, FrozenScanDataset dataset,
+      StorageTableBinding binding, int bucketCount, StorageTableBinding latest) throws Exception {
     for (boolean flushed : List.of(false, true)) {
       if (flushed) {
-        await(environment.connection.getAdmin().flush(binding.table()));
-        await(environment.connection.getAdmin().clearBlockCache(binding.table()));
-        if (latest != null) await(environment.connection.getAdmin().flush(latest.table()));
+        flushProfileTables(environment, binding, latest);
       }
       for (Scenario scenario : scenarios()) runScenario(environment, dataset, binding, bucketCount, scenario, flushed);
     }
+  }
+
+  private static void flushProfileTables(M1TestEnvironment environment, StorageTableBinding binding,
+      StorageTableBinding latest) throws Exception {
+    await(environment.connection().getAdmin().flush(binding.table()));
+    await(environment.connection().getAdmin().clearBlockCache(binding.table()));
+    if (latest != null) await(environment.connection().getAdmin().flush(latest.table()));
   }
 
   private static void runScenario(M1TestEnvironment environment, FrozenScanDataset dataset,
@@ -99,40 +139,71 @@ class M1ScanBenchmarkIT {
     long pointReads = 0, peakBytes = 0, peakScanners = 0;
     var expected = dataset.liveView(scenario.range(), scenario.upper());
     int expectedCount = scenario.limit() == 0 ? expected.size() : Math.min(scenario.limit(), expected.size());
-    for (int sample = 0; sample < SAMPLES; sample++) {
-      var budget = new BudgetManager(LIMITS, Map.of("public", LIMITS), LIMITS);
-      try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60));
-          var account = budget.admit("public", scope, new BudgetManager.Reservation(bucketCount * 16384L, 16384, 64L << 20, 2L << 20));
-          var scheduler = new ScanScheduler(budget, Duration.ofSeconds(10))) {
-        var store = environment.store(binding, scope);
-        var template = new ScanRequest(0, scenario.range(), Optional.empty(), scenario.upper(), ReadProjection.METADATA, 1, 16384, 4096);
-        var source = scheduler.bind(store, account);
-        try (var cursor = scenario.full() ? SortedMergeCursor.values(store, source, template, bucketCount, account, scope)
-            : new SortedMergeCursor(source, template, bucketCount, account, scope)) {
-          long start = System.nanoTime();
-          try (var page = await(cursor.read(scenario.limit()))) {
-            times.add(System.nanoTime() - start);
-            assertEquals(expectedCount, page.count());
-            assertEquals(scenario.limit() > 0 && expected.size() > scenario.limit(), page.more());
-            for (int index = 0; index < expectedCount; index++) {
-              var actual = page.records().get(index);
-              var reference = expected.get(index);
-              assertEquals(reference.key(), actual.key());
-              assertEquals(reference.metadata(), actual.metadata());
-              if (scenario.full()) assertArrayEquals(reference.value().orElseThrow(), actual.value().orElseThrow());
-              else assertFalse(actual.hasValue());
-            }
-            total = total.plus(page.cost());
-            pointReads += page.pointReads();
-          }
-        }
-        peakBytes = Math.max(peakBytes, budget.snapshot().peakAllocatedBytes());
-        peakScanners = Math.max(peakScanners, budget.snapshot().peakScanners());
-        assertTrue(peakScanners <= 1);
-        assertEquals(0, budget.snapshot().allocatedBytes());
-      }
-      assertEquals(0, budget.snapshot().requests());
+    for (int sampleIndex = 0; sampleIndex < SAMPLES; sampleIndex++) {
+      var sample = runScenarioSample(environment, binding, bucketCount, scenario, expected, expectedCount);
+      times.add(sample.elapsedNanos());
+      total = total.plus(sample.cost());
+      pointReads += sample.pointReads();
+      peakBytes = Math.max(peakBytes, sample.peakBytes());
+      peakScanners = Math.max(peakScanners, sample.peakScanners());
     }
+    printBenchmarkSummary(binding, bucketCount, scenario, flushed, expectedCount, times, total, pointReads,
+        peakBytes, peakScanners);
+  }
+
+  private static ScenarioSample runScenarioSample(M1TestEnvironment environment, StorageTableBinding binding,
+      int bucketCount, Scenario scenario, List<StoredRecord> expected, int expectedCount) throws Exception {
+    var budget = new BudgetManager(LIMITS, Map.of("public", LIMITS), LIMITS);
+    PageSample pageSample;
+    long peakBytes;
+    long peakScanners;
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60));
+        var account = budget.admit("public", scope, new BudgetManager.Reservation(bucketCount * 16384L, 16384, 64L << 20, 2L << 20));
+        var scheduler = new ScanScheduler(budget, Duration.ofSeconds(10))) {
+      var store = environment.store(binding, scope);
+      var template = new ScanRequest(0, scenario.range(), Optional.empty(), scenario.upper(), ReadProjection.METADATA, 1, 16384, 4096);
+      var source = scheduler.bind(store, account);
+      try (var cursor = scenario.full() ? SortedMergeCursor.values(store, source, template, bucketCount, account, scope)
+          : new SortedMergeCursor(source, template, bucketCount, account, scope)) {
+        pageSample = readScenarioPage(cursor, scenario, expected, expectedCount);
+      }
+      var snapshot = budget.snapshot();
+      peakBytes = snapshot.peakAllocatedBytes();
+      peakScanners = snapshot.peakScanners();
+      assertTrue(peakScanners <= 1);
+      assertEquals(0, snapshot.allocatedBytes());
+    }
+    assertEquals(0, budget.snapshot().requests());
+    return new ScenarioSample(pageSample.elapsedNanos(), pageSample.cost(), pageSample.pointReads(), peakBytes, peakScanners);
+  }
+
+  private static PageSample readScenarioPage(SortedMergeCursor cursor, Scenario scenario,
+      List<StoredRecord> expected, int expectedCount) throws Exception {
+    long start = System.nanoTime();
+    try (var page = await(cursor.read(scenario.limit()))) {
+      long elapsedNanos = System.nanoTime() - start;
+      assertScenarioPage(scenario, expected, expectedCount, page);
+      return new PageSample(elapsedNanos, page.cost(), page.pointReads());
+    }
+  }
+
+  private static void assertScenarioPage(Scenario scenario, List<StoredRecord> expected,
+      int expectedCount, StoragePage page) {
+    assertEquals(expectedCount, page.count());
+    assertEquals(scenario.limit() > 0 && expected.size() > scenario.limit(), page.more());
+    for (int index = 0; index < expectedCount; index++) {
+      var actual = page.records().get(index);
+      var reference = expected.get(index);
+      assertEquals(reference.key(), actual.key());
+      assertEquals(reference.metadata(), actual.metadata());
+      if (scenario.full()) assertArrayEquals(reference.value().orElseThrow(), actual.value().orElseThrow());
+      else assertFalse(actual.hasValue());
+    }
+  }
+
+  private static void printBenchmarkSummary(StorageTableBinding binding, int bucketCount, Scenario scenario,
+      boolean flushed, int expectedCount, List<Long> times, StoragePage.Cost total, long pointReads,
+      long peakBytes, long peakScanners) {
     System.out.printf(java.util.Locale.ROOT,
         "m1-benchmark {\"layout\":\"%s\",\"buckets\":%d,\"phase\":\"%s\",\"case\":\"%s\",\"samples\":%d,\"returnedPerSample\":%d,\"returnedPhysicalRows\":%d,\"returnedCellBytes\":%d,\"observedScanRpcCalls\":%d,\"applicationPointReads\":%d,\"peakLeasedBytes\":%d,\"peakLocalScannerPermits\":%d,\"p50Micros\":%d,\"p95Micros\":%d,\"p99Micros\":%d,\"observedServerCounters\":%s,\"oracleMatches\":true}%n",
         binding.layout(), bucketCount, flushed ? "flushed_cache_reset_then_warming" : "memstore_warming", scenario.id(), SAMPLES,
@@ -172,5 +243,8 @@ class M1ScanBenchmarkIT {
     return cost.observations().entrySet().stream().sorted(Map.Entry.comparingByKey())
         .map(entry -> "\"" + entry.getKey().name() + "\":" + entry.getValue()).collect(java.util.stream.Collectors.joining(",", "{", "}"));
   }
+  private record BucketDistribution(int[] uniqueKeys, int[] writes) {}
+  private record PageSample(long elapsedNanos, StoragePage.Cost cost, long pointReads) {}
+  private record ScenarioSample(long elapsedNanos, StoragePage.Cost cost, long pointReads, long peakBytes, long peakScanners) {}
   private record Scenario(String id, KeyRange range, int limit, long upper, boolean full) {}
 }

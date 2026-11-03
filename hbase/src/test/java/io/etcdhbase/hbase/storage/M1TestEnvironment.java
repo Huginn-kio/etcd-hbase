@@ -20,10 +20,10 @@ import org.apache.hadoop.hbase.client.AsyncConnection;
 /** Disposable real backend shared by M1 fixture callers; does not touch a target environment. */
 final class M1TestEnvironment implements AutoCloseable {
   private TemporaryHBaseClusterProcess cluster;
-  HBaseBackendIdentityProvider provider;
-  AuthorizedBackendIdentity identity;
-  AsyncConnection connection;
-  ThreadPoolExecutor worker;
+  private HBaseBackendIdentityProvider provider;
+  private AuthorizedBackendIdentity identity;
+  private AsyncConnection connection;
+  private ThreadPoolExecutor worker;
   private final List<TableName> tables = new ArrayList<>();
 
   static M1TestEnvironment start(int servers) throws Exception {
@@ -51,6 +51,9 @@ final class M1TestEnvironment implements AutoCloseable {
     return await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
   }
 
+  /** Returns the provider-owned connection for fixture callers that borrow it. */
+  AsyncConnection connection() { return connection; }
+
   void create(StorageTableBinding binding, byte[][] splits) throws Exception {
     await(connection.getAdmin().createTable(binding.descriptor(), splits));
     tables.add(binding.table());
@@ -60,24 +63,54 @@ final class M1TestEnvironment implements AutoCloseable {
 
   @Override
   public void close() throws Exception {
-    Throwable failure = null;
+    CleanupFailures failures = new CleanupFailures();
     if (connection != null) {
       for (TableName table : tables) {
-        try { await(connection.getAdmin().disableTable(table)); await(connection.getAdmin().deleteTable(table)); }
-        catch (Exception | Error problem) { if (failure == null) failure = problem; else failure.addSuppressed(problem); }
+        try {
+          await(connection.getAdmin().disableTable(table));
+          await(connection.getAdmin().deleteTable(table));
+        } catch (Exception | Error problem) {
+          failures.add(problem);
+        }
       }
     }
     try {
       if (worker != null) {
         worker.shutdownNow();
-        if (!worker.awaitTermination(20, TimeUnit.SECONDS)) throw new IllegalStateException("fixture scan workers did not terminate");
+        if (!worker.awaitTermination(20, TimeUnit.SECONDS)) {
+          throw new IllegalStateException("fixture scan workers did not terminate");
+        }
       }
-    } catch (Exception | Error problem) { if (failure == null) failure = problem; else failure.addSuppressed(problem); }
-    try { if (provider != null) provider.close(); }
-    catch (RuntimeException | Error problem) { if (failure == null) failure = problem; else failure.addSuppressed(problem); }
-    try { if (cluster != null) cluster.close(); }
-    catch (Exception | Error problem) { if (failure == null) failure = problem; else failure.addSuppressed(problem); }
-    if (failure instanceof Error fatal) throw fatal;
-    if (failure instanceof Exception exception) throw exception;
+    } catch (Exception | Error problem) {
+      failures.add(problem);
+    }
+    try {
+      if (provider != null) provider.close();
+    } catch (RuntimeException | Error problem) {
+      failures.add(problem);
+    }
+    try {
+      if (cluster != null) cluster.close();
+    } catch (Exception | Error problem) {
+      failures.add(problem);
+    }
+    failures.throwIfPresent();
+  }
+
+  private static final class CleanupFailures {
+    private Throwable primary;
+
+    void add(Throwable failure) {
+      if (primary == null) {
+        primary = failure;
+      } else {
+        primary.addSuppressed(failure);
+      }
+    }
+
+    void throwIfPresent() throws Exception {
+      if (primary instanceof Error fatal) throw fatal;
+      if (primary instanceof Exception exception) throw exception;
+    }
   }
 }

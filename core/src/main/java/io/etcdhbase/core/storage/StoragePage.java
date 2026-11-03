@@ -1,8 +1,8 @@
 package io.etcdhbase.core.storage;
 
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
-import java.util.EnumMap;
 
 /** Physical rows are client-returned Result rows; observations are sampled counters, not total IO. */
 public record StoragePage(List<StoredRecord> records, boolean exhausted, Cost cost) {
