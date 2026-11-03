@@ -49,9 +49,9 @@ class ReadViewRecordStoreTest {
       ReadViewRecordStore view = fixture.readStore(pinned, scope);
       assertSelectedPointReads(view, account);
       assertCurrentScanPage(view, pinned, account);
-      assertRangeMergeAndExists(view, scope);
+      assertRangeMergeAndExists(fixture, view, scope);
     }
-    assertEquals(1, fixture.pinCloses.get());
+    assertEquals(4, fixture.pinCloses.get());
   }
 
   private static Fixture currentReadFixture() {
@@ -94,8 +94,8 @@ class ReadViewRecordStoreTest {
     assertEquals(1, pinned.view().stableRevision());
   }
 
-  private static void assertRangeMergeAndExists(ReadViewRecordStore view, RequestScope scope)
-      throws BackendFailure {
+  private static void assertRangeMergeAndExists(Fixture fixture, ReadViewRecordStore view,
+      RequestScope scope) throws BackendFailure {
     var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
     var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
     var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192, 8192);
@@ -110,14 +110,23 @@ class ReadViewRecordStoreTest {
           .map(record -> text(record.key())).toList());
       assertEquals("new-gamma", new String(response.records().getLast().value().orElseThrow()));
       assertEquals(2, response.pointReads(), "selected heads fetch values through the same pinned view");
-      assertEquals(1, ExistsExecutor.point(view, key("gamma"), 2, account).join());
-      assertEquals(0, ExistsExecutor.point(view, key("doomed"), 2, account).join());
-      try (var exists = new ExistsExecutor(scheduler.bind(view, account),
+      PinnedReadView gammaPin = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
+      try (ReadViewRecordStore gammaView = fixture.readStore(gammaPin, scope)) {
+        assertEquals(1, ExistsExecutor.point(gammaView, key("gamma"), 2, account).join());
+      }
+      PinnedReadView doomedPin = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
+      try (ReadViewRecordStore doomedView = fixture.readStore(doomedPin, scope)) {
+        assertEquals(0, ExistsExecutor.point(doomedView, key("doomed"), 2, account).join());
+      }
+      PinnedReadView rangeExistsPin = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
+      try (ReadViewRecordStore rangeExistsView = fixture.readStore(rangeExistsPin, scope);
+          var exists = new ExistsExecutor(scheduler.bind(rangeExistsView, account),
           new ScanRequest(0, KeyRange.point(key("gamma")), Optional.empty(), 2,
-              ReadProjection.METADATA, 1, 1024, 64), 1, scope)) {
+              ReadProjection.METADATA, 1, 1024, 64), 1, scope, rangeExistsView)) {
         assertEquals(1, exists.execute().join().count());
       }
     }
+    assertEquals(4, fixture.pinCloses.get());
   }
 
   @Test

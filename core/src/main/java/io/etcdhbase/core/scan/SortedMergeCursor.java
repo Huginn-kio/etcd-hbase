@@ -26,6 +26,7 @@ public final class SortedMergeCursor implements AutoCloseable {
   private final BudgetManager.Account account;
   private final RequestScope scope;
   private final RequestScope.ScopedCleanup registration;
+  private final RecordStore completionStore;
   private final PriorityQueue<Head> heap = new PriorityQueue<>(Comparator.comparing(head -> head.record.key()));
   private final Head[] heads;
   private final boolean[] exhausted;
@@ -56,7 +57,15 @@ public final class SortedMergeCursor implements AutoCloseable {
 
   public static SortedMergeCursor values(RecordStore store, ScanSource source, ScanRequest template,
       int bucketCount, BudgetManager.Account account, RequestScope scope) {
-    return new SortedMergeCursor(source, template, bucketCount, account, scope, java.util.Objects.requireNonNull(store, "store"));
+    return new SortedMergeCursor(source, template, bucketCount, account, scope,
+        java.util.Objects.requireNonNull(store, "store"));
+  }
+
+  /** Metadata-only merge that still completes the same pinned view before returning its page. */
+  public static SortedMergeCursor metadata(RecordStore store, ScanSource source,
+      ScanRequest template, int bucketCount, BudgetManager.Account account, RequestScope scope) {
+    return new SortedMergeCursor(source, template, bucketCount, account, scope,
+        java.util.Objects.requireNonNull(store, "store"));
   }
 
   private SortedMergeCursor(ScanSource source, ScanRequest template, int bucketCount,
@@ -69,6 +78,8 @@ public final class SortedMergeCursor implements AutoCloseable {
     this.account = account;
     this.scope = scope;
     this.valueStore = valueStore;
+    this.completionStore = valueStore != null ? valueStore
+        : source instanceof RecordStore recordStore ? recordStore : null;
     if (valueStore == null && template.projection() != ReadProjection.METADATA) {
       throw new IllegalArgumentException("full values require a pinned value reader");
     }
@@ -148,7 +159,8 @@ public final class SortedMergeCursor implements AutoCloseable {
     else {
       selected = head;
       waiting = true;
-      PointRead.get(valueStore, head.record.key(), head.record.metadata().modificationRevision(), ReadProjection.FULL, account)
+      PointRead.get(valueStore, head.record.key(), head.record.metadata().modificationRevision(),
+          ReadProjection.FULL, account, false)
           .whenComplete((record, failure) -> { valueCompletion.set(new ValueCompletion(record, failure)); drain(); });
     }
     return true;
@@ -241,7 +253,35 @@ public final class SortedMergeCursor implements AutoCloseable {
     if (failure != null) {
       if (response != null) response.close();
       result.completeExceptionally(failure);
-    } else result.complete(response);
+      return;
+    }
+    RangePage completedResponse = response;
+    if (completionStore == null) {
+      result.complete(completedResponse);
+      return;
+    }
+    CompletableFuture<Void> pinCompletion;
+    try {
+      pinCompletion = completionStore.finishRead();
+    } catch (RuntimeException | Error pinFailure) {
+      if (completedResponse != null) completedResponse.close();
+      result.completeExceptionally(pinFailure);
+      if (pinFailure instanceof Error fatal) throw fatal;
+      return;
+    }
+    pinCompletion.whenComplete((ignored, pinFailure) -> {
+      Throwable terminal = pinFailure == null ? null : unwrap(pinFailure);
+      if (terminal == null && (scope.isClosed() || scope.isDeadlineExceeded())) {
+        terminal = new BackendFailure(scope.isDeadlineExceeded()
+            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+      }
+      if (terminal != null) {
+        if (completedResponse != null) completedResponse.close();
+        result.completeExceptionally(terminal);
+      } else {
+        result.complete(completedResponse);
+      }
+    });
   }
 
   @Override public void close() { stopRequested.set(true); drain(); }

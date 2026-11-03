@@ -361,7 +361,7 @@
           "items": {
             "$ref": "#/$defs/RecordCategory"
           },
-          "maxItems": 7,
+          "maxItems": 11,
           "uniqueItems": true
         },
         "identity_permissions": {
@@ -548,7 +548,8 @@
         "CONTROL",
         "INVOCATION",
         "CANDIDATE",
-        "MANIFEST"
+        "MANIFEST",
+        "SNAPSHOT_PIN"
       ]
     },
     "TablePermission": {

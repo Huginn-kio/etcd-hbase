@@ -24,6 +24,7 @@ public final class ExistsExecutor implements AutoCloseable {
   private final ScanRequest template;
   private final int bucketCount;
   private final RequestScope scope;
+  private final RecordStore completionStore;
   private final RequestScope.ScopedCleanup registration;
   private final CompletableFuture<Result> result = new CompletableFuture<>();
   private final AtomicBoolean started = new AtomicBoolean();
@@ -41,11 +42,19 @@ public final class ExistsExecutor implements AutoCloseable {
   private StoragePage.Cost cost = new StoragePage.Cost(0, 0, 0);
 
   public ExistsExecutor(ScanSource source, ScanRequest template, int bucketCount, RequestScope scope) {
+    this(source, template, bucketCount, scope,
+        source instanceof RecordStore store ? store : null);
+  }
+
+  /** Supplies the pinned view whose unary result must be fenced before it is returned. */
+  public ExistsExecutor(ScanSource source, ScanRequest template, int bucketCount,
+      RequestScope scope, RecordStore completionStore) {
     if (bucketCount < 1 || bucketCount > 4096) throw new IllegalArgumentException("invalid bucket count");
     this.source = source;
     this.template = template;
     this.bucketCount = bucketCount;
     this.scope = scope;
+    this.completionStore = completionStore;
     registration = scope.registerScopedCleanup(this::closeFromScope);
   }
 
@@ -123,6 +132,21 @@ public final class ExistsExecutor implements AutoCloseable {
     } finally {
       synchronized (outcomeLock) { releasingRegistration = false; }
     }
+    if (failure == null && completionStore != null) {
+      Error primaryFatal = fatal;
+      try {
+        completionStore.finishRead().whenComplete((ignored, pinFailure) ->
+            completeResult(count, pinFailure == null ? null : unwrap(pinFailure), primaryFatal));
+      } catch (RuntimeException | Error pinFailure) {
+        if (fatal == null && pinFailure instanceof Error error) fatal = error;
+        completeResult(count, pinFailure, fatal);
+      }
+      return;
+    }
+    completeResult(count, failure, fatal);
+  }
+
+  private void completeResult(int count, Throwable failure, Error fatal) {
     synchronized (outcomeLock) {
       if (failure == null && (stopRequested.get() || scope.isClosed() || scope.isDeadlineExceeded())) {
         failure = new BackendFailure(scope.isDeadlineExceeded()

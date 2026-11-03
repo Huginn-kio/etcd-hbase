@@ -124,7 +124,8 @@ public record InitializationConfiguration(
     CONTROL,
     INVOCATION,
     CANDIDATE,
-    MANIFEST
+    MANIFEST,
+    SNAPSHOT_PIN
   }
 
   public enum TablePermission {

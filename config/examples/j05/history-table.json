@@ -81,7 +81,8 @@
           "CONTROL",
           "INVOCATION",
           "CANDIDATE",
-          "MANIFEST"
+          "MANIFEST",
+          "SNAPSHOT_PIN"
         ],
         "identity_permissions": [
           {

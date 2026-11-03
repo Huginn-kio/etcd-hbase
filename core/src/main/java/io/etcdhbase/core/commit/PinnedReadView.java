@@ -1,5 +1,6 @@
 package io.etcdhbase.core.commit;
 
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.Optional;
@@ -12,8 +13,11 @@ public final class PinnedReadView implements AutoCloseable {
   private final ReadViewPinRegistry.Pin pin;
   private final RequestScope scope;
   private final CompletableFuture<Void> cleanupCompletion = new CompletableFuture<>();
+  private final CompletableFuture<Void> termination = new CompletableFuture<>();
   private boolean closeRequested;
   private boolean pinClosed;
+  private boolean completionInProgress;
+  private boolean releaseStarted;
   private int activeReaders;
 
   PinnedReadView(ReadView view, ReadViewPinRegistry.Pin pin, RequestScope scope) {
@@ -29,6 +33,47 @@ public final class PinnedReadView implements AutoCloseable {
   public Optional<ManifestRoot> selectedRoot() { return view.selectedRoot(); }
   public synchronized boolean isOpen() { return !closeRequested && !pinClosed; }
   CompletionStage<Void> cleanupCompletion() { return cleanupCompletion.minimalCompletionStage(); }
+  public CompletionStage<Void> termination() { return termination.minimalCompletionStage(); }
+
+  CompletableFuture<Void> renew(RequestScope scope) {
+    synchronized (this) {
+      if (closeRequested || pinClosed || activeReaders == 0) {
+        return CompletableFuture.failedFuture(cancelled());
+      }
+    }
+    return Objects.requireNonNull(pin.renew(scope), "pin renewal future");
+  }
+
+  CompletableFuture<Void> complete(RequestScope scope) {
+    synchronized (this) {
+      if (pinClosed) return CompletableFuture.completedFuture(null);
+      if (closeRequested || activeReaders != 1 || completionInProgress) {
+        return CompletableFuture.failedFuture(cancelled());
+      }
+      closeRequested = true;
+      completionInProgress = true;
+    }
+    CompletableFuture<Void> completion;
+    try {
+      completion = Objects.requireNonNull(pin.complete(scope), "pin completion future");
+    } catch (RuntimeException | Error failure) {
+      synchronized (this) { completionInProgress = false; }
+      if (failure instanceof Error fatal) throw fatal;
+      return CompletableFuture.failedFuture(failure);
+    }
+    return completion.whenComplete((ignored, failure) -> {
+      boolean completed;
+      boolean release;
+      synchronized (PinnedReadView.this) {
+        completionInProgress = false;
+        if (failure == null) pinClosed = true;
+        completed = pinClosed && activeReaders == 0;
+        release = closeRequested && activeReaders == 0;
+      }
+      if (completed) termination.complete(null);
+      if (release) releasePinIfReady();
+    });
+  }
 
   synchronized ReaderLease retainReader() {
     if (closeRequested || pinClosed) {
@@ -43,40 +88,67 @@ public final class PinnedReadView implements AutoCloseable {
     synchronized (this) {
       closeRequested = true;
     }
-    // Closing the view seals its producer set. Release the pin only after it has stopped.
+    // Seal the producer set before waiting for it; cancelled request futures may finish earlier.
     scope.close();
     releasePinIfReady();
   }
 
   private void releaseReader() {
+    boolean completed;
+    boolean release;
     synchronized (this) {
       if (activeReaders == 0) throw new IllegalStateException("read view reader lease underflow");
       activeReaders--;
+      completed = pinClosed && activeReaders == 0;
+      release = closeRequested && activeReaders == 0 && !completionInProgress;
     }
-    releasePinIfReady();
+    if (completed) termination.complete(null);
+    if (release) releasePinIfReady();
   }
 
   private void releasePinIfReady() {
     synchronized (this) {
-      if (!closeRequested || activeReaders != 0 || pinClosed) return;
-      pinClosed = true;
+      if (!closeRequested || activeReaders != 0 || completionInProgress || releaseStarted) return;
+      releaseStarted = true;
     }
     scope.physicalProducersCompletion().whenComplete((ignored, producerFailure) -> {
       if (producerFailure != null) {
+        termination.completeExceptionally(producerFailure);
         cleanupCompletion.completeExceptionally(producerFailure);
+        return;
+      }
+      boolean releasePin;
+      synchronized (PinnedReadView.this) {
+        releasePin = !pinClosed;
+        pinClosed = true;
+      }
+      if (!releasePin) {
+        termination.complete(null);
+        cleanupCompletion.complete(null);
         return;
       }
       try {
         pin.close();
-        cleanupCompletion.complete(null);
       } catch (RuntimeException | Error failure) {
-        // This detached callback must publish fatal close failures: an escaping Error fails its
-        // ignored dependent stage and leaves the scoped registration pending. ReadViewService
-        // registers this stage as the ScopedCleanup completion, so RequestScope records failure
-        // without changing a request result that may already have completed.
+        termination.completeExceptionally(failure);
         cleanupCompletion.completeExceptionally(failure);
+        if (failure instanceof Error fatal) throw fatal;
+        return;
       }
+      pin.releaseCompletion().whenComplete((released, failure) -> {
+        if (failure == null) {
+          termination.complete(null);
+          cleanupCompletion.complete(null);
+        } else {
+          termination.completeExceptionally(failure);
+          cleanupCompletion.completeExceptionally(failure);
+        }
+      });
     });
+  }
+
+  private static BackendFailure cancelled() {
+    return new BackendFailure(BackendFailure.Category.CANCELLED);
   }
 
   static final class ReaderLease implements AutoCloseable {

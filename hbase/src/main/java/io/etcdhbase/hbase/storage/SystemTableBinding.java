@@ -22,7 +22,7 @@ import org.apache.hadoop.hbase.client.TableDescriptor;
 /** Validated binding to the pre-provisioned system table; it never creates or adopts a table. */
 public final class SystemTableBinding {
   private static final Set<String> REQUIRED_RECORD_CATEGORIES =
-      Set.of("CONTROL", "INVOCATION", "CANDIDATE", "MANIFEST", "DECISION");
+      Set.of("CONTROL", "INVOCATION", "CANDIDATE", "MANIFEST", "DECISION", "SNAPSHOT_PIN");
   private final TableName table;
   private final byte[] family;
   private final String tableGroupId;
