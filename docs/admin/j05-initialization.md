@@ -28,7 +28,7 @@ J05 提供可重复验证的公开盐候选、两种历史布局配置，以及�
 
 每份配置都保留两种候选，仅创建所选布局。配置声明列族、min/max versions、TTL、KeepDeletedCells、record categories、schema/profile 版本、split keys 及权限意图。`ttl_seconds: -1` 在配置中表示不设置过期，适配器转换为 HBase 的 `FOREVER`。表级 durability 显式为 `SYNC_WAL`。
 
-当前值、历史和系统类别分别完整声明；系统表覆盖 DECISION、EVENT、LEASE、AUTH、CONTROL、INVOCATION、CANDIDATE、MANIFEST。M2 的调用绑定、私有候选和封存目录分别使用后三类。示例中的 history 单版本和 kv 多版本数值是原型参数。迟到写、删除重建、TTL/compaction、历史保留与容量对照仍归 J11/J24/J25/J52，尚未据此选择生产布局。
+当前值、历史和系统类别分别完整声明；系统表覆盖 DECISION、EVENT、LEASE、AUTH、CONTROL、INVOCATION、CANDIDATE、MANIFEST。M2 的调用绑定、私有候选和封存目录使用 INVOCATION、CANDIDATE、MANIFEST；J23 使用 DECISION 按 commit sequence 保存不可变发布决定。示例中的 history 单版本和 kv 多版本数值是原型参数。迟到写、删除重建、TTL/compaction、历史保留与容量对照仍归 J11/J24/J25/J52，尚未据此选择生产布局。
 
 ## 2. 配置与确认边界
 

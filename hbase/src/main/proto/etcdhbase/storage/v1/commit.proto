@@ -3,7 +3,7 @@ package etcdhbase.storage.v1;
 option java_package = "io.etcdhbase.hbase.storage.proto";
 option java_outer_classname = "CommitProtos";
 
-// Internal M2 control and invocation records; separate from the upstream etcd wire API.
+// Internal HBase commit/MVCC records. This schema is separate from the upstream etcd wire API.
 message CommitControlState {
   optional uint32 format_version = 1;
   optional bytes profile_fingerprint = 2;
@@ -54,6 +54,7 @@ message InvocationBinding {
   optional bytes manifest_root = 10;
   optional bytes result_reference = 11;
 }
+
 message PreparedCandidate {
   optional uint32 format_version = 1;
   optional bytes transaction_id = 2;
@@ -203,4 +204,16 @@ message EventDirectoryPage {
   optional uint32 level = 4;
   repeated EventPageReference children = 5;
   optional bytes page_digest = 6;
+}
+
+message CommitDecision {
+  optional uint32 format_version = 1;
+  optional bytes transaction_id = 2;
+  optional bytes invocation_id = 3;
+  optional int64 sequence = 4;
+  optional int64 revision = 5;
+  optional bytes manifest_root = 6;
+  optional bytes manifest_digest = 7;
+  optional bool contains_key_changes = 8;
+  optional int64 base_revision = 9;
 }
