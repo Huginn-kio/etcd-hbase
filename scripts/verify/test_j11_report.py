@@ -16,7 +16,7 @@ spec.loader.exec_module(reporter)
 
 
 class J11EvidenceTest(unittest.TestCase):
-    def check_report(self, missing_case=False, missing_matrix=False):
+    def check_report(self, missing_case=False, missing_matrix=False, missing_j21_case=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "evidence"
@@ -35,6 +35,12 @@ class J11EvidenceTest(unittest.TestCase):
             if missing_matrix:
                 stdout.text = ""
             ET.ElementTree(suite).write(target)
+            j21 = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.J21OwnerInvocationStoreIT.xml"
+            j21.parent.mkdir(parents=True, exist_ok=True)
+            j21_suite = ET.Element("testsuite", tests="1", failures="0", errors="0", skipped="0")
+            ET.SubElement(j21_suite, "testcase", name=(
+                "unrelatedCase" if missing_j21_case else "ownerTakeoverAndInvocationBindingUseDurableHBaseCas"))
+            ET.ElementTree(j21_suite).write(j21)
             counts = {"fixture": {"tests": len(cases), "failures": 0, "errors": 0, "skipped": 0}}
             with (
                 patch.object(reporter, "require_unchanged_source"),
@@ -52,6 +58,10 @@ class J11EvidenceTest(unittest.TestCase):
     def test_missing_scenario_cannot_report_success(self):
         with self.assertRaisesRegex(ValueError, "cases did not execute"):
             self.check_report(missing_case=True)
+
+    def test_j21_owner_invocation_case_must_execute(self):
+        with self.assertRaisesRegex(ValueError, "required J21 owner invocation case did not execute"):
+            self.check_report(missing_j21_case=True)
 
     def test_missing_real_compaction_markers_cannot_report_success(self):
         with self.assertRaisesRegex(ValueError, "matrix evidence is missing"):
