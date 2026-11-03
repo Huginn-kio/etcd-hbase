@@ -10,6 +10,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.scan.RangePage;
 import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.core.scan.SortedMergeCursor;
 import io.etcdhbase.core.storage.ReadProjection;
@@ -188,7 +189,7 @@ class M1ScanBenchmarkIT {
   }
 
   private static void assertScenarioPage(Scenario scenario, List<StoredRecord> expected,
-      int expectedCount, StoragePage page) {
+      int expectedCount, RangePage page) {
     assertEquals(expectedCount, page.count());
     assertEquals(scenario.limit() > 0 && expected.size() > scenario.limit(), page.more());
     for (int index = 0; index < expectedCount; index++) {
