@@ -14,13 +14,15 @@ REQUIRED = {"io.etcdhbase.hbase.storage.M1StorageIT",
             "io.etcdhbase.hbase.storage.HBaseRecordStoreTest",
             "io.etcdhbase.core.request.ScopedCleanupTest",
             "io.etcdhbase.hbase.probe.LocalHBaseProbeIT",
-            "io.etcdhbase.hbase.probe.SecureHBaseAuthenticationIT"}
+            "io.etcdhbase.hbase.probe.SecureHBaseAuthenticationIT",
+            "io.etcdhbase.hbase.storage.J21OwnerInvocationStoreIT"}
 CASES = {"realGetPutAtomicCasBatchAndRawByteBucketOrder",
          "bothHistoryLayoutsKeepDeleteRecreateAndVersionProjectionAfterFlush",
          "partialBatchResultsKeepIndexesAndValueMismatchIsNotAnAbsentKey",
          "nativeTimestampCollisionIsRecordedAsACandidateLimitation",
          "bothLayoutsRetainVersionsAfterObservedMinorAndMajorCompaction",
          "wallClockTtlAndSmallVersionRetentionCannotStandInForLogicalCompaction"}
+J21_CASES = {"ownerTakeoverAndInvocationBindingUseDurableHBaseCas"}
 
 
 def collect(root, output):
@@ -32,6 +34,11 @@ def collect(root, output):
     observed = {case.get("name") for case in suite.iter("testcase")}
     if not CASES <= observed:
         raise ValueError("required real J11 cases did not execute")
+    j21_report = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.J21OwnerInvocationStoreIT.xml"
+    j21_suite = ET.parse(j21_report).getroot()
+    j21_observed = {case.get("name") for case in j21_suite.iter("testcase")}
+    if not J21_CASES <= j21_observed:
+        raise ValueError("required J21 owner invocation case did not execute")
     stdout = "\n".join(element.text or "" for element in suite.iter("system-out"))
     layouts = re.findall(r"j11-layout layout=(HISTORY|NATIVE).*?minorObserved=true majorFileObserved=true", stdout)
     if layouts.count("HISTORY") != 4 or layouts.count("NATIVE") != 4 or "j11-retention wallClockTtlRejected=true maxVersionsNotLogicalCompact=true" not in stdout:

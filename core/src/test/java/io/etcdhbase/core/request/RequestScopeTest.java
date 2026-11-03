@@ -12,10 +12,38 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 class RequestScopeTest {
+  @Test
+  void cancellationCannotOvertakeTheSendOwnershipHandoff() throws Exception {
+    RequestScope scope = RequestScope.withoutDeadline();
+    var starterEntered = new CountDownLatch(1);
+    var releaseStarter = new CountDownLatch(1);
+    var cancelEntered = new CountDownLatch(1);
+    var started = CompletableFuture.supplyAsync(() -> scope.startIfOpen(() -> {
+      starterEntered.countDown();
+      await(releaseStarter);
+    }));
+
+    assertTrue(starterEntered.await(1, TimeUnit.SECONDS));
+    var cancellation = CompletableFuture.supplyAsync(() -> {
+      cancelEntered.countDown();
+      return scope.cancel();
+    });
+    assertTrue(cancelEntered.await(1, TimeUnit.SECONDS));
+    assertFalse(cancellation.isDone(), "cancel must wait until the atomic starter returns");
+
+    releaseStarter.countDown();
+    assertTrue(started.join());
+    assertTrue(cancellation.join());
+    assertTrue(scope.isClosed());
+  }
+
   @Test
   void completionWaitsForAsyncAndLateCleanupWithoutBlockingReentrantClose() throws Exception {
     var scope = RequestScope.withoutDeadline();
@@ -187,6 +215,21 @@ class RequestScopeTest {
   }
 
   @Test
+  void childDeadlineUsesOneClockSampleAndNeverExtendsParentBudget() {
+    AtomicLong now = new AtomicLong();
+    AtomicInteger samples = new AtomicInteger();
+    RequestScope parent = new RequestScope(500, () -> {
+      samples.incrementAndGet();
+      return now.getAndAdd(100);
+    });
+
+    RequestScope child = parent.childWithTimeoutNanos(1_000);
+
+    assertEquals(2, samples.get(), "parent and child deadlines should each sample the clock once");
+    assertEquals(300, child.remainingDeadlineNanos());
+  }
+
+  @Test
   void boundsAndRejectsInvalidTimeouts() {
     assertEquals(Long.MAX_VALUE, RequestScope.withoutDeadline().remainingDeadlineNanos());
     assertThrows(
@@ -211,5 +254,14 @@ class RequestScopeTest {
     assertSame(operationFailure, observed.getCause());
     assertEquals(1, scope.cleanupFailureCount());
     assertTrue(scope.isClosed());
+  }
+
+  private static void await(CountDownLatch latch) {
+    try {
+      latch.await();
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new AssertionError(interrupted);
+    }
   }
 }
