@@ -82,8 +82,18 @@ class CommitStateTest {
         Optional.empty(), 0);
     assertThrows(ArithmeticException.class, () -> exhaustedEpoch.claimOwner("owner-b", 1, 2));
 
-    assertThrows(ArithmeticException.class, () -> slot(Long.MAX_VALUE, 1, false, 1));
-    assertThrows(ArithmeticException.class, () -> slot(0, Long.MAX_VALUE, true, 1));
+    assertThrows(ArithmeticException.class,
+        () -> new PublicationSlot(TXN, INVOCATION, 1, Long.MAX_VALUE, 1,
+            0, 1, false, ByteKey.copyOf(new byte[] {1}), ByteKey.copyOf(new byte[32])));
+    assertThrows(ArithmeticException.class,
+        () -> new PublicationSlot(TXN, INVOCATION, 1, 0, Long.MAX_VALUE,
+            1, Long.MAX_VALUE, true, ByteKey.copyOf(new byte[] {1}), ByteKey.copyOf(new byte[32])));
+
+    var lastRepresentablePublication = new PublicationSlot(TXN, INVOCATION, 1,
+        Long.MAX_VALUE - 1, Long.MAX_VALUE - 1, Long.MAX_VALUE, Long.MAX_VALUE,
+        true, ByteKey.copyOf(new byte[] {1}), ByteKey.copyOf(new byte[32]));
+    assertEquals(Long.MAX_VALUE, lastRepresentablePublication.sequence());
+    assertEquals(Long.MAX_VALUE, lastRepresentablePublication.revision());
   }
 
   private static PublicationSlot slot(long baseSequence, long baseRevision,
