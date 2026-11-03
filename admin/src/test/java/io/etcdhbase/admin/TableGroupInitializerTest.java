@@ -217,6 +217,14 @@ class TableGroupInitializerTest {
     for (Map.Entry<TableName, TableDescriptor> entry : localDescriptors.entrySet()) {
       assertSame(entry.getValue(), admin.descriptors.get(entry.getKey()));
       assertEquals("local", entry.getValue().getValue("etcdhbase.m0.table-group-id"));
+      assertEquals(local.saltProfile().strategyId(),
+          entry.getValue().getValue("etcdhbase.m0.salt-strategy-id"));
+      assertEquals(Integer.toString(local.saltProfile().encodingVersion()),
+          entry.getValue().getValue("etcdhbase.m0.salt-encoding-version"));
+      assertEquals(Integer.toString(local.saltProfile().bucketCount()),
+          entry.getValue().getValue("etcdhbase.m0.salt-bucket-count"));
+      assertEquals(Integer.toString(local.saltProfile().saltWidthBytes()),
+          entry.getValue().getValue("etcdhbase.m0.salt-width-bytes"));
     }
     for (TableSchemaCandidate table : sibling.tables()) {
       assertEquals(

@@ -3,6 +3,7 @@ package io.etcdhbase.hbase.storage;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.hbase.codec.SystemRecordKeyCodec;
+import io.etcdhbase.spi.salt.SaltProfile;
 import io.etcdhbase.spi.salt.SaltStrategy;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
@@ -23,6 +24,7 @@ public final class SystemTableBinding {
   private final byte[] family;
   private final String tableGroupId;
   private final String saltProfileId;
+  private final SaltProfile saltProfile;
   private final SystemRecordKeyCodec keyCodec;
   private final ByteKey profileFingerprint;
 
@@ -33,9 +35,13 @@ public final class SystemTableBinding {
     this.tableGroupId = requireIdentifier(tableGroupId, "tableGroupId");
     this.saltProfileId = requireIdentifier(saltProfileId, "saltProfileId");
     SaltStrategy checkedSalt = Objects.requireNonNull(salt, "salt");
+    this.saltProfile = Objects.requireNonNull(checkedSalt.profile(), "salt profile");
+    if (!checkedSalt.id().equals(saltProfile.strategyId())) {
+      throw new IllegalArgumentException("salt strategy ID does not match its profile");
+    }
     this.keyCodec = new SystemRecordKeyCodec(checkedSalt);
     this.profileFingerprint = ByteKey.copyOf(fingerprint(table, this.family, this.tableGroupId,
-        this.saltProfileId, checkedSalt.profile()));
+        this.saltProfileId, saltProfile));
     if (this.family.length == 0) throw new IllegalArgumentException("system family must not be empty");
   }
 
@@ -63,6 +69,14 @@ public final class SystemTableBinding {
         || descriptor.getDurability() != Durability.SYNC_WAL
         || !tableGroupId.equals(descriptor.getValue("etcdhbase.m0.table-group-id"))
         || !saltProfileId.equals(descriptor.getValue("etcdhbase.m0.salt-profile-id"))
+        || !saltProfile.strategyId().equals(
+            descriptor.getValue("etcdhbase.m0.salt-strategy-id"))
+        || !Integer.toString(saltProfile.encodingVersion()).equals(
+            descriptor.getValue("etcdhbase.m0.salt-encoding-version"))
+        || !Integer.toString(saltProfile.bucketCount()).equals(
+            descriptor.getValue("etcdhbase.m0.salt-bucket-count"))
+        || !Integer.toString(saltProfile.saltWidthBytes()).equals(
+            descriptor.getValue("etcdhbase.m0.salt-width-bytes"))
         || !containsControlCategory(descriptor.getValue("etcdhbase.m0.record-categories"))) {
       throw new IllegalArgumentException("table does not match its M2 system binding");
     }

@@ -11,6 +11,7 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.codec.CommitControlMessages;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
+import io.etcdhbase.spi.salt.SaltProfile;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
@@ -18,6 +19,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.Durability;
+import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.junit.jupiter.api.Test;
@@ -39,6 +41,13 @@ class J20CommitControlStoreIT {
         .setDurability(Durability.SYNC_WAL)
         .setValue("etcdhbase.m0.table-group-id", TABLE_GROUP)
         .setValue("etcdhbase.m0.salt-profile-id", SALT_PROFILE)
+        .setValue("etcdhbase.m0.salt-strategy-id", SALT.profile().strategyId())
+        .setValue("etcdhbase.m0.salt-encoding-version",
+            Integer.toString(SALT.profile().encodingVersion()))
+        .setValue("etcdhbase.m0.salt-bucket-count",
+            Integer.toString(SALT.profile().bucketCount()))
+        .setValue("etcdhbase.m0.salt-width-bytes",
+            Integer.toString(SALT.profile().saltWidthBytes()))
         .setValue("etcdhbase.m0.record-categories", "CONTROL")
         .build();
 
@@ -58,6 +67,18 @@ class J20CommitControlStoreIT {
 
       assertTrue(M1TestEnvironment.await(store.initializeIfAbsent(initial, scope)));
       assertFalse(M1TestEnvironment.await(store.initializeIfAbsent(initial, scope)));
+
+      var differentSalt = new HashSaltStrategy(
+          new SaltProfile(HashSaltStrategy.STRATEGY_ID, 1, 32, 2));
+      var differentBinding = new SystemTableBinding(
+          table, FAMILY, TABLE_GROUP, SALT_PROFILE, differentSalt);
+      assertFalse(java.util.Arrays.equals(binding.controlRow(), differentBinding.controlRow()));
+      assertThrows(ExecutionException.class, () -> M1TestEnvironment.await(
+          HBaseCommitControlStore.open(
+              environment.factory(), environment.identity(), differentBinding, scope)));
+      var mismatchedTableClient = environment.connection().getTableBuilder(table).build();
+      assertTrue(M1TestEnvironment.await(mismatchedTableClient.get(
+          new Get(differentBinding.controlRow()).addFamily(FAMILY))).isEmpty());
 
       var firstSnapshot = M1TestEnvironment.await(store.read(scope)).orElseThrow();
       CommitState claimed = firstSnapshot.state().claimOwner("owner-a", 10, 20);

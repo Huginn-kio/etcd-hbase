@@ -1,8 +1,11 @@
 package io.etcdhbase.hbase.storage;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.etcdhbase.spi.salt.HashSaltStrategy;
+import io.etcdhbase.spi.salt.SaltProfile;
+import java.util.Arrays;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
@@ -58,6 +61,20 @@ class SystemTableBindingTest {
         Durability.SYNC_WAL, HConstants.FOREVER, 2)));
   }
 
+  @Test
+  void rejectsDifferentRoutingParametersWithTheSameProfileId() {
+    var differentSalt = new HashSaltStrategy(
+        new SaltProfile(HashSaltStrategy.STRATEGY_ID, 1, 32, 2));
+    var differentBinding = new SystemTableBinding(
+        TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, differentSalt);
+    var persistedDescriptor = descriptor(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, "CONTROL",
+        Durability.SYNC_WAL, HConstants.FOREVER, 1);
+
+    assertFalse(Arrays.equals(BINDING.controlRow(), differentBinding.controlRow()));
+    assertThrows(IllegalArgumentException.class,
+        () -> differentBinding.validate(persistedDescriptor));
+  }
+
   private static TableDescriptor descriptor(TableName table, byte[] family, String tableGroup,
       String saltProfile, String categories, Durability durability, int ttl, int maxVersions) {
     var column = ColumnFamilyDescriptorBuilder.newBuilder(family)
@@ -65,6 +82,13 @@ class SystemTableBindingTest {
     return TableDescriptorBuilder.newBuilder(table).setColumnFamily(column)
         .setDurability(durability).setValue("etcdhbase.m0.table-group-id", tableGroup)
         .setValue("etcdhbase.m0.salt-profile-id", saltProfile)
+        .setValue("etcdhbase.m0.salt-strategy-id", SALT.profile().strategyId())
+        .setValue("etcdhbase.m0.salt-encoding-version",
+            Integer.toString(SALT.profile().encodingVersion()))
+        .setValue("etcdhbase.m0.salt-bucket-count",
+            Integer.toString(SALT.profile().bucketCount()))
+        .setValue("etcdhbase.m0.salt-width-bytes",
+            Integer.toString(SALT.profile().saltWidthBytes()))
         .setValue("etcdhbase.m0.record-categories", categories).build();
   }
 }

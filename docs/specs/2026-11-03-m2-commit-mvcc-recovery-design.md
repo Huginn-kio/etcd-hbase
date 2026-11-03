@@ -137,7 +137,7 @@ key 准入按本次操作涉及的全部物理行形态检查编码后长度，�
 | 行落地 fence / 历史行 guard | 已应用 sequence、事务/内容身份及维护代次；历史行另有 PRESENT/RETIRED 生命周期，与对应数据 mutation 同行原子更新 |
 | pin 分片/检查点 | 有界槽及保护下界、代次；恢复阶段和页位置，格式与所属表组明确 |
 
-内部 protobuf 留在 hbase，新增字段验证 presence、范围、身份与摘要，不修改上游 etcd proto。M1 的原始 `m`/`v` 和 CURRENT/NATIVE 普通 Put 没有这些保证；M2 使用显式新 schema/绑定校验。现有未知表或原型表不得被自动接管，迁移/正式 bootstrap 由 J55 负责。
+内部 protobuf 留在 hbase，新增字段验证 presence、范围、身份与摘要，不修改上游 etcd proto。M1 的原始 `m`/`v` 和 CURRENT/NATIVE 普通 Put 没有这些保证；M2 使用显式新 schema/绑定校验。表描述符除 salt profile 名称外，还持久化 strategy ID、encoding version、bucket count 和 salt width；控制表绑定必须逐项核对这些路由格式参数，再用同一 `SaltStrategy` 计算控制行，不能因 profile 名称相同而接受不同路由。现有未知表或原型表不得被自动接管，迁移/正式 bootstrap 由 J55 负责。
 
 控制、准备、决定和落地均显式使用 SYNC_WAL，descriptor 校验不得放宽。事务/保护记录不使用 HBase TTL 代替应用过期协议。确认写入持久化与文件系统/故障模型分别记录，跨连接读回不充当 WAL 故障恢复证明。
 
