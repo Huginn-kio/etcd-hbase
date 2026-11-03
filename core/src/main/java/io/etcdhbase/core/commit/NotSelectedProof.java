@@ -16,19 +16,14 @@ public final class NotSelectedProof {
 
   private final long preparedOwnerEpoch;
   private final long baseSequence;
-  private final long observedOwnerEpoch;
-  private final long observedPublishedSequence;
   private final Optional<SelectedDecision> selectedDecision;
-  private final Reason reason;
 
   NotSelectedProof(long preparedOwnerEpoch, long baseSequence, long observedOwnerEpoch,
       long observedPublishedSequence, Optional<SelectedDecision> selectedDecision, Reason reason) {
     this.preparedOwnerEpoch = preparedOwnerEpoch;
     this.baseSequence = baseSequence;
-    this.observedOwnerEpoch = observedOwnerEpoch;
-    this.observedPublishedSequence = observedPublishedSequence;
     this.selectedDecision = Objects.requireNonNull(selectedDecision, "selectedDecision");
-    this.reason = Objects.requireNonNull(reason, "reason");
+    Objects.requireNonNull(reason, "reason");
     if (preparedOwnerEpoch <= 0 || baseSequence < 0 || observedOwnerEpoch < preparedOwnerEpoch
         || observedPublishedSequence < baseSequence) {
       throw new IllegalArgumentException("invalid not-selected evidence");
