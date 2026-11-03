@@ -139,6 +139,7 @@
                 <include>**/LocalHBaseProbeIT.java</include>
                 <include>**/SecureHBaseAuthenticationIT.java</include>
                 <include>**/M1*IT.java</include>
+                <include>**/J20CommitControlStoreIT.java</include>
               </includes>
               <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
             </configuration>

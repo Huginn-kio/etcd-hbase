@@ -69,6 +69,7 @@ public final class CommitControlMessages {
   }
 
   private static CommitProtos.PublicationSlot encode(PublicationSlot slot) {
+    validateManifestRootLength(slot.manifestRoot().length());
     return CommitProtos.PublicationSlot.newBuilder()
         .setTransactionId(ByteString.copyFrom(slot.transactionId().bytes()))
         .setInvocationId(ByteString.copyFrom(slot.invocationId().bytes()))
@@ -97,10 +98,10 @@ public final class CommitControlMessages {
     byte[] root = message.getManifestRoot().toByteArray();
     byte[] digest = message.getManifestDigest().toByteArray();
     if (transactionId.length != 16 || invocationId.length != 16
-        || root.length == 0 || root.length > MAX_MANIFEST_ROOT_BYTES
         || digest.length != FINGERPRINT_BYTES) {
       throw invalid();
     }
+    validateManifestRootLength(root.length);
     return new PublicationSlot(TransactionId.fromBytes(transactionId),
         InvocationId.fromBytes(invocationId), message.getOwnerEpoch(), message.getBaseSequence(),
         message.getBaseRevision(), message.getSequence(), message.getRevision(),
@@ -109,6 +110,10 @@ public final class CommitControlMessages {
 
   private static void requireLength(int length) {
     if (length <= 0 || length > MAX_CONTROL_BYTES) throw invalid();
+  }
+
+  private static void validateManifestRootLength(int length) {
+    if (length <= 0 || length > MAX_MANIFEST_ROOT_BYTES) throw invalid();
   }
 
   private static IllegalArgumentException invalid() {

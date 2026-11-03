@@ -1,6 +1,7 @@
 package io.etcdhbase.hbase.storage;
 
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.hbase.identity.HBaseAuthenticators;
 import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.hbase.probe.TemporaryHBaseClusterProcess;
@@ -16,8 +17,9 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.AsyncConnection;
+import org.apache.hadoop.hbase.client.TableDescriptor;
 
-/** Disposable real backend shared by M1 fixture callers; does not touch a target environment. */
+/** Disposable real backend shared by storage integration tests; never touches a target environment. */
 final class M1TestEnvironment implements AutoCloseable {
   private TemporaryHBaseClusterProcess cluster;
   private HBaseBackendIdentityProvider provider;
@@ -51,12 +53,20 @@ final class M1TestEnvironment implements AutoCloseable {
     return await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
   }
 
+  HBaseConnectionFactory factory() { return provider; }
+
+  AuthorizedBackendIdentity identity() { return identity; }
+
   /** Returns the provider-owned connection for fixture callers that borrow it. */
   AsyncConnection connection() { return connection; }
 
   void create(StorageTableBinding binding, byte[][] splits) throws Exception {
-    await(connection.getAdmin().createTable(binding.descriptor(), splits));
-    tables.add(binding.table());
+    create(binding.table(), binding.descriptor(), splits);
+  }
+
+  void create(TableName table, TableDescriptor descriptor, byte[][] splits) throws Exception {
+    await(connection.getAdmin().createTable(descriptor, splits));
+    tables.add(table);
   }
 
   static <T> T await(CompletableFuture<T> future) throws Exception { return future.get(60, TimeUnit.SECONDS); }
