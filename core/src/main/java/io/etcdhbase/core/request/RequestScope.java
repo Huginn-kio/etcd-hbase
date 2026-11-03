@@ -41,11 +41,31 @@ public final class RequestScope implements AutoCloseable {
     } catch (ArithmeticException overflow) {
       nanos = Long.MAX_VALUE;
     }
-    return new RequestScope(nanos, System::nanoTime);
+    return withTimeoutNanos(nanos, System::nanoTime);
+  }
+
+  /** Creates a deadline scope using a monotonic clock, primarily for deterministic tests. */
+  public static RequestScope withTimeoutNanos(long timeoutNanos, LongSupplier nanoTime) {
+    return new RequestScope(timeoutNanos, nanoTime);
   }
 
   public static RequestScope withoutDeadline() {
-    return new RequestScope(false, 0, System::nanoTime);
+    return withoutDeadline(System::nanoTime);
+  }
+
+  /** Creates a no-deadline scope whose child scopes can share a deterministic monotonic clock. */
+  public static RequestScope withoutDeadline(LongSupplier nanoTime) {
+    return new RequestScope(false, 0, nanoTime);
+  }
+
+  /** Creates one child budget, capped by this scope's remaining deadline and sharing its clock. */
+  public RequestScope childWithTimeoutNanos(long maximumTimeoutNanos) {
+    if (maximumTimeoutNanos < 0) {
+      throw new IllegalArgumentException("timeout must not be negative");
+    }
+    long now = nanoTime.getAsLong();
+    long parentRemaining = hasDeadline ? Math.max(0, deadlineNanos - now) : Long.MAX_VALUE;
+    return new RequestScope(true, now + Math.min(maximumTimeoutNanos, parentRemaining), nanoTime);
   }
 
   RequestScope(long timeoutNanos, LongSupplier nanoTime) {

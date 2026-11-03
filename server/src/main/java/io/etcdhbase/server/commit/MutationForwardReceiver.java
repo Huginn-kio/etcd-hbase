@@ -19,9 +19,12 @@ import java.util.Arrays;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Revalidates a forwarded request at the owner before dispatching it to the commit kernel. */
 public final class MutationForwardReceiver {
+  private static final long MAX_LOCAL_TIMEOUT_NANOS = MutationForwardRequest.MAX_TIMEOUT_NANOS;
+
   public record VerifiedAuthorization(
       AuthorizedBackendIdentity identity, ByteKey authorizationScopeDigest) {
     public VerifiedAuthorization {
@@ -90,16 +93,37 @@ public final class MutationForwardReceiver {
       String authenticatedPeerIdentity, MutationForwardRequest request, RequestScope scope) {
     Objects.requireNonNull(request, "request");
     Objects.requireNonNull(scope, "scope");
+    long requestBudget = Math.min(request.remainingTimeoutNanos(), MAX_LOCAL_TIMEOUT_NANOS);
+    RequestScope effectiveScope = scope.childWithTimeoutNanos(requestBudget);
+    RequestScope.ScopedCleanup parentRegistration = scope.registerScopedCleanup(
+        () -> {
+          if (scope.isCancelled()) effectiveScope.cancel();
+          else effectiveScope.close();
+        },
+        effectiveScope.cleanupCompletion());
+    try {
+      return receiveWithinScope(authenticatedPeerIdentity, request, effectiveScope)
+          .whenComplete((reply, failure) -> closeScopeRegistration(parentRegistration));
+    } catch (RuntimeException | Error failure) {
+      closeScopeRegistration(parentRegistration);
+      throw failure;
+    }
+  }
+
+  private CompletableFuture<OwnerForwarding.Reply> receiveWithinScope(
+      String authenticatedPeerIdentity, MutationForwardRequest request, RequestScope scope) {
     if (!validPeerIdentity(authenticatedPeerIdentity)
         || request.hopCount() != MutationForwardRequest.MAX_HOPS) {
       return unknown(BackendFailure.Category.PERMISSION);
     }
     if (scope.isDeadlineExceeded() || scope.isClosed()) {
-      return unknown(scope.isDeadlineExceeded()
-          ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+      return unknown(scopeFailureCategory(scope));
     }
     return control.read(scope).handle((snapshot, failure) -> new ControlRead(snapshot, failure))
         .thenCompose(read -> {
+          if (scope.isDeadlineExceeded() || scope.isClosed()) {
+            return unknown(scopeFailureCategory(scope));
+          }
           if (read.failure() != null) return unknown(category(read.failure()));
           if (read.snapshot().isEmpty()) return unknown(BackendFailure.Category.UNAVAILABLE);
           CommitState state = read.snapshot().orElseThrow().state();
@@ -115,20 +139,25 @@ public final class MutationForwardReceiver {
       String peerIdentity, MutationForwardRequest request, RequestScope scope, CommitState observed) {
     CompletableFuture<VerifiedAuthorization> authorization;
     try {
-      authorization = authorizations.verifyAndResolve(peerIdentity, request, scope);
+      var authorizationReference = new AtomicReference<CompletableFuture<VerifiedAuthorization>>();
+      if (!scope.startIfOpen(() -> authorizationReference.set(
+          authorizations.verifyAndResolve(peerIdentity, request, scope)))) {
+        return unknown(scopeFailureCategory(scope));
+      }
+      authorization = authorizationReference.get();
     } catch (RuntimeException failure) {
-      return unknown(category(failure));
+      return unknown(scope.isDeadlineExceeded() || scope.isClosed()
+          ? scopeFailureCategory(scope) : category(failure));
     }
     if (authorization == null) return unknown(BackendFailure.Category.UNKNOWN);
     return authorization.handle((verified, failure) -> new AuthorizationResult(verified, failure))
         .thenCompose(result -> {
+          if (scope.isDeadlineExceeded() || scope.isClosed()) {
+            return unknown(scopeFailureCategory(scope));
+          }
           if (result.failure() != null) return unknown(category(result.failure()));
           if (!matchesAuthorization(request, result.authorization())) {
             return unknown(BackendFailure.Category.PERMISSION);
-          }
-          if (scope.isDeadlineExceeded() || scope.isClosed()) {
-            return unknown(scope.isDeadlineExceeded()
-                ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
           }
           InvocationBinding proposed = InvocationBinding.begin(
               request.invocationId(), request.requestDigest(),
@@ -146,18 +175,22 @@ public final class MutationForwardReceiver {
       InvocationBinding proposed) {
     CompletableFuture<InvocationBinding> bound;
     try {
-      bound = invocations.bindOrJoin(proposed, scope);
+      var bindingReference = new AtomicReference<CompletableFuture<InvocationBinding>>();
+      if (!scope.startIfOpen(() -> bindingReference.set(invocations.bindOrJoin(proposed, scope)))) {
+        return unknown(scopeFailureCategory(scope));
+      }
+      bound = bindingReference.get();
     } catch (RuntimeException failure) {
-      return unknown(category(failure));
+      return unknown(scope.isDeadlineExceeded() || scope.isClosed()
+          ? scopeFailureCategory(scope) : category(failure));
     }
     if (bound == null) return unknown(BackendFailure.Category.UNKNOWN);
     return bound.handle((binding, failure) -> new BindingResult(binding, failure))
         .thenCompose(result -> {
-          if (result.failure() != null) return unknown(category(result.failure()));
           if (scope.isDeadlineExceeded() || scope.isClosed()) {
-            return unknown(scope.isDeadlineExceeded()
-                ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+            return unknown(scopeFailureCategory(scope));
           }
+          if (result.failure() != null) return unknown(category(result.failure()));
           if (!bindingBelongsToObservedAttempt(result.binding(), observed)) {
             return unknown(BackendFailure.Category.UNAVAILABLE);
           }
@@ -184,6 +217,9 @@ public final class MutationForwardReceiver {
       InvocationBinding binding) {
     return control.read(scope).handle((snapshot, failure) -> new ControlRead(snapshot, failure))
         .thenCompose(read -> {
+          if (scope.isDeadlineExceeded() || scope.isClosed()) {
+            return unknown(scopeFailureCategory(scope));
+          }
           if (read.failure() != null) return unknown(category(read.failure()));
           if (read.snapshot().isEmpty()) return unknown(BackendFailure.Category.UNAVAILABLE);
           CommitState current = read.snapshot().orElseThrow().state();
@@ -194,20 +230,21 @@ public final class MutationForwardReceiver {
               || current.publishedRevision() != observed.publishedRevision()) {
             return unknown(BackendFailure.Category.UNAVAILABLE);
           }
-          if (scope.isDeadlineExceeded() || scope.isClosed()) {
-            return unknown(scope.isDeadlineExceeded()
-                ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
-          }
+          var processingReference = new AtomicReference<CompletableFuture<OwnerForwarding.Reply>>();
           try {
-            CompletableFuture<OwnerForwarding.Reply> processing = processor.process(
-                request, binding, authorization.identity(), scope);
-            return processing == null
-                ? CompletableFuture.failedFuture(new IllegalStateException(
-                    "mutation processor returned no future"))
-                : processing;
+            if (!scope.startIfOpen(() -> processingReference.set(processor.process(
+                request, binding, authorization.identity(), scope)))) {
+              return unknown(scopeFailureCategory(scope));
+            }
           } catch (RuntimeException failure) {
-            return CompletableFuture.failedFuture(failure);
+            return unknown(scope.isDeadlineExceeded() || scope.isClosed()
+                ? scopeFailureCategory(scope) : category(failure));
           }
+          CompletableFuture<OwnerForwarding.Reply> processing = processingReference.get();
+          if (processing == null) {
+            return unknown(BackendFailure.Category.UNKNOWN);
+          }
+          return processing;
         });
   }
 
@@ -234,6 +271,19 @@ public final class MutationForwardReceiver {
 
   private static CompletableFuture<OwnerForwarding.Reply> unknown(BackendFailure.Category category) {
     return CompletableFuture.completedFuture(new OwnerForwarding.Unknown(category));
+  }
+
+  private static void closeScopeRegistration(RequestScope.ScopedCleanup registration) {
+    try {
+      registration.close();
+    } catch (Exception failure) {
+      throw new IllegalStateException("failed to close forwarded request scope", failure);
+    }
+  }
+
+  private static BackendFailure.Category scopeFailureCategory(RequestScope scope) {
+    return scope.isDeadlineExceeded()
+        ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED;
   }
 
   private static BackendFailure.Category category(Throwable failure) {

@@ -2,6 +2,7 @@ package io.etcdhbase.server.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.CommitControlStore;
@@ -28,6 +29,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class MutationForwardReceiverTest {
@@ -113,6 +116,78 @@ class MutationForwardReceiverTest {
     assertEquals(0, processors.get());
   }
 
+  @Test
+  void receiverUsesOneScopeCappedByEnvelopeAndOuterDeadline() {
+    assertEffectiveBudget(
+        RequestScope.withoutDeadline(() -> 0), 1_000_000_000L, 1_000_000_000L);
+    assertEffectiveBudget(
+        RequestScope.withTimeoutNanos(5_000_000_000L, () -> 0), 1_000_000_000L, 1_000_000_000L);
+    assertEffectiveBudget(
+        RequestScope.withTimeoutNanos(500_000_000L, () -> 0), 1_000_000_000L, 500_000_000L);
+  }
+
+  @Test
+  void authorizationWaitConsumesBudgetAndPreventsBindingAndDispatch() {
+    AtomicLong now = new AtomicLong();
+    var authorizationBudget = new AtomicLong(-1);
+    var pendingAuthorization = new CompletableFuture<MutationForwardReceiver.VerifiedAuthorization>();
+    var repository = new InMemoryInvocationRepository();
+    var processors = new AtomicInteger();
+    var fixture = receiver(currentState(), repository, processors,
+        (peer, request, scope) -> {
+          authorizationBudget.set(scope.remainingDeadlineNanos());
+          return pendingAuthorization;
+        }, (request, binding, identity, scope) -> {
+          processors.incrementAndGet();
+          return CompletableFuture.completedFuture(
+              new OwnerForwarding.Rejected(BackendFailure.Category.RESOURCE_LIMIT));
+        });
+
+    CompletableFuture<OwnerForwarding.Reply> reply = fixture.receiver().receive(
+        "authenticated-peer", request(1_000), RequestScope.withoutDeadline(now::get));
+    now.set(1_000);
+    pendingAuthorization.complete(verifiedAuthorization());
+
+    var unknown = assertInstanceOf(OwnerForwarding.Unknown.class, reply.join());
+    assertEquals(BackendFailure.Category.TIMEOUT, unknown.category());
+    assertEquals(0, repository.createCalls);
+    assertEquals(0, processors.get());
+    assertEquals(1_000, authorizationBudget.get());
+  }
+
+  @Test
+  void authorizationWaitDoesNotReissueTheEnvelopeBudget() {
+    AtomicLong now = new AtomicLong();
+    var capturedAuthorizationScope = new AtomicReference<RequestScope>();
+    var processorScope = new AtomicReference<RequestScope>();
+    var pendingAuthorization = new CompletableFuture<MutationForwardReceiver.VerifiedAuthorization>();
+    var repository = new InMemoryInvocationRepository();
+    var processors = new AtomicInteger();
+    var fixture = receiver(currentState(), repository, processors,
+        (peer, request, scope) -> {
+          capturedAuthorizationScope.set(scope);
+          return pendingAuthorization;
+        }, (request, binding, identity, scope) -> {
+          processorScope.set(scope);
+          processors.incrementAndGet();
+          return CompletableFuture.completedFuture(
+              new OwnerForwarding.Rejected(BackendFailure.Category.RESOURCE_LIMIT));
+        });
+
+    CompletableFuture<OwnerForwarding.Reply> reply = fixture.receiver().receive(
+        "authenticated-peer", request(1_000), RequestScope.withoutDeadline(now::get));
+    now.set(400);
+    pendingAuthorization.complete(verifiedAuthorization());
+
+    assertInstanceOf(OwnerForwarding.Rejected.class, reply.join());
+    assertSame(capturedAuthorizationScope.get(), processorScope.get());
+    assertSame(capturedAuthorizationScope.get(), fixture.controlScope().get());
+    assertSame(capturedAuthorizationScope.get(), repository.lastScope);
+    assertEquals(600, processorScope.get().remainingDeadlineNanos());
+    assertEquals(1, repository.createCalls);
+    assertEquals(1, processors.get());
+  }
+
   private static void assertStaleBindingRejected(InvocationBinding.State state) {
     var repository = new InMemoryInvocationRepository();
     var stale = InvocationBinding.begin(INVOCATION, request().requestDigest(), AUTH_DIGEST,
@@ -148,21 +223,62 @@ class MutationForwardReceiverTest {
 
   private static Fixture receiver(CommitState current, InMemoryInvocationRepository repository,
       AtomicInteger processors, ByteKey resolvedAuthorizationDigest) {
-    CommitControlStore control = new FixedControlStore(current);
+    return receiver(current, repository, processors,
+        (peer, request, scope) -> CompletableFuture.completedFuture(
+            new MutationForwardReceiver.VerifiedAuthorization(identity(), resolvedAuthorizationDigest)),
+        (request, binding, verified, scope) -> {
+          processors.incrementAndGet();
+          return CompletableFuture.completedFuture(
+              new OwnerForwarding.Rejected(BackendFailure.Category.RESOURCE_LIMIT));
+        });
+  }
+
+  private static Fixture receiver(CommitState current, InMemoryInvocationRepository repository,
+      AtomicInteger processors, MutationForwardReceiver.AuthorizationResolver authorizations,
+      MutationForwardReceiver.MutationProcessor processor) {
+    var controlScope = new AtomicReference<RequestScope>();
+    CommitControlStore control = new FixedControlStore(current, controlScope);
     var invocations = new InvocationService(repository);
-    var identity = new AuthorizedBackendIdentity("test-provider", "test-subject", "ctx-1",
-        new AuthenticationScope(GROUP, "profile-a"), Set.of(GROUP), 1);
-    MutationForwardReceiver.AuthorizationResolver authorizations = (peer, request, scope) ->
-        CompletableFuture.completedFuture(new MutationForwardReceiver.VerifiedAuthorization(
-            identity, resolvedAuthorizationDigest));
-    MutationForwardReceiver.MutationProcessor processor = (request, binding, verified, scope) -> {
-      processors.incrementAndGet();
-      return CompletableFuture.completedFuture(
-          new OwnerForwarding.Rejected(BackendFailure.Category.RESOURCE_LIMIT));
-    };
     var receiver = new MutationForwardReceiver(control, invocations, authorizations, processor,
         Clock.fixed(Instant.ofEpochMilli(1_000), ZoneOffset.UTC));
-    return new Fixture(receiver);
+    return new Fixture(receiver, controlScope);
+  }
+
+  private static void assertEffectiveBudget(
+      RequestScope outerScope, long requestNanos, long expectedNanos) {
+    AtomicReference<RequestScope> authorizationScope = new AtomicReference<>();
+    AtomicReference<RequestScope> processorScope = new AtomicReference<>();
+    var repository = new InMemoryInvocationRepository();
+    var processors = new AtomicInteger();
+    var fixture = receiver(currentState(), repository, processors,
+        (peer, request, scope) -> {
+          authorizationScope.set(scope);
+          return CompletableFuture.completedFuture(verifiedAuthorization());
+        }, (request, binding, identity, scope) -> {
+          processorScope.set(scope);
+          processors.incrementAndGet();
+          return CompletableFuture.completedFuture(
+              new OwnerForwarding.Rejected(BackendFailure.Category.RESOURCE_LIMIT));
+        });
+
+    OwnerForwarding.Reply reply = fixture.receiver().receive(
+        "authenticated-peer", request(requestNanos), outerScope).join();
+
+    assertInstanceOf(OwnerForwarding.Rejected.class, reply);
+    assertSame(authorizationScope.get(), processorScope.get());
+    assertSame(authorizationScope.get(), fixture.controlScope().get());
+    assertSame(authorizationScope.get(), repository.lastScope);
+    assertEquals(expectedNanos, processorScope.get().remainingDeadlineNanos());
+    assertEquals(1, processors.get());
+  }
+
+  private static MutationForwardReceiver.VerifiedAuthorization verifiedAuthorization() {
+    return new MutationForwardReceiver.VerifiedAuthorization(identity(), AUTH_DIGEST);
+  }
+
+  private static AuthorizedBackendIdentity identity() {
+    return new AuthorizedBackendIdentity("test-provider", "test-subject", "ctx-1",
+        new AuthenticationScope(GROUP, "profile-a"), Set.of(GROUP), 1);
   }
 
   private static CommitState currentState() {
@@ -177,24 +293,32 @@ class MutationForwardReceiverTest {
   }
 
   private static MutationForwardRequest request() {
+    return request(MutationForwardRequest.MAX_TIMEOUT_NANOS);
+  }
+
+  private static MutationForwardRequest request(long remainingTimeoutNanos) {
     ByteKey operation = ByteKey.copyOf(new byte[] {1, 2, 3});
     return new MutationForwardRequest(GROUP, INVOCATION,
         MutationForwardRequest.digest(GROUP, operation), AUTH_DIGEST,
         ByteKey.copyOf("ctx-1".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
-        2, 1_000, MutationForwardRequest.MAX_HOPS, operation);
+        2, remainingTimeoutNanos, MutationForwardRequest.MAX_HOPS, operation);
   }
 
-  private record Fixture(MutationForwardReceiver receiver) {}
+  private record Fixture(
+      MutationForwardReceiver receiver, AtomicReference<RequestScope> controlScope) {}
 
   private static final class FixedControlStore implements CommitControlStore {
     private final ControlSnapshot snapshot;
+    private final AtomicReference<RequestScope> lastScope;
 
-    private FixedControlStore(CommitState state) {
+    private FixedControlStore(CommitState state, AtomicReference<RequestScope> lastScope) {
       snapshot = new ControlSnapshot(state, new byte[] {1});
+      this.lastScope = lastScope;
     }
 
     @Override
     public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
+      lastScope.set(scope);
       return CompletableFuture.completedFuture(Optional.of(snapshot));
     }
 
@@ -212,16 +336,21 @@ class MutationForwardReceiverTest {
 
   private static final class InMemoryInvocationRepository implements InvocationRepository {
     private InvocationBinding binding;
+    private int createCalls;
+    private RequestScope lastScope;
 
     @Override
     public CompletableFuture<Optional<InvocationBinding>> read(
         InvocationId invocationId, RequestScope scope) {
+      lastScope = scope;
       return CompletableFuture.completedFuture(Optional.ofNullable(binding));
     }
 
     @Override
     public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
         InvocationBinding proposed, RequestScope scope) {
+      lastScope = scope;
+      createCalls++;
       if (binding == null) {
         binding = proposed;
         return CompletableFuture.completedFuture(SystemRecordStore.CreateResult.CREATED);
@@ -232,6 +361,7 @@ class MutationForwardReceiverTest {
     @Override
     public CompletableFuture<Boolean> compareAndSet(
         InvocationBinding expected, InvocationBinding replacement, RequestScope scope) {
+      lastScope = scope;
       if (binding != expected) return CompletableFuture.completedFuture(false);
       binding = replacement;
       return CompletableFuture.completedFuture(true);

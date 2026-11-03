@@ -14,6 +14,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
@@ -211,6 +212,21 @@ class RequestScopeTest {
     now.addAndGet(11);
     assertTrue(scope.isDeadlineExceeded());
     assertEquals(0, scope.remainingDeadlineNanos());
+  }
+
+  @Test
+  void childDeadlineUsesOneClockSampleAndNeverExtendsParentBudget() {
+    AtomicLong now = new AtomicLong();
+    AtomicInteger samples = new AtomicInteger();
+    RequestScope parent = new RequestScope(500, () -> {
+      samples.incrementAndGet();
+      return now.getAndAdd(100);
+    });
+
+    RequestScope child = parent.childWithTimeoutNanos(1_000);
+
+    assertEquals(2, samples.get(), "parent and child deadlines should each sample the clock once");
+    assertEquals(300, child.remainingDeadlineNanos());
   }
 
   @Test
