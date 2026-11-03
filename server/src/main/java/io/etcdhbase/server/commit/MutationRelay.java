@@ -26,10 +26,6 @@ public final class MutationRelay {
   public record ResultUnknown(BackendFailure.Category category) implements Result {
     public ResultUnknown {
       Objects.requireNonNull(category, "category");
-      if (category != BackendFailure.Category.TIMEOUT && category != BackendFailure.Category.CANCELLED
-          && category != BackendFailure.Category.UNAVAILABLE && category != BackendFailure.Category.UNKNOWN) {
-        throw new IllegalArgumentException("result-unknown requires an indeterminate failure category");
-      }
     }
   }
 
@@ -124,7 +120,10 @@ public final class MutationRelay {
     if (reply instanceof OwnerForwarding.Completed completed) {
       return new KnownResult(completed.operationResult());
     }
-    return new KnownRejection(((OwnerForwarding.Rejected) reply).category());
+    if (reply instanceof OwnerForwarding.Rejected rejected) {
+      return new KnownRejection(rejected.category());
+    }
+    return new ResultUnknown(((OwnerForwarding.Unknown) reply).category());
   }
 
   private static BackendFailure.Category classifyUnknown(Throwable failure) {

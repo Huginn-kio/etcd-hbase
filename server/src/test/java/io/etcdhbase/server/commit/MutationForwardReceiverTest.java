@@ -13,6 +13,7 @@ import io.etcdhbase.core.commit.InvocationRepository;
 import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.OwnerForwarding;
+import io.etcdhbase.core.commit.PublicationSlot;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.error.BackendFailure;
@@ -49,6 +50,40 @@ class MutationForwardReceiverTest {
   }
 
   @Test
+  void staleSealedBindingAfterItsSequenceWasSelectedRemainsUnknown() {
+    var repository = new InMemoryInvocationRepository();
+    repository.binding = InvocationBinding.begin(INVOCATION, request().requestDigest(), AUTH_DIGEST,
+        TRANSACTION, 1, 0, 1).seal(ByteKey.copyOf(new byte[] {9}));
+    var processors = new AtomicInteger();
+    CommitState current = currentState().publish(publication(2)).finalizePublication(TRANSACTION);
+    var fixture = receiver(current, repository, processors);
+
+    OwnerForwarding.Reply reply = fixture.receiver().receive(
+        "authenticated-peer", request(), RequestScope.withoutDeadline()).join();
+
+    var unknown = assertInstanceOf(OwnerForwarding.Unknown.class, reply);
+    assertEquals(BackendFailure.Category.UNAVAILABLE, unknown.category());
+    assertEquals(0, processors.get(), "the old attempt must not be revived at the new sequence");
+  }
+
+  @Test
+  void duplicateRequestDuringPublicationDoesNotClaimKnownRejection() {
+    var repository = new InMemoryInvocationRepository();
+    repository.binding = InvocationBinding.begin(INVOCATION, request().requestDigest(), AUTH_DIGEST,
+        TRANSACTION, 2, 0, 1).seal(ByteKey.copyOf(new byte[] {9}));
+    var processors = new AtomicInteger();
+    CommitState publishing = currentState().publish(publication(2));
+    var fixture = receiver(publishing, repository, processors);
+
+    OwnerForwarding.Reply reply = fixture.receiver().receive(
+        "authenticated-peer", request(), RequestScope.withoutDeadline()).join();
+
+    var unknown = assertInstanceOf(OwnerForwarding.Unknown.class, reply);
+    assertEquals(BackendFailure.Category.UNAVAILABLE, unknown.category());
+    assertEquals(0, processors.get());
+  }
+
+  @Test
   void currentBindingCanReachProcessorAndRejectedMeansNoMutationWasDispatched() {
     var repository = new InMemoryInvocationRepository();
     var processors = new AtomicInteger();
@@ -73,8 +108,8 @@ class MutationForwardReceiverTest {
     OwnerForwarding.Reply reply = fixture.receiver().receive(
         "authenticated-peer", request(), RequestScope.withoutDeadline()).join();
 
-    var rejected = assertInstanceOf(OwnerForwarding.Rejected.class, reply);
-    assertEquals(BackendFailure.Category.PERMISSION, rejected.category());
+    var unknown = assertInstanceOf(OwnerForwarding.Unknown.class, reply);
+    assertEquals(BackendFailure.Category.PERMISSION, unknown.category());
     assertEquals(0, processors.get());
   }
 
@@ -92,8 +127,8 @@ class MutationForwardReceiverTest {
     OwnerForwarding.Reply reply = fixture.receiver().receive(
         "authenticated-peer", request(), RequestScope.withoutDeadline()).join();
 
-    var rejected = assertInstanceOf(OwnerForwarding.Rejected.class, reply);
-    assertEquals(BackendFailure.Category.UNAVAILABLE, rejected.category());
+    var unknown = assertInstanceOf(OwnerForwarding.Unknown.class, reply);
+    assertEquals(BackendFailure.Category.UNAVAILABLE, unknown.category());
     assertEquals(0, processors.get());
   }
 
@@ -103,9 +138,16 @@ class MutationForwardReceiverTest {
 
   private static Fixture receiver(InMemoryInvocationRepository repository,
       AtomicInteger processors, ByteKey resolvedAuthorizationDigest) {
-    CommitState current = CommitState.initial(FINGERPRINT, 1)
-        .claimOwner("owner-old", 1, 10)
-        .claimOwner("owner-current", 10, 2_000);
+    return receiver(currentState(), repository, processors, resolvedAuthorizationDigest);
+  }
+
+  private static Fixture receiver(CommitState current, InMemoryInvocationRepository repository,
+      AtomicInteger processors) {
+    return receiver(current, repository, processors, AUTH_DIGEST);
+  }
+
+  private static Fixture receiver(CommitState current, InMemoryInvocationRepository repository,
+      AtomicInteger processors, ByteKey resolvedAuthorizationDigest) {
     CommitControlStore control = new FixedControlStore(current);
     var invocations = new InvocationService(repository);
     var identity = new AuthorizedBackendIdentity("test-provider", "test-subject", "ctx-1",
@@ -121,6 +163,17 @@ class MutationForwardReceiverTest {
     var receiver = new MutationForwardReceiver(control, invocations, authorizations, processor,
         Clock.fixed(Instant.ofEpochMilli(1_000), ZoneOffset.UTC));
     return new Fixture(receiver);
+  }
+
+  private static CommitState currentState() {
+    return CommitState.initial(FINGERPRINT, 1)
+        .claimOwner("owner-old", 1, 10)
+        .claimOwner("owner-current", 10, 2_000);
+  }
+
+  private static PublicationSlot publication(long ownerEpoch) {
+    return new PublicationSlot(TRANSACTION, INVOCATION, ownerEpoch, 0, 1,
+        1, 2, true, ByteKey.copyOf(new byte[] {7}), FINGERPRINT);
   }
 
   private static MutationForwardRequest request() {

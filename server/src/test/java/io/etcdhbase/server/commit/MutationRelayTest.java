@@ -82,6 +82,17 @@ class MutationRelayTest {
   }
 
   @Test
+  void receiverUnknownReplyRemainsUnknownAtRelay() {
+    var relay = relay(ignored -> CompletableFuture.completedFuture(ROUTE),
+        (selected, forwarded, scope) -> CompletableFuture.completedFuture(
+            new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE)));
+
+    var unknown = assertInstanceOf(MutationRelay.ResultUnknown.class,
+        relay.forward(request(), RequestScope.withoutDeadline()).join());
+    assertEquals(BackendFailure.Category.UNAVAILABLE, unknown.category());
+  }
+
+  @Test
   void routeMustMatchTheAuthoritativeOwnerBeforeSend() {
     var wrongRoute = new OwnerForwarding.Route("owner-b", 2, "endpoint-b", "peer-b");
     var sends = new AtomicInteger();

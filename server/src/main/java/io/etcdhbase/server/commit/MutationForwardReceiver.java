@@ -92,20 +92,20 @@ public final class MutationForwardReceiver {
     Objects.requireNonNull(scope, "scope");
     if (!validPeerIdentity(authenticatedPeerIdentity)
         || request.hopCount() != MutationForwardRequest.MAX_HOPS) {
-      return rejected(BackendFailure.Category.PERMISSION);
+      return unknown(BackendFailure.Category.PERMISSION);
     }
     if (scope.isDeadlineExceeded() || scope.isClosed()) {
-      return rejected(scope.isDeadlineExceeded()
+      return unknown(scope.isDeadlineExceeded()
           ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
     }
     return control.read(scope).handle((snapshot, failure) -> new ControlRead(snapshot, failure))
         .thenCompose(read -> {
-          if (read.failure() != null) return rejected(category(read.failure()));
-          if (read.snapshot().isEmpty()) return rejected(BackendFailure.Category.UNAVAILABLE);
+          if (read.failure() != null) return unknown(category(read.failure()));
+          if (read.snapshot().isEmpty()) return unknown(BackendFailure.Category.UNAVAILABLE);
           CommitState state = read.snapshot().orElseThrow().state();
           if (!isCurrentOwner(state, request.expectedOwnerEpoch())
               || state.publication().isPresent()) {
-            return rejected(BackendFailure.Category.UNAVAILABLE);
+            return unknown(BackendFailure.Category.UNAVAILABLE);
           }
           return authorizeAndBind(authenticatedPeerIdentity, request, scope, state);
         });
@@ -117,17 +117,17 @@ public final class MutationForwardReceiver {
     try {
       authorization = authorizations.verifyAndResolve(peerIdentity, request, scope);
     } catch (RuntimeException failure) {
-      return rejected(category(failure));
+      return unknown(category(failure));
     }
-    if (authorization == null) return rejected(BackendFailure.Category.UNKNOWN);
+    if (authorization == null) return unknown(BackendFailure.Category.UNKNOWN);
     return authorization.handle((verified, failure) -> new AuthorizationResult(verified, failure))
         .thenCompose(result -> {
-          if (result.failure() != null) return rejected(category(result.failure()));
+          if (result.failure() != null) return unknown(category(result.failure()));
           if (!matchesAuthorization(request, result.authorization())) {
-            return rejected(BackendFailure.Category.PERMISSION);
+            return unknown(BackendFailure.Category.PERMISSION);
           }
           if (scope.isDeadlineExceeded() || scope.isClosed()) {
-            return rejected(scope.isDeadlineExceeded()
+            return unknown(scope.isDeadlineExceeded()
                 ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
           }
           InvocationBinding proposed = InvocationBinding.begin(
@@ -148,18 +148,18 @@ public final class MutationForwardReceiver {
     try {
       bound = invocations.bindOrJoin(proposed, scope);
     } catch (RuntimeException failure) {
-      return rejected(category(failure));
+      return unknown(category(failure));
     }
-    if (bound == null) return rejected(BackendFailure.Category.UNKNOWN);
+    if (bound == null) return unknown(BackendFailure.Category.UNKNOWN);
     return bound.handle((binding, failure) -> new BindingResult(binding, failure))
         .thenCompose(result -> {
-          if (result.failure() != null) return rejected(category(result.failure()));
+          if (result.failure() != null) return unknown(category(result.failure()));
           if (scope.isDeadlineExceeded() || scope.isClosed()) {
-            return rejected(scope.isDeadlineExceeded()
+            return unknown(scope.isDeadlineExceeded()
                 ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
           }
           if (!bindingBelongsToObservedAttempt(result.binding(), observed)) {
-            return rejected(BackendFailure.Category.UNAVAILABLE);
+            return unknown(BackendFailure.Category.UNAVAILABLE);
           }
           return verifyOwnerBeforeDispatch(request, scope, observed, authorization, result.binding());
         });
@@ -184,18 +184,18 @@ public final class MutationForwardReceiver {
       InvocationBinding binding) {
     return control.read(scope).handle((snapshot, failure) -> new ControlRead(snapshot, failure))
         .thenCompose(read -> {
-          if (read.failure() != null) return rejected(category(read.failure()));
-          if (read.snapshot().isEmpty()) return rejected(BackendFailure.Category.UNAVAILABLE);
+          if (read.failure() != null) return unknown(category(read.failure()));
+          if (read.snapshot().isEmpty()) return unknown(BackendFailure.Category.UNAVAILABLE);
           CommitState current = read.snapshot().orElseThrow().state();
           if (!isCurrentOwner(current, request.expectedOwnerEpoch())
               || !current.ownerInstance().equals(observed.ownerInstance())
               || current.publication().isPresent()
               || current.publishedSequence() != observed.publishedSequence()
               || current.publishedRevision() != observed.publishedRevision()) {
-            return rejected(BackendFailure.Category.UNAVAILABLE);
+            return unknown(BackendFailure.Category.UNAVAILABLE);
           }
           if (scope.isDeadlineExceeded() || scope.isClosed()) {
-            return rejected(scope.isDeadlineExceeded()
+            return unknown(scope.isDeadlineExceeded()
                 ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
           }
           try {
@@ -232,8 +232,8 @@ public final class MutationForwardReceiver {
         && identity.codePoints().noneMatch(Character::isISOControl);
   }
 
-  private static CompletableFuture<OwnerForwarding.Reply> rejected(BackendFailure.Category category) {
-    return CompletableFuture.completedFuture(new OwnerForwarding.Rejected(category));
+  private static CompletableFuture<OwnerForwarding.Reply> unknown(BackendFailure.Category category) {
+    return CompletableFuture.completedFuture(new OwnerForwarding.Unknown(category));
   }
 
   private static BackendFailure.Category category(Throwable failure) {
