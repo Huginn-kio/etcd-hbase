@@ -670,7 +670,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J21.1** owner/fencing：HBase 权威 epoch/CAS、两副本竞争及旧执行器恢复隔离；K8s 进程退出接管。
     - [ ] **J21.2** 请求转发：目标发现、身份/上下文传播、取消/超时和结果未知边界；不因转发重试重复承诺提交。
   - 验证层次：L1 存储/内核。
-  - 跟踪：状态=代码已提交，验收待补；负责人=Codex；完成日期=2026-11-03；PR/commit=PR #25 / J21 单任务提交；验证报告=作者多维自审与 Java 21 全模块 compile 通过；测试未运行，真实双副本 HBase、受控 peer 通道装配和 B03/B06 认证验收待执行；评审人/结论=`reidchan` / 待评审。
+  - 跟踪：状态=公开代码验证已完成，目标验收待补；负责人=Codex；完成日期=2026-11-04；PR/commit=PR #25 / `7588c65208fc5092fd8f6501a34ba6fcd71899a9`；验证报告=该提交上 Java 21 `scripts/verify/j11.sh` 共 264 项通过，失败/错误/跳过均为 0；J21 `J21OwnerInvocationStoreIT` 与 J20 `J20CommitControlStoreIT` 本地 MiniCluster 用例各 1/1，`MutationRelayTest` 与 `MutationForwardReceiverTest` 定向回归共 15/15；原始摘要保存在本地 `.artifacts/m1/j11/20261103T222348Z-22195/summary.json`；本地 MiniCluster 不代表目标集群验收，新 head 的 PR CI、真实双副本 HBase 接管、受控 peer 通道装配、B03/B06 认证及目标 HBase 验收仍待完成；评审人/结论=`Reidddddd` / 第一阶段通过、第二阶段待维护者复核。
 
 - [ ] **J22｜私有准备版本与有界提交计划**
   - 依赖：J11/J13/J20。
