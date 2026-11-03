@@ -37,6 +37,7 @@ class MutationForwardReceiverTest {
   private static final String GROUP = "group-a";
   private static final ByteKey FINGERPRINT = ByteKey.copyOf(new byte[32]);
   private static final ByteKey AUTH_DIGEST = ByteKey.copyOf(new byte[32]);
+  private static final ByteKey MANIFEST_ROOT = ByteKey.copyOf(new byte[] {9});
   private static final InvocationId INVOCATION = new InvocationId(
       UUID.fromString("00000000-0000-0000-0000-000000000001"));
   private static final TransactionId TRANSACTION = new TransactionId(
@@ -56,9 +57,15 @@ class MutationForwardReceiverTest {
   void staleSealedBindingAfterItsSequenceWasSelectedRemainsUnknown() {
     var repository = new InMemoryInvocationRepository();
     repository.binding = InvocationBinding.begin(INVOCATION, request().requestDigest(), AUTH_DIGEST,
-        TRANSACTION, 1, 0, 1).seal(ByteKey.copyOf(new byte[] {9}));
+        TRANSACTION, 1, 0, 1).seal(MANIFEST_ROOT);
     var processors = new AtomicInteger();
-    CommitState current = currentState().publish(publication(2)).finalizePublication(TRANSACTION);
+    CommitState current = CommitState.initial(FINGERPRINT, 1)
+        .claimOwner("owner-old", 1, 10)
+        .publish(publication(1))
+        .claimOwner("owner-current", 10, 2_000)
+        .finalizePublication(TRANSACTION);
+    assertEquals(1, current.publishedSequence());
+    assertEquals(1, current.finalizedSequence());
     var fixture = receiver(current, repository, processors);
 
     OwnerForwarding.Reply reply = fixture.receiver().receive(
@@ -73,9 +80,11 @@ class MutationForwardReceiverTest {
   void duplicateRequestDuringPublicationDoesNotClaimKnownRejection() {
     var repository = new InMemoryInvocationRepository();
     repository.binding = InvocationBinding.begin(INVOCATION, request().requestDigest(), AUTH_DIGEST,
-        TRANSACTION, 2, 0, 1).seal(ByteKey.copyOf(new byte[] {9}));
+        TRANSACTION, 1, 0, 1).seal(MANIFEST_ROOT);
     var processors = new AtomicInteger();
-    CommitState publishing = currentState().publish(publication(2));
+    CommitState publishing = CommitState.initial(FINGERPRINT, 1)
+        .claimOwner("owner-old", 1, 10)
+        .publish(publication(1));
     var fixture = receiver(publishing, repository, processors);
 
     OwnerForwarding.Reply reply = fixture.receiver().receive(
@@ -133,7 +142,7 @@ class MutationForwardReceiverTest {
     var pendingAuthorization = new CompletableFuture<MutationForwardReceiver.VerifiedAuthorization>();
     var repository = new InMemoryInvocationRepository();
     var processors = new AtomicInteger();
-    var fixture = receiver(currentState(), repository, processors,
+    var fixture = receiver(currentState(), repository,
         (peer, request, scope) -> {
           authorizationBudget.set(scope.remainingDeadlineNanos());
           return pendingAuthorization;
@@ -163,7 +172,7 @@ class MutationForwardReceiverTest {
     var pendingAuthorization = new CompletableFuture<MutationForwardReceiver.VerifiedAuthorization>();
     var repository = new InMemoryInvocationRepository();
     var processors = new AtomicInteger();
-    var fixture = receiver(currentState(), repository, processors,
+    var fixture = receiver(currentState(), repository,
         (peer, request, scope) -> {
           capturedAuthorizationScope.set(scope);
           return pendingAuthorization;
@@ -223,7 +232,7 @@ class MutationForwardReceiverTest {
 
   private static Fixture receiver(CommitState current, InMemoryInvocationRepository repository,
       AtomicInteger processors, ByteKey resolvedAuthorizationDigest) {
-    return receiver(current, repository, processors,
+    return receiver(current, repository,
         (peer, request, scope) -> CompletableFuture.completedFuture(
             new MutationForwardReceiver.VerifiedAuthorization(identity(), resolvedAuthorizationDigest)),
         (request, binding, verified, scope) -> {
@@ -234,7 +243,7 @@ class MutationForwardReceiverTest {
   }
 
   private static Fixture receiver(CommitState current, InMemoryInvocationRepository repository,
-      AtomicInteger processors, MutationForwardReceiver.AuthorizationResolver authorizations,
+      MutationForwardReceiver.AuthorizationResolver authorizations,
       MutationForwardReceiver.MutationProcessor processor) {
     var controlScope = new AtomicReference<RequestScope>();
     CommitControlStore control = new FixedControlStore(current, controlScope);
@@ -250,7 +259,7 @@ class MutationForwardReceiverTest {
     AtomicReference<RequestScope> processorScope = new AtomicReference<>();
     var repository = new InMemoryInvocationRepository();
     var processors = new AtomicInteger();
-    var fixture = receiver(currentState(), repository, processors,
+    var fixture = receiver(currentState(), repository,
         (peer, request, scope) -> {
           authorizationScope.set(scope);
           return CompletableFuture.completedFuture(verifiedAuthorization());
@@ -289,7 +298,7 @@ class MutationForwardReceiverTest {
 
   private static PublicationSlot publication(long ownerEpoch) {
     return new PublicationSlot(TRANSACTION, INVOCATION, ownerEpoch, 0, 1,
-        1, 2, true, ByteKey.copyOf(new byte[] {7}), FINGERPRINT);
+        1, 2, true, MANIFEST_ROOT, FINGERPRINT);
   }
 
   private static MutationForwardRequest request() {
