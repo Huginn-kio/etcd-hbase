@@ -414,6 +414,14 @@ class InitializeTablesIT {
       TableDescriptor actual = await(connection.getAdmin().getDescriptor(name), OPERATION_TIMEOUT);
       assertEquals(plan.fingerprint(), actual.getValue("etcdhbase.m0.plan-fingerprint"));
       assertEquals(clusterId, actual.getValue("etcdhbase.m0.backend-cluster-id"));
+      assertEquals(plan.saltProfile().strategyId(),
+          actual.getValue("etcdhbase.m0.salt-strategy-id"));
+      assertEquals(Integer.toString(plan.saltProfile().encodingVersion()),
+          actual.getValue("etcdhbase.m0.salt-encoding-version"));
+      assertEquals(Integer.toString(plan.saltProfile().bucketCount()),
+          actual.getValue("etcdhbase.m0.salt-bucket-count"));
+      assertEquals(Integer.toString(plan.saltProfile().saltWidthBytes()),
+          actual.getValue("etcdhbase.m0.salt-width-bytes"));
       assertEquals(Durability.SYNC_WAL, actual.getDurability());
       assertEquals(table.columnFamilies().size(), actual.getColumnFamilyCount());
       assertFamilies(table, actual);

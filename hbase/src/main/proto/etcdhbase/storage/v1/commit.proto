@@ -1,0 +1,33 @@
+syntax = "proto3";
+package etcdhbase.storage.v1;
+option java_package = "io.etcdhbase.hbase.storage.proto";
+option java_outer_classname = "CommitProtos";
+
+// Internal M2 control row; this schema is separate from the upstream etcd wire API.
+message CommitControlState {
+  optional uint32 format_version = 1;
+  optional bytes profile_fingerprint = 2;
+  optional string owner_instance = 3;
+  optional int64 owner_epoch = 4;
+  optional int64 owner_lease_deadline_epoch_millis = 5;
+  optional int64 state_version = 6;
+  optional int64 published_sequence = 7;
+  optional int64 published_revision = 8;
+  optional int64 finalized_sequence = 9;
+  optional int64 finalized_revision = 10;
+  optional int64 compact_revision = 11;
+  optional PublicationSlot publication = 12;
+}
+
+message PublicationSlot {
+  optional bytes transaction_id = 1;
+  optional bytes invocation_id = 2;
+  optional int64 owner_epoch = 3;
+  optional int64 base_sequence = 4;
+  optional int64 base_revision = 5;
+  optional int64 sequence = 6;
+  optional int64 revision = 7;
+  optional bool contains_key_changes = 8;
+  optional bytes manifest_root = 9;
+  optional bytes manifest_digest = 10;
+}

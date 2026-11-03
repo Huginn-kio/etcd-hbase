@@ -47,6 +47,13 @@ record PlannedHBaseTable(TableDescriptor descriptor, byte[][] splitKeys) {
             .setValue("etcdhbase.m0.table-schema-version", Integer.toString(table.schemaVersion()))
             .setValue("etcdhbase.m0.profile-version", Integer.toString(table.profileVersion()))
             .setValue("etcdhbase.m0.salt-profile-id", plan.saltProfile().id())
+            .setValue("etcdhbase.m0.salt-strategy-id", plan.saltProfile().strategyId())
+            .setValue("etcdhbase.m0.salt-encoding-version",
+                Integer.toString(plan.saltProfile().encodingVersion()))
+            .setValue("etcdhbase.m0.salt-bucket-count",
+                Integer.toString(plan.saltProfile().bucketCount()))
+            .setValue("etcdhbase.m0.salt-width-bytes",
+                Integer.toString(plan.saltProfile().saltWidthBytes()))
             .setValue("etcdhbase.m0.history-layout", plan.historyLayout().name())
             .setValue("etcdhbase.m0.plan-fingerprint", plan.fingerprint())
             .setValue(
