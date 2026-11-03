@@ -7,9 +7,11 @@ import java.util.concurrent.CompletableFuture;
 /** Verifies every sealed candidate and event reference before the publication CAS. */
 public final class CommitPlanVerifier {
   private final ManifestCatalog catalog;
+  private final MaterializationStore materialization;
 
-  public CommitPlanVerifier(ManifestCatalog catalog) {
+  public CommitPlanVerifier(ManifestCatalog catalog, MaterializationStore materialization) {
     this.catalog = Objects.requireNonNull(catalog, "catalog");
+    this.materialization = Objects.requireNonNull(materialization, "materialization");
   }
 
   public CompletableFuture<ManifestRoot> verify(
@@ -32,8 +34,8 @@ public final class CommitPlanVerifier {
         return CompletableFuture.failedFuture(new IllegalStateException(
             "durable manifest root differs from the proposed root"));
       }
-      return catalog.forEachCandidate(root, scope, ignoredCandidate ->
-              CompletableFuture.completedFuture(null))
+      return catalog.forEachCandidate(root, scope,
+              candidate -> materialization.preflight(candidate, scope))
           .thenCompose(candidates -> catalog.forEachEvent(root, scope,
               event -> CompletableFuture.completedFuture(null)))
           .thenApply(ignored -> root);

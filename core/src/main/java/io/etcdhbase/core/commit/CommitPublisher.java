@@ -14,16 +14,19 @@ public final class CommitPublisher {
   private final CommitOutcomeResolver outcomes;
   private final CommitPlanVerifier planVerifier;
   private final PublicationHandoff handoff;
+  private final CommitFinalizer finalizer;
 
   public CommitPublisher(
       CommitControlStore control,
       CommitOutcomeResolver outcomes,
       CommitPlanVerifier planVerifier,
-      PublicationHandoff handoff) {
+      PublicationHandoff handoff,
+      CommitFinalizer finalizer) {
     this.control = Objects.requireNonNull(control, "control");
     this.outcomes = Objects.requireNonNull(outcomes, "outcomes");
     this.planVerifier = Objects.requireNonNull(planVerifier, "planVerifier");
     this.handoff = Objects.requireNonNull(handoff, "handoff");
+    this.finalizer = Objects.requireNonNull(finalizer, "finalizer");
   }
 
   /**
@@ -45,7 +48,8 @@ public final class CommitPublisher {
     }
     return planVerifier.verify(invocation, manifest, requestScope).thenCompose(verified ->
         handoff.transfer(invocation, requestScope, serviceScope ->
-            attempt(invocation, owner, verified, serviceScope, 0)))
+            attempt(invocation, owner, verified, serviceScope, 0)
+                .thenCompose(publication -> finalizer.finish(invocation, publication, serviceScope))))
         .exceptionallyCompose(CommitPublisher::failed);
   }
 

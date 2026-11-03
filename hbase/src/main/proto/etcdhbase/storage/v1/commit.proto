@@ -217,3 +217,16 @@ message CommitDecision {
   optional bool contains_key_changes = 8;
   optional int64 base_revision = 9;
 }
+
+message RowFence {
+  optional uint32 format_version = 1;
+  optional uint32 row_kind = 2;
+  optional uint32 state = 3;
+  optional int64 applied_sequence = 4;
+  optional bytes transaction_id = 5;
+  optional int64 revision = 6;
+  optional bytes content_digest = 7;
+  optional int64 maintenance_generation = 8;
+  optional int64 owner_epoch = 9;
+  optional int64 base_sequence = 10;
+}
