@@ -1,0 +1,42 @@
+# J29.1–J29.3 公开成本报告
+
+## 范围与结论边界
+
+本报告使用本地 HBase MiniCluster 和固定合成请求，覆盖 `HISTORY + CURRENT` 与 `NATIVE` 两种候选布局。它用于观察 M2 协议成本与单活队列行为，不代表目标集群的容量、吞吐或 p99 验收。B04/B05 尚未提供，目标验收门槛仍未冻结。
+
+J29.1 通过现有 invocation、manifest、control 行 CAS、发布解析、decision archive、materialization 与最终 control CAS 执行真实提交。J29.2 将选中事务部分落地后交给真实 `RecoveryManager` 接管并收尾；通过向其 owner claim 传入原租约截止时间加 1 ms 模拟租约已过期，不等待真实的一小时。读取在 pin 固定该未完成视图后启动。测试专用 interlock 按读页完成顺序逐项放行恢复物化，确定性地产生读/恢复交错，不等待恢复结果再读。J29.3 使用 KV 与 metadata-only 模拟续租组成有界公平队列，metadata-only 提交只模拟续租类写入，不代表 etcd Lease TTL、到期删除或 Watch 语义。
+
+## 固定负载
+
+- Seed：`20261104`。
+- 候选基线：单 key 64 B、16 key × 1024 B、大事务；metadata-only 模拟续租不改变 KV revision。
+- 读负载：8 个候选，均匀分布到 4 个 salt bucket；先部分物化，再由新 owner 恢复剩余版本，同时按每页 1 个 key 读取。HBase 页耗尽需要终止探测，因此共 12 次页请求、8 次 scanner 重开；测试 interlock 使其中 8 页与恢复物化交错，只调度恢复物化，不暂停读请求；此确定性时序不代替自然竞争或目标集群延迟。
+- 混合队列：4 个单 key KV、2 个 8 key 大事务、2 个 metadata-only 模拟续租；单活执行，最多连续处理 3 个业务事务后运行一个待处理续租。
+- HISTORY 和 NATIVE 复用相同 workload digest、JDK、MiniCluster 与 bucket 配置；协议内部行的完整成本仍计入。
+
+## 指标口径
+
+`j29-commit-baseline` 区分 invocation bind、准备、publish-and-finalize、finalization 与总耗时。finalization 是 publish-and-finalize 的子区间，二者不能相加。control CAS 与 system-record 操作记录应用层调用、冲突/未知结果、逻辑请求/响应字节和调用耗时；`j29-read` 的物理行、返回 Cell 字节和 scan RPC 数来自存储页计数，同时报告读页重开次数、恢复物化调用数、恢复进行中完成的页数及恢复总时长。队列等待从单线程执行器提交到任务开始计时，服务时间单独记录。
+
+以下数据未由当前 MiniCluster instrumentation 可靠提供，保持为缺口：点请求的 HBase RPC/retry 数、服务端 scan counters、WAL/HFile IO 和 compaction 成本、JVM/direct-memory 高水位、恢复 reserve 的真实账本峰值、多进程故障接管成本。应用逻辑字节不能当作网络字节或 HBase Cell 字节。
+
+## 本次验证结果
+
+运行环境为 HBase `2.6.6-hadoop3`、Temurin JDK `21.0.12.1+1-LTS`、单 RegionServer 和 4 个 salt bucket。固定 seed 为 `20261104`，workload SHA-256 为 `99fd421f6ecc306ec263fc2a53ee0b08523d8793b239c0d945a26a5ec50402fd`。`scripts/verify/j29.sh` 的 MiniCluster 用例通过 1 次，失败、错误和跳过均为 0；同次机器报告保存在本地忽略目录 `.artifacts/m2/j29/`。
+
+下表为每类单次观测耗时，单位为微秒；没有预热和重复运行，因此这些数值只描述本次本地执行。finalization 是 publish-and-finalize 总区间的子区间，不能相加。8 个请求的队列 p99 是小样本最大值，不作为稳定尾延迟估计。
+
+| 布局 | 1-key / 16-key / 模拟续租提交总耗时 | 读屏障+pin / 候选点读 / 12 页读取（8 次重开） | 队列等待 p50 / p95 / p99 | control CAS 未知/失败 |
+| --- | --- | --- | --- | --- |
+| HISTORY + CURRENT | 94,726 / 218,119 / 21,098 | 17,121 / 10,019 / 75,873 | 103,337 / 368,466 / 368,466 | 0 / 0 |
+| NATIVE | 30,659 / 107,649 / 15,524 | 4,690 / 3,181 / 40,590 | 65,303 / 205,703 / 205,703 | 0 / 0 |
+
+两种布局均执行 12 次页请求、8 次重开和 8 次恢复物化；恢复进行中分别完成 10 页（HISTORY）和 9 页（NATIVE），恢复总时长分别为 135,776 µs 和 65,642 µs，包含测试 interlock 的逐页让步时间。
+
+本次请求边界采样的 heap 峰值为 HISTORY 89,176,024 B、NATIVE 58,268,784 B；direct buffer 分别为 12,592,074 B 和 12,592,070 B；线程数为 24 和 25。两个布局的候选逻辑负载峰值均为 16,710 B；扫描器峰值均为 1，pin 释放后活跃数均为 0（容量 32）。这些是稀疏请求边界采样值，不是连续 JVM 高水位。
+
+所有记录的 control CAS 均无冲突、未知结果或失败。每种布局均完成 26 次 control CAS、46 次 materialize apply；系统记录中的候选、manifest、decision、snapshot pin 操作和逻辑字节数见同目录 `summary.json`。本次仅运行一次且 HISTORY 先于 NATIVE 执行，结果不用于宣称某种物理布局更快。
+
+## 后续验收
+
+J29.4 仍属于 M4：依赖真实 Lease 实现补充 Lease/业务提交/到期工作的混合负载。真实目标容量、p99 与恢复结论需先冻结 B04/B05，并在获批目标环境独立测量；本报告不替代这些证据。
