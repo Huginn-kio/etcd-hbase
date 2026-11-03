@@ -110,8 +110,8 @@ public final class CommitState {
   /** Refreshes liveness while preserving the logical sequence and any selected publication. */
   public CommitState heartbeat(String expectedOwner, long expectedEpoch, long leaseDeadlineEpochMillis) {
     requireOwner(expectedOwner, expectedEpoch);
-    if (leaseDeadlineEpochMillis <= 0) {
-      throw new IllegalArgumentException("owner lease deadline must be positive");
+    if (leaseDeadlineEpochMillis <= ownerLeaseDeadlineEpochMillis) {
+      throw new IllegalArgumentException("owner heartbeat must extend the existing lease");
     }
     return copy(ownerInstance, ownerEpoch, leaseDeadlineEpochMillis, nextStateVersion(),
         publishedSequence, publishedRevision, finalizedSequence, finalizedRevision,

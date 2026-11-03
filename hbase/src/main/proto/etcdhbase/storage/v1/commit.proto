@@ -3,7 +3,7 @@ package etcdhbase.storage.v1;
 option java_package = "io.etcdhbase.hbase.storage.proto";
 option java_outer_classname = "CommitProtos";
 
-// Internal M2 control row; this schema is separate from the upstream etcd wire API.
+// Internal M2 control and invocation records; separate from the upstream etcd wire API.
 message CommitControlState {
   optional uint32 format_version = 1;
   optional bytes profile_fingerprint = 2;
@@ -30,4 +30,27 @@ message PublicationSlot {
   optional bool contains_key_changes = 8;
   optional bytes manifest_root = 9;
   optional bytes manifest_digest = 10;
+}
+
+enum InvocationAttemptState {
+  INVOCATION_STATE_UNSPECIFIED = 0;
+  INVOCATION_PREPARING = 1;
+  INVOCATION_SEALED = 2;
+  INVOCATION_SELECTED = 3;
+  INVOCATION_NOT_SELECTED = 4;
+  INVOCATION_WINDOW_CLOSED = 5;
+}
+
+message InvocationBinding {
+  optional uint32 format_version = 1;
+  optional bytes invocation_id = 2;
+  optional bytes request_digest = 3;
+  optional bytes authorization_scope_digest = 4;
+  optional bytes transaction_id = 5;
+  optional int64 prepared_owner_epoch = 6;
+  optional int64 base_sequence = 7;
+  optional int64 base_revision = 8;
+  optional InvocationAttemptState state = 9;
+  optional bytes manifest_root = 10;
+  optional bytes result_reference = 11;
 }
