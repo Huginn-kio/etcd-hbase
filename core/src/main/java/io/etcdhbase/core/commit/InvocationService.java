@@ -5,7 +5,6 @@ import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 
 /** Resolves concurrent first binds and persists progress without rebinding an invocation ID. */
 public final class InvocationService {

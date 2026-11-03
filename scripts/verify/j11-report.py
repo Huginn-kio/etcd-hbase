@@ -14,7 +14,8 @@ REQUIRED = {"io.etcdhbase.hbase.storage.M1StorageIT",
             "io.etcdhbase.hbase.storage.HBaseRecordStoreTest",
             "io.etcdhbase.core.request.ScopedCleanupTest",
             "io.etcdhbase.hbase.probe.LocalHBaseProbeIT",
-            "io.etcdhbase.hbase.probe.SecureHBaseAuthenticationIT"}
+            "io.etcdhbase.hbase.probe.SecureHBaseAuthenticationIT",
+            "io.etcdhbase.hbase.storage.J21OwnerInvocationStoreIT"}
 CASES = {"realGetPutAtomicCasBatchAndRawByteBucketOrder",
          "bothHistoryLayoutsKeepDeleteRecreateAndVersionProjectionAfterFlush",
          "partialBatchResultsKeepIndexesAndValueMismatchIsNotAnAbsentKey",

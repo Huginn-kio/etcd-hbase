@@ -133,11 +133,6 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
     return value.bytes();
   }
 
-  private static byte[] checkedValue(byte[] value) {
-    validateValueLength(value.length);
-    return value.clone();
-  }
-
   private static void validateValueLength(int length) {
     if (length == 0 || length > MAX_RECORD_BYTES) {
       throw new IllegalArgumentException("system record value exceeds its storage budget");
