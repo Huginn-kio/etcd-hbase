@@ -1,6 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -51,7 +52,7 @@ public final class InvocationService {
             }
             return readAndJoin(proposed, scope, result.created());
           }
-          Throwable cause = unwrap(result.failure());
+          Throwable cause = CompletionFailures.unwrapCompletion(result.failure());
           if (!isUnknown(cause)) return CompletableFuture.failedFuture(cause);
           return resolveUnknownCreate(proposed, scope, attempt, cause);
         });
@@ -69,8 +70,8 @@ public final class InvocationService {
         .handle((stored, readFailure) -> new ReadResult(stored, readFailure))
         .thenCompose(result -> {
           if (result.failure() != null) {
-            Throwable cause = unwrap(unknownFailure);
-            cause.addSuppressed(unwrap(result.failure()));
+            Throwable cause = CompletionFailures.unwrapCompletion(unknownFailure);
+            cause.addSuppressed(CompletionFailures.unwrapCompletion(result.failure()));
             return CompletableFuture.failedFuture(new BackendFailure(
                 BackendFailure.Category.UNKNOWN, cause));
           }
@@ -147,7 +148,8 @@ public final class InvocationService {
               return CompletableFuture.failedFuture(new IllegalStateException("invocation progressed concurrently"));
             }
             if (result.failure() != null) {
-              return CompletableFuture.failedFuture(unwrap(result.failure()));
+              return CompletableFuture.failedFuture(
+                  CompletionFailures.unwrapCompletion(result.failure()));
             }
             return transition(current, replacement, scope, attempt + 1);
           });
@@ -176,14 +178,6 @@ public final class InvocationService {
   private static boolean sameProgress(InvocationBinding left, InvocationBinding right) {
     return left.state() == right.state() && left.manifestRoot().equals(right.manifestRoot())
         && left.resultReference().equals(right.resultReference());
-  }
-
-  private static Throwable unwrap(Throwable failure) {
-    Throwable current = failure;
-    while (current instanceof CompletionException && current.getCause() != null) {
-      current = current.getCause();
-    }
-    return current;
   }
 
   private static boolean isUnknown(Throwable failure) {

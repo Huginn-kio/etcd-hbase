@@ -83,6 +83,19 @@ public final class RequestScope implements AutoCloseable {
     }
   }
 
+  /**
+   * Starts a nonblocking operation while cancellation and deadline closure are excluded.
+   * The starter must return promptly; its invocation is the ownership handoff point.
+   */
+  public boolean startIfOpen(Runnable starter) {
+    Objects.requireNonNull(starter, "starter");
+    synchronized (lock) {
+      if (closed || isDeadlineExceeded()) return false;
+      starter.run();
+      return true;
+    }
+  }
+
   public int cleanupFailureCount() {
     return cleanupFailureCount.get();
   }

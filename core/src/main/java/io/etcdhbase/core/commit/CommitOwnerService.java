@@ -1,6 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.Optional;
@@ -76,11 +77,12 @@ public final class CommitOwnerService {
           ? CompletableFuture.completedFuture(Optional.of(new OwnerToken(instance, claimed.ownerEpoch())))
           : claim(instance, nowMillis, leaseDeadlineMillis, scope, attempt + 1);
     }
-    if (!isUnknown(result.failure())) return CompletableFuture.failedFuture(unwrap(result.failure()));
+    if (!isUnknown(result.failure())) return CompletableFuture.failedFuture(
+        CompletionFailures.unwrapCompletion(result.failure()));
     return control.read(scope).handle((snapshot, rereadFailure) -> {
       if (rereadFailure != null) {
-        Throwable unknown = unwrap(result.failure());
-        unknown.addSuppressed(unwrap(rereadFailure));
+        Throwable unknown = CompletionFailures.unwrapCompletion(result.failure());
+        unknown.addSuppressed(CompletionFailures.unwrapCompletion(rereadFailure));
         throw new CompletionException(unknown);
       }
       if (snapshot.isPresent()) {
@@ -129,11 +131,12 @@ public final class CommitOwnerService {
           ? CompletableFuture.completedFuture(true)
           : heartbeat(owner, leaseDeadlineMillis, scope, attempt + 1);
     }
-    if (!isUnknown(result.failure())) return CompletableFuture.failedFuture(unwrap(result.failure()));
+    if (!isUnknown(result.failure())) return CompletableFuture.failedFuture(
+        CompletionFailures.unwrapCompletion(result.failure()));
     return control.read(scope).handle((snapshot, rereadFailure) -> {
       if (rereadFailure != null) {
-        Throwable unknown = unwrap(result.failure());
-        unknown.addSuppressed(unwrap(rereadFailure));
+        Throwable unknown = CompletionFailures.unwrapCompletion(result.failure());
+        unknown.addSuppressed(CompletionFailures.unwrapCompletion(rereadFailure));
         throw new CompletionException(unknown);
       }
       if (snapshot.isPresent()) {
@@ -153,7 +156,7 @@ public final class CommitOwnerService {
   }
 
   private static boolean isUnknown(Throwable failure) {
-    Throwable cause = unwrap(failure);
+    Throwable cause = CompletionFailures.unwrapCompletion(failure);
     if (cause instanceof BackendFailure backend) {
       return switch (backend.category()) {
         case TIMEOUT, UNAVAILABLE, UNKNOWN -> true;
@@ -161,14 +164,6 @@ public final class CommitOwnerService {
       };
     }
     return false;
-  }
-
-  private static Throwable unwrap(Throwable failure) {
-    Throwable current = failure;
-    while (current instanceof CompletionException && current.getCause() != null) {
-      current = current.getCause();
-    }
-    return current;
   }
 
   private record CasResult(Boolean updated, Throwable failure) {}

@@ -34,7 +34,7 @@ public interface OwnerForwarding {
     @Override public byte[] operationResult() { return operationResult.clone(); }
   }
 
-  /** A known rejection is valid only when the receiver proves it did not dispatch the mutation. */
+  /** A known rejection requires proof that no mutation was dispatched for the invocation. */
   record Rejected(BackendFailure.Category category) implements Reply {
     public Rejected {
       Objects.requireNonNull(category, "category");
@@ -51,6 +51,8 @@ public interface OwnerForwarding {
      * Sends one attempt without automatic retries. Implementations authenticate the route peer
      * and table-group audience before dispatch; an indeterminate transport failure is surfaced
      * so the caller can resolve the durable invocation instead of submitting it under a new ID.
+     * The send initiation must return promptly; its invocation is the request-cancellation
+     * ownership handoff.
      */
     CompletableFuture<Reply> sendOnce(Route route, MutationForwardRequest request, RequestScope scope);
   }

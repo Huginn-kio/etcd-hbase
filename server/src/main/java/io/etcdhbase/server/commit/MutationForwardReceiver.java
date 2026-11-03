@@ -10,6 +10,7 @@ import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.nio.charset.StandardCharsets;
@@ -18,7 +19,6 @@ import java.util.Arrays;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 
 /** Revalidates a forwarded request at the owner before dispatching it to the commit kernel. */
 public final class MutationForwardReceiver {
@@ -47,8 +47,9 @@ public final class MutationForwardReceiver {
   public interface MutationProcessor {
     /**
      * Processes or resolves this durable invocation. Implementations must use the returned
-     * binding, never allocate a second txnId for the same invocation, and only return Rejected
-     * when they can prove no mutation was dispatched.
+     * binding and never allocate a second txnId for the same invocation. They may be invoked
+     * before returning Rejected, but only when they can prove no mutation was dispatched for
+     * the invocation.
      */
     CompletableFuture<OwnerForwarding.Reply> process(
         MutationForwardRequest request,
@@ -84,15 +85,13 @@ public final class MutationForwardReceiver {
     this.clock = Objects.requireNonNull(clock, "clock");
   }
 
-  /** A returned Rejected reply guarantees that the mutation processor was never invoked. */
+  /** A returned Rejected reply guarantees no mutation was dispatched for this invocation. */
   public CompletableFuture<OwnerForwarding.Reply> receive(
       String authenticatedPeerIdentity, MutationForwardRequest request, RequestScope scope) {
     Objects.requireNonNull(request, "request");
     Objects.requireNonNull(scope, "scope");
     if (!validPeerIdentity(authenticatedPeerIdentity)
-        || request.hopCount() != MutationForwardRequest.MAX_HOPS
-        || !request.requestDigest().equals(
-            MutationForwardRequest.digest(request.tableGroupId(), request.operationBytes()))) {
+        || request.hopCount() != MutationForwardRequest.MAX_HOPS) {
       return rejected(BackendFailure.Category.PERMISSION);
     }
     if (scope.isDeadlineExceeded() || scope.isClosed()) {
@@ -159,8 +158,22 @@ public final class MutationForwardReceiver {
             return rejected(scope.isDeadlineExceeded()
                 ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
           }
+          if (!bindingBelongsToObservedAttempt(result.binding(), observed)) {
+            return rejected(BackendFailure.Category.UNAVAILABLE);
+          }
           return verifyOwnerBeforeDispatch(request, scope, observed, authorization, result.binding());
         });
+  }
+
+  private static boolean bindingBelongsToObservedAttempt(
+      InvocationBinding binding, CommitState observed) {
+    if (binding.state() != InvocationBinding.State.PREPARING
+        && binding.state() != InvocationBinding.State.SEALED) {
+      return true;
+    }
+    return binding.preparedOwnerEpoch() == observed.ownerEpoch()
+        && binding.baseSequence() == observed.publishedSequence()
+        && binding.baseRevision() == observed.publishedRevision();
   }
 
   private CompletableFuture<OwnerForwarding.Reply> verifyOwnerBeforeDispatch(
@@ -224,10 +237,7 @@ public final class MutationForwardReceiver {
   }
 
   private static BackendFailure.Category category(Throwable failure) {
-    Throwable cause = failure;
-    while (cause instanceof CompletionException && cause.getCause() != null) {
-      cause = cause.getCause();
-    }
+    Throwable cause = CompletionFailures.unwrapCompletion(failure);
     return cause instanceof BackendFailure backend
         ? backend.category() : BackendFailure.Category.UNKNOWN;
   }
