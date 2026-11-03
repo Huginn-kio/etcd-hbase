@@ -36,16 +36,10 @@ public final class CommitState {
     this.profileFingerprint = Objects.requireNonNull(profileFingerprint, "profileFingerprint");
     this.ownerInstance = Objects.requireNonNull(ownerInstance, "ownerInstance");
     this.publication = Objects.requireNonNull(publication, "publication");
-    if (profileFingerprint.length() != 32 || ownerEpoch < 0 || stateVersion <= 0
-        || publishedSequence < 0 || publishedRevision <= 0
-        || finalizedSequence < 0 || finalizedRevision <= 0 || compactRevision < 0
-        || compactRevision > finalizedRevision
-        || (ownerEpoch == 0) != ownerInstance.isEmpty()
-        || (ownerEpoch == 0) != (ownerLeaseDeadlineEpochMillis == 0)
-        || ownerLeaseDeadlineEpochMillis < 0
-        || ownerInstance.isPresent() && !validOwnerInstance(ownerInstance.orElseThrow())) {
-      throw new IllegalArgumentException("invalid commit control state");
-    }
+    validateProfileFingerprint(profileFingerprint);
+    validateCountersAndWatermarks(ownerEpoch, stateVersion, publishedSequence, publishedRevision,
+        finalizedSequence, finalizedRevision, compactRevision);
+    validateOwnerLease(ownerInstance, ownerEpoch, ownerLeaseDeadlineEpochMillis);
     validatePublication(publishedSequence, publishedRevision, finalizedSequence,
         finalizedRevision, ownerEpoch, publication);
     this.ownerEpoch = ownerEpoch;
@@ -177,6 +171,32 @@ public final class CommitState {
 
   private long nextStateVersion() {
     return Math.addExact(stateVersion, 1);
+  }
+
+  private static void validateProfileFingerprint(ByteKey profileFingerprint) {
+    if (profileFingerprint.length() != 32) {
+      throw new IllegalArgumentException("invalid commit control state");
+    }
+  }
+
+  private static void validateCountersAndWatermarks(long ownerEpoch, long stateVersion,
+      long publishedSequence, long publishedRevision, long finalizedSequence,
+      long finalizedRevision, long compactRevision) {
+    if (ownerEpoch < 0 || stateVersion <= 0 || publishedSequence < 0 || publishedRevision <= 0
+        || finalizedSequence < 0 || finalizedRevision <= 0 || compactRevision < 0
+        || compactRevision > finalizedRevision) {
+      throw new IllegalArgumentException("invalid commit control state");
+    }
+  }
+
+  private static void validateOwnerLease(Optional<String> ownerInstance, long ownerEpoch,
+      long ownerLeaseDeadlineEpochMillis) {
+    if ((ownerEpoch == 0) != ownerInstance.isEmpty()
+        || (ownerEpoch == 0) != (ownerLeaseDeadlineEpochMillis == 0)
+        || ownerLeaseDeadlineEpochMillis < 0
+        || ownerInstance.isPresent() && !validOwnerInstance(ownerInstance.orElseThrow())) {
+      throw new IllegalArgumentException("invalid commit control state");
+    }
   }
 
   private static void validatePublication(long publishedSequence, long publishedRevision,
