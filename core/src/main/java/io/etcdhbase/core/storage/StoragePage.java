@@ -11,7 +11,18 @@ public record StoragePage(List<StoredRecord> records, boolean exhausted, Cost co
     if (cost == null) throw new NullPointerException("cost");
   }
 
-  public enum Observation { SERVER_ROWS_SCANNED, BLOCK_BYTES_SCANNED, FS_BYTES, BLOCK_CACHE_BYTES, MEMSTORE_BYTES, SCANNER_RETRIES }
+  public enum Observation {
+    SERVER_ROWS_SCANNED,
+    BLOCK_BYTES_SCANNED,
+    FS_BYTES,
+    BLOCK_CACHE_BYTES,
+    MEMSTORE_BYTES,
+    SCANNER_RETRIES,
+    MANIFEST_DIRECTORY_PAGES,
+    MANIFEST_LEAF_PAGES,
+    MANIFEST_CANDIDATE_RECORDS,
+    MANIFEST_CANDIDATE_BYTES
+  }
 
   public record Cost(long physicalRows, long returnedCellBytes, long scanRpcCalls, Map<Observation, Long> observations) {
     public Cost(long physicalRows, long returnedCellBytes, long scanRpcCalls) {

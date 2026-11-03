@@ -1,11 +1,15 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 /** Verifies and streams a sealed candidate/event manifest without collecting transaction data. */
@@ -13,6 +17,17 @@ public final class ManifestCatalog {
   public record Summary(long count, long payloadBytes) {
     public Summary {
       if (count < 0 || payloadBytes < 0) throw new IllegalArgumentException("negative manifest summary");
+    }
+  }
+
+  /** Bounded, authenticated candidate slice for one physical salt bucket and logical key range. */
+  public record CandidateSlice(List<PreparedCandidate> candidates, boolean exhausted,
+      int directoryPages, int leafPages, long payloadBytes) {
+    public CandidateSlice {
+      candidates = List.copyOf(candidates);
+      if (directoryPages < 0 || leafPages < 0 || payloadBytes < 0) {
+        throw new IllegalArgumentException("negative candidate slice accounting");
+      }
     }
   }
 
@@ -62,6 +77,188 @@ public final class ManifestCatalog {
           : CompletableFuture.failedFuture(new IllegalStateException("manifest event directory is missing"));
     }
     return cursor.visit(root.eventDirectory().orElseThrow()).thenApply(ignored -> cursor.summary());
+  }
+
+  /**
+   * Reads only candidate leaves that can intersect a bucket/range. The caller resumes after the
+   * last returned key; a full slice reports non-exhaustion conservatively until the next read.
+   */
+  public CompletableFuture<CandidateSlice> candidatesInRange(ManifestRoot root, int bucket,
+      KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
+      long maximumPayloadBytes, RequestScope scope) {
+    return candidatesInRange(root, bucket, range, afterExclusive, maximumCandidates,
+        maximumPayloadBytes, scope, () -> false);
+  }
+
+  /** Same bounded traversal with a local stop signal for a page operation being closed. */
+  public CompletableFuture<CandidateSlice> candidatesInRange(ManifestRoot root, int bucket,
+      KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
+      long maximumPayloadBytes, RequestScope scope, BooleanSupplier cancelled) {
+    Objects.requireNonNull(root, "root");
+    Objects.requireNonNull(range, "range");
+    Objects.requireNonNull(afterExclusive, "afterExclusive");
+    Objects.requireNonNull(scope, "scope");
+    Objects.requireNonNull(cancelled, "cancelled");
+    if (bucket < 0 || maximumCandidates <= 0 || maximumCandidates > 1025
+        || maximumPayloadBytes <= 0) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid candidate slice bounds"));
+    }
+    if (range.isEmpty() || root.candidateDirectory().isEmpty()) {
+      return CompletableFuture.completedFuture(new CandidateSlice(List.of(), true, 0, 0, 0));
+    }
+    var cursor = new CandidateRangeCursor(root, bucket, range, afterExclusive,
+        maximumCandidates, maximumPayloadBytes, scope, cancelled);
+    return cursor.visit(root.candidateDirectory().orElseThrow())
+        .thenApply(ignored -> cursor.slice());
+  }
+
+  private final class CandidateRangeCursor {
+    private final ManifestRoot root;
+    private final int bucket;
+    private final KeyRange range;
+    private final Optional<ByteKey> after;
+    private final int maximumCandidates;
+    private final long maximumPayloadBytes;
+    private final RequestScope scope;
+    private final BooleanSupplier cancelled;
+    private final List<PreparedCandidate> candidates = new java.util.ArrayList<>();
+    private int directoryPages;
+    private int leafPages;
+    private long payloadBytes;
+    private ByteKey lastKey;
+    private boolean exhausted = true;
+
+    private CandidateRangeCursor(ManifestRoot root, int bucket, KeyRange range,
+        Optional<ByteKey> after, int maximumCandidates, long maximumPayloadBytes,
+        RequestScope scope, BooleanSupplier cancelled) {
+      this.root = root;
+      this.bucket = bucket;
+      this.range = range;
+      this.after = after;
+      this.maximumCandidates = maximumCandidates;
+      this.maximumPayloadBytes = maximumPayloadBytes;
+      this.scope = scope;
+      this.cancelled = cancelled;
+    }
+
+    private CompletableFuture<Void> visit(ManifestChildReference reference) {
+      if (stopped()) return CompletableFuture.completedFuture(null);
+      if (cancelled.getAsBoolean()) {
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.CANCELLED));
+      }
+      if (scope.isClosed() || scope.isDeadlineExceeded()) {
+        return CompletableFuture.failedFuture(new BackendFailure(scope.isDeadlineExceeded()
+            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
+      }
+      if (!mayIntersect(reference)) return CompletableFuture.completedFuture(null);
+      if (reference.level() == 0) return visitLeaf(reference);
+      if (++directoryPages > MAX_CANDIDATE_DIRECTORY_PAGES) {
+        return invalid("manifest range traversal exceeds its directory budget");
+      }
+      return repository.readDirectoryPage(reference.identity(), scope).thenCompose(stored -> {
+        ManifestDirectoryPage page = stored.orElseThrow(() -> missing("manifest directory page"));
+        if (!page.transactionId().equals(root.transactionId()) || !page.reference().equals(reference)) {
+          return invalid("manifest directory page differs from its authenticated range reference");
+        }
+        return visitChildren(page.children(), 0);
+      });
+    }
+
+    private CompletableFuture<Void> visitChildren(List<ManifestChildReference> children, int index) {
+      if (index == children.size() || stopped()) return CompletableFuture.completedFuture(null);
+      return visit(children.get(index)).thenCompose(ignored -> visitChildren(children, index + 1));
+    }
+
+    private CompletableFuture<Void> visitLeaf(ManifestChildReference reference) {
+      if (++leafPages > MAX_CANDIDATE_PAGES) {
+        return invalid("manifest range traversal exceeds its leaf budget");
+      }
+      return repository.readPage(reference.identity(), scope).thenCompose(stored -> {
+        ManifestPage page = stored.orElseThrow(() -> missing("manifest leaf page"));
+        if (!page.transactionId().equals(root.transactionId()) || !page.reference().equals(reference)
+            || page.bucket() != bucket) {
+          return invalid("manifest leaf page differs from its authenticated bucket range");
+        }
+        return visitCandidates(page.candidates(), 0);
+      });
+    }
+
+    private CompletableFuture<Void> visitCandidates(
+        List<ManifestCandidateReference> references, int index) {
+      if (index == references.size() || stopped()) return CompletableFuture.completedFuture(null);
+      if (cancelled.getAsBoolean() || scope.isClosed() || scope.isDeadlineExceeded()) {
+        return CompletableFuture.failedFuture(new BackendFailure(scope.isDeadlineExceeded()
+            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
+      }
+      ManifestCandidateReference reference = references.get(index);
+      if (reference.bucket() != bucket) {
+        return invalid("manifest leaf contains a candidate from another bucket");
+      }
+      ByteKey key = reference.logicalKey();
+      if (!range.contains(key) || after.filter(previous -> key.compareTo(previous) <= 0).isPresent()) {
+        return visitCandidates(references, index + 1);
+      }
+      if (lastKey != null && lastKey.compareTo(key) >= 0) {
+        return invalid("manifest range candidates are duplicated or unordered");
+      }
+      return repository.readCandidate(reference.candidateIdentity(), scope).thenCompose(stored -> {
+        PreparedCandidate candidate = stored.orElseThrow(() -> missing("private candidate"));
+        if (!candidate.transactionId().equals(root.transactionId())
+            || candidate.ownerEpoch() != root.ownerEpoch()
+            || candidate.baseSequence() != root.baseSequence()
+            || candidate.baseRevision() != root.baseRevision()
+            || !candidate.systemIdentity().equals(reference.candidateIdentity())
+            || repository.candidateBucket(candidate) != bucket
+            || !candidate.record().key().equals(key)
+            || !candidate.contentDigest().equals(reference.candidateDigest())
+            || !candidate.valueDigest().equals(reference.valueDigest())
+            || candidate.record().metadata().valueLength() != reference.valueLength()
+            || (candidate.record().metadata().state()
+                == io.etcdhbase.core.storage.StorageMetadata.State.TOMBSTONE) != reference.tombstone()) {
+          return invalid("private candidate differs from its authenticated range reference");
+        }
+        long retained = candidate.record().retainedBytes();
+        if (retained > maximumPayloadBytes - payloadBytes) {
+          if (!candidates.isEmpty()) {
+            exhausted = false;
+            return CompletableFuture.completedFuture(null);
+          }
+          return CompletableFuture.failedFuture(new CompletionException(
+              new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT)));
+        }
+        candidates.add(candidate);
+        payloadBytes = Math.addExact(payloadBytes, retained);
+        lastKey = key;
+        if (candidates.size() == maximumCandidates) {
+          exhausted = false;
+          return CompletableFuture.completedFuture(null);
+        }
+        return visitCandidates(references, index + 1);
+      });
+    }
+
+    private boolean mayIntersect(ManifestChildReference reference) {
+      if (bucket < reference.firstBucket() || bucket > reference.lastBucket()) return false;
+      if (reference.firstBucket() != reference.lastBucket()) return true;
+      if (reference.firstBucket() != bucket) return false;
+      if (after.filter(previous -> reference.lastKey().compareTo(previous) <= 0).isPresent()) {
+        return false;
+      }
+      if (range.kind() == KeyRange.Kind.POINT) {
+        ByteKey key = range.lowerInclusive().orElseThrow();
+        return reference.firstKey().compareTo(key) <= 0 && reference.lastKey().compareTo(key) >= 0;
+      }
+      return range.upperExclusive().map(upper -> reference.firstKey().compareTo(upper) < 0).orElse(true)
+          && range.lowerInclusive().map(lower -> reference.lastKey().compareTo(lower) >= 0).orElse(true);
+    }
+
+    private boolean stopped() {
+      return !exhausted;
+    }
+
+    private CandidateSlice slice() {
+      return new CandidateSlice(candidates, exhausted, directoryPages, leafPages, payloadBytes);
+    }
   }
 
   private final class CandidateCursor {
