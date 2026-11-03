@@ -11,11 +11,13 @@ import io.etcdhbase.hbase.connection.HBaseRequestContext;
 import io.etcdhbase.hbase.error.HBaseFailures;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Supplier;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.client.AsyncConnection;
 import org.apache.hadoop.hbase.client.AsyncTable;
@@ -45,11 +47,11 @@ public final class HBaseCommitControlStore implements CommitControlStore {
       RequestScope scope) {
     var context = new HBaseRequestContext(scope);
     return context.borrowConnection(factory, identity).thenCompose(connection ->
-        context.execute(() -> connection.getAdmin().getDescriptor(binding.table()))
+        startRequest(scope, () -> connection.getAdmin().getDescriptor(binding.table())
             .thenApply(descriptor -> {
               binding.validate(descriptor);
               return new HBaseCommitControlStore(connection, binding);
-            })).exceptionallyCompose(failure -> failed(failure));
+            }))).exceptionallyCompose(failure -> failed(failure));
   }
 
   @Override
@@ -127,26 +129,72 @@ public final class HBaseCommitControlStore implements CommitControlStore {
 
   private <T> CompletableFuture<T> executeRequest(RequestScope scope,
       java.util.function.Function<AsyncTable<?>, CompletableFuture<T>> operation) {
-    CompletableFuture<T> backend;
-    try {
-      if (scope.isDeadlineExceeded()) throw new TimeoutException();
-      if (scope.isClosed()) throw new java.util.concurrent.CancellationException();
+    return startRequest(scope, () -> {
       long timeout = Math.max(1, Math.min(TimeUnit.SECONDS.toNanos(30), scope.remainingDeadlineNanos()));
       AsyncTable<?> table = connection.getTableBuilder(binding.table())
           .setOperationTimeout(timeout, TimeUnit.NANOSECONDS)
           .setRpcTimeout(timeout, TimeUnit.NANOSECONDS).build();
-      backend = operation.apply(table);
+      return operation.apply(table);
+    });
+  }
+
+  private static <T> CompletableFuture<T> startRequest(
+      RequestScope scope, Supplier<CompletableFuture<T>> operation) {
+    try {
+      if (scope.isDeadlineExceeded()) throw new TimeoutException();
+      if (scope.isClosed()) throw new CancellationException();
+      return bindRequestToProducer(scope, operation);
     } catch (Exception failure) {
       return CompletableFuture.failedFuture(HBaseFailures.classify(failure));
     }
-    return scope.track(backend).handle((value, failure) -> {
-      if (failure != null) throw new CompletionException(HBaseFailures.classify(failure));
-      if (scope.isDeadlineExceeded()) throw new CompletionException(
-          new BackendFailure(BackendFailure.Category.TIMEOUT));
-      if (scope.isClosed()) throw new CompletionException(
-          new BackendFailure(BackendFailure.Category.CANCELLED));
-      return value;
-    }).copy();
+  }
+
+  /** Keeps producer completion independent from the caller's cancellable result future. */
+  static <T> CompletableFuture<T> bindRequestToProducer(
+      RequestScope scope, Supplier<CompletableFuture<T>> startProducer) {
+    var request = new CompletableFuture<T>();
+    var actualCompletion = new CompletableFuture<Void>();
+    var registration = scope.registerScopedCleanup(
+        () -> request.completeExceptionally(new BackendFailure(scope.isDeadlineExceeded()
+            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED)),
+        actualCompletion);
+    if (scope.isClosed()) {
+      actualCompletion.complete(null);
+      closeRegistration(registration, request);
+      return request;
+    }
+    CompletableFuture<T> producer;
+    try {
+      producer = Objects.requireNonNull(startProducer.get(), "producer");
+    } catch (Exception failure) {
+      request.completeExceptionally(HBaseFailures.classify(failure));
+      actualCompletion.complete(null);
+      closeRegistration(registration, request);
+      return request;
+    }
+    producer.whenComplete((value, failure) -> {
+      if (failure != null) {
+        request.completeExceptionally(HBaseFailures.classify(failure));
+      } else if (scope.isDeadlineExceeded()) {
+        request.completeExceptionally(new BackendFailure(BackendFailure.Category.TIMEOUT));
+      } else if (scope.isClosed()) {
+        request.completeExceptionally(new BackendFailure(BackendFailure.Category.CANCELLED));
+      } else {
+        request.complete(value);
+      }
+      actualCompletion.complete(null);
+      closeRegistration(registration, request);
+    });
+    return request;
+  }
+
+  private static void closeRegistration(RequestScope.ScopedCleanup registration,
+      CompletableFuture<?> request) {
+    try {
+      registration.close();
+    } catch (Exception failureToClose) {
+      request.completeExceptionally(HBaseFailures.classify(failureToClose));
+    }
   }
 
   private static <T> CompletableFuture<T> failed(Throwable failure) {
