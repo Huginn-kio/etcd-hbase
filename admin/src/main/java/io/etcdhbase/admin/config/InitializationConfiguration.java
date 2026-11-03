@@ -121,7 +121,10 @@ public record InitializationConfiguration(
     EVENT,
     LEASE,
     AUTH,
-    CONTROL
+    CONTROL,
+    INVOCATION,
+    CANDIDATE,
+    MANIFEST
   }
 
   public enum TablePermission {

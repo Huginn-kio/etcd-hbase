@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
+import java.util.Set;
 import java.util.Objects;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
@@ -20,6 +21,8 @@ import org.apache.hadoop.hbase.client.TableDescriptor;
 
 /** Validated binding to the pre-provisioned system table; it never creates or adopts a table. */
 public final class SystemTableBinding {
+  private static final Set<String> REQUIRED_RECORD_CATEGORIES =
+      Set.of("CONTROL", "INVOCATION", "CANDIDATE", "MANIFEST");
   private final TableName table;
   private final byte[] family;
   private final String tableGroupId;
@@ -41,7 +44,7 @@ public final class SystemTableBinding {
     }
     this.keyCodec = new SystemRecordKeyCodec(checkedSalt);
     this.profileFingerprint = ByteKey.copyOf(fingerprint(table, this.family, this.tableGroupId,
-        this.saltProfileId, saltProfile));
+        this.saltProfileId, saltProfile, keyCodec.formatVersion()));
     if (this.family.length == 0) throw new IllegalArgumentException("system family must not be empty");
   }
 
@@ -77,7 +80,7 @@ public final class SystemTableBinding {
             descriptor.getValue("etcdhbase.m0.salt-bucket-count"))
         || !Integer.toString(saltProfile.saltWidthBytes()).equals(
             descriptor.getValue("etcdhbase.m0.salt-width-bytes"))
-        || !containsControlCategory(descriptor.getValue("etcdhbase.m0.record-categories"))) {
+        || !containsRequiredCategories(descriptor.getValue("etcdhbase.m0.record-categories"))) {
       throw new IllegalArgumentException("table does not match its M2 system binding");
     }
     var columnFamily = descriptor.getColumnFamily(family);
@@ -87,9 +90,10 @@ public final class SystemTableBinding {
     }
   }
 
-  private static boolean containsControlCategory(String categories) {
+  private static boolean containsRequiredCategories(String categories) {
     if (categories == null) return false;
-    return Arrays.stream(categories.split(",", -1)).anyMatch("CONTROL"::equals);
+    Set<String> declared = Set.copyOf(Arrays.asList(categories.split(",", -1)));
+    return declared.containsAll(REQUIRED_RECORD_CATEGORIES);
   }
 
   private static String requireIdentifier(String value, String name) {
@@ -101,11 +105,11 @@ public final class SystemTableBinding {
   }
 
   private static byte[] fingerprint(TableName table, byte[] family, String group,
-      String saltProfileId, io.etcdhbase.spi.salt.SaltProfile profile) {
+      String saltProfileId, SaltProfile profile, int keyFormatVersion) {
     try {
       var bytes = new ByteArrayOutputStream();
       try (var output = new DataOutputStream(bytes)) {
-        output.writeInt(1);
+        output.writeInt(2);
         write(output, table.getName());
         write(output, family);
         write(output, group.getBytes(StandardCharsets.UTF_8));
@@ -114,6 +118,7 @@ public final class SystemTableBinding {
         output.writeInt(profile.encodingVersion());
         output.writeInt(profile.bucketCount());
         output.writeInt(profile.saltWidthBytes());
+        output.writeInt(keyFormatVersion);
       }
       return MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray());
     } catch (IOException impossible) {

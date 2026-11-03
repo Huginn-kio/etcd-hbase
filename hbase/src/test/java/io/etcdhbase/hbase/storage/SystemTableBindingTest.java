@@ -19,42 +19,43 @@ class SystemTableBindingTest {
   private static final byte[] FAMILY = {'s'};
   private static final String TABLE_GROUP = "system-group";
   private static final String SALT_PROFILE = "system-salt";
+  private static final String REQUIRED_CATEGORIES = "CONTROL,INVOCATION,CANDIDATE,MANIFEST";
   private static final HashSaltStrategy SALT = new HashSaltStrategy();
   private static final SystemTableBinding BINDING =
       new SystemTableBinding(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, SALT);
 
   @Test
   void acceptsTheExactDurableSingleVersionSystemTable() {
-    BINDING.validate(descriptor(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, "CONTROL",
+    BINDING.validate(descriptor(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, HConstants.FOREVER, 1));
   }
 
   @Test
   void rejectsTableFamilyProfileCategoryAndDurabilityMismatches() {
     assertThrows(IllegalArgumentException.class, () -> BINDING.validate(descriptor(
-        TableName.valueOf("m2", "other"), FAMILY, TABLE_GROUP, SALT_PROFILE, "CONTROL",
+        TableName.valueOf("m2", "other"), FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, HConstants.FOREVER, 1)));
     assertThrows(IllegalArgumentException.class, () -> BINDING.validate(descriptor(
-        TABLE, new byte[] {'x'}, TABLE_GROUP, SALT_PROFILE, "CONTROL",
+        TABLE, new byte[] {'x'}, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, HConstants.FOREVER, 1)));
     assertThrows(IllegalArgumentException.class, () -> BINDING.validate(descriptor(
-        TABLE, FAMILY, "other-group", SALT_PROFILE, "CONTROL",
+        TABLE, FAMILY, "other-group", SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, HConstants.FOREVER, 1)));
     assertThrows(IllegalArgumentException.class, () -> BINDING.validate(descriptor(
-        TABLE, FAMILY, TABLE_GROUP, "other-salt", "CONTROL",
+        TABLE, FAMILY, TABLE_GROUP, "other-salt", REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, HConstants.FOREVER, 1)));
     assertThrows(IllegalArgumentException.class, () -> BINDING.validate(descriptor(
         TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, "PREPARATION",
         Durability.SYNC_WAL, HConstants.FOREVER, 1)));
     assertThrows(IllegalArgumentException.class, () -> BINDING.validate(descriptor(
-        TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, "CONTROL",
+        TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.ASYNC_WAL, HConstants.FOREVER, 1)));
   }
 
   @Test
   void rejectsExpiringOrMultiVersionFamilies() {
     assertThrows(IllegalArgumentException.class, () -> BINDING.validate(descriptor(
-        TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, "CONTROL",
+        TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, 60, 1)));
     assertThrows(IllegalArgumentException.class, () -> BINDING.validate(descriptor(
         TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, "CONTROL",
@@ -67,7 +68,7 @@ class SystemTableBindingTest {
         new SaltProfile(HashSaltStrategy.STRATEGY_ID, 1, 32, 2));
     var differentBinding = new SystemTableBinding(
         TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, differentSalt);
-    var persistedDescriptor = descriptor(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, "CONTROL",
+    var persistedDescriptor = descriptor(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, HConstants.FOREVER, 1);
 
     assertFalse(Arrays.equals(BINDING.controlRow(), differentBinding.controlRow()));

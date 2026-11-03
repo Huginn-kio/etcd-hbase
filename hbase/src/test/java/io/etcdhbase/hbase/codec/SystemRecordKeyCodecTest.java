@@ -8,6 +8,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
+import java.nio.ByteBuffer;
 import org.apache.hadoop.hbase.HConstants;
 import org.junit.jupiter.api.Test;
 
@@ -20,9 +21,11 @@ class SystemRecordKeyCodecTest {
   void binaryIdentityRoundTripsForEveryRecordDomain() {
     ByteKey identity = ByteKey.copyOf(new byte[] {0, 1, (byte) 0xff, 0});
     for (SystemRecordType type : SystemRecordType.values()) {
-      var decoded = CODEC.decode(CODEC.encode(type, identity));
+      ByteKey encodedIdentity = type == SystemRecordType.CANDIDATE
+          ? candidateIdentity(identity) : identity;
+      var decoded = CODEC.decode(CODEC.encode(type, encodedIdentity));
       assertEquals(type, decoded.type());
-      assertEquals(identity, decoded.identity());
+      assertEquals(encodedIdentity, decoded.identity());
     }
   }
 
@@ -30,6 +33,8 @@ class SystemRecordKeyCodecTest {
   void enforcesIdentityAndRowLengthBoundaries() {
     assertThrows(IllegalArgumentException.class,
         () -> CODEC.encode(SystemRecordType.CONTROL, ByteKey.empty()));
+    assertThrows(IllegalArgumentException.class, () -> CODEC.encode(
+        SystemRecordType.CANDIDATE, ByteKey.copyOf(new byte[16 + Integer.BYTES])));
 
     byte[] maximumIdentity = new byte[HConstants.MAX_ROW_LENGTH - KEY_OVERHEAD];
     byte[] maximumRow = CODEC.encode(SystemRecordType.CONTROL, ByteKey.copyOf(maximumIdentity));
@@ -59,5 +64,11 @@ class SystemRecordKeyCodecTest {
     invalidLength[6] = 2;
     assertThrows(IllegalArgumentException.class, () -> CODEC.decode(invalidLength));
     assertThrows(IllegalArgumentException.class, () -> CODEC.decode(new byte[7]));
+  }
+
+  private static ByteKey candidateIdentity(ByteKey logicalKey) {
+    byte[] key = logicalKey.bytes();
+    return ByteKey.copyOf(ByteBuffer.allocate(16 + Integer.BYTES + key.length)
+        .put(new byte[16]).putInt(key.length).put(key).array());
   }
 }
