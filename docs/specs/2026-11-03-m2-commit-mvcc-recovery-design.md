@@ -1,6 +1,6 @@
 # M2 提交、MVCC、恢复与热点可行性设计
 
-**状态：待设计评审** · **日期：2026-11-03** · **需求与代码基线：** [DEVELOPMENT_PLAN.md v0.10 / 783b0e9](https://github.com/Reidddddd/etcd-hbase/blob/783b0e961f33f79ccd593262b8a30a5f93520bfe/DEVELOPMENT_PLAN.md)
+**状态：已通过 PR #23 设计评审** · **日期：2026-11-03** · **需求与代码基线：** [DEVELOPMENT_PLAN.md v0.10 / 783b0e9](https://github.com/Reidddddd/etcd-hbase/blob/783b0e961f33f79ccd593262b8a30a5f93520bfe/DEVELOPMENT_PLAN.md)
 
 > 本文定义 J20–J29 的提交、可见性、跨副本读保护与恢复契约，沿用已批准的 [M0 设计](2026-10-10-m0-engineering-environment-protocol-design.md)和 [M1 设计](2026-10-30-m1-storage-scan-budget-design.md)。具体执行步骤、验证命令与恢复记录由实施计划维护。本 PR 仅提交设计，设计获批不代表实现、负载或阶段验收通过。
 
