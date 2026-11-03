@@ -1,8 +1,10 @@
 package io.etcdhbase.server.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.CommitControlStore;
@@ -80,11 +82,15 @@ class MutationForwardReceiverTest {
   void duplicateRequestDuringPublicationDoesNotClaimKnownRejection() {
     var repository = new InMemoryInvocationRepository();
     repository.binding = InvocationBinding.begin(INVOCATION, request().requestDigest(), AUTH_DIGEST,
-        TRANSACTION, 1, 0, 1).seal(MANIFEST_ROOT);
+        TRANSACTION, 2, 0, 1).seal(MANIFEST_ROOT);
     var processors = new AtomicInteger();
     CommitState publishing = CommitState.initial(FINGERPRINT, 1)
-        .claimOwner("owner-old", 1, 10)
-        .publish(publication(1));
+        .claimOwner("owner-old", 0, 10)
+        .claimOwner("owner-current", 10, 2_000)
+        .publish(publication(2));
+    assertEquals(2, publishing.ownerEpoch());
+    assertFalse(publishing.ownerLeaseExpired(1_000));
+    assertTrue(publishing.publication().isPresent());
     var fixture = receiver(publishing, repository, processors);
 
     OwnerForwarding.Reply reply = fixture.receiver().receive(

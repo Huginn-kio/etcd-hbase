@@ -129,10 +129,7 @@ public final class MutationRelay {
   private static BackendFailure.Category classifyUnknown(Throwable failure) {
     Throwable cause = CompletionFailures.unwrapCompletion(failure);
     if (cause instanceof BackendFailure backend) {
-      return switch (backend.category()) {
-        case TIMEOUT, CANCELLED, UNAVAILABLE, UNKNOWN -> backend.category();
-        default -> BackendFailure.Category.UNKNOWN;
-      };
+      return backend.category();
     }
     return BackendFailure.Category.UNKNOWN;
   }

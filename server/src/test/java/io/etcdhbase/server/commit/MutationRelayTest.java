@@ -82,6 +82,38 @@ class MutationRelayTest {
   }
 
   @Test
+  void knownBackendCategoriesSurviveWrappedSendFailuresAndUnknownReplies() {
+    for (BackendFailure.Category category : new BackendFailure.Category[] {
+        BackendFailure.Category.AUTHENTICATION,
+        BackendFailure.Category.PERMISSION,
+        BackendFailure.Category.RESOURCE_LIMIT}) {
+      var synchronousSends = new AtomicInteger();
+      var synchronousFailure = relay(ignored -> CompletableFuture.completedFuture(ROUTE),
+          (selected, forwarded, scope) -> {
+            synchronousSends.incrementAndGet();
+            throw new CompletionException(new BackendFailure(category));
+          });
+      assertUnknownCategory(category, synchronousFailure);
+      assertEquals(1, synchronousSends.get());
+
+      var asynchronousSends = new AtomicInteger();
+      var asynchronousFailure = relay(ignored -> CompletableFuture.completedFuture(ROUTE),
+          (selected, forwarded, scope) -> {
+            asynchronousSends.incrementAndGet();
+            return CompletableFuture.failedFuture(
+                new CompletionException(new BackendFailure(category)));
+          });
+      assertUnknownCategory(category, asynchronousFailure);
+      assertEquals(1, asynchronousSends.get());
+
+      var unknownReply = relay(ignored -> CompletableFuture.completedFuture(ROUTE),
+          (selected, forwarded, scope) -> CompletableFuture.completedFuture(
+              new OwnerForwarding.Unknown(category)));
+      assertUnknownCategory(category, unknownReply);
+    }
+  }
+
+  @Test
   void receiverUnknownReplyRemainsUnknownAtRelay() {
     var relay = relay(ignored -> CompletableFuture.completedFuture(ROUTE),
         (selected, forwarded, scope) -> CompletableFuture.completedFuture(
@@ -132,6 +164,13 @@ class MutationRelayTest {
     };
     return new MutationRelay(control,
         (group, owner, epoch) -> routes.apply(owner), channel);
+  }
+
+  private static void assertUnknownCategory(
+      BackendFailure.Category category, MutationRelay relay) {
+    var unknown = assertInstanceOf(MutationRelay.ResultUnknown.class,
+        relay.forward(request(), RequestScope.withoutDeadline()).join());
+    assertEquals(category, unknown.category());
   }
 
   private static MutationForwardRequest request() {
