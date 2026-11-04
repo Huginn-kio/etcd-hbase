@@ -3,6 +3,7 @@ package io.etcdhbase.core.commit;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -10,9 +11,34 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
 
 /** Sequential, bounded writer for private candidates, ordered events, and Merkle directories. */
 public final class ManifestPreparation {
+  /** Queue for nested continuations currently draining on this thread. */
+  private static final ThreadLocal<ArrayDeque<Runnable>> CONTINUATION_QUEUE =
+      new ThreadLocal<>();
+  /** Runs queued continuations iteratively on the completing thread. */
+  private static final Executor CONTINUATION_EXECUTOR = command -> {
+    ArrayDeque<Runnable> queue = CONTINUATION_QUEUE.get();
+    if (queue != null) {
+      queue.addLast(command);
+      return;
+    }
+    queue = new ArrayDeque<>();
+    CONTINUATION_QUEUE.set(queue);
+    try {
+      queue.addLast(command);
+      Runnable next;
+      while ((next = queue.pollFirst()) != null) {
+        next.run();
+      }
+    } finally {
+      queue.clear();
+      CONTINUATION_QUEUE.remove();
+    }
+  };
+
   public record Limits(long maxCandidates, long maxValueBytes, long maxEvents, long maxEventBytes) {
     public Limits(long maxCandidates, long maxValueBytes) {
       this(maxCandidates, maxValueBytes, ManifestRoot.MAX_EVENTS, ManifestRoot.MAX_EVENT_BYTES);
@@ -117,7 +143,8 @@ public final class ManifestPreparation {
 
     private CompletableFuture<ManifestRoot> accept(PreparedCandidate candidate, int bucket) {
       checkCandidateBudget(candidate);
-      return repository.createCandidate(candidate, scope).thenCompose(result -> {
+      return repository.createCandidate(candidate, scope)
+          .thenComposeAsync(result -> {
         requireCreatedOrIdentical(result, "candidate");
         ManifestCandidateReference reference = ManifestCandidateReference.from(candidate, bucket);
         leaf.add(reference);
@@ -128,7 +155,7 @@ public final class ManifestPreparation {
         previousBucket = bucket;
         previousKey = candidate.record().key();
         return next();
-      });
+      }, CONTINUATION_EXECUTOR);
     }
 
     private CompletableFuture<Void> flushLeaf() {
@@ -294,7 +321,7 @@ public final class ManifestPreparation {
     }
 
     private CompletableFuture<EventSummary> accept(PreparedEvent event) {
-      return repository.createEvent(event, scope).thenCompose(result -> {
+      return repository.createEvent(event, scope).thenComposeAsync(result -> {
         requireCreatedOrIdentical(result, "event");
         PreparedEventReference reference = PreparedEventReference.from(event);
         leaf.add(reference);
@@ -304,7 +331,7 @@ public final class ManifestPreparation {
         totalBytes = Math.addExact(totalBytes, reference.encodedBytes());
         nextOrdinal++;
         return next();
-      });
+      }, CONTINUATION_EXECUTOR);
     }
 
     private CompletableFuture<Void> flushLeaf() {

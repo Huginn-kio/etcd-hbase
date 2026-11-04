@@ -1,5 +1,6 @@
 package io.etcdhbase.core.commit;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -10,6 +11,7 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -17,12 +19,153 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 
 class ManifestPreparationTest {
   private static final long OWNER_EPOCH = 1;
   private static final long BASE_SEQUENCE = 0;
   private static final long BASE_REVISION = 1;
+
+  @Test
+  void rejectsEventRecordsThatCannotBeDecoded() {
+    TransactionId transactionId = TransactionId.create();
+    ByteKey key = ByteKey.copyOf(new byte[] {'k'});
+    byte[] value = {1};
+    StoredRecord current = StoredRecord.live(key,
+        new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length), value);
+    StoredRecord metadataOnlyPrevious = StoredRecord.metadataOnly(key,
+        new StorageMetadata(1, 1, 1, 0, StorageMetadata.State.LIVE, value.length));
+    byte[] oversizedValue = new byte[PreparedCandidate.MAX_VALUE_BYTES + 1];
+    StoredRecord oversizedCurrent = StoredRecord.live(key,
+        new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, oversizedValue.length),
+        oversizedValue);
+    StoredRecord oversizedPrevious = StoredRecord.live(key,
+        new StorageMetadata(1, 1, 1, 0, StorageMetadata.State.LIVE, oversizedValue.length),
+        oversizedValue);
+
+    assertThrows(IllegalArgumentException.class, () -> new PreparedEvent(transactionId,
+        OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, 0, PreparedEvent.Kind.PUT, current,
+        Optional.of(metadataOnlyPrevious)));
+    assertThrows(IllegalArgumentException.class, () -> new PreparedEvent(transactionId,
+        OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, 0, PreparedEvent.Kind.PUT, oversizedCurrent,
+        Optional.empty()));
+    assertThrows(IllegalArgumentException.class, () -> new PreparedEvent(transactionId,
+        OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, 0, PreparedEvent.Kind.PUT, current,
+        Optional.of(oversizedPrevious)));
+
+    MemoryRepository repository = new MemoryRepository();
+    try (RequestScope scope = scope()) {
+      assertThrows(IllegalArgumentException.class, () -> prepare(repository, transactionId,
+          List.of(candidate(transactionId, new byte[] {'a'}, value)), List.of(new PreparedEvent(
+              transactionId, OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, 0, PreparedEvent.Kind.PUT,
+              current, Optional.of(metadataOnlyPrevious))), new ManifestPreparation.Limits(1, 1),
+          scope));
+      assertEquals(0, repository.writeCount);
+    }
+  }
+
+  @Test
+  void preparesLargeLazyCandidatePlanWithoutRecursiveStackGrowth() {
+    int candidateCount = 5_000;
+    TransactionId transactionId = TransactionId.create();
+    MemoryRepository repository = new MemoryRepository();
+    var candidates = IntStream.range(0, candidateCount)
+        .mapToObj(index -> candidate(transactionId, sequenceKey(index), new byte[] {(byte) index}))
+        .iterator();
+
+    try (RequestScope scope = scope()) {
+      ManifestRoot root = assertDoesNotThrow(() -> join(new ManifestPreparation(repository,
+          new ManifestPreparation.Limits(candidateCount, candidateCount, 0, 0))
+          .prepare(transactionId, OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, candidates,
+              java.util.Collections.emptyIterator(), scope)));
+
+      assertEquals(candidateCount, root.candidateCount());
+      assertTrue(root.candidateDirectory().orElseThrow().level() >= 2);
+      assertTrue(repository.directories.size() >= 2);
+      assertEquals(0, root.eventCount());
+    }
+  }
+
+  @Test
+  void preparesLargeLazyEventPlanWithoutRecursiveStackGrowth() {
+    int eventCount = 8_193;
+    TransactionId transactionId = TransactionId.create();
+    MemoryRepository repository = new MemoryRepository();
+    var events = IntStream.range(0, eventCount)
+        .mapToObj(index -> event(transactionId, index, sequenceKey(index), new byte[] {(byte) index}))
+        .iterator();
+
+    try (RequestScope scope = scope()) {
+      ManifestRoot root = assertDoesNotThrow(() -> join(new ManifestPreparation(repository,
+          new ManifestPreparation.Limits(0, 0, eventCount, ManifestRoot.MAX_EVENT_BYTES))
+          .prepare(transactionId, OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION,
+              java.util.Collections.emptyIterator(), events, scope)));
+
+      assertEquals(eventCount, root.eventCount());
+      assertTrue(root.eventDirectory().orElseThrow().level() >= 2);
+      assertTrue(repository.eventDirectories.size() >= 2);
+      assertEquals(0, root.candidateCount());
+    }
+  }
+
+  @Test
+  void completesDelayedCandidateAndEventWritesSequentially() {
+    TransactionId transactionId = TransactionId.create();
+    MemoryRepository repository = new MemoryRepository();
+    repository.deferCreateResults = true;
+    List<PreparedCandidate> candidates = List.of(
+        candidate(transactionId, new byte[] {'a'}, new byte[] {1}),
+        candidate(transactionId, new byte[] {'b'}, new byte[] {2}));
+    List<PreparedEvent> events = List.of(
+        event(transactionId, 0, new byte[] {'a'}, new byte[] {1}),
+        event(transactionId, 1, new byte[] {'b'}, new byte[] {2}));
+
+    try (RequestScope scope = scope()) {
+      CompletableFuture<ManifestRoot> prepared = new ManifestPreparation(repository,
+          new ManifestPreparation.Limits(2, 2, 2, 1_000))
+          .prepare(transactionId, OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION,
+              candidates.iterator(), events.iterator(), scope);
+
+      int completedWrites = 0;
+      while (!prepared.isDone()) {
+        assertEquals(1, repository.pendingCreates.size());
+        assertTrue(repository.completeNextCreate());
+        completedWrites++;
+      }
+
+      ManifestRoot root = join(prepared);
+      assertEquals(2, root.candidateCount());
+      assertEquals(2, root.eventCount());
+      assertEquals(1, repository.maximumPendingCreates);
+      assertEquals(repository.writeCount, completedWrites);
+      assertEquals(1, repository.sealCalls);
+    }
+  }
+
+  @Test
+  void closedScopeStopsWriterAfterDelayedCreateWithoutSealing() {
+    TransactionId transactionId = TransactionId.create();
+    MemoryRepository repository = new MemoryRepository();
+    repository.deferCreateResults = true;
+    List<PreparedCandidate> candidates = List.of(
+        candidate(transactionId, new byte[] {'a'}, new byte[] {1}),
+        candidate(transactionId, new byte[] {'b'}, new byte[] {2}));
+
+    try (RequestScope scope = scope()) {
+      CompletableFuture<ManifestRoot> prepared = new ManifestPreparation(repository,
+          new ManifestPreparation.Limits(2, 2))
+          .prepare(transactionId, OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, candidates.iterator(), scope);
+      assertEquals(1, repository.candidateWriteCount);
+      scope.close();
+      assertTrue(repository.completeNextCreate());
+
+      assertThrows(CompletionException.class, prepared::join);
+      assertEquals(1, repository.candidateWriteCount);
+      assertEquals(0, repository.sealCalls);
+      assertTrue(repository.roots.isEmpty());
+    }
+  }
 
   @Test
   void preparesMultipleCandidateAndEventPagesAndStreamsThemInOrder() {
@@ -287,6 +430,10 @@ class ManifestPreparationTest {
     return String.format("k%03d", index).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
   }
 
+  private static byte[] sequenceKey(int index) {
+    return java.nio.ByteBuffer.allocate(Integer.BYTES).putInt(index).array();
+  }
+
   private static RequestScope scope() {
     return RequestScope.withTimeout(Duration.ofMinutes(1));
   }
@@ -308,6 +455,9 @@ class ManifestPreparationTest {
     private int failCandidateWriteNumber = -1;
     private int writeCount;
     private int sealCalls;
+    private boolean deferCreateResults;
+    private final ArrayDeque<PendingCreate> pendingCreates = new ArrayDeque<>();
+    private int maximumPendingCreates;
 
     @Override
     public int candidateBucket(PreparedCandidate candidate) {
@@ -414,14 +564,29 @@ class ManifestPreparationTest {
     private void put(EventPage value) { eventPages.put(value.systemIdentity(), value); }
     private void put(EventDirectoryPage value) { eventDirectories.put(value.systemIdentity(), value); }
 
-    private static <T> CompletableFuture<SystemRecordStore.CreateResult> create(
+    private <T> CompletableFuture<SystemRecordStore.CreateResult> create(
         Map<ByteKey, T> records, ByteKey identity, T value,
         java.util.function.Function<T, ByteKey> digest) {
       T previous = records.putIfAbsent(identity, value);
-      if (previous == null) return CompletableFuture.completedFuture(SystemRecordStore.CreateResult.CREATED);
-      return CompletableFuture.completedFuture(digest.apply(previous).equals(digest.apply(value))
-          ? SystemRecordStore.CreateResult.ALREADY_PRESENT : SystemRecordStore.CreateResult.CONFLICT);
+      SystemRecordStore.CreateResult result = previous == null
+          ? SystemRecordStore.CreateResult.CREATED
+          : digest.apply(previous).equals(digest.apply(value))
+              ? SystemRecordStore.CreateResult.ALREADY_PRESENT
+              : SystemRecordStore.CreateResult.CONFLICT;
+      if (!deferCreateResults) return CompletableFuture.completedFuture(result);
+      CompletableFuture<SystemRecordStore.CreateResult> future = new CompletableFuture<>();
+      pendingCreates.addLast(new PendingCreate(future, result));
+      maximumPendingCreates = Math.max(maximumPendingCreates, pendingCreates.size());
+      return future;
     }
+
+    private boolean completeNextCreate() {
+      PendingCreate pending = pendingCreates.pollFirst();
+      return pending != null && pending.future().complete(pending.result());
+    }
+
+    private record PendingCreate(CompletableFuture<SystemRecordStore.CreateResult> future,
+        SystemRecordStore.CreateResult result) {}
 
     private static <T> CompletableFuture<Optional<T>> completed(T value) {
       return CompletableFuture.completedFuture(Optional.ofNullable(value));

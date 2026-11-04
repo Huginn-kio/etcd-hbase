@@ -1,5 +1,6 @@
 package io.etcdhbase.hbase.storage;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -109,6 +110,10 @@ class J22ManifestRepositoryIT {
       List<PreparedEvent> events, TransactionId transactionId, RequestScope scope) {
     PreparedEvent first = events.getFirst();
     assertEquals(SystemRecordStore.CreateResult.CREATED, repository.createEvent(first, scope).join());
+    PreparedEvent restored = repository.readEvent(first.systemIdentity(), scope).join().orElseThrow();
+    assertTrue(restored.previous().orElseThrow().hasValue());
+    assertArrayEquals(first.previous().orElseThrow().value().orElseThrow(),
+        restored.previous().orElseThrow().value().orElseThrow());
     assertEquals(SystemRecordStore.CreateResult.ALREADY_PRESENT,
         repository.createEvent(first, scope).join());
     assertEquals(SystemRecordStore.CreateResult.CONFLICT,
@@ -167,8 +172,15 @@ class J22ManifestRepositoryIT {
   private static List<PreparedEvent> preparedEvents(TransactionId transactionId, int count) {
     List<PreparedEvent> result = new ArrayList<>(count);
     for (int ordinal = 0; ordinal < count; ordinal++) {
-      result.add(event(transactionId, ordinal,
-          new byte[] {'e', (byte) (ordinal >>> 8), (byte) ordinal}));
+      byte[] key = new byte[] {'e', (byte) (ordinal >>> 8), (byte) ordinal};
+      Optional<StoredRecord> previous = Optional.empty();
+      if (ordinal == 0) {
+        byte[] previousValue = new byte[] {9};
+        previous = Optional.of(StoredRecord.live(ByteKey.copyOf(key),
+            new StorageMetadata(1, 1, 1, 0, StorageMetadata.State.LIVE, previousValue.length),
+            previousValue));
+      }
+      result.add(event(transactionId, ordinal, key, previous));
     }
     return List.copyOf(result);
   }
@@ -203,10 +215,15 @@ class J22ManifestRepositoryIT {
   }
 
   private static PreparedEvent event(TransactionId transactionId, long ordinal, byte[] key) {
+    return event(transactionId, ordinal, key, Optional.empty());
+  }
+
+  private static PreparedEvent event(TransactionId transactionId, long ordinal, byte[] key,
+      Optional<StoredRecord> previous) {
     byte[] value = {(byte) ordinal};
     StorageMetadata metadata = new StorageMetadata(1, 2, 1, 0, StorageMetadata.State.LIVE, value.length);
     return new PreparedEvent(transactionId, 1, 0, 1, ordinal, PreparedEvent.Kind.PUT,
-        StoredRecord.live(ByteKey.copyOf(key), metadata, value), Optional.empty());
+        StoredRecord.live(ByteKey.copyOf(key), metadata, value), previous);
   }
 
   private static final class CountingSystemRecordStore implements SystemRecordStore {

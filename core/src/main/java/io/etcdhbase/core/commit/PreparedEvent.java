@@ -42,11 +42,12 @@ public final class PreparedEvent {
         || current.metadata().modificationRevision() != Math.addExact(baseRevision, 1)
         || current.metadata().state() != (kind == Kind.PUT
             ? StorageMetadata.State.LIVE : StorageMetadata.State.TOMBSTONE)
-        || current.metadata().state() == StorageMetadata.State.LIVE && !current.hasValue()
         || previous.filter(value -> !value.key().equals(current.key())
             || value.metadata().modificationRevision() > baseRevision).isPresent()) {
       throw new IllegalArgumentException("event does not match its commit identity or operation kind");
     }
+    requireDecodableProjection(current);
+    previous.ifPresent(PreparedEvent::requireDecodableProjection);
     this.ownerEpoch = ownerEpoch;
     this.baseSequence = baseSequence;
     this.baseRevision = baseRevision;
@@ -120,6 +121,16 @@ public final class PreparedEvent {
     output.writeInt(metadata.valueLength());
     output.writeInt(value.length);
     output.write(value);
+  }
+
+  private static void requireDecodableProjection(final StoredRecord record) {
+    if (record.metadata().state() == StorageMetadata.State.LIVE
+        && (!record.hasValue()
+            || record.metadata().valueLength()
+                > PreparedCandidate.MAX_VALUE_BYTES)) {
+      throw new IllegalArgumentException(
+          "live event value must be present and within the storage limit");
+    }
   }
 
 }
