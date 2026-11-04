@@ -676,7 +676,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J11/J13/J20。
   - 完成标准：部分准备失败不可见；候选按 txnId 隔离，分页 manifest 和大计划内存有界；两种物理布局均不能让旧候选污染已选版本。
   - 验证层次：L1 存储/内核。
-  - 跟踪：状态=代码已提交，验收待补；负责人=Codex；完成日期=2026-11-03；PR/commit=PR #26 / 单任务提交；验证报告=Java 21 全模块 compile 通过，未运行测试；双副本真实 HBase、两种历史布局隔离和目标环境故障验收待执行；评审人/结论=`reidchan` / 待评审。
+  - 跟踪：状态=公开基础行为验证已通过，维护者前置复查、目标验收待补；负责人=Codex；完成日期=2026-11-04；PR/commit=PR #26 / 验证提交 `483eab1`；验证报告=Java 21 定向 `clean verify`（18 项单测、一次性 MiniCluster `J22ManifestRepositoryIT.persistsPagesEventsAndSealedRootOnDisposableHBase` 1/1，失败/错误/跳过均为 0）；XML 锚点=`hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.J22ManifestRepositoryIT.xml`；前一提交 `999b9f4` 的 `scripts/verify/m1.sh --through J17` 全门禁为 276 项通过、失败/错误/跳过均为 0，GitHub CI run `41775235618` 成功并强制校验 J22 用例报告；真实目标双副本 HBase、两种历史布局隔离及准备中断/结果未知故障窗口仍待验收；评审人/结论=`Reidddddd` / 前置问题修订待复查，第二阶段待开始。
 
 - [ ] **J23｜发布 CAS 与结果未知查询**
   - 依赖：J21/J22。
