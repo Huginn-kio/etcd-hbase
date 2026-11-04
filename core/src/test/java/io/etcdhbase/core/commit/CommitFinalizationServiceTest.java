@@ -6,7 +6,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.storage.StorageMetadata;
+import io.etcdhbase.core.storage.StoredRecord;
 import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -33,6 +36,38 @@ class CommitFinalizationServiceTest {
   }
 
   @Test
+  void materializesNonEmptySealedPlanBeforeAdvancingFinalizedSequence() throws Exception {
+    Fixture fixture = new Fixture(SystemRecordStore.CreateResult.ALREADY_PRESENT, true, false);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pending = new CommitOutcomeResolver.Resolution(
+          CommitOutcomeResolver.State.SELECTED_PENDING, Optional.of(fixture.decision), Optional.empty());
+
+      var result = fixture.service.finish(fixture.invocation, pending, scope).get();
+
+      assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED, result.state());
+      assertEquals(1, fixture.materializationCalls.get());
+      assertEquals(1, fixture.control.state.finalizedSequence());
+      assertTrue(fixture.control.state.publication().isEmpty());
+    }
+  }
+
+  @Test
+  void failedMaterializationDoesNotAdvanceFinalizedSequence() {
+    Fixture fixture = new Fixture(SystemRecordStore.CreateResult.ALREADY_PRESENT, true, true);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pending = new CommitOutcomeResolver.Resolution(
+          CommitOutcomeResolver.State.SELECTED_PENDING, Optional.of(fixture.decision), Optional.empty());
+
+      assertThrows(ExecutionException.class,
+          () -> fixture.service.finish(fixture.invocation, pending, scope).get());
+
+      assertEquals(1, fixture.materializationCalls.get());
+      assertEquals(0, fixture.control.state.finalizedSequence());
+      assertTrue(fixture.control.state.publication().isPresent());
+    }
+  }
+
+  @Test
   void conflictingDecisionArchiveCannotAdvanceFinalizedSequence() {
     Fixture fixture = new Fixture(SystemRecordStore.CreateResult.CONFLICT);
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
@@ -51,32 +86,60 @@ class CommitFinalizationServiceTest {
   private static final class Fixture {
     private final TransactionId transactionId = TransactionId.create();
     private final InvocationId invocationId = InvocationId.create();
-    private final ManifestRoot root = ManifestRoot.create(transactionId, 1, 0, 1, 0, 0,
-        Optional.empty());
-    private final InvocationBinding invocation = InvocationBinding.begin(invocationId,
-        repeatedDigest(), repeatedDigest(), transactionId, 1, 0, 1).seal(root.systemIdentity());
-    private final CommitDecision decision = new CommitDecision(transactionId, invocationId,
-        1, 1, 1, root.systemIdentity(), root.digest(), false);
+    private final ManifestRoot root;
+    private final InvocationBinding invocation;
+    private final CommitDecision decision;
+    private final PreparedCandidate candidate;
     private final MemoryControl control = new MemoryControl();
     private final MemoryDecisions decisions;
     private final AtomicInteger materializationCalls = new AtomicInteger();
     private final CommitFinalizationService service;
 
     private Fixture(SystemRecordStore.CreateResult archiveResult) {
+      this(archiveResult, false, false);
+    }
+
+    private Fixture(SystemRecordStore.CreateResult archiveResult,
+        boolean withCandidate, boolean failMaterialization) {
+      if (withCandidate) {
+        byte[] value = {7};
+        candidate = new PreparedCandidate(transactionId, 1, 0, 1,
+            StoredRecord.live(ByteKey.copyOf(new byte[] {'k'}),
+                new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length), value));
+        ManifestPage page = ManifestPage.create(transactionId, 0,
+            List.of(ManifestCandidateReference.from(candidate, 0)));
+        root = ManifestRoot.create(transactionId, 1, 0, 1, 1, value.length,
+            Optional.of(page.reference()));
+        invocation = InvocationBinding.begin(invocationId,
+            repeatedDigest(), repeatedDigest(), transactionId, 1, 0, 1).seal(root.systemIdentity());
+        decision = new CommitDecision(transactionId, invocationId,
+            1, 1, 2, root.systemIdentity(), root.digest(), true);
+      } else {
+        candidate = null;
+        root = ManifestRoot.create(transactionId, 1, 0, 1, 0, 0, Optional.empty());
+        invocation = InvocationBinding.begin(invocationId,
+            repeatedDigest(), repeatedDigest(), transactionId, 1, 0, 1).seal(root.systemIdentity());
+        decision = new CommitDecision(transactionId, invocationId,
+            1, 1, 1, root.systemIdentity(), root.digest(), false);
+      }
       CommitState state = CommitState.initial(repeatedDigest(), 1)
           .claimOwner("fixture-owner", 1, 100);
       PublicationSlot slot = new PublicationSlot(transactionId, invocationId, 1,
-          0, 1, 1, 1, false, root.systemIdentity(), root.digest());
+          0, 1, 1, withCandidate ? 2 : 1, withCandidate, root.systemIdentity(), root.digest());
       control.state = state.publish(slot);
       decisions = new MemoryDecisions(decision, archiveResult);
-      ManifestRepository repository = new EmptyManifestRepository(root);
+      ManifestRepository repository = new EmptyManifestRepository(root, candidate,
+          withCandidate ? ManifestPage.create(transactionId, 0,
+              List.of(ManifestCandidateReference.from(candidate, 0))) : null);
       ManifestCatalog catalog = new ManifestCatalog(repository);
       MaterializationStore materialization = new MaterializationStore() {
         @Override
         public CompletableFuture<ApplyResult> applySelected(
             CommitDecision selected, PreparedCandidate candidate, RequestScope scope) {
           materializationCalls.incrementAndGet();
-          return CompletableFuture.completedFuture(ApplyResult.APPLIED);
+          return failMaterialization
+              ? CompletableFuture.failedFuture(new IllegalStateException("materialization failed"))
+              : CompletableFuture.completedFuture(ApplyResult.APPLIED);
         }
 
         @Override
@@ -151,9 +214,13 @@ class CommitFinalizationServiceTest {
 
   private static final class EmptyManifestRepository implements ManifestRepository {
     private final ManifestRoot root;
+    private final PreparedCandidate candidate;
+    private final ManifestPage page;
 
-    private EmptyManifestRepository(ManifestRoot root) {
+    private EmptyManifestRepository(ManifestRoot root, PreparedCandidate candidate, ManifestPage page) {
       this.root = root;
+      this.candidate = candidate;
+      this.page = page;
     }
 
     @Override public int candidateBucket(PreparedCandidate candidate) { return 0; }
@@ -177,9 +244,15 @@ class CommitFinalizationServiceTest {
           ? Optional.of(root) : Optional.empty());
     }
     @Override public CompletableFuture<Optional<PreparedCandidate>> readCandidate(
-        ByteKey identity, RequestScope scope) { return CompletableFuture.completedFuture(Optional.empty()); }
+        ByteKey identity, RequestScope scope) {
+      return CompletableFuture.completedFuture(candidate != null && candidate.systemIdentity().equals(identity)
+          ? Optional.of(candidate) : Optional.empty());
+    }
     @Override public CompletableFuture<Optional<ManifestPage>> readPage(
-        ByteKey identity, RequestScope scope) { return CompletableFuture.completedFuture(Optional.empty()); }
+        ByteKey identity, RequestScope scope) {
+      return CompletableFuture.completedFuture(page != null && page.systemIdentity().equals(identity)
+          ? Optional.of(page) : Optional.empty());
+    }
     @Override public CompletableFuture<Optional<ManifestDirectoryPage>> readDirectoryPage(
         ByteKey identity, RequestScope scope) { return CompletableFuture.completedFuture(Optional.empty()); }
     @Override public CompletableFuture<Optional<PreparedEvent>> readEvent(

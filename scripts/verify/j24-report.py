@@ -8,35 +8,59 @@ import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from evidence import java_reports
 
 
-def collect(root: Path, output: Path) -> None:
-    source = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.M2CommitMaterializationIT.xml"
+REQUIRED_SUITE = "io.etcdhbase.hbase.storage.M2CommitMaterializationIT"
+REQUIRED_CASE = "materializesHistoryAndNativeVersionsAndFencesLateWriters"
+TESTED_PATHS = (
+    "core/src/main/java/io/etcdhbase/core/commit/CommitFinalizationService.java",
+    "core/src/test/java/io/etcdhbase/core/commit/CommitFinalizationServiceTest.java",
+    "core/src/test/java/io/etcdhbase/core/commit/CommitPublisherTest.java",
+    "hbase/src/main/java/io/etcdhbase/hbase/storage/HBaseMaterializationStore.java",
+    "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CommitMaterializationIT.java",
+    "scripts/verify/j24-report.py",
+    "scripts/verify/test_j24_report.py",
+)
+
+
+def inspect_report(root: Path):
+    source = root / f"hbase/target/failsafe-reports/TEST-{REQUIRED_SUITE}.xml"
     if not source.is_file():
         raise ValueError("J24 MiniCluster report is missing")
+    _, suites = java_reports(root, {REQUIRED_SUITE}, ("hbase",))
     suite = ET.parse(source).getroot()
-    counts = {name: int(suite.get(name, "0")) for name in ("tests", "failures", "errors", "skipped")}
-    cases = {case.get("name") for case in suite.iter("testcase")}
+    counts = suites[REQUIRED_SUITE]
+    cases = {case.get("name") for case in suite.findall("testcase")}
     if counts != {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}:
         raise ValueError("J24 MiniCluster test did not pass exactly once")
-    if "materializesHistoryAndNativeVersionsAndFencesLateWriters" not in cases:
+    if cases != {REQUIRED_CASE}:
         raise ValueError("required J24 MiniCluster case did not execute")
     stdout = "\n".join(element.text or "" for element in suite.iter("system-out"))
     for layout in ("HISTORY", "NATIVE"):
         if f"j24-materialization layout={layout} idempotent=true lateWriterFenced=true" not in stdout:
             raise ValueError(f"missing J24 evidence for {layout}")
+    return source, counts
+
+
+def collect(root: Path, output: Path) -> None:
+    source, counts = inspect_report(root)
     shutil.copyfile(source, output / source.name)
     base_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
     ).stdout.strip()
     patch = subprocess.run(
-        ["git", "diff", "--binary", "HEAD"], cwd=root, check=True, capture_output=True
+        ["git", "diff", "--binary", "HEAD", "--", *TESTED_PATHS],
+        cwd=root,
+        check=True,
+        capture_output=True,
     ).stdout
     summary = {
         "phase": "J24",
         "scope": "public-local-minicluster",
         "base_commit": base_commit,
         "tested_patch_sha256": hashlib.sha256(patch).hexdigest(),
+        "source_report_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "ended_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         **counts,
         "layouts": ["HISTORY", "NATIVE"],
@@ -49,6 +73,7 @@ def collect(root: Path, output: Path) -> None:
         ],
         "unverified": [
             "J52.1 retention and recovery comparison",
+            "explicit compaction comparison between the HISTORY and NATIVE layouts",
             "final M2 history-layout selection with J25",
             "target HBase and cross-replica failure recovery",
             "maintainer review",

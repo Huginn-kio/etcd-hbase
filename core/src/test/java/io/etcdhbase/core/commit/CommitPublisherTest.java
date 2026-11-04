@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.storage.StorageMetadata;
+import io.etcdhbase.core.storage.StoredRecord;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -24,6 +26,16 @@ class CommitPublisherTest {
   @Test
   void failedPreflightDoesNotTransferWorkOrAttemptCas() {
     Fixture fixture = new Fixture(false, ScriptedControlStore::write);
+
+    assertThrows(CompletionException.class, () -> fixture.publish().join());
+
+    assertEquals(0, fixture.handoff.calls.get());
+    assertEquals(0, fixture.control.casCalls.get());
+  }
+
+  @Test
+  void layoutPreflightFailureDoesNotPublish() {
+    Fixture fixture = new Fixture(true, ScriptedControlStore::write, true);
 
     assertThrows(CompletionException.class, () -> fixture.publish().join());
 
@@ -122,13 +134,34 @@ class CommitPublisherTest {
     private final CommitOwnerService.OwnerToken owner =
         new CommitOwnerService.OwnerToken(OWNER, 1);
     private final ManifestRoot manifest;
+    private final PreparedCandidate candidate;
+    private final ManifestPage page;
     private final ScriptedControlStore control;
     private final DirectHandoff handoff = new DirectHandoff();
     private final CommitPublisher publisher;
 
     private Fixture(boolean storedRootPresent,
         BiFunction<ScriptedControlStore, CommitState, CompletableFuture<Boolean>> compareAndSet) {
-      manifest = root(transactionId, 1);
+      this(storedRootPresent, compareAndSet, false);
+    }
+
+    private Fixture(boolean storedRootPresent,
+        BiFunction<ScriptedControlStore, CommitState, CompletableFuture<Boolean>> compareAndSet,
+        boolean failLayoutPreflight) {
+      if (failLayoutPreflight) {
+        byte[] value = {7};
+        candidate = new PreparedCandidate(transactionId, 1, 0, 1,
+            StoredRecord.live(ByteKey.copyOf(new byte[] {'k'}),
+                new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length), value));
+        page = ManifestPage.create(transactionId, 0,
+            java.util.List.of(ManifestCandidateReference.from(candidate, 0)));
+        manifest = ManifestRoot.create(transactionId, 1, 0, 1, 1, value.length,
+            Optional.of(page.reference()));
+      } else {
+        candidate = null;
+        page = null;
+        manifest = root(transactionId, 1);
+      }
       invocation = InvocationBinding.begin(new InvocationId(UUID.randomUUID()), DIGEST, DIGEST,
           transactionId, 1, 0, 1).seal(manifest.systemIdentity());
       control = new ScriptedControlStore(CommitState.initial(FINGERPRINT, 1)
@@ -143,11 +176,13 @@ class CommitPublisherTest {
 
         @Override
         public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope scope) {
-          return CompletableFuture.completedFuture(null);
+          return failLayoutPreflight
+              ? CompletableFuture.failedFuture(new IllegalStateException("layout preflight failed"))
+              : CompletableFuture.completedFuture(null);
         }
       };
       var verifier = new CommitPlanVerifier(new ManifestCatalog(new EmptyManifestRepository(
-          storedRootPresent ? Optional.of(manifest) : Optional.empty())), materialization);
+          storedRootPresent ? Optional.of(manifest) : Optional.empty(), candidate, page)), materialization);
       CommitFinalizer finalizer = (invocation, publication, scope) ->
           CompletableFuture.completedFuture(publication);
       publisher = new CommitPublisher(control, outcomes, verifier, handoff, finalizer);
@@ -219,13 +254,18 @@ class CommitPublisherTest {
 
   private static final class EmptyManifestRepository implements ManifestRepository {
     private final Optional<ManifestRoot> root;
+    private final PreparedCandidate candidate;
+    private final ManifestPage page;
 
-    private EmptyManifestRepository(Optional<ManifestRoot> root) {
+    private EmptyManifestRepository(
+        Optional<ManifestRoot> root, PreparedCandidate candidate, ManifestPage page) {
       this.root = root;
+      this.candidate = candidate;
+      this.page = page;
     }
 
     @Override public int candidateBucket(PreparedCandidate candidate) {
-      throw new UnsupportedOperationException();
+      return candidate.equals(this.candidate) ? 0 : -1;
     }
     @Override public CompletableFuture<SystemRecordStore.CreateResult> createCandidate(
         PreparedCandidate candidate, RequestScope scope) {
@@ -261,11 +301,13 @@ class CommitPublisherTest {
     }
     @Override public CompletableFuture<Optional<PreparedCandidate>> readCandidate(
         ByteKey identity, RequestScope scope) {
-      throw new UnsupportedOperationException();
+      return CompletableFuture.completedFuture(candidate != null && candidate.systemIdentity().equals(identity)
+          ? Optional.of(candidate) : Optional.empty());
     }
     @Override public CompletableFuture<Optional<ManifestPage>> readPage(
         ByteKey identity, RequestScope scope) {
-      throw new UnsupportedOperationException();
+      return CompletableFuture.completedFuture(page != null && page.systemIdentity().equals(identity)
+          ? Optional.of(page) : Optional.empty());
     }
     @Override public CompletableFuture<Optional<ManifestDirectoryPage>> readDirectoryPage(
         ByteKey identity, RequestScope scope) {

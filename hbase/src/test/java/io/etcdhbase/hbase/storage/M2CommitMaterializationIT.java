@@ -75,27 +75,56 @@ class M2CommitMaterializationIT {
 
   @AfterAll
   static void stopCluster() throws Exception {
-    try {
-      if (connection != null) {
-        for (TableName table : TABLES) {
-          await(connection.getAdmin().disableTable(table));
-          await(connection.getAdmin().deleteTable(table));
-        }
-      }
-    } finally {
-      try {
-        if (worker != null) {
-          worker.shutdownNow();
-          assertTrue(worker.awaitTermination(20, TimeUnit.SECONDS));
-        }
-      } finally {
-        try {
-          if (provider != null) provider.close();
-        } finally {
-          if (cluster != null) cluster.close();
-        }
+    Throwable failure = null;
+    failure = attemptCleanup(failure, M2CommitMaterializationIT::deleteTables);
+    failure = attemptCleanup(failure, M2CommitMaterializationIT::stopWorker);
+    failure = attemptCleanup(failure, M2CommitMaterializationIT::closeProvider);
+    failure = attemptCleanup(failure, M2CommitMaterializationIT::closeCluster);
+    rethrowCleanupFailure(failure);
+  }
+
+  private static void deleteTables() throws Exception {
+    if (connection != null) {
+      for (TableName table : TABLES) {
+        await(connection.getAdmin().disableTable(table));
+        await(connection.getAdmin().deleteTable(table));
       }
     }
+  }
+
+  private static void stopWorker() throws Exception {
+    if (worker != null) {
+      worker.shutdownNow();
+      assertTrue(worker.awaitTermination(20, TimeUnit.SECONDS));
+    }
+  }
+
+  private static void closeProvider() throws Exception {
+    if (provider != null) provider.close();
+  }
+
+  private static void closeCluster() throws Exception {
+    if (cluster != null) cluster.close();
+  }
+
+  private static Throwable attemptCleanup(Throwable previous, CleanupAction cleanup) {
+    try {
+      cleanup.run();
+    } catch (Throwable failure) {
+      if (previous == null) return failure;
+      if (previous != failure) previous.addSuppressed(failure);
+    }
+    return previous;
+  }
+
+  private static void rethrowCleanupFailure(Throwable failure) throws Exception {
+    if (failure instanceof Exception exception) throw exception;
+    if (failure instanceof Error error) throw error;
+  }
+
+  @FunctionalInterface
+  private interface CleanupAction {
+    void run() throws Exception;
   }
 
   @Test

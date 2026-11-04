@@ -24,7 +24,6 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
@@ -107,8 +106,9 @@ public final class HBaseMaterializationStore implements MaterializationStore {
   public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope scope) {
     Objects.requireNonNull(candidate, "candidate");
     long revision = candidate.record().metadata().modificationRevision();
+    byte[] primaryRow;
     try {
-      primary.codec().encode(candidate.record().key(), revision);
+      primaryRow = primary.codec().encode(candidate.record().key(), revision);
       current.ifPresent(binding -> binding.codec().encode(candidate.record().key(), revision));
     } catch (RuntimeException invalidKey) {
       return CompletableFuture.failedFuture(invalidKey);
@@ -116,8 +116,7 @@ public final class HBaseMaterializationStore implements MaterializationStore {
     if (primary.layout() != StorageTableBinding.Layout.NATIVE) {
       return CompletableFuture.completedFuture(null);
     }
-    byte[] row = primary.codec().encode(candidate.record().key(), revision);
-    return readNativeState(row, nativeVersionLimit + 1, scope).thenApply(observed -> {
+    return readNativeState(primaryRow, nativeVersionLimit + 1, scope).thenApply(observed -> {
       int versions = cells(observed.versions(), METADATA).size();
       if (versions >= nativeVersionLimit) {
         throw new CompletionException(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
@@ -154,7 +153,8 @@ public final class HBaseMaterializationStore implements MaterializationStore {
         if (!sameFence(fence, decision, candidate)) {
           throw new CompletionException(new IllegalStateException("history row is fenced by another version"));
         }
-        verifyCandidateData(history, row, result, candidate, decision.revision());
+        // observedFence validates the stored bytes against the fence; sameFence binds that
+        // validated result to the selected candidate without copying and hashing cells again.
         return CompletableFuture.completedFuture(MaterializationStore.ApplyResult.ALREADY_APPLIED);
       }
       return readValidatedFence(current.orElseThrow(),
@@ -184,7 +184,6 @@ public final class HBaseMaterializationStore implements MaterializationStore {
       if (observed.isPresent()) {
         RowFenceMessages.Fence fence = observed.orElseThrow().fence();
         requirePresent(fence);
-        verifyFenceData(binding, row, result, fence);
         if (fence.appliedSequence() > decision.sequence()) {
           return CompletableFuture.completedFuture(MaterializationStore.ApplyResult.CURRENT_SUPERSEDED);
         }
@@ -192,7 +191,6 @@ public final class HBaseMaterializationStore implements MaterializationStore {
           if (!sameFence(fence, decision, candidate)) {
             throw new CompletionException(new IllegalStateException("current row sequence conflicts"));
           }
-          verifyCandidateData(binding, row, result, candidate, decision.revision());
           return CompletableFuture.completedFuture(MaterializationStore.ApplyResult.ALREADY_APPLIED);
         }
       }
@@ -221,7 +219,6 @@ public final class HBaseMaterializationStore implements MaterializationStore {
           if (!sameFence(fence, decision, candidate)) {
             throw new CompletionException(new IllegalStateException("native row sequence conflicts"));
           }
-          verifyCandidateData(primary, row, observed.latestVersion(), candidate, decision.revision());
           return CompletableFuture.completedFuture(MaterializationStore.ApplyResult.ALREADY_APPLIED);
         }
       }
@@ -249,7 +246,7 @@ public final class HBaseMaterializationStore implements MaterializationStore {
       return CompletableFuture.failedFuture(HBaseFailures.classify(failure));
     }
     return readVersions.thenCompose(result -> {
-      Optional<ObservedFence> observed = observedNativeFence(row, result);
+      Optional<ObservedFence> observed = observedNativeFence(result);
       if (observed.isEmpty()) {
         return CompletableFuture.completedFuture(new NativeRowState(result, Optional.empty(), Result.EMPTY_RESULT));
       }
@@ -273,7 +270,7 @@ public final class HBaseMaterializationStore implements MaterializationStore {
     }
   }
 
-  private Optional<ObservedFence> observedNativeFence(byte[] row, Result versions) {
+  private Optional<ObservedFence> observedNativeFence(Result versions) {
     if (versions.isEmpty()) return Optional.empty();
     validateQualifiers(primary, versions, RowFenceMessages.RowKind.NATIVE);
     List<Cell> metadataVersions = cells(versions, METADATA);
@@ -382,38 +379,6 @@ public final class HBaseMaterializationStore implements MaterializationStore {
     }
   }
 
-  private void verifyCandidateData(StorageTableBinding binding, byte[] row, Result result,
-      PreparedCandidate candidate, long revision) {
-    long timestamp = RevisionTimestamp.timestamp(revision);
-    RowFenceMessages.RowKind rowKind = rowKind(binding);
-    Cell fenceCell = cellAt(result, guardQualifier(rowKind), timestamp);
-    if (fenceCell == null) {
-      throw new IllegalArgumentException("selected version is missing its row fence");
-    }
-    RowFenceMessages.Fence fence = RowFenceMessages.decode(CellUtil.cloneValue(fenceCell));
-    if (fence.rowKind() != rowKind || fence.state() != RowFenceMessages.State.PRESENT
-        || fence.appliedSequence() != Math.addExact(candidate.baseSequence(), 1)
-        || !fence.transactionId().equals(candidate.transactionId())
-        || fence.revision() != revision || fence.ownerEpoch() != candidate.ownerEpoch()
-        || fence.baseSequence() != candidate.baseSequence()
-        || !fence.contentDigest().equals(candidate.contentDigest())) {
-      throw new IllegalArgumentException("selected version row fence conflicts with its candidate");
-    }
-    Cell metadata = cellAt(result, METADATA, timestamp);
-    if (metadata == null || !Arrays.equals(CellUtil.cloneValue(metadata),
-        StorageMessages.metadata(candidate.record().metadata()))) {
-      throw new IllegalArgumentException("selected metadata is missing or conflicts with its candidate");
-    }
-    if (candidate.record().metadata().state() == StorageMetadata.State.LIVE) {
-      Cell value = cellAt(result, VALUE, timestamp);
-      if (value == null || !Arrays.equals(CellUtil.cloneValue(value), StorageMessages.value(candidate.record()))) {
-        throw new IllegalArgumentException("selected value is missing or conflicts with its candidate");
-      }
-    } else if (cellAt(result, VALUE, timestamp) != null) {
-      throw new IllegalArgumentException("selected tombstone has a value at its revision");
-    }
-  }
-
   private CompletableFuture<Boolean> mutateRow(StorageTableBinding binding, byte[] row,
       Optional<byte[]> expectedFence, byte[] guardQualifier, RowFenceMessages.RowKind rowKind,
       CommitDecision decision, PreparedCandidate candidate, long generation, RequestScope scope) {
@@ -457,26 +422,13 @@ public final class HBaseMaterializationStore implements MaterializationStore {
 
   private <T> CompletableFuture<T> execute(RequestScope scope, StorageTableBinding binding,
       Function<AsyncTable<?>, CompletableFuture<T>> operation) {
-    CompletableFuture<T> backend;
-    try {
-      if (scope.isDeadlineExceeded()) throw new TimeoutException();
-      if (scope.isClosed()) throw new java.util.concurrent.CancellationException();
+    return HBaseRequestCompletion.startRequest(scope, () -> {
       long timeout = Math.max(1, Math.min(TimeUnit.SECONDS.toNanos(30), scope.remainingDeadlineNanos()));
       AsyncTable<?> table = connection.getTableBuilder(binding.table())
           .setOperationTimeout(timeout, TimeUnit.NANOSECONDS)
           .setRpcTimeout(timeout, TimeUnit.NANOSECONDS).build();
-      backend = operation.apply(table);
-    } catch (Exception failure) {
-      return CompletableFuture.failedFuture(HBaseFailures.classify(failure));
-    }
-    return scope.track(backend).handle((value, failure) -> {
-      if (failure != null) throw new CompletionException(HBaseFailures.classify(failure));
-      if (scope.isDeadlineExceeded()) throw new CompletionException(
-          new BackendFailure(BackendFailure.Category.TIMEOUT));
-      if (scope.isClosed()) throw new CompletionException(
-          new BackendFailure(BackendFailure.Category.CANCELLED));
-      return value;
-    }).copy();
+      return operation.apply(table);
+    });
   }
 
   private static void validateSelected(CommitDecision decision, PreparedCandidate candidate) {
@@ -490,6 +442,7 @@ public final class HBaseMaterializationStore implements MaterializationStore {
 
   private static boolean sameFence(
       RowFenceMessages.Fence fence, CommitDecision decision, PreparedCandidate candidate) {
+    // Callers validate persisted row bytes before comparing the fence to the selected candidate.
     return fence.appliedSequence() == decision.sequence()
         && fence.revision() == decision.revision()
         && fence.transactionId().equals(candidate.transactionId())

@@ -1,10 +1,11 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 
 /** Archives and idempotently materializes a selected transaction before advancing finalized state. */
 public final class CommitFinalizationService implements CommitFinalizer {
@@ -65,30 +66,38 @@ public final class CommitFinalizationService implements CommitFinalizer {
     }
     return decisions.createIfAbsent(decision, scope)
         .handle((result, failure) -> new ArchiveAttempt(result, failure))
-        .thenCompose(result -> {
-          if (result.failure() != null && !isUnknown(result.failure())) {
-            return CompletableFuture.failedFuture(unwrap(result.failure()));
-          }
-          if (result.failure() == null && (result.result() == null
-              || result.result() == SystemRecordStore.CreateResult.CONFLICT)) {
-            return CompletableFuture.failedFuture(
-                new IllegalStateException("commit sequence has a conflicting durable decision"));
-          }
-          return decisions.read(decision.sequence(), scope).thenCompose(stored -> {
-            if (stored.isPresent()) {
-              if (!stored.orElseThrow().equals(decision)) {
-                return CompletableFuture.failedFuture(
-                    new IllegalStateException("archived decision differs from the selected control slot"));
-              }
-              return CompletableFuture.completedFuture(null);
-            }
-            if (result.failure() != null) {
-              return archiveDecision(decision, scope, attempt + 1);
-            }
-            return CompletableFuture.failedFuture(
-                new IllegalStateException("successful decision creation is not strongly readable"));
-          });
-        });
+        .thenCompose(result -> completeArchiveAttempt(decision, scope, attempt, result));
+  }
+
+  private CompletableFuture<Void> completeArchiveAttempt(
+      CommitDecision decision, RequestScope scope, int attempt, ArchiveAttempt result) {
+    if (result.failure() != null && !isUnknown(result.failure())) {
+      return CompletableFuture.failedFuture(CompletionFailures.unwrapCompletion(result.failure()));
+    }
+    if (result.failure() == null && (result.result() == null
+        || result.result() == SystemRecordStore.CreateResult.CONFLICT)) {
+      return CompletableFuture.failedFuture(
+          new IllegalStateException("commit sequence has a conflicting durable decision"));
+    }
+    return decisions.read(decision.sequence(), scope).thenCompose(stored ->
+        completeArchiveRead(decision, scope, attempt, result, stored));
+  }
+
+  private CompletableFuture<Void> completeArchiveRead(
+      CommitDecision decision,
+      RequestScope scope,
+      int attempt,
+      ArchiveAttempt result,
+      Optional<CommitDecision> stored) {
+    if (stored.isPresent()) {
+      return stored.orElseThrow().equals(decision)
+          ? CompletableFuture.completedFuture(null)
+          : CompletableFuture.failedFuture(new IllegalStateException(
+              "archived decision differs from the selected control slot"));
+    }
+    if (result.failure() != null) return archiveDecision(decision, scope, attempt + 1);
+    return CompletableFuture.failedFuture(
+        new IllegalStateException("successful decision creation is not strongly readable"));
   }
 
   private CompletableFuture<ManifestRoot> readAndValidateManifest(
@@ -145,7 +154,7 @@ public final class CommitFinalizationService implements CommitFinalizer {
           .handle((updated, failure) -> new FinalizeAttempt(updated, failure))
           .thenCompose(result -> {
             if (result.failure() != null) {
-              Throwable failure = unwrap(result.failure());
+              Throwable failure = CompletionFailures.unwrapCompletion(result.failure());
               if (!isUnknown(failure)) return CompletableFuture.failedFuture(failure);
               return resolveAndRetry(invocation, decision, scope, attempt);
             }
@@ -182,16 +191,8 @@ public final class CommitFinalizationService implements CommitFinalizer {
     }
   }
 
-  private static Throwable unwrap(Throwable failure) {
-    Throwable current = failure;
-    while (current instanceof CompletionException && current.getCause() != null) {
-      current = current.getCause();
-    }
-    return current;
-  }
-
   private static boolean isUnknown(Throwable failure) {
-    Throwable cause = unwrap(failure);
+    Throwable cause = CompletionFailures.unwrapCompletion(failure);
     return cause instanceof BackendFailure backend && switch (backend.category()) {
       case TIMEOUT, CANCELLED, UNAVAILABLE, UNKNOWN -> true;
       default -> false;
