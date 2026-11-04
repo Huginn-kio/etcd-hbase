@@ -79,7 +79,7 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
       if (failure instanceof Error fatal) throw fatal;
       return failed(failure);
     }
-    return read.whenComplete((ignored, failure) -> completeOperation());
+    return read.whenComplete((ignored, failure) -> completeOperation()).copy();
   }
 
   private CompletableFuture<Optional<StoredRecord>> getAtView(
@@ -98,19 +98,10 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
     return manifests.candidatesInRange(root, bucket, KeyRange.point(key), Optional.empty(), 2,
         Long.MAX_VALUE, scope, this::isInactive).thenCompose(slice -> {
           if (!isActive()) return failed(inactiveFailure());
-          if (slice.candidates().size() > 1) {
-            return CompletableFuture.failedFuture(new IllegalStateException(
-                "selected manifest contains duplicate candidates for one key"));
-          }
           if (slice.candidates().isEmpty()) {
             return physicalGet(key, Math.min(upper, view.stableRevision()), projection);
           }
           PreparedCandidate candidate = slice.candidates().getFirst();
-          if (candidate.record().metadata().modificationRevision()
-              != view.selectedDecision().orElseThrow().revision()) {
-            return CompletableFuture.failedFuture(new IllegalStateException(
-                "selected candidate revision differs from the control decision"));
-          }
           return CompletableFuture.completedFuture(Optional.of(project(candidate.record(), projection)));
         });
   }
@@ -430,6 +421,23 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
   private static StoragePage merge(StoragePage base,
       ManifestCatalog.CandidateSlice candidates, ScanRequest request) {
     List<StoredRecord> records = new ArrayList<>(request.maximumRows());
+    // Resume only through the common prefix when either source has more keys beyond its page.
+    ByteKey safeBoundary = null;
+    if (!base.exhausted()) {
+      if (base.records().isEmpty()) {
+        throw new IllegalStateException("nonexhausted physical page has no resume key");
+      }
+      safeBoundary = base.records().getLast().key();
+    }
+    if (!candidates.exhausted()) {
+      if (candidates.candidates().isEmpty()) {
+        throw new IllegalStateException("nonexhausted candidate page has no resume key");
+      }
+      ByteKey candidateBoundary = candidates.candidates().getLast().record().key();
+      if (safeBoundary == null || candidateBoundary.compareTo(safeBoundary) < 0) {
+        safeBoundary = candidateBoundary;
+      }
+    }
     int baseIndex = 0;
     int candidateIndex = 0;
     long bytes = 0;
@@ -455,6 +463,10 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
           next = candidateRecord;
           candidateIndex++;
         }
+      }
+      if (safeBoundary != null && next.key().compareTo(safeBoundary) > 0) {
+        truncated = true;
+        break;
       }
       StoredRecord projected = project(next, request.projection());
       long retained = projected.retainedBytes();

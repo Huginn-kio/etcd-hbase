@@ -8,6 +8,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BucketCursor;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.ExistsExecutor;
 import io.etcdhbase.core.scan.ScanScheduler;
@@ -30,6 +31,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
@@ -171,6 +173,92 @@ class ReadViewRecordStoreTest {
     assertEquals(1, fixture.pinCloses.get(), "the view pin releases after producer completion");
   }
 
+  @Test
+  void byteTruncatedPhysicalPageDoesNotSkipKeysDuringOverlayMerge() {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("z", 2, 2, 1, StorageMetadata.State.LIVE, new byte[100])));
+    fixture.physical.add(liveBytes("a", 1, 1, 100));
+    fixture.physical.add(liveBytes("b", 1, 1, 700));
+
+    assertEquals(List.of("a", "b", "z"), scanKeys(fixture, 1024, 3));
+    assertEquals(List.of("a", "b", "z"), scanKeys(fixture, 4096, 1));
+    assertEquals(2, fixture.pinCloses.get());
+  }
+
+  @Test
+  void byteTruncatedCandidatePageDoesNotSkipKeysDuringOverlayMerge() {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("a", 2, 2, 1, StorageMetadata.State.LIVE, new byte[400]),
+        candidate("b", 2, 2, 1, StorageMetadata.State.LIVE, new byte[700])));
+    fixture.physical.add(liveBytes("z", 1, 1, 100));
+
+    assertEquals(List.of("a", "b", "z"), scanKeys(fixture, 1024, 3));
+    assertEquals(List.of("a", "b", "z"), scanKeys(fixture, 4096, 1));
+    assertEquals(2, fixture.pinCloses.get());
+  }
+
+  @Test
+  void cancellingReadResultDoesNotCancelPinAccounting() throws Exception {
+    Fixture beforeProducerCompletion = new Fixture(1, List.of(
+        candidate("alpha", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
+    RequestScope firstScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+    PinnedReadView firstPinned = beforeProducerCompletion.views
+        .open(OptionalLong.empty(), digest(9), firstScope).join();
+    beforeProducerCompletion.physical.blockNextGet(key("zeta"));
+    var firstResult = beforeProducerCompletion.readStore(firstPinned, firstScope)
+        .get(key("zeta"), 2, ReadProjection.FULL);
+
+    assertTrue(firstResult.cancel(false));
+    firstScope.close();
+    assertEquals(0, beforeProducerCompletion.pinCloses.get());
+    beforeProducerCompletion.physical.pendingGet.complete(Optional.empty());
+    firstScope.cleanupCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+    assertEquals(1, beforeProducerCompletion.pinCloses.get(),
+        "scope cleanup waits for the physical producer even when the caller cancels its result");
+
+    Fixture afterProducerCompletion = new Fixture(1, List.of(
+        candidate("alpha", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
+    RequestScope secondScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+    PinnedReadView secondPinned = afterProducerCompletion.views
+        .open(OptionalLong.empty(), digest(9), secondScope).join();
+    afterProducerCompletion.physical.blockNextGet(key("zeta"));
+    var secondResult = afterProducerCompletion.readStore(secondPinned, secondScope)
+        .get(key("zeta"), 2, ReadProjection.FULL);
+
+    assertTrue(secondResult.cancel(false));
+    afterProducerCompletion.physical.pendingGet.complete(Optional.empty());
+    assertEquals(0, afterProducerCompletion.pinCloses.get());
+    secondScope.close();
+    secondScope.cleanupCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+    assertEquals(1, afterProducerCompletion.pinCloses.get(),
+        "scope cleanup releases the pin when the producer already completed");
+  }
+
+  private static List<String> scanKeys(Fixture fixture, long maximumBytes, int expectedPages) {
+    List<String> keys = new ArrayList<>();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      PinnedReadView pinned = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
+      ReadViewRecordStore view = fixture.readStore(pinned, scope);
+      var request = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
+          ReadProjection.FULL, 8, maximumBytes, 8);
+      try (BucketCursor cursor = new BucketCursor(view, request, scope)) {
+        int pages = 0;
+        boolean exhausted = false;
+        while (!exhausted && pages < 10) {
+          try (BucketCursor.Page page = cursor.fetch().join()) {
+            pages++;
+            Optional<StoredRecord> next;
+            while ((next = page.next()).isPresent()) keys.add(text(next.orElseThrow().key()));
+            exhausted = page.exhausted();
+          }
+        }
+        assertTrue(exhausted, "read view scan must finish without losing progress");
+        assertEquals(expectedPages, pages);
+      }
+    }
+    return List.copyOf(keys);
+  }
+
   private static PreparedCandidate candidate(String key, long createRevision,
       long modificationRevision, long version, StorageMetadata.State state, byte[] value) {
     StorageMetadata metadata = new StorageMetadata(createRevision, modificationRevision, version,
@@ -185,6 +273,13 @@ class ReadViewRecordStoreTest {
     byte[] bytes = bytes(value);
     return StoredRecord.live(key(key), new StorageMetadata(createRevision, modificationRevision,
         version, lease, StorageMetadata.State.LIVE, bytes.length), bytes);
+  }
+
+  private static StoredRecord liveBytes(String key, long createRevision,
+      long modificationRevision, int valueLength) {
+    byte[] value = new byte[valueLength];
+    return StoredRecord.live(key(key), new StorageMetadata(createRevision, modificationRevision,
+        1, 0, StorageMetadata.State.LIVE, value.length), value);
   }
 
   private static StoredRecord tombstone(String key, long createRevision, long modificationRevision) {
