@@ -14,6 +14,16 @@ SPEC = importlib.util.spec_from_file_location("j25_report", SCRIPT)
 j25_report = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(j25_report)
 
+CORE_CASES = {
+    "currentReadOverlaysOnlyTheSelectedPendingTransactionBeforeRangeMerge",
+    "historicalReadUsesItsOwnBarrierAndCanReadDeleteThenRecreateVersions",
+    "selectedRootIsPinnedAndRecheckedBeforeAnyDataRead",
+    "cancellingAReadKeepsItsPinUntilThePhysicalProducerStops",
+    "byteTruncatedPhysicalPageDoesNotSkipKeysDuringOverlayMerge",
+    "byteTruncatedCandidatePageDoesNotSkipKeysDuringOverlayMerge",
+    "cancellingReadResultDoesNotCancelPinAccounting",
+}
+
 
 class J25ReportTest(unittest.TestCase):
     def setUp(self):
@@ -47,23 +57,29 @@ class J25ReportTest(unittest.TestCase):
         )
         ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
 
-    def _write_reports(self, invalid_suite=None, invalid_case=None):
+    def _write_reports(self, invalid_suite=None, invalid_case=None, extra_core_cases=()):
         hbase_path = self.root / "hbase/target/failsafe-reports" / f"TEST-{j25_report.J25_SUITE}.xml"
         core_path = self.root / "core/target/surefire-reports" / f"TEST-{j25_report.CORE_SUITE}.xml"
         self._write_suite(hbase_path, j25_report.J25_SUITE, [j25_report.J25_CASE],
                           invalid_case if invalid_suite == "hbase" else None)
         self._write_suite(core_path, j25_report.CORE_SUITE,
-                          sorted(j25_report.REQUIRED_CORE_CASES),
+                          sorted(CORE_CASES | set(extra_core_cases)),
                           invalid_case if invalid_suite == "core" else None)
 
-    def test_collect_accepts_required_cases_and_both_layout_markers(self):
+    def test_collect_accepts_all_seven_core_cases_and_both_layout_markers(self):
         j25_report.collect(self.root, self.output)
         summary = json.loads((self.output / "summary.json").read_text())
         self.assertEqual(1, summary["tests"])
-        self.assertEqual(4, summary["core_tests"])
+        self.assertEqual(7, summary["core_tests"])
         self.assertEqual("J25", summary["phase"])
         self.assertTrue(summary["source_commit"])
         self.assertTrue(summary["source_report_sha256"])
+
+    def test_collect_reports_additional_passing_core_cases(self):
+        self._write_reports(extra_core_cases={"futureReadViewRegression"})
+        j25_report.collect(self.root, self.output)
+        summary = json.loads((self.output / "summary.json").read_text())
+        self.assertEqual(8, summary["core_tests"])
 
     def _assert_report_rejects_invalid_case(self, suite, case_result):
         self._write_reports(suite, case_result)
@@ -72,8 +88,8 @@ class J25ReportTest(unittest.TestCase):
         self.assertFalse((self.output / "summary.json").exists())
 
     def test_report_rejects_skipped_or_failed_required_case_with_zero_suite_counters(self):
-        cases = (("hbase", "skipped"), ("hbase", "failure"),
-                 ("core", "skipped"), ("core", "failure"))
+        cases = (("hbase", "skipped"), ("hbase", "failure"), ("hbase", "error"),
+                 ("core", "skipped"), ("core", "failure"), ("core", "error"))
         for suite, case_result in cases:
             with self.subTest(suite=suite, case_result=case_result):
                 self._assert_report_rejects_invalid_case(suite, case_result)

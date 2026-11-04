@@ -235,28 +235,38 @@ class ReadViewRecordStoreTest {
   }
 
   private static List<String> scanKeys(Fixture fixture, long maximumBytes, int expectedPages) {
-    List<String> keys = new ArrayList<>();
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       PinnedReadView pinned = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
       ReadViewRecordStore view = fixture.readStore(pinned, scope);
       var request = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
           ReadProjection.FULL, 8, maximumBytes, 8);
       try (BucketCursor cursor = new BucketCursor(view, request, scope)) {
-        int pages = 0;
-        boolean exhausted = false;
-        while (!exhausted && pages < 10) {
-          try (BucketCursor.Page page = cursor.fetch().join()) {
-            pages++;
-            Optional<StoredRecord> next;
-            while ((next = page.next()).isPresent()) keys.add(text(next.orElseThrow().key()));
-            exhausted = page.exhausted();
-          }
-        }
-        assertTrue(exhausted, "read view scan must finish without losing progress");
-        assertEquals(expectedPages, pages);
+        return readAllPages(cursor, expectedPages);
       }
     }
+  }
+
+  private static List<String> readAllPages(BucketCursor cursor, int expectedPages) {
+    List<String> keys = new ArrayList<>();
+    int pages = 0;
+    boolean exhausted = false;
+    while (!exhausted && pages < 10) {
+      try (BucketCursor.Page page = cursor.fetch().join()) {
+        pages++;
+        appendPageKeys(page, keys);
+        exhausted = page.exhausted();
+      }
+    }
+    assertTrue(exhausted, "read view scan must finish without losing progress");
+    assertEquals(expectedPages, pages);
     return List.copyOf(keys);
+  }
+
+  private static void appendPageKeys(BucketCursor.Page page, List<String> keys) {
+    Optional<StoredRecord> record;
+    while ((record = page.next()).isPresent()) {
+      keys.add(text(record.orElseThrow().key()));
+    }
   }
 
   private static PreparedCandidate candidate(String key, long createRevision,

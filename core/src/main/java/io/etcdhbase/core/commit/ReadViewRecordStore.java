@@ -421,23 +421,7 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
   private static StoragePage merge(StoragePage base,
       ManifestCatalog.CandidateSlice candidates, ScanRequest request) {
     List<StoredRecord> records = new ArrayList<>(request.maximumRows());
-    // Resume only through the common prefix when either source has more keys beyond its page.
-    ByteKey safeBoundary = null;
-    if (!base.exhausted()) {
-      if (base.records().isEmpty()) {
-        throw new IllegalStateException("nonexhausted physical page has no resume key");
-      }
-      safeBoundary = base.records().getLast().key();
-    }
-    if (!candidates.exhausted()) {
-      if (candidates.candidates().isEmpty()) {
-        throw new IllegalStateException("nonexhausted candidate page has no resume key");
-      }
-      ByteKey candidateBoundary = candidates.candidates().getLast().record().key();
-      if (safeBoundary == null || candidateBoundary.compareTo(safeBoundary) < 0) {
-        safeBoundary = candidateBoundary;
-      }
-    }
+    ByteKey safeBoundary = commonPrefixBoundary(base, candidates);
     int baseIndex = 0;
     int candidateIndex = 0;
     long bytes = 0;
@@ -487,6 +471,24 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
       throw new IllegalStateException("read view merge failed to make bounded scan progress");
     }
     return new StoragePage(records, exhausted, mergeCost(base.cost(), candidates));
+  }
+
+  private static ByteKey commonPrefixBoundary(StoragePage base,
+      ManifestCatalog.CandidateSlice candidates) {
+    ByteKey boundary = null;
+    if (!base.exhausted()) {
+      if (base.records().isEmpty()) {
+        throw new IllegalStateException("nonexhausted physical page has no resume key");
+      }
+      boundary = base.records().getLast().key();
+    }
+    if (!candidates.exhausted()) {
+      ByteKey candidateBoundary = candidates.candidates().getLast().record().key();
+      if (boundary == null || candidateBoundary.compareTo(boundary) < 0) {
+        boundary = candidateBoundary;
+      }
+    }
+    return boundary;
   }
 
   private static StoragePage.Cost mergeCost(StoragePage.Cost base,
