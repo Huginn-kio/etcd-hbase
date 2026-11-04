@@ -682,7 +682,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J21/J22。
   - 完成标准：发布成功/失败/未知结果可从持久化状态判定。
   - 验证层次：L1 存储/内核。
-  - 跟踪：状态=J23 定向验证通过，公开 CI 与维护者复查待继续；负责人=Codex；完成日期=2026-11-04；PR/commit=PR #27 / `5e30382`；验证报告=本地 Java 21 `scripts/verify/j23.sh` 定向 `clean verify` 17 项通过，失败/错误/跳过均为 0（`CommitPublisherTest` 7、`CommitOutcomeResolverTest` 3、`BoundedPublicationHandoffTest` 4、`CommitDecisionMessagesTest` 2、一次性 MiniCluster `J23CommitDecisionRepositoryIT` 1）；摘要=`.artifacts/j23/20261104T081416Z-61922/summary.json`，SHA256=`bde27b9057db52cbcb86118fd72d9d1c67b56979c5bd1ce75cf31318b0ce1696`，该报告在提交前工作树运行，测试内容现对应提交 `5e30382`；GitHub 新 head CI 待观察；评审人/结论=`Reidddddd` / 第一阶段未通过、第二阶段尚未开始；真实双副本 CAS 超时/断连恢复和目标 HBase 验收待执行。
+  - 跟踪：状态=J23 定向验证及公开 CI 已通过，维护者复查与目标验收待继续；负责人=Codex；完成日期=2026-11-04；PR/commit=PR #27 / `5e30382`；验证报告=本地 Java 21 `scripts/verify/j23.sh` 定向 `clean verify` 17 项通过，失败/错误/跳过均为 0（`CommitPublisherTest` 7、`CommitOutcomeResolverTest` 3、`BoundedPublicationHandoffTest` 4、`CommitDecisionMessagesTest` 2、一次性 MiniCluster `J23CommitDecisionRepositoryIT` 1）；摘要=`.artifacts/j23/20261104T081416Z-61922/summary.json`，SHA256=`bde27b9057db52cbcb86118fd72d9d1c67b56979c5bd1ce75cf31318b0ce1696`，该报告在提交前工作树运行，测试内容现对应提交 `5e30382`；PR head `ef2bd857599c528262c5f17283067687ec1bd202` 上 11/11 个 GitHub check-runs 全部 success，含 J23 run `41799037604`（实际 PR merge checkout `34c3e1989530fa1936253b5ae93876c96f72e523`，17 项）和公开构建/运行包 run `41799037460`（同 checkout，Java 两次各 412 项、Go 与 race 各 223 个成功测试事件、镜像传输检查通过；`m0_accepted=false`）；本跟踪行后续仅作验证记录更新，更新提交的新 head CI 仍需观察；评审人/结论=`Reidddddd` / 第一阶段未通过、第二阶段尚未开始；真实双副本 CAS 超时/断连恢复和目标 HBase 验收待执行。
 
 - [ ] **J24｜已提交版本存储与提交收尾**
   - 依赖：J23。
