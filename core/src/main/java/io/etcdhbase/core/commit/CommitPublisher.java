@@ -1,10 +1,10 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 
 /** Publishes a sealed manifest at the control-row CAS linearization point. */
 public final class CommitPublisher {
@@ -39,16 +39,9 @@ public final class CommitPublisher {
     Objects.requireNonNull(owner, "owner");
     Objects.requireNonNull(manifest, "manifest");
     Objects.requireNonNull(requestScope, "requestScope");
-    if (invocation.state() != InvocationBinding.State.SEALED
-        || invocation.manifestRoot().isEmpty()
-        || !invocation.transactionId().equals(manifest.transactionId())
-        || !invocation.manifestRoot().orElseThrow().equals(manifest.systemIdentity())
-        || invocation.preparedOwnerEpoch() != owner.epoch()
-        || manifest.ownerEpoch() != owner.epoch()
-        || manifest.baseSequence() != invocation.baseSequence()
-        || manifest.baseRevision() != invocation.baseRevision()) {
+    if (invocation.preparedOwnerEpoch() != owner.epoch()) {
       return CompletableFuture.failedFuture(
-          new IllegalArgumentException("only a sealed manifest can be published"));
+          new IllegalArgumentException("owner token does not match the sealed invocation"));
     }
     return planVerifier.verify(invocation, manifest, requestScope).thenCompose(verified ->
         handoff.transfer(invocation, requestScope, serviceScope ->
@@ -99,7 +92,7 @@ public final class CommitPublisher {
       int attempt,
       CasResult result) {
     if (result.failure() != null) {
-      Throwable failure = unwrap(result.failure());
+      Throwable failure = CompletionFailures.unwrapCompletion(result.failure());
       if (!(failure instanceof BackendFailure backend)
           || !isUnknown(backend.category())) {
         return CompletableFuture.failedFuture(failure);
@@ -124,15 +117,7 @@ public final class CommitPublisher {
   }
 
   private static <T> CompletableFuture<T> failed(Throwable failure) {
-    return CompletableFuture.failedFuture(unwrap(failure));
-  }
-
-  private static Throwable unwrap(Throwable failure) {
-    Throwable current = failure;
-    while (current instanceof CompletionException && current.getCause() != null) {
-      current = current.getCause();
-    }
-    return current;
+    return CompletableFuture.failedFuture(CompletionFailures.unwrapCompletion(failure));
   }
 
   private static boolean isUnknown(BackendFailure.Category category) {

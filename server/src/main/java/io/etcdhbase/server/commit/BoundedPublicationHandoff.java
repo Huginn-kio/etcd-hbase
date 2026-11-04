@@ -3,12 +3,12 @@ package io.etcdhbase.server.commit;
 import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.PublicationHandoff;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -123,21 +123,40 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
       CompletableFuture<T> serviceResult;
       try {
         serviceResult = Objects.requireNonNull(serviceWork.apply(serviceScope), "serviceWork result");
-      } catch (RuntimeException | Error failure) {
+      } catch (RuntimeException failure) {
         serviceResult = CompletableFuture.failedFuture(failure);
+      } catch (Error fatal) {
+        // This task already owns capacity and may have registered service resources. Preserve
+        // the fatal result, drain that scope, and release capacity only after physical cleanup.
+        failFatal(fatal, serviceScope);
+        throw fatal;
       }
       serviceResult.whenComplete((value, failure) -> {
         synchronized (lock) {
           state = State.FINISHED;
         }
         if (failure == null) waitingResult.complete(value);
-        else waitingResult.completeExceptionally(unwrap(failure));
+        else waitingResult.completeExceptionally(CompletionFailures.unwrapCompletion(failure));
         try {
           serviceScope.close();
         } finally {
           serviceScope.cleanupCompletion().whenComplete((ignored, cleanupFailure) -> release());
         }
       });
+    }
+
+    private void failFatal(Error fatal, RequestScope serviceScope) {
+      synchronized (lock) {
+        state = State.FINISHED;
+      }
+      waitingResult.completeExceptionally(fatal);
+      try {
+        serviceScope.close();
+      } catch (Error cleanupFailure) {
+        if (cleanupFailure != fatal) fatal.addSuppressed(cleanupFailure);
+      } finally {
+        serviceScope.cleanupCompletion().whenComplete((ignored, cleanupFailure) -> release());
+      }
     }
 
     private void reject(RuntimeException failure) {
@@ -159,9 +178,4 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
     }
   }
 
-  private static Throwable unwrap(Throwable failure) {
-    Throwable cause = failure;
-    while (cause instanceof CompletionException && cause.getCause() != null) cause = cause.getCause();
-    return cause;
-  }
 }

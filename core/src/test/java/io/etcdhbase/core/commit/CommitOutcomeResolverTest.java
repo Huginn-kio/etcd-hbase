@@ -1,12 +1,14 @@
 package io.etcdhbase.core.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import org.junit.jupiter.api.Test;
 
 class CommitOutcomeResolverTest {
@@ -43,6 +45,16 @@ class CommitOutcomeResolverTest {
     assertEquals(CommitOutcomeResolver.State.NOT_SELECTED, resolution.state());
     assertEquals(InvocationBinding.State.NOT_SELECTED,
         sealedAttempt().notSelected(resolution.notSelectedProof().orElseThrow()).state());
+  }
+
+  @Test
+  void selectedSlotStillMustMatchTheInvocationBaseRevision() {
+    CommitState state = ownedState().publish(slot(1, 0, 1));
+    InvocationBinding mismatchedBase = InvocationBinding.begin(ATTEMPT_INVOCATION, DIGEST, DIGEST,
+        ATTEMPT_TRANSACTION, 1, 0, 2).seal(ATTEMPT_ROOT);
+
+    assertThrows(CompletionException.class, () -> resolver(state, Optional.empty())
+        .resolve(mismatchedBase, RequestScope.withoutDeadline()).join());
   }
 
   private static CommitOutcomeResolver resolver(

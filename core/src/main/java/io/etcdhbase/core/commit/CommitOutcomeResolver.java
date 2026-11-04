@@ -100,12 +100,10 @@ public final class CommitOutcomeResolver {
 
   private CompletableFuture<Resolution> resolveSlot(
       InvocationBinding invocation, CommitState state, PublicationSlot slot) {
-    long proposedSequence = Math.addExact(invocation.baseSequence(), 1);
-    if (slot.baseSequence() != invocation.baseSequence()
-        || slot.baseRevision() != invocation.baseRevision()
-        || slot.sequence() != proposedSequence
-        || state.publishedSequence() != slot.sequence()
-        || state.publishedRevision() != slot.revision()) {
+    // The caller selected this slot by proposed sequence, and CommitState validates its sequence
+    // and revision against the immutable snapshot. Keep the invocation-specific base revision
+    // check because it joins two separately persisted records.
+    if (slot.baseRevision() != invocation.baseRevision()) {
       return CompletableFuture.failedFuture(
           new IllegalStateException("selected control slot conflicts with invocation base"));
     }
@@ -136,8 +134,6 @@ public final class CommitOutcomeResolver {
     long proposedSequence = Math.addExact(invocation.baseSequence(), 1);
     if (decision.sequence() != proposedSequence
         || decision.baseRevision() != invocation.baseRevision()
-        || decision.revision() != Math.addExact(invocation.baseRevision(),
-            decision.containsKeyChanges() ? 1 : 0)
         || state.publishedSequence() < decision.sequence()
         || state.publishedRevision() < decision.revision()) {
       throw new IllegalStateException("archived commit decision conflicts with control state");
