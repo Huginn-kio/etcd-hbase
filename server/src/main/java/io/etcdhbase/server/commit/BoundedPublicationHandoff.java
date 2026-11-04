@@ -27,16 +27,25 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
   private final CompletableFuture<Void> drained = new CompletableFuture<>();
 
   public BoundedPublicationHandoff(int workerCount, int queueCapacity, Duration serviceDeadline) {
+    this(workerCount, queueCapacity, serviceDeadline,
+        Thread.ofPlatform().daemon().name("commit-publish-", 0).factory());
+  }
+
+  BoundedPublicationHandoff(
+      int workerCount,
+      int queueCapacity,
+      Duration serviceDeadline,
+      ThreadFactory threads) {
     if (workerCount < 1 || workerCount > 256 || queueCapacity < 1 || queueCapacity > 65_536) {
       throw new IllegalArgumentException("invalid bounded publication capacity");
     }
     this.serviceDeadline = Objects.requireNonNull(serviceDeadline, "serviceDeadline");
+    Objects.requireNonNull(threads, "threads");
     if (serviceDeadline.isZero() || serviceDeadline.isNegative()) {
       throw new IllegalArgumentException("service deadline must be positive");
     }
     int slots = Math.addExact(workerCount, queueCapacity);
     capacity = new Semaphore(slots);
-    ThreadFactory threads = Thread.ofPlatform().daemon().name("commit-publish-", 0).factory();
     workers = new ThreadPoolExecutor(workerCount, workerCount, 0, TimeUnit.NANOSECONDS,
         new ArrayBlockingQueue<>(queueCapacity), threads, new ThreadPoolExecutor.AbortPolicy());
   }
@@ -57,13 +66,18 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
     var task = new HandoffTask<T>(requestScope, serviceWork);
     requestScope.registerCleanup(task);
     if (!task.accept()) {
-      release();
+      task.releaseCapacity();
       return task.waitingResult.copy();
     }
     try {
       workers.execute(task::run);
     } catch (java.util.concurrent.RejectedExecutionException rejected) {
       task.reject(rejected);
+    } catch (Error fatal) {
+      // Thread creation may fail after execute has queued this task. Reject it before returning
+      // capacity so a later worker cannot invoke serviceWork for an unaccepted attempt.
+      task.rejectFatal(fatal);
+      throw fatal;
     }
     return task.waitingResult.copy();
   }
@@ -90,13 +104,14 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
   }
 
   private final class HandoffTask<T> implements AutoCloseable {
-    private enum State { WAITING, TRANSFERRED, CANCELLED, REJECTED, FINISHED }
+    private enum State { WAITING, TRANSFERRED, RUNNING, CANCELLED, REJECTED, FINISHED }
 
     private final Object lock = new Object();
     private final RequestScope requestScope;
     private final Function<RequestScope, CompletableFuture<T>> serviceWork;
     private final CompletableFuture<T> waitingResult = new CompletableFuture<>();
     private State state = State.WAITING;
+    private boolean capacityReleased;
 
     private HandoffTask(RequestScope requestScope,
         Function<RequestScope, CompletableFuture<T>> serviceWork) {
@@ -105,23 +120,42 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
     }
 
     private boolean accept() {
-      synchronized (lock) {
-        if (state != State.WAITING || requestScope.isClosed() || closing.get()) {
-          state = State.CANCELLED;
-          waitingResult.completeExceptionally(new BackendFailure(
-              requestScope.isDeadlineExceeded()
-                  ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
-          return false;
+      boolean requestOpen = requestScope.startIfOpen(() -> {
+        synchronized (lock) {
+          if (state != State.WAITING) return;
+          if (closing.get()) {
+            state = State.CANCELLED;
+            return;
+          }
+          state = State.TRANSFERRED;
         }
-        state = State.TRANSFERRED;
-        return true;
+      });
+      if (!requestOpen) {
+        synchronized (lock) {
+          if (state == State.WAITING) state = State.CANCELLED;
+        }
       }
+      boolean accepted;
+      synchronized (lock) {
+        accepted = state == State.TRANSFERRED;
+      }
+      if (!accepted) {
+        waitingResult.completeExceptionally(new BackendFailure(
+            requestScope.isDeadlineExceeded()
+                ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
+      }
+      return accepted;
     }
 
     private void run() {
-      RequestScope serviceScope = RequestScope.withTimeout(serviceDeadline);
+      synchronized (lock) {
+        if (state != State.TRANSFERRED) return;
+        state = State.RUNNING;
+      }
+      RequestScope serviceScope = null;
       CompletableFuture<T> serviceResult;
       try {
+        serviceScope = RequestScope.withTimeout(serviceDeadline);
         serviceResult = Objects.requireNonNull(serviceWork.apply(serviceScope), "serviceWork result");
       } catch (RuntimeException failure) {
         serviceResult = CompletableFuture.failedFuture(failure);
@@ -131,41 +165,97 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
         failFatal(fatal, serviceScope);
         throw fatal;
       }
+      RequestScope ownedServiceScope = serviceScope;
       serviceResult.whenComplete((value, failure) -> {
         synchronized (lock) {
+          if (state != State.RUNNING) return;
           state = State.FINISHED;
         }
-        if (failure == null) waitingResult.complete(value);
-        else waitingResult.completeExceptionally(CompletionFailures.unwrapCompletion(failure));
+        Throwable serviceFailure = failure == null
+            ? null : CompletionFailures.unwrapCompletion(failure);
+        Error cleanupFatal = null;
         try {
-          serviceScope.close();
-        } finally {
-          serviceScope.cleanupCompletion().whenComplete((ignored, cleanupFailure) -> release());
+          if (ownedServiceScope != null) ownedServiceScope.close();
+        } catch (Error fatal) {
+          cleanupFatal = fatal;
+        }
+        if (ownedServiceScope == null) releaseCapacityAfterCleanup(null);
+        else releaseCapacityAfterCleanup(ownedServiceScope);
+
+        if (cleanupFatal != null) {
+          Throwable propagated = cleanupFatal;
+          if (serviceFailure instanceof Error serviceFatal) {
+            propagated = serviceFatal;
+            suppressDistinct(serviceFatal, cleanupFatal);
+          } else {
+            suppressDistinct(cleanupFatal, serviceFailure);
+          }
+          waitingResult.completeExceptionally(propagated);
+        } else if (serviceFailure == null) {
+          waitingResult.complete(value);
+        } else {
+          waitingResult.completeExceptionally(serviceFailure);
         }
       });
     }
 
     private void failFatal(Error fatal, RequestScope serviceScope) {
       synchronized (lock) {
+        if (state != State.RUNNING) return;
         state = State.FINISHED;
       }
-      waitingResult.completeExceptionally(fatal);
+      if (serviceScope == null) {
+        waitingResult.completeExceptionally(fatal);
+        releaseCapacity();
+        return;
+      }
       try {
         serviceScope.close();
       } catch (Error cleanupFailure) {
-        if (cleanupFailure != fatal) fatal.addSuppressed(cleanupFailure);
-      } finally {
-        serviceScope.cleanupCompletion().whenComplete((ignored, cleanupFailure) -> release());
+        suppressDistinct(fatal, cleanupFailure);
       }
+      releaseCapacityAfterCleanup(serviceScope);
+      waitingResult.completeExceptionally(fatal);
     }
 
     private void reject(RuntimeException failure) {
-      synchronized (lock) {
-        if (state != State.TRANSFERRED) return;
-        state = State.REJECTED;
-      }
+      if (!markRejected()) return;
       waitingResult.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE, failure));
-      release();
+      releaseCapacity();
+    }
+
+    private void rejectFatal(Error failure) {
+      if (!markRejected()) return;
+      waitingResult.completeExceptionally(failure);
+      releaseCapacity();
+    }
+
+    private boolean markRejected() {
+      synchronized (lock) {
+        if (state != State.TRANSFERRED) return false;
+        state = State.REJECTED;
+        return true;
+      }
+    }
+
+    private void releaseCapacityAfterCleanup(RequestScope serviceScope) {
+      if (serviceScope == null) {
+        releaseCapacity();
+      } else {
+        serviceScope.cleanupCompletion().whenComplete((ignored, cleanupFailure) -> releaseCapacity());
+      }
+    }
+
+    private void releaseCapacity() {
+      synchronized (lock) {
+        if (capacityReleased) return;
+        capacityReleased = true;
+      }
+      BoundedPublicationHandoff.this.release();
+    }
+
+    private void suppressDistinct(Throwable primary, Throwable secondary) {
+      if (secondary != null && primary != secondary) primary.addSuppressed(secondary);
     }
 
     @Override

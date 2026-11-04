@@ -17,6 +17,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -41,6 +42,31 @@ class BoundedPublicationHandoffTest {
     assertEquals(0, starts.get());
     handoff.close();
     handoff.drained().join();
+  }
+
+  @Test
+  void expiredButOpenRequestRejectsBeforeStartingServiceWork() {
+    var handoff = handoff();
+    var requestScope = RequestScope.withTimeoutNanos(0, () -> 0L);
+    var starts = new AtomicInteger();
+    try {
+      assertFalse(requestScope.isClosed());
+      assertTrue(requestScope.isDeadlineExceeded());
+
+      CompletableFuture<String> result = handoff.transfer(invocation(), requestScope, serviceScope -> {
+        starts.incrementAndGet();
+        return CompletableFuture.completedFuture("unexpected");
+      });
+
+      CompletionException failure = assertThrows(CompletionException.class, result::join);
+      assertEquals(BackendFailure.Category.TIMEOUT,
+          ((BackendFailure) failure.getCause()).category());
+      assertEquals(0, starts.get());
+    } finally {
+      requestScope.close();
+      handoff.close();
+      handoff.drained().join();
+    }
   }
 
   @Test
@@ -84,6 +110,122 @@ class BoundedPublicationHandoffTest {
     cleanupCompletion.complete(null);
     handoff.drained().get(5, TimeUnit.SECONDS);
     assertTrue(handoff.drained().isDone());
+  }
+
+  @Test
+  void fatalWorkerSubmissionSettlesCapacityAndDoesNotRunLateTask() throws Exception {
+    var submissionFatal = new OutOfMemoryError("synthetic worker creation failure");
+    var factoryCalls = new AtomicInteger();
+    ThreadFactory fallbackFactory =
+        Thread.ofPlatform().daemon().name("commit-publish-test-", 0).factory();
+    ThreadFactory threads = command -> {
+      return switch (factoryCalls.getAndIncrement()) {
+        case 0 -> null;
+        case 1 -> throw submissionFatal;
+        default -> fallbackFactory.newThread(command);
+      };
+    };
+    var handoff = new BoundedPublicationHandoff(1, 2, Duration.ofSeconds(30), threads);
+    var failedRequestScope = RequestScope.withoutDeadline();
+    var secondRequestScope = RequestScope.withoutDeadline();
+    var thirdRequestScope = RequestScope.withoutDeadline();
+    var fourthRequestScope = RequestScope.withoutDeadline();
+    var overflowRequestScope = RequestScope.withoutDeadline();
+    var serviceResult = new CompletableFuture<String>();
+    var validStarts = new CountDownLatch(3);
+    var serviceStarts = new AtomicInteger();
+    try {
+      OutOfMemoryError failure = assertThrows(OutOfMemoryError.class,
+          () -> handoff.transfer(invocation(), failedRequestScope, serviceScope -> {
+            serviceStarts.incrementAndGet();
+            return CompletableFuture.completedFuture("unexpected");
+          }));
+      assertSame(submissionFatal, failure);
+      assertEquals(0, serviceStarts.get());
+
+      CompletableFuture<String> second = handoff.transfer(invocation(), secondRequestScope,
+          serviceScope -> {
+            serviceStarts.incrementAndGet();
+            validStarts.countDown();
+            return serviceResult;
+          });
+      CompletableFuture<String> third = handoff.transfer(invocation(), thirdRequestScope,
+          serviceScope -> {
+            serviceStarts.incrementAndGet();
+            validStarts.countDown();
+            return serviceResult;
+          });
+      CompletableFuture<String> fourth = handoff.transfer(invocation(), fourthRequestScope,
+          serviceScope -> {
+            serviceStarts.incrementAndGet();
+            validStarts.countDown();
+            return serviceResult;
+          });
+
+      CompletableFuture<String> overflow = handoff.transfer(invocation(), overflowRequestScope,
+          serviceScope -> CompletableFuture.completedFuture("unexpected"));
+      CompletionException limit = assertThrows(CompletionException.class, overflow::join);
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT,
+          ((BackendFailure) limit.getCause()).category());
+      assertTrue(validStarts.await(5, TimeUnit.SECONDS));
+
+      handoff.close();
+      failedRequestScope.close();
+      secondRequestScope.close();
+      thirdRequestScope.close();
+      fourthRequestScope.close();
+      overflowRequestScope.close();
+      serviceResult.complete("published-observation");
+      assertEquals("published-observation", second.get(5, TimeUnit.SECONDS));
+      assertEquals("published-observation", third.get(5, TimeUnit.SECONDS));
+      assertEquals("published-observation", fourth.get(5, TimeUnit.SECONDS));
+      assertEquals(3, serviceStarts.get(), "the rejected task must not run after a worker appears");
+      handoff.drained().get(5, TimeUnit.SECONDS);
+    } finally {
+      serviceResult.complete("published-observation");
+      failedRequestScope.close();
+      secondRequestScope.close();
+      thirdRequestScope.close();
+      fourthRequestScope.close();
+      overflowRequestScope.close();
+      handoff.close();
+    }
+  }
+
+  @Test
+  void cleanupFatalIsReturnedAndDrainWaitsForPhysicalCleanup() throws Exception {
+    var handoff = handoff();
+    var requestScope = RequestScope.withoutDeadline();
+    var actualCleanup = new CompletableFuture<Void>();
+    var cleanupStarted = new CountDownLatch(1);
+    var cleanupFatal = new AssertionError("synthetic service cleanup failure");
+    var serviceScopeReference = new AtomicReference<RequestScope>();
+    try {
+      CompletableFuture<String> result = handoff.transfer(invocation(), requestScope, serviceScope -> {
+        serviceScopeReference.set(serviceScope);
+        serviceScope.registerScopedCleanup(() -> {
+          cleanupStarted.countDown();
+          throw cleanupFatal;
+        }, actualCleanup);
+        return CompletableFuture.completedFuture("published-observation");
+      });
+      assertTrue(cleanupStarted.await(5, TimeUnit.SECONDS));
+
+      CompletionException failure = assertThrows(CompletionException.class, result::join);
+      assertSame(cleanupFatal, failure.getCause());
+      assertFalse(handoff.drained().isDone(), "capacity remains owned until actual cleanup completes");
+      assertEquals(0, serviceScopeReference.get().cleanupFailureCount());
+
+      handoff.close();
+      requestScope.close();
+      actualCleanup.complete(null);
+      handoff.drained().get(5, TimeUnit.SECONDS);
+      assertEquals(1, serviceScopeReference.get().cleanupFailureCount());
+    } finally {
+      actualCleanup.complete(null);
+      requestScope.close();
+      handoff.close();
+    }
   }
 
   @Test
