@@ -124,6 +124,9 @@ public final class PreparedEvent {
   }
 
   private static void requireDecodableProjection(final StoredRecord record) {
+    if (record.key().length() == 0) {
+      throw new IllegalArgumentException("event record key must not be empty");
+    }
     if (record.metadata().state() == StorageMetadata.State.LIVE
         && (!record.hasValue()
             || record.metadata().valueLength()

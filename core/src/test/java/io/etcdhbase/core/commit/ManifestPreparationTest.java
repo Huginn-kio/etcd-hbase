@@ -34,6 +34,10 @@ class ManifestPreparationTest {
     byte[] value = {1};
     StoredRecord current = StoredRecord.live(key,
         new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length), value);
+    StoredRecord emptyKeyCurrent = StoredRecord.live(ByteKey.empty(),
+        new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length), value);
+    StoredRecord emptyValueCurrent = StoredRecord.live(key,
+        new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, 0), new byte[0]);
     StoredRecord metadataOnlyPrevious = StoredRecord.metadataOnly(key,
         new StorageMetadata(1, 1, 1, 0, StorageMetadata.State.LIVE, value.length));
     byte[] oversizedValue = new byte[PreparedCandidate.MAX_VALUE_BYTES + 1];
@@ -53,14 +57,19 @@ class ManifestPreparationTest {
     assertThrows(IllegalArgumentException.class, () -> new PreparedEvent(transactionId,
         OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, 0, PreparedEvent.Kind.PUT, current,
         Optional.of(oversizedPrevious)));
+    assertThrows(IllegalArgumentException.class, () -> new PreparedEvent(transactionId,
+        OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, 0, PreparedEvent.Kind.PUT, emptyKeyCurrent,
+        Optional.empty()));
+    assertDoesNotThrow(() -> new PreparedEvent(transactionId, OWNER_EPOCH, BASE_SEQUENCE,
+        BASE_REVISION, 0, PreparedEvent.Kind.PUT, emptyValueCurrent, Optional.empty()));
 
     MemoryRepository repository = new MemoryRepository();
     try (RequestScope scope = scope()) {
       assertThrows(IllegalArgumentException.class, () -> prepare(repository, transactionId,
-          List.of(candidate(transactionId, new byte[] {'a'}, value)), List.of(new PreparedEvent(
-              transactionId, OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, 0, PreparedEvent.Kind.PUT,
-              current, Optional.of(metadataOnlyPrevious))), new ManifestPreparation.Limits(1, 1),
-          scope));
+          List.of(candidate(transactionId, new byte[] {'a'}, value)),
+          List.of(new PreparedEvent(transactionId, OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, 0,
+              PreparedEvent.Kind.PUT, emptyKeyCurrent, Optional.empty())),
+          new ManifestPreparation.Limits(1, 1), scope));
       assertEquals(0, repository.writeCount);
     }
   }
