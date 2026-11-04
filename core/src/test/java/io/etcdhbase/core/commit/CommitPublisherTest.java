@@ -134,8 +134,20 @@ class CommitPublisherTest {
       control = new ScriptedControlStore(CommitState.initial(FINGERPRINT, 1)
           .claimOwner(OWNER, 0, 10_000), compareAndSet);
       var outcomes = new CommitOutcomeResolver(control, new EmptyDecisionRepository());
+      MaterializationStore materialization = new MaterializationStore() {
+        @Override
+        public CompletableFuture<ApplyResult> applySelected(
+            CommitDecision decision, PreparedCandidate candidate, RequestScope scope) {
+          return CompletableFuture.completedFuture(ApplyResult.APPLIED);
+        }
+
+        @Override
+        public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope scope) {
+          return CompletableFuture.completedFuture(null);
+        }
+      };
       var verifier = new CommitPlanVerifier(new ManifestCatalog(new EmptyManifestRepository(
-          storedRootPresent ? Optional.of(manifest) : Optional.empty())));
+          storedRootPresent ? Optional.of(manifest) : Optional.empty())), materialization);
       publisher = new CommitPublisher(control, outcomes, verifier, handoff);
     }
 
