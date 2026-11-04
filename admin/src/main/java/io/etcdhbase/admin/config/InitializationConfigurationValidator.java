@@ -35,7 +35,10 @@ public final class InitializationConfigurationValidator {
           RecordCategory.EVENT,
           RecordCategory.LEASE,
           RecordCategory.AUTH,
-          RecordCategory.CONTROL);
+          RecordCategory.CONTROL,
+          RecordCategory.INVOCATION,
+          RecordCategory.CANDIDATE,
+          RecordCategory.MANIFEST);
 
   private InitializationConfigurationValidator() {}
 

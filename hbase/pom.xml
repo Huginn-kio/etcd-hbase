@@ -141,6 +141,7 @@
                 <include>**/M1*IT.java</include>
                 <include>**/J20CommitControlStoreIT.java</include>
                 <include>**/J21OwnerInvocationStoreIT.java</include>
+                <include>**/J22ManifestRepositoryIT.java</include>
               </includes>
               <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
             </configuration>

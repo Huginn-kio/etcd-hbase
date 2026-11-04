@@ -4,7 +4,6 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.spi.salt.SaltProfile;
 import io.etcdhbase.spi.salt.SaltStrategy;
-import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Objects;
@@ -56,18 +55,19 @@ public final class RowKeyCodec {
     if (row.length > HConstants.MAX_ROW_LENGTH || row.length < prefixLength + 2) {
       throw new IllegalArgumentException("invalid physical row length");
     }
-    DecodedKey decoded = decodeKey(row, prefixLength);
+    OrderedKeyBytes.Decoded decoded = OrderedKeyBytes.decode(row, prefixLength);
+    ByteKey key = ByteKey.copyOf(decoded.key());
     int remaining = row.length - decoded.nextOffset();
     int expected = shape == Shape.HISTORY ? Long.BYTES : 0;
     if (remaining != expected) throw new IllegalArgumentException("invalid row suffix length");
-    byte[] prefix = checkedSalt(decoded.key());
+    byte[] prefix = checkedSalt(key);
     if (!Arrays.equals(prefix, Arrays.copyOf(row, prefixLength))) {
       throw new IllegalArgumentException("row does not belong to its logical key bucket");
     }
-    if (shape == Shape.CURRENT) return new DecodedRow(decoded.key(), OptionalLong.empty());
+    if (shape == Shape.CURRENT) return new DecodedRow(key, OptionalLong.empty());
     long revision = ByteBuffer.wrap(row, decoded.nextOffset(), Long.BYTES).getLong();
     RevisionTimestamp.requireRevision(revision);
-    return new DecodedRow(decoded.key(), OptionalLong.of(revision));
+    return new DecodedRow(key, OptionalLong.of(revision));
   }
 
   public KeyRange physicalRange(int bucketNumber, KeyRange logical) {
@@ -111,42 +111,16 @@ public final class RowKeyCodec {
   }
 
   private byte[] encodeKey(ByteKey key) {
-    long length = (long) key.length() + 2;
+    long minimumLength = (long) key.length() + 2;
     int overhead = salt.profile().saltWidthBytes() + (shape == Shape.HISTORY ? Long.BYTES : 0);
-    if (length + overhead > HConstants.MAX_ROW_LENGTH) {
+    if (minimumLength + overhead > HConstants.MAX_ROW_LENGTH) {
       throw new IllegalArgumentException("encoded key exceeds the storage row limit");
     }
     byte[] original = key.bytes();
-    for (byte part : original) if (part == 0) length++;
+    long length = OrderedKeyBytes.encodedLength(original);
     if (length + overhead > HConstants.MAX_ROW_LENGTH) {
       throw new IllegalArgumentException("encoded key exceeds the storage row limit");
     }
-    byte[] encoded = new byte[(int) length];
-    int offset = 0;
-    for (byte part : original) {
-      encoded[offset++] = part;
-      if (part == 0) encoded[offset++] = (byte) 0xff;
-    }
-    return encoded;
+    return OrderedKeyBytes.encode(original);
   }
-
-  private static DecodedKey decodeKey(byte[] row, int start) {
-    var decoded = new ByteArrayOutputStream(row.length - start);
-    int offset = start;
-    while (offset < row.length) {
-      byte part = row[offset++];
-      if (part != 0) {
-        decoded.write(part);
-        continue;
-      }
-      if (offset == row.length) break;
-      int escaped = Byte.toUnsignedInt(row[offset++]);
-      if (escaped == 0) return new DecodedKey(ByteKey.copyOf(decoded.toByteArray()), offset);
-      if (escaped != 0xff) throw new IllegalArgumentException("invalid ordered key escape");
-      decoded.write(0);
-    }
-    throw new IllegalArgumentException("missing ordered key terminator");
-  }
-
-  private record DecodedKey(ByteKey key, int nextOffset) {}
 }

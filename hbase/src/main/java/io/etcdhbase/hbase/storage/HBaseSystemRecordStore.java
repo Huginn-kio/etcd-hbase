@@ -26,7 +26,7 @@ import org.apache.hadoop.hbase.client.Result;
 
 /** Strong-read, exact-CAS adapter for immutable system records; borrowed connections stay shared. */
 public final class HBaseSystemRecordStore implements SystemRecordStore {
-  public static final int MAX_RECORD_BYTES = 5 * 1024 * 1024;
+  public static final int MAX_RECORD_BYTES = 9 * 1024 * 1024;
   private static final byte[] VALUE = {'r'};
 
   private final AsyncConnection connection;
@@ -35,6 +35,11 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
   private HBaseSystemRecordStore(AsyncConnection connection, SystemTableBinding binding) {
     this.connection = connection;
     this.binding = binding;
+  }
+
+  @Override
+  public int bucket(SystemRecordType type, ByteKey identity) {
+    return binding.keyCodec().bucket(type, identity);
   }
 
   public static CompletableFuture<HBaseSystemRecordStore> open(

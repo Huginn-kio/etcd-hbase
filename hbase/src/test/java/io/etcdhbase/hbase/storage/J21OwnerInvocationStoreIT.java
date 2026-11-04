@@ -50,7 +50,7 @@ class J21OwnerInvocationStoreIT {
             Integer.toString(salt.profile().bucketCount()))
         .setValue("etcdhbase.m0.salt-width-bytes",
             Integer.toString(salt.profile().saltWidthBytes()))
-        .setValue("etcdhbase.m0.record-categories", "CONTROL,INVOCATION")
+        .setValue("etcdhbase.m0.record-categories", "CONTROL,INVOCATION,CANDIDATE,MANIFEST")
         .build();
 
     try (var environment = M1TestEnvironment.start(1);

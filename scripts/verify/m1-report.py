@@ -16,7 +16,8 @@ REQUIRED = {12: {"io.etcdhbase.core.scan.BucketCursorTest",
             15: {"io.etcdhbase.core.scan.ExistsExecutorTest", "io.etcdhbase.core.scan.PinnedValueReadTest"},
             16: {"io.etcdhbase.core.scan.DirectRecordReaderTest"},
             17: {"io.etcdhbase.core.scan.StorageCostTest", "io.etcdhbase.hbase.storage.FrozenScanDatasetTest",
-                 "io.etcdhbase.hbase.storage.M1ScanBenchmarkIT"}}
+                 "io.etcdhbase.hbase.storage.M1ScanBenchmarkIT",
+                 "io.etcdhbase.hbase.storage.J22ManifestRepositoryIT"}}
 CASES = {12: "cursorResumesFromConsumedKeysForBothLayoutsAndKeepsSharedResourcesOpen",
          13: "onePhysicalScannerCanSupplyEveryBucketHeadWithoutClosingTheRequest",
          14: "globallySortedLimitMoreAndLightCountMatchBothFrozenHistoryLayouts",
@@ -38,6 +39,7 @@ def collect(root, output, phase):
     if not required_cases <= {case.get("name") for case in actual.iter("testcase")}:
         raise ValueError("required real M1 cases did not execute")
     if through >= 17:
+        require_j22_manifest_case(root)
         benchmark = ET.parse(root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.M1ScanBenchmarkIT.xml").getroot()
         stdout = "\n".join(element.text or "" for element in benchmark.iter("system-out"))
         source["benchmark"] = collect_benchmark(stdout)
@@ -59,6 +61,14 @@ def collect(root, output, phase):
     if through >= 17:
         for row in source["benchmark"]["cases"]:
             print(json.dumps({"benchmark": row}))
+
+
+def require_j22_manifest_case(root):
+    report = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.J22ManifestRepositoryIT.xml"
+    suite = ET.parse(report).getroot()
+    observed = {case.get("name") for case in suite.iter("testcase")}
+    if "persistsPagesEventsAndSealedRootOnDisposableHBase" not in observed:
+        raise ValueError("required real J22 manifest repository case did not execute")
 
 
 if __name__ == "__main__":

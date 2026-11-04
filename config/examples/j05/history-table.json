@@ -78,7 +78,10 @@
           "EVENT",
           "LEASE",
           "AUTH",
-          "CONTROL"
+          "CONTROL",
+          "INVOCATION",
+          "CANDIDATE",
+          "MANIFEST"
         ],
         "identity_permissions": [
           {

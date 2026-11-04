@@ -545,7 +545,10 @@
         "EVENT",
         "LEASE",
         "AUTH",
-        "CONTROL"
+        "CONTROL",
+        "INVOCATION",
+        "CANDIDATE",
+        "MANIFEST"
       ]
     },
     "TablePermission": {

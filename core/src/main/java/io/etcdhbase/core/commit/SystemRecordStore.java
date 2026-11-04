@@ -12,6 +12,9 @@ public interface SystemRecordStore {
   CompletableFuture<Optional<ByteKey>> read(
       SystemRecordType type, ByteKey identity, RequestScope scope);
 
+  /** Validates the physical row identity and returns its configured salt bucket without I/O. */
+  int bucket(SystemRecordType type, ByteKey identity);
+
   /** Returns CONFLICT for a durable value under the same identity with different bytes. */
   CompletableFuture<CreateResult> createIfAbsent(
       SystemRecordType type, ByteKey identity, ByteKey value, RequestScope scope);
