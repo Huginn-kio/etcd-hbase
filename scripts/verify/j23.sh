@@ -6,6 +6,8 @@ cd "$ROOT"
 REPORT="$ROOT/.artifacts/j23/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "$REPORT"
 
+python3 scripts/verify/test_evidence.py
+
 scripts/dev/mvn21.sh -B -ntp -pl core,server,hbase -am clean verify -Pj23-review-local \
   > "$REPORT/maven.log" 2>&1 || {
   tail -n 80 "$REPORT/maven.log" >&2
@@ -16,34 +18,21 @@ python3 - "$REPORT" <<'PY'
 import json
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
+sys.path.insert(0, str(Path("scripts/verify").resolve()))
+from evidence import java_reports
 
 root = Path.cwd()
 report_dir = Path(sys.argv[1])
-expected = {
-    "core/target/surefire-reports/TEST-io.etcdhbase.core.commit.CommitPublisherTest.xml",
-    "core/target/surefire-reports/TEST-io.etcdhbase.core.commit.CommitOutcomeResolverTest.xml",
-    "server/target/surefire-reports/TEST-io.etcdhbase.server.commit.BoundedPublicationHandoffTest.xml",
-    "hbase/target/surefire-reports/TEST-io.etcdhbase.hbase.codec.CommitDecisionMessagesTest.xml",
-    "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.J23CommitDecisionRepositoryIT.xml",
+required = {
+    "io.etcdhbase.core.commit.CommitPublisherTest",
+    "io.etcdhbase.core.commit.CommitOutcomeResolverTest",
+    "io.etcdhbase.server.commit.BoundedPublicationHandoffTest",
+    "io.etcdhbase.hbase.codec.CommitDecisionMessagesTest",
+    "io.etcdhbase.hbase.storage.J23CommitDecisionRepositoryIT",
 }
-results = []
-for relative in sorted(expected):
-    path = root / relative
-    if not path.is_file():
-        raise SystemExit(f"required J23 test report is missing: {relative}")
-    suite = ET.parse(path).getroot()
-    item = {
-        "report": relative,
-        "tests": int(suite.attrib.get("tests", "0")),
-        "failures": int(suite.attrib.get("failures", "0")),
-        "errors": int(suite.attrib.get("errors", "0")),
-        "skipped": int(suite.attrib.get("skipped", "0")),
-    }
-    if item["tests"] == 0 or item["failures"] or item["errors"]:
-        raise SystemExit(f"J23 test report is not green: {item}")
-    results.append(item)
+_, suites = java_reports(root, required, ("core", "server", "hbase"))
+results = [{"suite": name, **suites[name]} for name in sorted(required)]
 
 summary = {
     "checkout_sha": subprocess.run(["git", "rev-parse", "HEAD"], check=True,

@@ -30,6 +30,31 @@ class EvidenceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             java_reports(self.root, {"scope"})
 
+    def test_java_rejects_skipped_counters_and_inconsistent_case_counts(self):
+        path = self.root / "core/target/surefire-reports/TEST-scope.xml"
+        path.parent.mkdir(parents=True)
+
+        def write(tests="1", failures="0", errors="0", skipped="0", case_count=1):
+            suite = ET.Element("testsuite", name="scope", tests=tests, failures=failures,
+                               errors=errors, skipped=skipped)
+            for index in range(case_count):
+                ET.SubElement(suite, "testcase", name=f"case-{index}")
+            ET.ElementTree(suite).write(path)
+
+        invalid_reports = (
+            {"tests": "0", "case_count": 0},
+            {"skipped": "1"},
+            {"failures": "1"},
+            {"errors": "1"},
+            {"tests": "2"},
+            {"case_count": 2},
+        )
+        for changes in invalid_reports:
+            with self.subTest(changes=changes):
+                write(**changes)
+                with self.assertRaises(ValueError):
+                    java_reports(self.root, {"scope"})
+
     def test_go_requires_every_package_and_executed_tests(self):
         path = self.root / "go.jsonl"
         events = []
