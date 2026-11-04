@@ -682,7 +682,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J21/J22。
   - 完成标准：发布成功/失败/未知结果可从持久化状态判定。
   - 验证层次：L1 存储/内核。
-  - 跟踪：状态=代码已提交，验收待补；负责人=Codex；完成日期=2026-11-03；PR/commit=PR #27 / 单任务提交；验证报告=Java 21 全模块 compile 通过，未运行测试；控制槽与归档决定判定分支已作者自审；真实双副本 CAS 超时/断连恢复验证待执行；评审人/结论=`reidchan` / 待评审。
+  - 跟踪：状态=J23 定向验证通过，公开 CI 与维护者复查待继续；负责人=Codex；完成日期=2026-11-04；PR/commit=PR #27 / `5e30382`；验证报告=本地 Java 21 `scripts/verify/j23.sh` 定向 `clean verify` 17 项通过，失败/错误/跳过均为 0（`CommitPublisherTest` 7、`CommitOutcomeResolverTest` 3、`BoundedPublicationHandoffTest` 4、`CommitDecisionMessagesTest` 2、一次性 MiniCluster `J23CommitDecisionRepositoryIT` 1）；摘要=`.artifacts/j23/20261104T081416Z-61922/summary.json`，SHA256=`bde27b9057db52cbcb86118fd72d9d1c67b56979c5bd1ce75cf31318b0ce1696`，该报告在提交前工作树运行，测试内容现对应提交 `5e30382`；GitHub 新 head CI 待观察；评审人/结论=`Reidddddd` / 第一阶段未通过、第二阶段尚未开始；真实双副本 CAS 超时/断连恢复和目标 HBase 验收待执行。
 
 - [ ] **J24｜已提交版本存储与提交收尾**
   - 依赖：J23。
