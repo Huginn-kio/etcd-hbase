@@ -123,17 +123,19 @@ class BoundedPublicationHandoffTest {
       assertSame(fixture.submissionFatal, failure);
       assertEquals(0, fixture.serviceStarts.get());
 
+      CompletableFuture<String> first = fixture.submitHeldServiceWork(fixture.firstRequestScope);
       CompletableFuture<String> second = fixture.submitHeldServiceWork(fixture.secondRequestScope);
+      assertTrue(fixture.firstTwoStarts.await(5, TimeUnit.SECONDS),
+          "the rejected queued task is skipped before the second service callback starts");
       CompletableFuture<String> third = fixture.submitHeldServiceWork(fixture.thirdRequestScope);
-      CompletableFuture<String> fourth = fixture.submitHeldServiceWork(fixture.fourthRequestScope);
-      assertResourceLimit(fixture.submitOverflow());
       assertTrue(fixture.validStarts.await(5, TimeUnit.SECONDS));
+      assertResourceLimit(fixture.submitOverflow());
 
       fixture.handoff.close();
       fixture.completeServiceWork();
+      assertEquals(PUBLISHED_OBSERVATION, first.get(5, TimeUnit.SECONDS));
       assertEquals(PUBLISHED_OBSERVATION, second.get(5, TimeUnit.SECONDS));
       assertEquals(PUBLISHED_OBSERVATION, third.get(5, TimeUnit.SECONDS));
-      assertEquals(PUBLISHED_OBSERVATION, fourth.get(5, TimeUnit.SECONDS));
       assertEquals(3, fixture.serviceStarts.get(),
           "the rejected task must not run after a worker appears");
       fixture.handoff.drained().get(5, TimeUnit.SECONDS);
@@ -237,11 +239,12 @@ class BoundedPublicationHandoffTest {
         new OutOfMemoryError("synthetic worker creation failure");
     private final BoundedPublicationHandoff handoff;
     private final RequestScope failedRequestScope = RequestScope.withoutDeadline();
+    private final RequestScope firstRequestScope = RequestScope.withoutDeadline();
     private final RequestScope secondRequestScope = RequestScope.withoutDeadline();
     private final RequestScope thirdRequestScope = RequestScope.withoutDeadline();
-    private final RequestScope fourthRequestScope = RequestScope.withoutDeadline();
     private final RequestScope overflowRequestScope = RequestScope.withoutDeadline();
     private final CompletableFuture<String> serviceResult = new CompletableFuture<>();
+    private final CountDownLatch firstTwoStarts = new CountDownLatch(2);
     private final CountDownLatch validStarts = new CountDownLatch(3);
     private final AtomicInteger serviceStarts = new AtomicInteger();
 
@@ -260,6 +263,7 @@ class BoundedPublicationHandoffTest {
     private CompletableFuture<String> submitHeldServiceWork(RequestScope requestScope) {
       return handoff.transfer(invocation(), requestScope, serviceScope -> {
         serviceStarts.incrementAndGet();
+        firstTwoStarts.countDown();
         validStarts.countDown();
         return serviceResult;
       });
@@ -278,8 +282,8 @@ class BoundedPublicationHandoffTest {
     public void close() {
       handoff.close();
       completeServiceWork();
-      List.of(failedRequestScope, secondRequestScope, thirdRequestScope,
-          fourthRequestScope, overflowRequestScope).forEach(RequestScope::close);
+      List.of(failedRequestScope, firstRequestScope, secondRequestScope,
+          thirdRequestScope, overflowRequestScope).forEach(RequestScope::close);
     }
   }
 
