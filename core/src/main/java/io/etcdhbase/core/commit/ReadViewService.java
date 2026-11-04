@@ -82,10 +82,12 @@ public final class ReadViewService {
       try {
         pinned = new PinnedReadView(capture.view().withPinGeneration(generation), pin);
       } catch (RuntimeException | Error failure) {
+        // A failed construction must release its registered pin before preserving a fatal cause.
         try {
           pin.close();
         } catch (RuntimeException | Error cleanup) {
-          failure.addSuppressed(cleanup);
+          // Keep the construction failure primary if releasing the pin also fails.
+          if (failure != cleanup) failure.addSuppressed(cleanup);
         }
         throw failure;
       }

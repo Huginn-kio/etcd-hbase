@@ -4,6 +4,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.storage.StorageMetadata;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -112,6 +113,22 @@ public final class ManifestCatalog {
         .thenApply(ignored -> cursor.slice());
   }
 
+  private boolean candidateMatchesReference(ManifestRoot root,
+      ManifestCandidateReference reference, PreparedCandidate candidate) {
+    return candidate.transactionId().equals(root.transactionId())
+        && candidate.ownerEpoch() == root.ownerEpoch()
+        && candidate.baseSequence() == root.baseSequence()
+        && candidate.baseRevision() == root.baseRevision()
+        && candidate.systemIdentity().equals(reference.candidateIdentity())
+        && repository.candidateBucket(candidate) == reference.bucket()
+        && candidate.record().key().equals(reference.logicalKey())
+        && candidate.contentDigest().equals(reference.candidateDigest())
+        && candidate.valueDigest().equals(reference.valueDigest())
+        && candidate.record().metadata().valueLength() == reference.valueLength()
+        && (candidate.record().metadata().state() == StorageMetadata.State.TOMBSTONE)
+            == reference.tombstone();
+  }
+
   private final class CandidateRangeCursor {
     private final ManifestRoot root;
     private final int bucket;
@@ -203,18 +220,7 @@ public final class ManifestCatalog {
       }
       return repository.readCandidate(reference.candidateIdentity(), scope).thenCompose(stored -> {
         PreparedCandidate candidate = stored.orElseThrow(() -> missing("private candidate"));
-        if (!candidate.transactionId().equals(root.transactionId())
-            || candidate.ownerEpoch() != root.ownerEpoch()
-            || candidate.baseSequence() != root.baseSequence()
-            || candidate.baseRevision() != root.baseRevision()
-            || !candidate.systemIdentity().equals(reference.candidateIdentity())
-            || repository.candidateBucket(candidate) != bucket
-            || !candidate.record().key().equals(key)
-            || !candidate.contentDigest().equals(reference.candidateDigest())
-            || !candidate.valueDigest().equals(reference.valueDigest())
-            || candidate.record().metadata().valueLength() != reference.valueLength()
-            || (candidate.record().metadata().state()
-                == io.etcdhbase.core.storage.StorageMetadata.State.TOMBSTONE) != reference.tombstone()) {
+        if (!candidateMatchesReference(root, reference, candidate)) {
           return invalid("private candidate differs from its authenticated range reference");
         }
         long retained = candidate.record().retainedBytes();
@@ -240,7 +246,6 @@ public final class ManifestCatalog {
     private boolean mayIntersect(ManifestChildReference reference) {
       if (bucket < reference.firstBucket() || bucket > reference.lastBucket()) return false;
       if (reference.firstBucket() != reference.lastBucket()) return true;
-      if (reference.firstBucket() != bucket) return false;
       if (after.filter(previous -> reference.lastKey().compareTo(previous) <= 0).isPresent()) {
         return false;
       }
@@ -323,18 +328,7 @@ public final class ManifestCatalog {
       }
       return repository.readCandidate(reference.candidateIdentity(), scope).thenCompose(value -> {
         PreparedCandidate candidate = value.orElseThrow(() -> missing("private candidate"));
-        if (!candidate.transactionId().equals(root.transactionId())
-            || candidate.ownerEpoch() != root.ownerEpoch()
-            || candidate.baseSequence() != root.baseSequence()
-            || candidate.baseRevision() != root.baseRevision()
-            || !candidate.systemIdentity().equals(reference.candidateIdentity())
-            || repository.candidateBucket(candidate) != reference.bucket()
-            || !candidate.record().key().equals(reference.logicalKey())
-            || !candidate.contentDigest().equals(reference.candidateDigest())
-            || !candidate.valueDigest().equals(reference.valueDigest())
-            || candidate.record().metadata().valueLength() != reference.valueLength()
-            || (candidate.record().metadata().state()
-                == io.etcdhbase.core.storage.StorageMetadata.State.TOMBSTONE) != reference.tombstone()) {
+        if (!candidateMatchesReference(root, reference, candidate)) {
           return invalid("private candidate differs from its sealed manifest leaf");
         }
         try {

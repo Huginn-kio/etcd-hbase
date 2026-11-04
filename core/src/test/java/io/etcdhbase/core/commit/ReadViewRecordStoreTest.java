@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.ExistsExecutor;
@@ -35,6 +36,18 @@ import org.junit.jupiter.api.Test;
 class ReadViewRecordStoreTest {
   @Test
   void currentReadOverlaysOnlyTheSelectedPendingTransactionBeforeRangeMerge() throws Exception {
+    Fixture fixture = currentReadFixture();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      PinnedReadView pinned = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
+      ReadViewRecordStore view = fixture.readStore(pinned, scope);
+      assertSelectedPointReads(view);
+      assertCurrentScanPage(view, pinned);
+      assertRangeMergeAndExists(view, scope);
+    }
+    assertEquals(1, fixture.pinCloses.get());
+  }
+
+  private static Fixture currentReadFixture() {
     Fixture fixture = new Fixture(1, List.of(
         candidate("beta", 1, 2, 2, StorageMetadata.State.TOMBSTONE, new byte[0]),
         candidate("doomed", 1, 2, 2, StorageMetadata.State.TOMBSTONE, new byte[0]),
@@ -46,55 +59,57 @@ class ReadViewRecordStoreTest {
         StorageMetadata.State.LIVE, bytes("private-only")));
     fixture.unselectedCandidate(candidate("gamma", 2, 2, 1,
         StorageMetadata.State.LIVE, bytes("failed-attempt-value")));
+    return fixture;
+  }
 
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
-      PinnedReadView pinned = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
-      ReadViewRecordStore view = fixture.readStore(pinned, scope);
+  private static void assertSelectedPointReads(ReadViewRecordStore view) {
+    StoredRecord selected = view.get(key("gamma"), 2, ReadProjection.FULL).join().orElseThrow();
+    assertEquals(2, selected.metadata().modificationRevision());
+    assertEquals(1, selected.metadata().version());
+    assertEquals(2, selected.metadata().createRevision());
+    assertEquals("new-gamma", new String(selected.value().orElseThrow()));
+    assertTrue(view.get(key("leak"), 2, ReadProjection.FULL).join().isEmpty());
+  }
 
-      StoredRecord selected = view.get(key("gamma"), 2, ReadProjection.FULL).join().orElseThrow();
-      assertEquals(2, selected.metadata().modificationRevision());
-      assertEquals(1, selected.metadata().version());
-      assertEquals(2, selected.metadata().createRevision());
-      assertEquals("new-gamma", new String(selected.value().orElseThrow()));
-      assertTrue(view.get(key("leak"), 2, ReadProjection.FULL).join().isEmpty());
+  private static void assertCurrentScanPage(ReadViewRecordStore view, PinnedReadView pinned) {
+    StoragePage page = view.startScan(new ScanRequest(0, KeyRange.all(), Optional.empty(),
+        2, ReadProjection.FULL, 16, 8192, 64)).completion().toCompletableFuture().join();
+    assertEquals(List.of("alpha", "beta", "doomed", "gamma"),
+        page.records().stream().map(record -> text(record.key())).toList());
+    assertEquals(StorageMetadata.State.TOMBSTONE, page.records().get(1).metadata().state());
+    assertEquals(StorageMetadata.State.TOMBSTONE, page.records().get(2).metadata().state());
+    assertEquals("new-gamma", new String(page.records().getLast().value().orElseThrow()));
+    assertTrue(page.exhausted());
+    assertEquals(1, page.cost().observations().get(StoragePage.Observation.MANIFEST_LEAF_PAGES));
+    assertEquals(3, page.cost().observations().get(StoragePage.Observation.MANIFEST_CANDIDATE_RECORDS));
+    assertEquals(2, pinned.view().targetRevision());
+    assertEquals(1, pinned.view().stableRevision());
+  }
 
-      StoragePage page = view.startScan(new ScanRequest(0, KeyRange.all(), Optional.empty(),
-          2, ReadProjection.FULL, 16, 8192, 64)).completion().toCompletableFuture().join();
-      assertEquals(List.of("alpha", "beta", "doomed", "gamma"),
-          page.records().stream().map(record -> text(record.key())).toList());
-      assertEquals(StorageMetadata.State.TOMBSTONE, page.records().get(1).metadata().state());
-      assertEquals(StorageMetadata.State.TOMBSTONE, page.records().get(2).metadata().state());
-      assertEquals("new-gamma", new String(page.records().getLast().value().orElseThrow()));
-      assertTrue(page.exhausted());
-      assertEquals(1, page.cost().observations().get(StoragePage.Observation.MANIFEST_LEAF_PAGES));
-      assertEquals(3, page.cost().observations().get(StoragePage.Observation.MANIFEST_CANDIDATE_RECORDS));
-      assertEquals(2, pinned.view().targetRevision());
-      assertEquals(1, pinned.view().stableRevision());
-
-      var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-      var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
-      var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192);
-      var request = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
-          ReadProjection.FULL, 1, 1024, 64);
-      try (var account = budgets.admit("public", scope, reservation);
-          var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
-          var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account), request,
-              1, account, scope);
-          var response = cursor.read(0).join()) {
-        assertEquals(List.of("alpha", "gamma"), response.records().stream()
-            .map(record -> text(record.key())).toList());
-        assertEquals("new-gamma", new String(response.records().getLast().value().orElseThrow()));
-        assertEquals(2, response.pointReads(), "selected heads fetch values through the same pinned view");
-        assertEquals(1, ExistsExecutor.point(view, key("gamma"), 2, account).join());
-        assertEquals(0, ExistsExecutor.point(view, key("doomed"), 2, account).join());
-        try (var exists = new ExistsExecutor(scheduler.bind(view, account),
-            new ScanRequest(0, KeyRange.point(key("gamma")), Optional.empty(), 2,
-                ReadProjection.METADATA, 1, 1024, 64), 1, scope)) {
-          assertEquals(1, exists.execute().join().count());
-        }
+  private static void assertRangeMergeAndExists(ReadViewRecordStore view, RequestScope scope)
+      throws BackendFailure {
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192);
+    var request = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
+        ReadProjection.FULL, 1, 1024, 64);
+    try (var account = budgets.admit("public", scope, reservation);
+        var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
+        var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account), request,
+            1, account, scope);
+        var response = cursor.read(0).join()) {
+      assertEquals(List.of("alpha", "gamma"), response.records().stream()
+          .map(record -> text(record.key())).toList());
+      assertEquals("new-gamma", new String(response.records().getLast().value().orElseThrow()));
+      assertEquals(2, response.pointReads(), "selected heads fetch values through the same pinned view");
+      assertEquals(1, ExistsExecutor.point(view, key("gamma"), 2, account).join());
+      assertEquals(0, ExistsExecutor.point(view, key("doomed"), 2, account).join());
+      try (var exists = new ExistsExecutor(scheduler.bind(view, account),
+          new ScanRequest(0, KeyRange.point(key("gamma")), Optional.empty(), 2,
+              ReadProjection.METADATA, 1, 1024, 64), 1, scope)) {
+        assertEquals(1, exists.execute().join().count());
       }
     }
-    assertEquals(1, fixture.pinCloses.get());
   }
 
   @Test
@@ -188,7 +203,6 @@ class ReadViewRecordStoreTest {
 
   private static final class Fixture {
     private final ByteKey profile = digest(3);
-    private final ByteKey authorization = digest(9);
     private final TransactionId transactionId = TransactionId.create();
     private final InvocationId invocationId = InvocationId.create();
     private final List<PreparedCandidate> selectedCandidates;

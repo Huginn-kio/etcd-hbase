@@ -3,6 +3,7 @@ package io.etcdhbase.core.commit;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.BatchWriteResult;
 import io.etcdhbase.core.storage.ReadProjection;
@@ -73,7 +74,8 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
         read = getAtView(key, revisionUpperBound, projection);
       }
     } catch (RuntimeException | Error failure) {
-      completeOperation();
+      // beginOperation already incremented the lease; settle it before rethrowing any fatal Error.
+      completeAfterSynchronousFailure(failure);
       if (failure instanceof Error fatal) throw fatal;
       return failed(failure);
     }
@@ -129,7 +131,8 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
       try {
         return track(physical.startScan(baseRequest));
       } catch (RuntimeException | Error failure) {
-        completeOperation();
+        // startScan has already incremented inFlight; balance it before preserving a fatal Error.
+        completeAfterSynchronousFailure(failure);
         if (failure instanceof Error fatal) throw fatal;
         return failedOperation(failure);
       }
@@ -149,10 +152,12 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
         try {
           base.close();
         } catch (RuntimeException | Error cleanup) {
-          failure.addSuppressed(cleanup);
+          // Keep the setup failure primary and attach close failure so an original Error stays fatal.
+          if (failure != cleanup) failure.addSuppressed(cleanup);
         }
       }
-      completeOperation();
+      // Finish local ownership even when setup failed after opening the physical scanner.
+      completeAfterSynchronousFailure(failure);
       if (failure instanceof Error fatal) throw fatal;
       return failedOperation(failure);
     }
@@ -173,6 +178,7 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
     }
     Error fatal = null;
     RuntimeException closeError = null;
+    // Continue closing every scan after an Error, then release the lease before rethrowing a fatal cause.
     for (ScanOperation scan : scans) {
       try {
         scan.close();
@@ -281,6 +287,23 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
     if (release != null) releaseReader(release);
   }
 
+  private void completeAfterSynchronousFailure(Throwable failure) {
+    try {
+      completeOperation();
+    } catch (RuntimeException | Error cleanup) {
+      // Preserve the initiating failure; a fatal cleanup Error takes precedence over a runtime failure.
+      if (cleanup == failure) return;
+      if (failure instanceof Error) {
+        failure.addSuppressed(cleanup);
+      } else if (cleanup instanceof Error fatal) {
+        fatal.addSuppressed(failure);
+        throw fatal;
+      } else {
+        failure.addSuppressed(cleanup);
+      }
+    }
+  }
+
   private void recordCloseFailure(Throwable failure) {
     synchronized (this) {
       if (closeFailure == null) closeFailure = failure;
@@ -293,6 +316,7 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
     try {
       release.close();
     } catch (RuntimeException | Error closeError) {
+      // Record the fatal release failure, settle the termination signal, then rethrow it below.
       recordCloseFailure(closeError);
     }
     synchronized (this) { failure = closeFailure; }
@@ -378,7 +402,8 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
           terminal = inactiveFailure();
         }
       } catch (RuntimeException | Error problem) {
-        terminal = unwrap(problem);
+        // Settle the result and close the physical scanner before propagating any unwrapped fatal error.
+        terminal = CompletionFailures.unwrapCompletion(problem);
       } finally {
         closeBase();
       }
@@ -396,6 +421,7 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
       try {
         base.close();
       } catch (RuntimeException | Error failure) {
+        // The completion path must settle the result; retain close failure to attach before fatal propagation.
         closeFailure = failure;
       }
     }
@@ -467,12 +493,4 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
         base.scanRpcCalls(), observations);
   }
 
-  private static Throwable unwrap(Throwable failure) {
-    if (failure instanceof Error) return failure;
-    Throwable current = failure;
-    while (current instanceof java.util.concurrent.CompletionException && current.getCause() != null) {
-      current = current.getCause();
-    }
-    return current;
-  }
 }

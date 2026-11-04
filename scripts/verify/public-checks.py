@@ -9,6 +9,7 @@ from build_process import run_logged
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ("test_maven_lock.py", "test_j06_source.py", "test_j06_report.py", "test_evidence.py",
+         "test_j25_report.py",
          "test_go_module_lock.py", "test_api_matrix.py", "test_m0_spi.py", "test_delivery.py", "test_m0_delivery.py")
 
 

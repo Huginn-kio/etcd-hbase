@@ -8,38 +8,34 @@ import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from evidence import java_reports
+
+
+J25_SUITE = "io.etcdhbase.hbase.storage.M2ReadViewIT"
+J25_CASE = "readsSelectedPendingVersionsAndHistoricalRowsInBothLayouts"
+CORE_SUITE = "io.etcdhbase.core.commit.ReadViewRecordStoreTest"
+REQUIRED_CORE_CASES = {
+    "currentReadOverlaysOnlyTheSelectedPendingTransactionBeforeRangeMerge",
+    "historicalReadUsesItsOwnBarrierAndCanReadDeleteThenRecreateVersions",
+    "selectedRootIsPinnedAndRecheckedBeforeAnyDataRead",
+    "cancellingAReadKeepsItsPinUntilThePhysicalProducerStops",
+}
 
 
 def collect(root: Path, output: Path) -> None:
-    source = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.M2ReadViewIT.xml"
-    core_source = root / "core/target/surefire-reports/TEST-io.etcdhbase.core.commit.ReadViewRecordStoreTest.xml"
+    source = root / f"hbase/target/failsafe-reports/TEST-{J25_SUITE}.xml"
     if not source.is_file():
         raise ValueError("J25 MiniCluster report is missing")
-    if not core_source.is_file():
-        raise ValueError("J25 core read-view report is missing")
-    suite = ET.parse(source).getroot()
-    counts = {name: int(suite.get(name, "0")) for name in ("tests", "failures", "errors", "skipped")}
-    cases = {case.get("name") for case in suite.iter("testcase")}
+    _, suites = java_reports(root, {J25_SUITE}, ("hbase",), {J25_SUITE: {J25_CASE}})
+    _, core_suites = java_reports(root, {CORE_SUITE}, ("core",),
+                                  {CORE_SUITE: REQUIRED_CORE_CASES})
+    counts = suites[J25_SUITE]
+    core_counts = core_suites[CORE_SUITE]
     if counts != {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}:
         raise ValueError("J25 MiniCluster test did not pass exactly once")
-    if "readsSelectedPendingVersionsAndHistoricalRowsInBothLayouts" not in cases:
-        raise ValueError("required J25 MiniCluster case did not execute")
-    core_suite = ET.parse(core_source).getroot()
-    core_counts = {
-        name: int(core_suite.get(name, "0"))
-        for name in ("tests", "failures", "errors", "skipped")
-    }
-    core_cases = {case.get("name") for case in core_suite.iter("testcase")}
-    required_core_cases = {
-        "currentReadOverlaysOnlyTheSelectedPendingTransactionBeforeRangeMerge",
-        "historicalReadUsesItsOwnBarrierAndCanReadDeleteThenRecreateVersions",
-        "selectedRootIsPinnedAndRecheckedBeforeAnyDataRead",
-        "cancellingAReadKeepsItsPinUntilThePhysicalProducerStops",
-    }
     if core_counts != {"tests": 4, "failures": 0, "errors": 0, "skipped": 0}:
         raise ValueError("J25 core read-view tests did not pass exactly once")
-    if not required_core_cases.issubset(core_cases):
-        raise ValueError("required J25 core read-view cases did not execute")
+    suite = ET.parse(source).getroot()
     stdout = "\n".join(element.text or "" for element in suite.iter("system-out"))
     for layout in ("HISTORY", "NATIVE"):
         if f"j25-readview layout={layout} selectedPending=true historical=true" not in stdout:
@@ -47,25 +43,11 @@ def collect(root: Path, output: Path) -> None:
         if "deleteVisible=true unselectedIsolated=true" not in stdout:
             raise ValueError(f"missing J25 deletion/isolation evidence for {layout}")
     shutil.copyfile(source, output / source.name)
-    base_commit = subprocess.run(
+    source_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
     ).stdout.strip()
     patch = subprocess.run(
-        [
-            "git", "diff", "--binary", "HEAD", "--",
-            "core/src/main/java/io/etcdhbase/core/commit/ManifestCatalog.java",
-            "core/src/main/java/io/etcdhbase/core/commit/PinnedReadView.java",
-            "core/src/main/java/io/etcdhbase/core/commit/ReadView.java",
-            "core/src/main/java/io/etcdhbase/core/commit/ReadViewPinRegistry.java",
-            "core/src/main/java/io/etcdhbase/core/commit/ReadViewRecordStore.java",
-            "core/src/main/java/io/etcdhbase/core/commit/ReadViewService.java",
-            "core/src/main/java/io/etcdhbase/core/storage/StoragePage.java",
-            "core/src/test/java/io/etcdhbase/core/commit/ReadViewRecordStoreTest.java",
-            "hbase/pom.xml",
-            "hbase/src/test/java/io/etcdhbase/hbase/storage/M2ReadViewIT.java",
-            "scripts/verify/j25-report.py",
-            "scripts/verify/j25.sh",
-        ],
+        ["git", "diff", "--binary", "HEAD"],
         cwd=root,
         check=True,
         capture_output=True,
@@ -73,8 +55,9 @@ def collect(root: Path, output: Path) -> None:
     summary = {
         "phase": "J25",
         "scope": "public-local-minicluster",
-        "base_commit": base_commit,
-        "implementation_patch_sha256": hashlib.sha256(patch).hexdigest(),
+        "source_commit": source_commit,
+        "tested_patch_sha256": hashlib.sha256(patch).hexdigest(),
+        "source_report_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "ended_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         **counts,
         "core_tests": core_counts["tests"],
@@ -104,7 +87,7 @@ def collect(root: Path, output: Path) -> None:
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({
         key: summary[key]
-        for key in ("phase", "scope", "base_commit", "tests", "core_tests")
+        for key in ("phase", "scope", "source_commit", "tested_patch_sha256", "tests", "core_tests")
     }))
 
 
