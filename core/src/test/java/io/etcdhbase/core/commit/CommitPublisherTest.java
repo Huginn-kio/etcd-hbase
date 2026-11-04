@@ -148,7 +148,9 @@ class CommitPublisherTest {
       };
       var verifier = new CommitPlanVerifier(new ManifestCatalog(new EmptyManifestRepository(
           storedRootPresent ? Optional.of(manifest) : Optional.empty())), materialization);
-      publisher = new CommitPublisher(control, outcomes, verifier, handoff);
+      CommitFinalizer finalizer = (invocation, publication, scope) ->
+          CompletableFuture.completedFuture(publication);
+      publisher = new CommitPublisher(control, outcomes, verifier, handoff, finalizer);
     }
 
     private CompletableFuture<CommitOutcomeResolver.Resolution> publish() {
