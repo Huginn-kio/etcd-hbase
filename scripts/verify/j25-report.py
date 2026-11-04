@@ -22,6 +22,8 @@ REQUIRED_CORE_CASES = {
     "byteTruncatedPhysicalPageDoesNotSkipKeysDuringOverlayMerge",
     "byteTruncatedCandidatePageDoesNotSkipKeysDuringOverlayMerge",
     "cancellingReadResultDoesNotCancelPinAccounting",
+    "scopeCancellationWaitsForManifestProducerBeforeReleasingRegisteredPin",
+    "metadataHeadBudgetDoesNotRejectLargeCandidatePayload",
 }
 
 

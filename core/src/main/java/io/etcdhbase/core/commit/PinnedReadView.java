@@ -70,6 +70,10 @@ public final class PinnedReadView implements AutoCloseable {
         pin.close();
         cleanupCompletion.complete(null);
       } catch (RuntimeException | Error failure) {
+        // This detached callback must publish fatal close failures: an escaping Error fails its
+        // ignored dependent stage and leaves the scoped registration pending. ReadViewService
+        // registers this stage as the ScopedCleanup completion, so RequestScope records failure
+        // without changing a request result that may already have completed.
         cleanupCompletion.completeExceptionally(failure);
       }
     });
