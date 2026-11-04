@@ -1,12 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.Objects;
 
@@ -25,12 +20,12 @@ public final class ManifestDirectoryPage {
   private final ByteKey digest;
 
   private ManifestDirectoryPage(TransactionId transactionId, int pageIndex, int level,
-      List<ManifestChildReference> children, ByteKey digest) {
+      List<ManifestChildReference> children, ByteKey expectedDigest) {
     this.transactionId = Objects.requireNonNull(transactionId, "transactionId");
     this.children = List.copyOf(children);
-    this.digest = Objects.requireNonNull(digest, "digest");
     if (pageIndex < 0 || level < 1 || level > MAX_DEPTH || this.children.isEmpty()
-        || this.children.size() > MAX_CHILDREN || digest.length() != 32) {
+        || this.children.size() > MAX_CHILDREN
+        || expectedDigest != null && expectedDigest.length() != 32) {
       throw new IllegalArgumentException("invalid manifest directory page");
     }
     long items = 0;
@@ -56,21 +51,21 @@ public final class ManifestDirectoryPage {
     if (encodedLength(this.children) > MAX_PAGE_BYTES) {
       throw new IllegalArgumentException("manifest directory page exceeds its byte budget");
     }
-    if (!ByteKey.copyOf(calculateDigest(transactionId, pageIndex, level, this.children)).equals(digest)) {
+    this.digest = calculateDigest(transactionId, pageIndex, level, this.children);
+    if (expectedDigest != null && !this.digest.equals(expectedDigest)) {
       throw new IllegalArgumentException("manifest directory digest mismatch");
     }
   }
 
   public static ManifestDirectoryPage create(TransactionId transactionId, int pageIndex, int level,
       List<ManifestChildReference> children) {
-    List<ManifestChildReference> snapshot = List.copyOf(children);
-    return new ManifestDirectoryPage(transactionId, pageIndex, level, snapshot,
-        ByteKey.copyOf(calculateDigest(transactionId, pageIndex, level, snapshot)));
+    return new ManifestDirectoryPage(transactionId, pageIndex, level, children, null);
   }
 
   public static ManifestDirectoryPage restore(TransactionId transactionId, int pageIndex,
       int level, List<ManifestChildReference> children, ByteKey digest) {
-    return new ManifestDirectoryPage(transactionId, pageIndex, level, children, digest);
+    return new ManifestDirectoryPage(transactionId, pageIndex, level, children,
+        Objects.requireNonNull(digest, "digest"));
   }
 
   public TransactionId transactionId() { return transactionId; }
@@ -94,43 +89,31 @@ public final class ManifestDirectoryPage {
 
   public ByteKey systemIdentity() {
     return ByteKey.copyOf(ByteBuffer.allocate(16 + 1 + Integer.BYTES)
-        .put(transactionId.bytes()).put((byte) 2).putInt(pageIndex).array());
+        .put(transactionId.bytes()).put(ManifestRecordFormat.MANIFEST_DIRECTORY_PAGE)
+        .putInt(pageIndex).array());
   }
 
-  private static byte[] calculateDigest(TransactionId transactionId, int pageIndex, int level,
+  private static ByteKey calculateDigest(TransactionId transactionId, int pageIndex, int level,
       List<ManifestChildReference> children) {
-    try {
-      var bytes = new ByteArrayOutputStream();
-      try (var output = new DataOutputStream(bytes)) {
-        output.writeInt(2);
-        output.write(transactionId.bytes());
-        output.writeInt(pageIndex);
-        output.writeInt(level);
-        output.writeInt(children.size());
-        for (ManifestChildReference child : children) {
-          writeBytes(output, child.identity().bytes());
-          writeBytes(output, child.digest().bytes());
-          output.writeInt(child.firstBucket());
-          output.writeInt(child.lastBucket());
-          writeBytes(output, child.firstKey().bytes());
-          writeBytes(output, child.lastKey().bytes());
-          output.writeLong(child.itemCount());
-          output.writeLong(child.valueBytes());
-          output.writeInt(child.leafPageCount());
-          output.writeInt(child.level());
-        }
+    return ManifestDigest.sha256(output -> {
+      output.writeInt(2);
+      output.write(transactionId.bytes());
+      output.writeInt(pageIndex);
+      output.writeInt(level);
+      output.writeInt(children.size());
+      for (ManifestChildReference child : children) {
+        ManifestDigest.writeBytes(output, child.identity().bytes());
+        ManifestDigest.writeBytes(output, child.digest().bytes());
+        output.writeInt(child.firstBucket());
+        output.writeInt(child.lastBucket());
+        ManifestDigest.writeBytes(output, child.firstKey().bytes());
+        ManifestDigest.writeBytes(output, child.lastKey().bytes());
+        output.writeLong(child.itemCount());
+        output.writeLong(child.valueBytes());
+        output.writeInt(child.leafPageCount());
+        output.writeInt(child.level());
       }
-      return MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray());
-    } catch (IOException impossible) {
-      throw new IllegalStateException("in-memory directory encoding failed", impossible);
-    } catch (NoSuchAlgorithmException impossible) {
-      throw new IllegalStateException("SHA-256 is unavailable", impossible);
-    }
-  }
-
-  private static void writeBytes(DataOutputStream output, byte[] value) throws IOException {
-    output.writeInt(value.length);
-    output.write(value);
+    });
   }
 
   private static int compareRanges(ManifestChildReference left, ManifestChildReference right) {

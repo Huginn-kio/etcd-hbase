@@ -58,7 +58,7 @@ class SystemTableBindingTest {
         TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, 60, 1)));
     assertThrows(IllegalArgumentException.class, () -> BINDING.validate(descriptor(
-        TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, "CONTROL",
+        TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, HConstants.FOREVER, 2)));
   }
 

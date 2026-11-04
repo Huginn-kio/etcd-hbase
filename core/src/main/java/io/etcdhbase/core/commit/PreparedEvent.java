@@ -3,11 +3,8 @@ package io.etcdhbase.core.commit;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
-import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -57,7 +54,7 @@ public final class PreparedEvent {
     this.ordinal = ordinal;
     byte[] canonical = canonicalBytes();
     this.encodedBytes = canonical.length;
-    this.digest = ByteKey.copyOf(hash(canonical));
+    this.digest = ManifestDigest.sha256(canonical);
     if (expectedDigest != null && !this.digest.equals(expectedDigest)) {
       throw new IllegalArgumentException("event digest mismatch");
     }
@@ -86,7 +83,7 @@ public final class PreparedEvent {
   /** Stable event identity is ordinal-addressed so repeated mutations of one key stay ordered. */
   public ByteKey systemIdentity() {
     return ByteKey.copyOf(java.nio.ByteBuffer.allocate(16 + 1 + Long.BYTES)
-        .put(transactionId.bytes()).put((byte) 4).putLong(ordinal).array());
+        .put(transactionId.bytes()).put(ManifestRecordFormat.PREPARED_EVENT).putLong(ordinal).array());
   }
 
   public int retainedBytes() {
@@ -94,25 +91,20 @@ public final class PreparedEvent {
   }
 
   private byte[] canonicalBytes() {
-    try {
-      var bytes = new ByteArrayOutputStream();
-      try (var output = new DataOutputStream(bytes)) {
-        output.writeInt(1);
-        output.write(transactionId.bytes());
-        output.writeLong(ownerEpoch);
-        output.writeLong(baseSequence);
-        output.writeLong(baseRevision);
-        output.writeLong(ordinal);
-        output.writeByte(kind.ordinal());
-        writeRecord(output, current);
-        output.writeBoolean(previous.isPresent());
-        if (previous.isPresent()) writeRecord(output, previous.orElseThrow());
-      }
-      if (bytes.size() > MAX_EVENT_BYTES) throw new IllegalArgumentException("event exceeds byte limit");
-      return bytes.toByteArray();
-    } catch (IOException impossible) {
-      throw new IllegalStateException("in-memory event encoding failed", impossible);
-    }
+    byte[] bytes = ManifestDigest.encode(output -> {
+      output.writeInt(1);
+      output.write(transactionId.bytes());
+      output.writeLong(ownerEpoch);
+      output.writeLong(baseSequence);
+      output.writeLong(baseRevision);
+      output.writeLong(ordinal);
+      output.writeByte(kind.ordinal());
+      writeRecord(output, current);
+      output.writeBoolean(previous.isPresent());
+      if (previous.isPresent()) writeRecord(output, previous.orElseThrow());
+    });
+    if (bytes.length > MAX_EVENT_BYTES) throw new IllegalArgumentException("event exceeds byte limit");
+    return bytes;
   }
 
   private static void writeRecord(DataOutputStream output, StoredRecord record) throws IOException {
@@ -131,11 +123,4 @@ public final class PreparedEvent {
     output.write(value);
   }
 
-  private static byte[] hash(byte[] value) {
-    try {
-      return MessageDigest.getInstance("SHA-256").digest(value);
-    } catch (NoSuchAlgorithmException impossible) {
-      throw new IllegalStateException("SHA-256 is unavailable", impossible);
-    }
-  }
 }

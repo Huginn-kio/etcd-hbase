@@ -1,14 +1,14 @@
 package io.etcdhbase.hbase.storage;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.commit.EventDirectoryPage;
+import io.etcdhbase.core.commit.EventPage;
 import io.etcdhbase.core.commit.ManifestDirectoryPage;
 import io.etcdhbase.core.commit.ManifestPage;
 import io.etcdhbase.core.commit.ManifestRepository;
 import io.etcdhbase.core.commit.ManifestRoot;
 import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.PreparedEvent;
-import io.etcdhbase.core.commit.EventDirectoryPage;
-import io.etcdhbase.core.commit.EventPage;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.request.RequestScope;
@@ -35,7 +35,6 @@ public final class HBaseManifestRepository implements ManifestRepository {
   public CompletableFuture<SystemRecordStore.CreateResult> createCandidate(
       PreparedCandidate candidate, RequestScope scope) {
     Objects.requireNonNull(candidate, "candidate");
-    candidateBucket(candidate);
     return create(SystemRecordType.CANDIDATE, candidate.systemIdentity(),
         ManifestMessages.encode(candidate), scope);
   }
@@ -84,52 +83,54 @@ public final class HBaseManifestRepository implements ManifestRepository {
 
   @Override
   public CompletableFuture<Optional<ManifestRoot>> readRoot(ByteKey identity, RequestScope scope) {
-    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeRoot, scope);
+    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeRoot,
+        ManifestRoot::systemIdentity, scope);
   }
 
   @Override
   public CompletableFuture<Optional<PreparedCandidate>> readCandidate(ByteKey identity, RequestScope scope) {
-    return read(SystemRecordType.CANDIDATE, identity, ManifestMessages::decodeCandidate, scope);
+    return read(SystemRecordType.CANDIDATE, identity, ManifestMessages::decodeCandidate,
+        PreparedCandidate::systemIdentity, scope);
   }
 
   @Override
   public CompletableFuture<Optional<ManifestPage>> readPage(ByteKey identity, RequestScope scope) {
-    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodePage, scope);
+    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodePage,
+        ManifestPage::systemIdentity, scope);
   }
 
   @Override
   public CompletableFuture<Optional<ManifestDirectoryPage>> readDirectoryPage(
       ByteKey identity, RequestScope scope) {
-    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeDirectory, scope);
+    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeDirectory,
+        ManifestDirectoryPage::systemIdentity, scope);
   }
 
   @Override
   public CompletableFuture<Optional<PreparedEvent>> readEvent(ByteKey identity, RequestScope scope) {
-    return read(SystemRecordType.EVENT, identity, ManifestMessages::decodeEvent, scope);
+    return read(SystemRecordType.EVENT, identity, ManifestMessages::decodeEvent,
+        PreparedEvent::systemIdentity, scope);
   }
 
   @Override
   public CompletableFuture<Optional<EventPage>> readEventPage(ByteKey identity, RequestScope scope) {
-    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeEventPage, scope);
+    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeEventPage,
+        EventPage::systemIdentity, scope);
   }
 
   @Override
   public CompletableFuture<Optional<EventDirectoryPage>> readEventDirectoryPage(
       ByteKey identity, RequestScope scope) {
-    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeEventDirectory, scope);
+    return read(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeEventDirectory,
+        EventDirectoryPage::systemIdentity, scope);
   }
 
   private <T> CompletableFuture<Optional<T>> read(SystemRecordType type, ByteKey identity,
-      java.util.function.Function<byte[], T> decoder, RequestScope scope) {
+      java.util.function.Function<byte[], T> decoder,
+      java.util.function.Function<T, ByteKey> identityOf, RequestScope scope) {
     return records.read(type, identity, scope).thenApply(value -> value.map(encoded -> {
       T decoded = decoder.apply(encoded.bytes());
-      if (decoded instanceof ManifestRoot root && !root.systemIdentity().equals(identity)
-          || decoded instanceof PreparedCandidate candidate && !candidate.systemIdentity().equals(identity)
-          || decoded instanceof ManifestPage page && !page.systemIdentity().equals(identity)
-          || decoded instanceof ManifestDirectoryPage page && !page.systemIdentity().equals(identity)
-          || decoded instanceof PreparedEvent event && !event.systemIdentity().equals(identity)
-          || decoded instanceof EventPage page && !page.systemIdentity().equals(identity)
-          || decoded instanceof EventDirectoryPage page && !page.systemIdentity().equals(identity)) {
+      if (!identityOf.apply(decoded).equals(identity)) {
         throw new IllegalArgumentException("manifest record row identity differs from its payload");
       }
       return decoded;

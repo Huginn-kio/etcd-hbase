@@ -4,8 +4,6 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.Objects;
 
 /** Immutable private KV candidate; it becomes visible only through its sealed manifest. */
@@ -28,16 +26,14 @@ public final class PreparedCandidate {
     this.record = Objects.requireNonNull(record, "record");
     if (ownerEpoch <= 0 || baseSequence < 0 || baseRevision <= 0
         || record.metadata().modificationRevision() != Math.addExact(baseRevision, 1)
-        || record.metadata().createRevision() > record.metadata().modificationRevision()
         || record.metadata().valueLength() > MAX_VALUE_BYTES
-        || record.metadata().state() == StorageMetadata.State.LIVE && !record.hasValue()
-        || record.metadata().state() == StorageMetadata.State.TOMBSTONE && record.hasValue()) {
+        || record.metadata().state() == StorageMetadata.State.LIVE && !record.hasValue()) {
       throw new IllegalArgumentException("candidate does not match its commit base or value state");
     }
     this.ownerEpoch = ownerEpoch;
     this.baseSequence = baseSequence;
     this.baseRevision = baseRevision;
-    this.contentDigest = ByteKey.copyOf(digest(canonicalBytes()));
+    this.contentDigest = ManifestDigest.sha256(canonicalBytes());
   }
 
   public TransactionId transactionId() { return transactionId; }
@@ -56,7 +52,7 @@ public final class PreparedCandidate {
   }
 
   public ByteKey valueDigest() {
-    return ByteKey.copyOf(digest(record.value().orElseGet(() -> new byte[0])));
+    return ManifestDigest.sha256(record.value().orElseGet(() -> new byte[0]));
   }
 
   private byte[] canonicalBytes() {
@@ -73,11 +69,4 @@ public final class PreparedCandidate {
     return bytes.array();
   }
 
-  private static byte[] digest(byte[] value) {
-    try {
-      return MessageDigest.getInstance("SHA-256").digest(value);
-    } catch (NoSuchAlgorithmException impossible) {
-      throw new IllegalStateException("SHA-256 is unavailable", impossible);
-    }
-  }
 }

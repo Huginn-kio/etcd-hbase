@@ -12,6 +12,7 @@ REPORT="$ROOT/.artifacts/m1/$PHASE/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "$REPORT"
 python3 scripts/verify/test_evidence.py
 python3 scripts/verify/test_benchmark_evidence.py
+python3 scripts/verify/test_m1_report.py
 python3 scripts/verify/j06-source.py "$REPORT"
 python3 scripts/verify/source-frozen.py "$REPORT"
 scripts/dev/mvn21.sh -B -ntp -pl hbase -am clean verify -Pj11-hbase-local > "$REPORT/maven.log" 2>&1 || {

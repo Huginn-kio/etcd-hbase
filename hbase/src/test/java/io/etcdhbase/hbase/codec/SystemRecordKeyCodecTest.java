@@ -9,6 +9,7 @@ import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import org.apache.hadoop.hbase.HConstants;
 import org.junit.jupiter.api.Test;
 
@@ -43,6 +44,44 @@ class SystemRecordKeyCodecTest {
         CODEC.decode(maximumRow).identity().bytes());
     assertThrows(IllegalArgumentException.class, () -> CODEC.encode(SystemRecordType.CONTROL,
         ByteKey.copyOf(new byte[maximumIdentity.length + 1])));
+
+    int candidateKeyLength = HConstants.MAX_ROW_LENGTH - 2 - 1 - 16 - 2;
+    byte[] maximumCandidateKey = new byte[candidateKeyLength];
+    Arrays.fill(maximumCandidateKey, (byte) 'x');
+    ByteKey maximumCandidateIdentity = candidateIdentity(ByteKey.copyOf(maximumCandidateKey));
+    assertEquals(HConstants.MAX_ROW_LENGTH,
+        CODEC.encode(SystemRecordType.CANDIDATE, maximumCandidateIdentity).length);
+    var decodedMaximum = CODEC.decode(
+        CODEC.encode(SystemRecordType.CANDIDATE, maximumCandidateIdentity));
+    assertEquals(SystemRecordType.CANDIDATE, decodedMaximum.type());
+    assertEquals(maximumCandidateIdentity, decodedMaximum.identity());
+
+    byte[] oversizedCandidateKey = Arrays.copyOf(maximumCandidateKey, maximumCandidateKey.length + 1);
+    ByteKey oversizedCandidateIdentity = candidateIdentity(ByteKey.copyOf(oversizedCandidateKey));
+    assertThrows(IllegalArgumentException.class,
+        () -> CODEC.bucket(SystemRecordType.CANDIDATE, oversizedCandidateIdentity));
+    assertThrows(IllegalArgumentException.class,
+        () -> CODEC.encode(SystemRecordType.CANDIDATE, oversizedCandidateIdentity));
+  }
+
+  @Test
+  void candidateRowsReuseTheKvOrderedKeyBytesWithoutChangingEscapeFormat() {
+    ByteKey key = ByteKey.copyOf(new byte[] {0, 1, (byte) 0xff, 0});
+    byte[] kvRow = new RowKeyCodec(
+        new HashSaltStrategy(new SaltProfile(HashSaltStrategy.STRATEGY_ID, 1, 4, 2)),
+        RowKeyCodec.Shape.CURRENT).encode(key, 1);
+    byte[] candidateRow = CODEC.encode(SystemRecordType.CANDIDATE, candidateIdentity(key));
+    assertArrayEquals(Arrays.copyOfRange(kvRow, 2, kvRow.length),
+        Arrays.copyOfRange(candidateRow, 2 + 1 + 16, candidateRow.length));
+    assertEquals(candidateIdentity(key), CODEC.decode(candidateRow).identity());
+  }
+
+  @Test
+  void kvRowsContinueToAllowAnEmptyLogicalKey() {
+    RowKeyCodec codec = new RowKeyCodec(
+        new HashSaltStrategy(new SaltProfile(HashSaltStrategy.STRATEGY_ID, 1, 4, 2)),
+        RowKeyCodec.Shape.CURRENT);
+    assertEquals(ByteKey.empty(), codec.decode(codec.encode(ByteKey.empty(), 1)).key());
   }
 
   @Test

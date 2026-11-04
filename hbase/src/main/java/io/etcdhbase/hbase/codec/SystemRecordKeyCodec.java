@@ -3,7 +3,6 @@ package io.etcdhbase.hbase.codec;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.spi.salt.SaltStrategy;
-import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Objects;
@@ -30,15 +29,17 @@ public final class SystemRecordKeyCodec {
     Objects.requireNonNull(identity, "identity");
     byte[] identifier = identity.bytes();
     byte[] routingIdentifier = routingIdentifier(type, identifier);
-    byte[] candidateKey = type == SystemRecordType.CANDIDATE
-        ? encodeCandidateKey(routingIdentifier) : null;
+    long encodedCandidateKeyLength = type == SystemRecordType.CANDIDATE
+        ? OrderedKeyBytes.encodedLength(routingIdentifier) : 0;
     long identityBytes = type == SystemRecordType.CANDIDATE
-        ? 16L + candidateKey.length : Integer.BYTES + (long) identifier.length;
+        ? 16L + encodedCandidateKeyLength : Integer.BYTES + (long) identifier.length;
     long rowLength = (long) salt.profile().saltWidthBytes() + 1 + identityBytes;
     if (identifier.length == 0 || rowLength > HConstants.MAX_ROW_LENGTH) {
       throw new IllegalArgumentException("invalid or oversized system record identity");
     }
-    byte[] prefix = prefix(type, identifier);
+    byte[] prefix = prefix(type, identifier, routingIdentifier);
+    byte[] candidateKey = type == SystemRecordType.CANDIDATE
+        ? OrderedKeyBytes.encode(routingIdentifier) : null;
     ByteBuffer row = ByteBuffer.allocate((int) rowLength);
     row.put(prefix).put((byte) type.id());
     if (type == SystemRecordType.CANDIDATE) {
@@ -68,7 +69,11 @@ public final class SystemRecordKeyCodec {
       encoded.get(transaction);
       byte[] keyEncoding = new byte[encoded.remaining()];
       encoded.get(keyEncoding);
-      byte[] key = decodeCandidateKey(keyEncoding);
+      OrderedKeyBytes.Decoded decoded = OrderedKeyBytes.decode(keyEncoding, 0);
+      if (decoded.nextOffset() != keyEncoding.length || decoded.key().length == 0) {
+        throw new IllegalArgumentException("candidate key terminator is misplaced or key is empty");
+      }
+      byte[] key = decoded.key();
       identity = ByteBuffer.allocate(16 + Integer.BYTES + key.length)
           .put(transaction).putInt(key.length).put(key).array();
     } else {
@@ -95,19 +100,23 @@ public final class SystemRecordKeyCodec {
     Objects.requireNonNull(identity, "identity");
     byte[] bytes = identity.bytes();
     byte[] routingIdentifier = routingIdentifier(type, bytes);
-    byte[] candidateKey = type == SystemRecordType.CANDIDATE
-        ? encodeCandidateKey(routingIdentifier) : null;
+    long encodedCandidateKeyLength = type == SystemRecordType.CANDIDATE
+        ? OrderedKeyBytes.encodedLength(routingIdentifier) : 0;
     long identityBytes = type == SystemRecordType.CANDIDATE
-        ? 16L + candidateKey.length : Integer.BYTES + (long) bytes.length;
+        ? 16L + encodedCandidateKeyLength : Integer.BYTES + (long) bytes.length;
     long rowLength = (long) salt.profile().saltWidthBytes() + 1 + identityBytes;
     if (bytes.length == 0 || rowLength > HConstants.MAX_ROW_LENGTH) {
       throw new IllegalArgumentException("invalid or oversized system record identity");
     }
-    return bucketNumber(salt.salt(saltIdentifier(type, bytes, routingIdentifier)));
+    return bucketNumber(prefix(type, bytes, routingIdentifier));
   }
 
   private byte[] prefix(SystemRecordType type, byte[] identity) {
     byte[] routingIdentifier = routingIdentifier(type, identity);
+    return prefix(type, identity, routingIdentifier);
+  }
+
+  private byte[] prefix(SystemRecordType type, byte[] identity, byte[] routingIdentifier) {
     return checkedPrefix(salt.salt(saltIdentifier(type, identity, routingIdentifier)));
   }
 
@@ -160,47 +169,4 @@ public final class SystemRecordKeyCodec {
     return Arrays.copyOfRange(identity, 16 + Integer.BYTES, identity.length);
   }
 
-  private byte[] encodeCandidateKey(byte[] key) {
-    if (key.length == 0) throw new IllegalArgumentException("candidate logical key must not be empty");
-    long encodedLength = (long) key.length + 2;
-    for (byte part : key) if (part == 0) encodedLength++;
-    if (salt.profile().saltWidthBytes() + 1L + 16 + encodedLength > HConstants.MAX_ROW_LENGTH) {
-      throw new IllegalArgumentException("candidate key exceeds the system row limit");
-    }
-    byte[] encoded = new byte[Math.toIntExact(encodedLength)];
-    int offset = 0;
-    for (byte part : key) {
-      encoded[offset++] = part;
-      if (part == 0) encoded[offset++] = (byte) 0xff;
-    }
-    encoded[offset++] = 0;
-    encoded[offset] = 0;
-    return encoded;
-  }
-
-  private static byte[] decodeCandidateKey(byte[] encoded) {
-    var decoded = new ByteArrayOutputStream(encoded.length);
-    for (int offset = 0; offset < encoded.length; ) {
-      byte part = encoded[offset++];
-      if (part != 0) {
-        decoded.write(part);
-        continue;
-      }
-      if (offset == encoded.length) {
-        throw new IllegalArgumentException("candidate key is missing its ordered terminator");
-      }
-      int escaped = Byte.toUnsignedInt(encoded[offset++]);
-      if (escaped == 0) {
-        if (offset != encoded.length || decoded.size() == 0) {
-          throw new IllegalArgumentException("candidate key terminator is misplaced");
-        }
-        return decoded.toByteArray();
-      }
-      if (escaped != 0xff) {
-        throw new IllegalArgumentException("candidate key contains an invalid zero escape");
-      }
-      decoded.write(0);
-    }
-    throw new IllegalArgumentException("candidate key is missing its ordered terminator");
-  }
 }

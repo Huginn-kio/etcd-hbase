@@ -303,9 +303,6 @@ public final class ManifestPreparation {
         count = Math.addExact(count, 1);
         totalBytes = Math.addExact(totalBytes, reference.encodedBytes());
         nextOrdinal++;
-        if (count > limits.maxEvents() || totalBytes > limits.maxEventBytes()) {
-          return failed(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-        }
         return next();
       });
     }

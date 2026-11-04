@@ -1,12 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.Objects;
 
@@ -22,12 +17,13 @@ public final class EventPage {
   private final ByteKey digest;
 
   private EventPage(TransactionId transactionId, int pageIndex, List<PreparedEventReference> events,
-      ByteKey digest) {
+      ByteKey expectedDigest) {
     this.transactionId = Objects.requireNonNull(transactionId, "transactionId");
     this.events = List.copyOf(events);
-    this.digest = Objects.requireNonNull(digest, "digest");
     if (pageIndex < 0 || this.events.isEmpty() || this.events.size() > MAX_EVENTS
-        || digest.length() != 32) throw new IllegalArgumentException("invalid event page");
+        || expectedDigest != null && expectedDigest.length() != 32) {
+      throw new IllegalArgumentException("invalid event page");
+    }
     int bytes = 64;
     long payloadBytes = 0;
     for (int index = 0; index < this.events.size(); index++) {
@@ -42,21 +38,20 @@ public final class EventPage {
     encodedBytes = bytes;
     eventBytes = payloadBytes;
     this.pageIndex = pageIndex;
-    if (!ByteKey.copyOf(calculateDigest(transactionId, pageIndex, this.events)).equals(digest)) {
+    this.digest = calculateDigest(transactionId, pageIndex, this.events);
+    if (expectedDigest != null && !this.digest.equals(expectedDigest)) {
       throw new IllegalArgumentException("event page digest mismatch");
     }
   }
 
   public static EventPage create(TransactionId transactionId, int pageIndex,
       List<PreparedEventReference> events) {
-    List<PreparedEventReference> copy = List.copyOf(events);
-    return new EventPage(transactionId, pageIndex, copy,
-        ByteKey.copyOf(calculateDigest(transactionId, pageIndex, copy)));
+    return new EventPage(transactionId, pageIndex, events, null);
   }
 
   public static EventPage restore(TransactionId transactionId, int pageIndex,
       List<PreparedEventReference> events, ByteKey digest) {
-    return new EventPage(transactionId, pageIndex, events, digest);
+    return new EventPage(transactionId, pageIndex, events, Objects.requireNonNull(digest, "digest"));
   }
 
   public TransactionId transactionId() { return transactionId; }
@@ -75,31 +70,22 @@ public final class EventPage {
 
   public ByteKey systemIdentity() {
     return ByteKey.copyOf(ByteBuffer.allocate(16 + 1 + Integer.BYTES)
-        .put(transactionId.bytes()).put((byte) 5).putInt(pageIndex).array());
+        .put(transactionId.bytes()).put(ManifestRecordFormat.EVENT_PAGE).putInt(pageIndex).array());
   }
 
-  private static byte[] calculateDigest(TransactionId transactionId, int pageIndex,
+  private static ByteKey calculateDigest(TransactionId transactionId, int pageIndex,
       List<PreparedEventReference> events) {
-    try {
-      var bytes = new ByteArrayOutputStream();
-      try (var output = new DataOutputStream(bytes)) {
-        output.writeInt(1);
-        output.write(transactionId.bytes());
-        output.writeInt(pageIndex);
-        output.writeInt(events.size());
-        for (PreparedEventReference event : events) {
-          output.writeLong(event.ordinal());
-          output.writeInt(event.identity().length());
-          output.write(event.identity().bytes());
-          output.write(event.digest().bytes());
-          output.writeInt(event.encodedBytes());
-        }
+    return ManifestDigest.sha256(output -> {
+      output.writeInt(1);
+      output.write(transactionId.bytes());
+      output.writeInt(pageIndex);
+      output.writeInt(events.size());
+      for (PreparedEventReference event : events) {
+        output.writeLong(event.ordinal());
+        ManifestDigest.writeBytes(output, event.identity().bytes());
+        output.write(event.digest().bytes());
+        output.writeInt(event.encodedBytes());
       }
-      return MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray());
-    } catch (IOException impossible) {
-      throw new IllegalStateException("in-memory event page digest failed", impossible);
-    } catch (NoSuchAlgorithmException impossible) {
-      throw new IllegalStateException("SHA-256 is unavailable", impossible);
-    }
+    });
   }
 }

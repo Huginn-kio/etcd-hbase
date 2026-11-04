@@ -1,12 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.Objects;
 
@@ -21,12 +16,12 @@ public final class ManifestPage {
   private final ByteKey digest;
 
   private ManifestPage(TransactionId transactionId, int pageIndex,
-      List<ManifestCandidateReference> candidates, ByteKey digest) {
+      List<ManifestCandidateReference> candidates, ByteKey expectedDigest) {
     this.transactionId = Objects.requireNonNull(transactionId, "transactionId");
     this.candidates = List.copyOf(candidates);
-    this.digest = Objects.requireNonNull(digest, "digest");
     if (pageIndex < 0 || this.candidates.isEmpty() || this.candidates.size() > MAX_ENTRIES
-        || digest.length() != 32 || encodedLength(this.candidates) > MAX_PAGE_BYTES) {
+        || expectedDigest != null && expectedDigest.length() != 32
+        || encodedLength(this.candidates) > MAX_PAGE_BYTES) {
       throw new IllegalArgumentException("manifest page exceeds its contract");
     }
     for (int index = 1; index < this.candidates.size(); index++) {
@@ -38,21 +33,21 @@ public final class ManifestPage {
     }
     this.pageIndex = pageIndex;
     this.bucket = this.candidates.getFirst().bucket();
-    if (!ByteKey.copyOf(calculateDigest(transactionId, pageIndex, this.candidates)).equals(digest)) {
+    this.digest = calculateDigest(transactionId, pageIndex, this.candidates);
+    if (expectedDigest != null && !this.digest.equals(expectedDigest)) {
       throw new IllegalArgumentException("manifest page digest mismatch");
     }
   }
 
   public static ManifestPage create(
       TransactionId transactionId, int pageIndex, List<ManifestCandidateReference> candidates) {
-    List<ManifestCandidateReference> snapshot = List.copyOf(candidates);
-    return new ManifestPage(transactionId, pageIndex, snapshot,
-        ByteKey.copyOf(calculateDigest(transactionId, pageIndex, snapshot)));
+    return new ManifestPage(transactionId, pageIndex, candidates, null);
   }
 
   public static ManifestPage restore(TransactionId transactionId, int pageIndex,
       List<ManifestCandidateReference> candidates, ByteKey digest) {
-    return new ManifestPage(transactionId, pageIndex, candidates, digest);
+    return new ManifestPage(transactionId, pageIndex, candidates,
+        Objects.requireNonNull(digest, "digest"));
   }
 
   public TransactionId transactionId() { return transactionId; }
@@ -72,7 +67,7 @@ public final class ManifestPage {
 
   public ByteKey systemIdentity() {
     return ByteKey.copyOf(ByteBuffer.allocate(16 + 1 + Integer.BYTES)
-        .put(transactionId.bytes()).put((byte) 1).putInt(pageIndex).array());
+        .put(transactionId.bytes()).put(ManifestRecordFormat.MANIFEST_PAGE).putInt(pageIndex).array());
   }
 
   private static int encodedLength(List<ManifestCandidateReference> candidates) {
@@ -86,35 +81,22 @@ public final class ManifestPage {
     return (int) total;
   }
 
-  private static byte[] calculateDigest(
+  private static ByteKey calculateDigest(
       TransactionId transactionId, int pageIndex, List<ManifestCandidateReference> candidates) {
-    try {
-      var bytes = new ByteArrayOutputStream();
-      try (var output = new DataOutputStream(bytes)) {
-        output.writeInt(2);
-        output.write(transactionId.bytes());
-        output.writeInt(pageIndex);
-        output.writeInt(candidates.size());
-        for (ManifestCandidateReference candidate : candidates) {
-          output.writeInt(candidate.bucket());
-          writeBytes(output, candidate.logicalKey().bytes());
-          writeBytes(output, candidate.candidateIdentity().bytes());
-          writeBytes(output, candidate.candidateDigest().bytes());
-          writeBytes(output, candidate.valueDigest().bytes());
-          output.writeInt(candidate.valueLength());
-          output.writeBoolean(candidate.tombstone());
-        }
+    return ManifestDigest.sha256(output -> {
+      output.writeInt(2);
+      output.write(transactionId.bytes());
+      output.writeInt(pageIndex);
+      output.writeInt(candidates.size());
+      for (ManifestCandidateReference candidate : candidates) {
+        output.writeInt(candidate.bucket());
+        ManifestDigest.writeBytes(output, candidate.logicalKey().bytes());
+        ManifestDigest.writeBytes(output, candidate.candidateIdentity().bytes());
+        ManifestDigest.writeBytes(output, candidate.candidateDigest().bytes());
+        ManifestDigest.writeBytes(output, candidate.valueDigest().bytes());
+        output.writeInt(candidate.valueLength());
+        output.writeBoolean(candidate.tombstone());
       }
-      return MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray());
-    } catch (IOException impossible) {
-      throw new IllegalStateException("in-memory manifest encoding failed", impossible);
-    } catch (NoSuchAlgorithmException impossible) {
-      throw new IllegalStateException("SHA-256 is unavailable", impossible);
-    }
-  }
-
-  private static void writeBytes(DataOutputStream output, byte[] bytes) throws IOException {
-    output.writeInt(bytes.length);
-    output.write(bytes);
+    });
   }
 }

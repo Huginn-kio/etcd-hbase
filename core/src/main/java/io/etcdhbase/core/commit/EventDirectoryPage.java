@@ -1,12 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.Objects;
 
@@ -24,12 +19,12 @@ public final class EventDirectoryPage {
   private final ByteKey digest;
 
   private EventDirectoryPage(TransactionId transactionId, int pageIndex, int level,
-      List<EventReference> children, ByteKey digest) {
+      List<EventReference> children, ByteKey expectedDigest) {
     this.transactionId = Objects.requireNonNull(transactionId, "transactionId");
     this.children = List.copyOf(children);
-    this.digest = Objects.requireNonNull(digest, "digest");
     if (pageIndex < 0 || level < 1 || level > MAX_DEPTH || this.children.isEmpty()
-        || this.children.size() > MAX_CHILDREN || digest.length() != 32) {
+        || this.children.size() > MAX_CHILDREN
+        || expectedDigest != null && expectedDigest.length() != 32) {
       throw new IllegalArgumentException("invalid event directory page");
     }
     long items = 0;
@@ -50,21 +45,21 @@ public final class EventDirectoryPage {
     this.itemCount = items;
     this.totalBytes = bytes;
     this.leafPageCount = pages;
-    if (!ByteKey.copyOf(calculateDigest(transactionId, pageIndex, level, this.children)).equals(digest)) {
+    this.digest = calculateDigest(transactionId, pageIndex, level, this.children);
+    if (expectedDigest != null && !this.digest.equals(expectedDigest)) {
       throw new IllegalArgumentException("event directory digest mismatch");
     }
   }
 
   public static EventDirectoryPage create(TransactionId transactionId, int pageIndex, int level,
       List<EventReference> children) {
-    List<EventReference> copy = List.copyOf(children);
-    return new EventDirectoryPage(transactionId, pageIndex, level, copy,
-        ByteKey.copyOf(calculateDigest(transactionId, pageIndex, level, copy)));
+    return new EventDirectoryPage(transactionId, pageIndex, level, children, null);
   }
 
   public static EventDirectoryPage restore(TransactionId transactionId, int pageIndex, int level,
       List<EventReference> children, ByteKey digest) {
-    return new EventDirectoryPage(transactionId, pageIndex, level, children, digest);
+    return new EventDirectoryPage(transactionId, pageIndex, level, children,
+        Objects.requireNonNull(digest, "digest"));
   }
 
   public TransactionId transactionId() { return transactionId; }
@@ -85,37 +80,28 @@ public final class EventDirectoryPage {
 
   public ByteKey systemIdentity() {
     return ByteKey.copyOf(ByteBuffer.allocate(16 + 1 + Integer.BYTES)
-        .put(transactionId.bytes()).put((byte) 6).putInt(pageIndex).array());
+        .put(transactionId.bytes()).put(ManifestRecordFormat.EVENT_DIRECTORY_PAGE)
+        .putInt(pageIndex).array());
   }
 
-  private static byte[] calculateDigest(TransactionId transactionId, int pageIndex, int level,
+  private static ByteKey calculateDigest(TransactionId transactionId, int pageIndex, int level,
       List<EventReference> children) {
-    try {
-      var bytes = new ByteArrayOutputStream();
-      try (var output = new DataOutputStream(bytes)) {
-        output.writeInt(1);
-        output.write(transactionId.bytes());
-        output.writeInt(pageIndex);
-        output.writeInt(level);
-        output.writeInt(children.size());
-        for (EventReference child : children) {
-          byte[] identity = child.identity().bytes();
-          output.writeInt(identity.length);
-          output.write(identity);
-          output.write(child.digest().bytes());
-          output.writeLong(child.firstOrdinal());
-          output.writeLong(child.lastOrdinal());
-          output.writeLong(child.itemCount());
-          output.writeLong(child.totalBytes());
-          output.writeInt(child.leafPageCount());
-          output.writeInt(child.level());
-        }
+    return ManifestDigest.sha256(output -> {
+      output.writeInt(1);
+      output.write(transactionId.bytes());
+      output.writeInt(pageIndex);
+      output.writeInt(level);
+      output.writeInt(children.size());
+      for (EventReference child : children) {
+        ManifestDigest.writeBytes(output, child.identity().bytes());
+        output.write(child.digest().bytes());
+        output.writeLong(child.firstOrdinal());
+        output.writeLong(child.lastOrdinal());
+        output.writeLong(child.itemCount());
+        output.writeLong(child.totalBytes());
+        output.writeInt(child.leafPageCount());
+        output.writeInt(child.level());
       }
-      return MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray());
-    } catch (IOException impossible) {
-      throw new IllegalStateException("in-memory event directory digest failed", impossible);
-    } catch (NoSuchAlgorithmException impossible) {
-      throw new IllegalStateException("SHA-256 is unavailable", impossible);
-    }
+    });
   }
 }

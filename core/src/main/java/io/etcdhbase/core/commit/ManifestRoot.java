@@ -1,12 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -31,15 +26,15 @@ public final class ManifestRoot {
   private ManifestRoot(TransactionId transactionId, long ownerEpoch, long baseSequence,
       long baseRevision, long candidateCount, long totalValueBytes,
       Optional<ManifestChildReference> candidateDirectory, long eventCount, long totalEventBytes,
-      Optional<EventReference> eventDirectory, ByteKey digest) {
+      Optional<EventReference> eventDirectory, ByteKey expectedDigest) {
     this.transactionId = Objects.requireNonNull(transactionId, "transactionId");
     this.candidateDirectory = Objects.requireNonNull(candidateDirectory, "candidateDirectory");
     this.eventDirectory = Objects.requireNonNull(eventDirectory, "eventDirectory");
-    this.digest = Objects.requireNonNull(digest, "digest");
     if (ownerEpoch <= 0 || baseSequence < 0 || baseRevision <= 0 || candidateCount < 0
         || candidateCount > MAX_CANDIDATES || totalValueBytes < 0
         || totalValueBytes > MAX_VALUE_BYTES || eventCount < 0 || eventCount > MAX_EVENTS
-        || totalEventBytes < 0 || totalEventBytes > MAX_EVENT_BYTES || digest.length() != 32
+        || totalEventBytes < 0 || totalEventBytes > MAX_EVENT_BYTES
+        || expectedDigest != null && expectedDigest.length() != 32
         || (candidateCount == 0) != candidateDirectory.isEmpty()
         || candidateCount == 0 && totalValueBytes != 0
         || (eventCount == 0) != eventDirectory.isEmpty()
@@ -65,9 +60,10 @@ public final class ManifestRoot {
     this.totalValueBytes = totalValueBytes;
     this.eventCount = eventCount;
     this.totalEventBytes = totalEventBytes;
-    if (!ByteKey.copyOf(calculateDigest(transactionId, ownerEpoch, baseSequence, baseRevision,
+    this.digest = calculateDigest(transactionId, ownerEpoch, baseSequence, baseRevision,
         candidateCount, totalValueBytes, candidateDirectory, eventCount, totalEventBytes,
-        eventDirectory)).equals(digest)) {
+        eventDirectory);
+    if (expectedDigest != null && !this.digest.equals(expectedDigest)) {
       throw new IllegalArgumentException("manifest root digest mismatch");
     }
   }
@@ -76,9 +72,7 @@ public final class ManifestRoot {
       long baseSequence, long baseRevision, long candidateCount, long totalValueBytes,
       Optional<ManifestChildReference> candidateDirectory) {
     return new ManifestRoot(transactionId, ownerEpoch, baseSequence, baseRevision, candidateCount,
-        totalValueBytes, candidateDirectory, 0, 0, Optional.empty(), ByteKey.copyOf(calculateDigest(transactionId,
-            ownerEpoch, baseSequence, baseRevision, candidateCount, totalValueBytes,
-            candidateDirectory, 0, 0, Optional.empty())));
+        totalValueBytes, candidateDirectory, 0, 0, Optional.empty(), null);
   }
 
   public static ManifestRoot create(TransactionId transactionId, long ownerEpoch,
@@ -87,16 +81,15 @@ public final class ManifestRoot {
       Optional<EventReference> eventDirectory) {
     return new ManifestRoot(transactionId, ownerEpoch, baseSequence, baseRevision, candidateCount,
         totalValueBytes, candidateDirectory, eventCount, totalEventBytes, eventDirectory,
-        ByteKey.copyOf(calculateDigest(transactionId, ownerEpoch, baseSequence, baseRevision,
-            candidateCount, totalValueBytes, candidateDirectory, eventCount, totalEventBytes,
-            eventDirectory)));
+        null);
   }
 
   public static ManifestRoot restore(TransactionId transactionId, long ownerEpoch,
       long baseSequence, long baseRevision, long candidateCount, long totalValueBytes,
       Optional<ManifestChildReference> candidateDirectory, ByteKey digest) {
     return new ManifestRoot(transactionId, ownerEpoch, baseSequence, baseRevision, candidateCount,
-        totalValueBytes, candidateDirectory, 0, 0, Optional.empty(), digest);
+        totalValueBytes, candidateDirectory, 0, 0, Optional.empty(),
+        Objects.requireNonNull(digest, "digest"));
   }
 
   public static ManifestRoot restore(TransactionId transactionId, long ownerEpoch,
@@ -104,7 +97,8 @@ public final class ManifestRoot {
       Optional<ManifestChildReference> candidateDirectory, long eventCount, long totalEventBytes,
       Optional<EventReference> eventDirectory, ByteKey digest) {
     return new ManifestRoot(transactionId, ownerEpoch, baseSequence, baseRevision, candidateCount,
-        totalValueBytes, candidateDirectory, eventCount, totalEventBytes, eventDirectory, digest);
+        totalValueBytes, candidateDirectory, eventCount, totalEventBytes, eventDirectory,
+        Objects.requireNonNull(digest, "digest"));
   }
 
   public TransactionId transactionId() { return transactionId; }
@@ -121,61 +115,49 @@ public final class ManifestRoot {
   public boolean containsKeyChanges() { return candidateCount > 0; }
 
   public ByteKey systemIdentity() {
-    return ByteKey.copyOf(ByteBuffer.allocate(16 + 1).put(transactionId.bytes()).put((byte) 3).array());
+    return ByteKey.copyOf(ByteBuffer.allocate(16 + 1).put(transactionId.bytes())
+        .put(ManifestRecordFormat.MANIFEST_ROOT).array());
   }
 
-  private static byte[] calculateDigest(TransactionId txn, long epoch, long sequence, long revision,
+  private static ByteKey calculateDigest(TransactionId txn, long epoch, long sequence, long revision,
       long count, long valueBytes, Optional<ManifestChildReference> directory,
       long eventCount, long eventBytes, Optional<EventReference> eventDirectory) {
-    try {
-      var bytes = new ByteArrayOutputStream();
-      try (var output = new DataOutputStream(bytes)) {
-        output.writeInt(2);
-        output.write(txn.bytes());
-        output.writeLong(epoch);
-        output.writeLong(sequence);
-        output.writeLong(revision);
-        output.writeLong(count);
-        output.writeLong(valueBytes);
-        output.writeBoolean(directory.isPresent());
-        if (directory.isPresent()) {
-          ManifestChildReference child = directory.orElseThrow();
-          writeBytes(output, child.identity().bytes());
-          writeBytes(output, child.digest().bytes());
-          output.writeInt(child.firstBucket());
-          output.writeInt(child.lastBucket());
-          writeBytes(output, child.firstKey().bytes());
-          writeBytes(output, child.lastKey().bytes());
-          output.writeLong(child.itemCount());
-          output.writeLong(child.valueBytes());
-          output.writeInt(child.leafPageCount());
-          output.writeInt(child.level());
-        }
-        output.writeLong(eventCount);
-        output.writeLong(eventBytes);
-        output.writeBoolean(eventDirectory.isPresent());
-        if (eventDirectory.isPresent()) {
-          EventReference child = eventDirectory.orElseThrow();
-          writeBytes(output, child.identity().bytes());
-          writeBytes(output, child.digest().bytes());
-          output.writeLong(child.firstOrdinal());
-          output.writeLong(child.lastOrdinal());
-          output.writeLong(child.itemCount());
-          output.writeLong(child.totalBytes());
-          output.writeInt(child.leafPageCount());
-          output.writeInt(child.level());
-        }
+    return ManifestDigest.sha256(output -> {
+      output.writeInt(2);
+      output.write(txn.bytes());
+      output.writeLong(epoch);
+      output.writeLong(sequence);
+      output.writeLong(revision);
+      output.writeLong(count);
+      output.writeLong(valueBytes);
+      output.writeBoolean(directory.isPresent());
+      if (directory.isPresent()) {
+        ManifestChildReference child = directory.orElseThrow();
+        ManifestDigest.writeBytes(output, child.identity().bytes());
+        ManifestDigest.writeBytes(output, child.digest().bytes());
+        output.writeInt(child.firstBucket());
+        output.writeInt(child.lastBucket());
+        ManifestDigest.writeBytes(output, child.firstKey().bytes());
+        ManifestDigest.writeBytes(output, child.lastKey().bytes());
+        output.writeLong(child.itemCount());
+        output.writeLong(child.valueBytes());
+        output.writeInt(child.leafPageCount());
+        output.writeInt(child.level());
       }
-      return MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray());
-    } catch (IOException impossible) {
-      throw new IllegalStateException("in-memory root encoding failed", impossible);
-    } catch (NoSuchAlgorithmException impossible) {
-      throw new IllegalStateException("SHA-256 is unavailable", impossible);
-    }
-  }
-
-  private static void writeBytes(DataOutputStream output, byte[] value) throws IOException {
-    output.writeInt(value.length);
-    output.write(value);
+      output.writeLong(eventCount);
+      output.writeLong(eventBytes);
+      output.writeBoolean(eventDirectory.isPresent());
+      if (eventDirectory.isPresent()) {
+        EventReference child = eventDirectory.orElseThrow();
+        ManifestDigest.writeBytes(output, child.identity().bytes());
+        ManifestDigest.writeBytes(output, child.digest().bytes());
+        output.writeLong(child.firstOrdinal());
+        output.writeLong(child.lastOrdinal());
+        output.writeLong(child.itemCount());
+        output.writeLong(child.totalBytes());
+        output.writeInt(child.leafPageCount());
+        output.writeInt(child.level());
+      }
+    });
   }
 }
