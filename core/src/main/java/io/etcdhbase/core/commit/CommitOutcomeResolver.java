@@ -149,7 +149,9 @@ public final class CommitOutcomeResolver {
         throw new IllegalStateException("competing decision conflicts with invocation identity");
       }
       var proof = new NotSelectedProof(invocation.preparedOwnerEpoch(), invocation.baseSequence(),
-          state.ownerEpoch(), state.publishedSequence(), Optional.of(decision.transactionId()),
+          state.ownerEpoch(), state.publishedSequence(),
+          Optional.of(new NotSelectedProof.SelectedDecision(
+              decision.sequence(), decision.transactionId())),
           NotSelectedProof.Reason.DIFFERENT_TRANSACTION_SELECTED);
       return new Resolution(State.NOT_SELECTED, Optional.of(decision), Optional.of(proof));
     }
@@ -164,8 +166,10 @@ public final class CommitOutcomeResolver {
 
   private static Resolution notSelected(
       InvocationBinding invocation, CommitState state, TransactionId selectedTransaction) {
+    var selectedDecision = new NotSelectedProof.SelectedDecision(
+        Math.addExact(invocation.baseSequence(), 1), selectedTransaction);
     var proof = new NotSelectedProof(invocation.preparedOwnerEpoch(), invocation.baseSequence(),
-        state.ownerEpoch(), state.publishedSequence(), Optional.of(selectedTransaction),
+        state.ownerEpoch(), state.publishedSequence(), Optional.of(selectedDecision),
         NotSelectedProof.Reason.DIFFERENT_TRANSACTION_SELECTED);
     return new Resolution(State.NOT_SELECTED, Optional.empty(), Optional.of(proof));
   }
