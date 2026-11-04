@@ -65,14 +65,18 @@ class J25ReportTest(unittest.TestCase):
         self.assertTrue(summary["source_commit"])
         self.assertTrue(summary["source_report_sha256"])
 
+    def _assert_report_rejects_invalid_case(self, suite, case_result):
+        self._write_reports(suite, case_result)
+        with self.assertRaises(ValueError):
+            j25_report.collect(self.root, self.output)
+        self.assertFalse((self.output / "summary.json").exists())
+
     def test_report_rejects_skipped_or_failed_required_case_with_zero_suite_counters(self):
-        for suite in ("hbase", "core"):
-            for case_result in ("skipped", "failure"):
-                with self.subTest(suite=suite, case_result=case_result):
-                    self._write_reports(suite, case_result)
-                    with self.assertRaises(ValueError):
-                        j25_report.collect(self.root, self.output)
-                    self.assertFalse((self.output / "summary.json").exists())
+        cases = (("hbase", "skipped"), ("hbase", "failure"),
+                 ("core", "skipped"), ("core", "failure"))
+        for suite, case_result in cases:
+            with self.subTest(suite=suite, case_result=case_result):
+                self._assert_report_rejects_invalid_case(suite, case_result)
 
 
 if __name__ == "__main__":
