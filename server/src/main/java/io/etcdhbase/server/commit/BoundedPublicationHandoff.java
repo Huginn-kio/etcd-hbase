@@ -166,54 +166,62 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
         throw fatal;
       }
       RequestScope ownedServiceScope = serviceScope;
-      serviceResult.whenComplete((value, failure) -> {
-        synchronized (lock) {
-          if (state != State.RUNNING) return;
-          state = State.FINISHED;
-        }
-        Throwable serviceFailure = failure == null
-            ? null : CompletionFailures.unwrapCompletion(failure);
-        Error cleanupFatal = null;
-        try {
-          if (ownedServiceScope != null) ownedServiceScope.close();
-        } catch (Error fatal) {
-          cleanupFatal = fatal;
-        }
-        if (ownedServiceScope == null) releaseCapacityAfterCleanup(null);
-        else releaseCapacityAfterCleanup(ownedServiceScope);
+      serviceResult.whenComplete(
+          (value, failure) -> finishServiceWork(ownedServiceScope, value, failure));
+    }
 
-        if (cleanupFatal != null) {
-          Throwable propagated = cleanupFatal;
-          if (serviceFailure instanceof Error serviceFatal) {
-            propagated = serviceFatal;
-            suppressDistinct(serviceFatal, cleanupFatal);
-          } else {
-            suppressDistinct(cleanupFatal, serviceFailure);
-          }
-          waitingResult.completeExceptionally(propagated);
-        } else if (serviceFailure == null) {
-          waitingResult.complete(value);
+    private void finishServiceWork(RequestScope serviceScope, T value, Throwable failure) {
+      if (!markFinished()) return;
+      Throwable serviceFailure = failure == null
+          ? null : CompletionFailures.unwrapCompletion(failure);
+      Error cleanupFatal = closeServiceScope(serviceScope);
+      releaseCapacityAfterCleanup(serviceScope);
+      publishServiceResult(value, serviceFailure, cleanupFatal);
+    }
+
+    private boolean markFinished() {
+      synchronized (lock) {
+        if (state != State.RUNNING) return false;
+        state = State.FINISHED;
+        return true;
+      }
+    }
+
+    private Error closeServiceScope(RequestScope serviceScope) {
+      if (serviceScope == null) return null;
+      try {
+        serviceScope.close();
+        return null;
+      } catch (Error fatal) {
+        return fatal;
+      }
+    }
+
+    private void publishServiceResult(T value, Throwable serviceFailure, Error cleanupFatal) {
+      if (cleanupFatal != null) {
+        Throwable propagated = cleanupFatal;
+        if (serviceFailure instanceof Error serviceFatal) {
+          propagated = serviceFatal;
+          suppressDistinct(serviceFatal, cleanupFatal);
         } else {
-          waitingResult.completeExceptionally(serviceFailure);
+          suppressDistinct(cleanupFatal, serviceFailure);
         }
-      });
+        waitingResult.completeExceptionally(propagated);
+      } else if (serviceFailure == null) {
+        waitingResult.complete(value);
+      } else {
+        waitingResult.completeExceptionally(serviceFailure);
+      }
     }
 
     private void failFatal(Error fatal, RequestScope serviceScope) {
-      synchronized (lock) {
-        if (state != State.RUNNING) return;
-        state = State.FINISHED;
-      }
+      if (!markFinished()) return;
       if (serviceScope == null) {
         waitingResult.completeExceptionally(fatal);
         releaseCapacity();
         return;
       }
-      try {
-        serviceScope.close();
-      } catch (Error cleanupFailure) {
-        suppressDistinct(fatal, cleanupFailure);
-      }
+      suppressDistinct(fatal, closeServiceScope(serviceScope));
       releaseCapacityAfterCleanup(serviceScope);
       waitingResult.completeExceptionally(fatal);
     }
