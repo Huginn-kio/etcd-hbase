@@ -150,6 +150,24 @@
       </build>
     </profile>
     <profile>
+      <id>j23-review-local</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <failIfNoTests>true</failIfNoTests>
+              <includes combine.self="override">
+                <include>**/J23CommitDecisionRepositoryIT.java</include>
+              </includes>
+              <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
       <id>j04-hbase-local</id>
       <build>
         <plugins>
