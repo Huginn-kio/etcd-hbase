@@ -44,6 +44,7 @@ final class HBaseRequestCompletion {
       closeRegistration(registration, request);
       return request;
     } catch (Error fatal) {
+      // No producer future owns physical completion; settle startup cleanup, then rethrow the fatal.
       request.completeExceptionally(fatal);
       actualCompletion.complete(null);
       closeRegistration(registration, request);
