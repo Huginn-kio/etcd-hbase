@@ -13,6 +13,7 @@ import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -24,6 +25,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class BoundedPublicationHandoffTest {
+  private static final String PUBLISHED_OBSERVATION = "published-observation";
+
   @Test
   void closedRequestCancelsBeforeTransferWithoutStartingServiceWork() {
     var handoff = handoff();
@@ -114,81 +117,26 @@ class BoundedPublicationHandoffTest {
 
   @Test
   void fatalWorkerSubmissionSettlesCapacityAndDoesNotRunLateTask() throws Exception {
-    var submissionFatal = new OutOfMemoryError("synthetic worker creation failure");
-    var factoryCalls = new AtomicInteger();
-    ThreadFactory fallbackFactory =
-        Thread.ofPlatform().daemon().name("commit-publish-test-", 0).factory();
-    ThreadFactory threads = command -> {
-      return switch (factoryCalls.getAndIncrement()) {
-        case 0 -> null;
-        case 1 -> throw submissionFatal;
-        default -> fallbackFactory.newThread(command);
-      };
-    };
-    var handoff = new BoundedPublicationHandoff(1, 2, Duration.ofSeconds(30), threads);
-    var failedRequestScope = RequestScope.withoutDeadline();
-    var secondRequestScope = RequestScope.withoutDeadline();
-    var thirdRequestScope = RequestScope.withoutDeadline();
-    var fourthRequestScope = RequestScope.withoutDeadline();
-    var overflowRequestScope = RequestScope.withoutDeadline();
-    var serviceResult = new CompletableFuture<String>();
-    var validStarts = new CountDownLatch(3);
-    var serviceStarts = new AtomicInteger();
-    try {
-      OutOfMemoryError failure = assertThrows(OutOfMemoryError.class,
-          () -> handoff.transfer(invocation(), failedRequestScope, serviceScope -> {
-            serviceStarts.incrementAndGet();
-            return CompletableFuture.completedFuture("unexpected");
-          }));
-      assertSame(submissionFatal, failure);
-      assertEquals(0, serviceStarts.get());
+    try (var fixture = new FatalWorkerSubmissionFixture()) {
+      OutOfMemoryError failure = assertThrows(
+          OutOfMemoryError.class, fixture::submitRequestWhoseWorkerCreationFails);
+      assertSame(fixture.submissionFatal, failure);
+      assertEquals(0, fixture.serviceStarts.get());
 
-      CompletableFuture<String> second = handoff.transfer(invocation(), secondRequestScope,
-          serviceScope -> {
-            serviceStarts.incrementAndGet();
-            validStarts.countDown();
-            return serviceResult;
-          });
-      CompletableFuture<String> third = handoff.transfer(invocation(), thirdRequestScope,
-          serviceScope -> {
-            serviceStarts.incrementAndGet();
-            validStarts.countDown();
-            return serviceResult;
-          });
-      CompletableFuture<String> fourth = handoff.transfer(invocation(), fourthRequestScope,
-          serviceScope -> {
-            serviceStarts.incrementAndGet();
-            validStarts.countDown();
-            return serviceResult;
-          });
+      CompletableFuture<String> second = fixture.submitHeldServiceWork(fixture.secondRequestScope);
+      CompletableFuture<String> third = fixture.submitHeldServiceWork(fixture.thirdRequestScope);
+      CompletableFuture<String> fourth = fixture.submitHeldServiceWork(fixture.fourthRequestScope);
+      assertResourceLimit(fixture.submitOverflow());
+      assertTrue(fixture.validStarts.await(5, TimeUnit.SECONDS));
 
-      CompletableFuture<String> overflow = handoff.transfer(invocation(), overflowRequestScope,
-          serviceScope -> CompletableFuture.completedFuture("unexpected"));
-      CompletionException limit = assertThrows(CompletionException.class, overflow::join);
-      assertEquals(BackendFailure.Category.RESOURCE_LIMIT,
-          ((BackendFailure) limit.getCause()).category());
-      assertTrue(validStarts.await(5, TimeUnit.SECONDS));
-
-      handoff.close();
-      failedRequestScope.close();
-      secondRequestScope.close();
-      thirdRequestScope.close();
-      fourthRequestScope.close();
-      overflowRequestScope.close();
-      serviceResult.complete("published-observation");
-      assertEquals("published-observation", second.get(5, TimeUnit.SECONDS));
-      assertEquals("published-observation", third.get(5, TimeUnit.SECONDS));
-      assertEquals("published-observation", fourth.get(5, TimeUnit.SECONDS));
-      assertEquals(3, serviceStarts.get(), "the rejected task must not run after a worker appears");
-      handoff.drained().get(5, TimeUnit.SECONDS);
-    } finally {
-      serviceResult.complete("published-observation");
-      failedRequestScope.close();
-      secondRequestScope.close();
-      thirdRequestScope.close();
-      fourthRequestScope.close();
-      overflowRequestScope.close();
-      handoff.close();
+      fixture.handoff.close();
+      fixture.completeServiceWork();
+      assertEquals(PUBLISHED_OBSERVATION, second.get(5, TimeUnit.SECONDS));
+      assertEquals(PUBLISHED_OBSERVATION, third.get(5, TimeUnit.SECONDS));
+      assertEquals(PUBLISHED_OBSERVATION, fourth.get(5, TimeUnit.SECONDS));
+      assertEquals(3, fixture.serviceStarts.get(),
+          "the rejected task must not run after a worker appears");
+      fixture.handoff.drained().get(5, TimeUnit.SECONDS);
     }
   }
 
@@ -276,6 +224,74 @@ class BoundedPublicationHandoffTest {
 
   private static BoundedPublicationHandoff handoff() {
     return new BoundedPublicationHandoff(1, 1, Duration.ofSeconds(30));
+  }
+
+  private static void assertResourceLimit(CompletableFuture<?> result) {
+    CompletionException failure = assertThrows(CompletionException.class, result::join);
+    assertEquals(BackendFailure.Category.RESOURCE_LIMIT,
+        ((BackendFailure) failure.getCause()).category());
+  }
+
+  private static final class FatalWorkerSubmissionFixture implements AutoCloseable {
+    private final OutOfMemoryError submissionFatal =
+        new OutOfMemoryError("synthetic worker creation failure");
+    private final BoundedPublicationHandoff handoff;
+    private final RequestScope failedRequestScope = RequestScope.withoutDeadline();
+    private final RequestScope secondRequestScope = RequestScope.withoutDeadline();
+    private final RequestScope thirdRequestScope = RequestScope.withoutDeadline();
+    private final RequestScope fourthRequestScope = RequestScope.withoutDeadline();
+    private final RequestScope overflowRequestScope = RequestScope.withoutDeadline();
+    private final CompletableFuture<String> serviceResult = new CompletableFuture<>();
+    private final CountDownLatch validStarts = new CountDownLatch(3);
+    private final AtomicInteger serviceStarts = new AtomicInteger();
+
+    private FatalWorkerSubmissionFixture() {
+      handoff = new BoundedPublicationHandoff(1, 2, Duration.ofSeconds(30),
+          fatalWorkerCreationFactory(submissionFatal));
+    }
+
+    private CompletableFuture<String> submitRequestWhoseWorkerCreationFails() {
+      return handoff.transfer(invocation(), failedRequestScope, serviceScope -> {
+        serviceStarts.incrementAndGet();
+        return CompletableFuture.completedFuture("unexpected");
+      });
+    }
+
+    private CompletableFuture<String> submitHeldServiceWork(RequestScope requestScope) {
+      return handoff.transfer(invocation(), requestScope, serviceScope -> {
+        serviceStarts.incrementAndGet();
+        validStarts.countDown();
+        return serviceResult;
+      });
+    }
+
+    private CompletableFuture<String> submitOverflow() {
+      return handoff.transfer(invocation(), overflowRequestScope,
+          serviceScope -> CompletableFuture.completedFuture("unexpected"));
+    }
+
+    private void completeServiceWork() {
+      serviceResult.complete(PUBLISHED_OBSERVATION);
+    }
+
+    @Override
+    public void close() {
+      handoff.close();
+      completeServiceWork();
+      List.of(failedRequestScope, secondRequestScope, thirdRequestScope,
+          fourthRequestScope, overflowRequestScope).forEach(RequestScope::close);
+    }
+  }
+
+  private static ThreadFactory fatalWorkerCreationFactory(OutOfMemoryError fatal) {
+    var factoryCalls = new AtomicInteger();
+    ThreadFactory fallbackFactory =
+        Thread.ofPlatform().daemon().name("commit-publish-test-", 0).factory();
+    return command -> switch (factoryCalls.getAndIncrement()) {
+      case 0 -> null;
+      case 1 -> throw fatal;
+      default -> fallbackFactory.newThread(command);
+    };
   }
 
   private static InvocationBinding invocation() {
