@@ -515,12 +515,11 @@ public final class HBaseMaterializationStore implements MaterializationStore {
         || current == MaterializationStore.ApplyResult.CURRENT_SUPERSEDED) {
       return MaterializationStore.ApplyResult.CURRENT_SUPERSEDED;
     }
-    return history == MaterializationStore.ApplyResult.APPLIED
-        || current == MaterializationStore.ApplyResult.APPLIED ? MaterializationStore.ApplyResult.APPLIED
-        : history == MaterializationStore.ApplyResult.ALREADY_APPLIED
-            && current == MaterializationStore.ApplyResult.ALREADY_APPLIED
-                ? MaterializationStore.ApplyResult.ALREADY_APPLIED
-                : MaterializationStore.ApplyResult.CURRENT_SUPERSEDED;
+    if (history == MaterializationStore.ApplyResult.APPLIED
+        || current == MaterializationStore.ApplyResult.APPLIED) {
+      return MaterializationStore.ApplyResult.APPLIED;
+    }
+    return MaterializationStore.ApplyResult.ALREADY_APPLIED;
   }
 
   private static <T> CompletableFuture<T> resourceLimit() {
