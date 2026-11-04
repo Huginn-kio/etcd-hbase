@@ -682,7 +682,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J21/J22。
   - 完成标准：发布成功/失败/未知结果可从持久化状态判定。
   - 验证层次：L1 存储/内核。
-  - 跟踪：状态=维护者第一阶段通过；第二阶段确认的三项 P2（过期请求准入、worker 创建 fatal 后的容量/迟到任务结算、cleanup fatal 对服务拥有方的传播）已由 PR #27 代码提交 `c76430a9b78fdd0eba685fc1481e33958ab45a3f` 修正，等待维护者复查新 head；目标验收待执行；负责人=Codex；完成日期=2026-11-04；PR/代码提交=PR #27 / `c76430a9b78fdd0eba685fc1481e33958ab45a3f`；验证报告=锁定 Temurin 21.0.12.1+1 上运行 `scripts/verify/j23.sh`，共享 `java_reports` 正反门禁 4/4、J23 定向验证 20 项通过，失败/错误/跳过均为 0（Publisher 7、Resolver 3、Handoff 7、Codec 2、一次性 MiniCluster `J23CommitDecisionRepositoryIT` 1）；摘要=`.artifacts/j23/20261104T095526Z-10963/summary.json`，SHA256=`32fe5fb1669a80ddff54f307ab226ffeb588930b2d65f9e1583c9992673012ca`，摘要 checkout 与代码提交相同；旧 head `6aeb708c42192fe8a6bd3f27a793083e618c99dc` 的 11/11 GitHub checks 均 success，新 head CI 待运行；真实双副本 HBase 故障恢复、M2 端到端、容量与目标验收仍未完成。
+  - 跟踪：状态=维护者首次第一阶段通过；第二阶段三项生命周期 P2（过期请求准入、worker 创建 fatal 后的容量/迟到任务结算、cleanup fatal 对服务拥有方的传播）由 PR #27 代码提交 `c76430a9b78fdd0eba685fc1481e33958ab45a3f` 修正，待新 head 复查。结构前置 P2 #6628054778 的作者修订拆出 `run()` 的启动编排、完成清理和结果传播，代码提交=`809312c`；测试整理提交=`7ad8e2f`、`55c62dc` 使用 fatal 提交专属 fixture、复用服务提交/资源关闭并以 latch 稳定残留队列项场景。锁定 Temurin 21.0.12.1+1 在最终代码/测试 head `55c62dc` 运行 `scripts/dev/mvn21.sh -B -ntp -pl server -am -Dtest=BoundedPublicationHandoffTest -Dsurefire.failIfNoSpecifiedTests=false test`：Handoff 7/7 通过、失败/错误/跳过 0；一次中间复跑暴露旧测试快速补满时可能遇到被拒队列项占槽，已由确定性 latch 顺序修正，最终提交态复跑通过。完整 `scripts/verify/j23.sh` 的 20 项报告仍锚定此前运行代码提交 `c76430a9b78fdd0eba685fc1481e33958ab45a3f`，不冒充结构修订后的全量结果；摘要=`.artifacts/j23/20261104T095526Z-10963/summary.json`，SHA256=`32fe5fb1669a80ddff54f307ab226ffeb588930b2d65f9e1583c9992673012ca`。当前新 head 的维护者第一阶段复查和第二阶段重审均待执行；真实双副本 HBase 故障恢复、M2 端到端、容量与目标验收仍未完成。
 
 - [ ] **J24｜已提交版本存储与提交收尾**
   - 依赖：J23。
