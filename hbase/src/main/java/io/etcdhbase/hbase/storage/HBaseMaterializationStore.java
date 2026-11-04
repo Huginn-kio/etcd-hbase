@@ -476,7 +476,7 @@ public final class HBaseMaterializationStore implements MaterializationStore {
   private static List<Cell> cells(Result row, byte[] qualifier) {
     if (row == null || row.rawCells() == null) return List.of();
     return Arrays.stream(row.rawCells())
-        .filter(cell -> Arrays.equals(CellUtil.cloneQualifier(cell), qualifier)).toList();
+        .filter(cell -> matchesQualifier(cell, qualifier)).toList();
   }
 
   private static Cell latestCell(Result row, byte[] qualifier) {
@@ -489,17 +489,21 @@ public final class HBaseMaterializationStore implements MaterializationStore {
         .findFirst().orElse(null);
   }
 
-  private static void validateQualifiers(
+  private static boolean matchesQualifier(Cell cell, byte[] qualifier) {
+    return cell.getQualifierLength() == qualifier.length
+        && CellUtil.matchingQualifier(cell, qualifier);
+  }
+
+  static void validateQualifiers(
       StorageTableBinding binding, Result row, RowFenceMessages.RowKind kind) {
     byte[] family = binding.family();
     byte[] guard = guardQualifier(kind);
     for (Cell cell : row.rawCells()) {
-      if (!Arrays.equals(CellUtil.cloneFamily(cell), family)) {
+      if (!CellUtil.matchingFamily(cell, family)) {
         throw new IllegalArgumentException("M2 row contains an unexpected column family");
       }
-      byte[] qualifier = CellUtil.cloneQualifier(cell);
-      if (!Arrays.equals(qualifier, METADATA) && !Arrays.equals(qualifier, VALUE)
-          && !Arrays.equals(qualifier, guard)) {
+      if (!matchesQualifier(cell, METADATA) && !matchesQualifier(cell, VALUE)
+          && !matchesQualifier(cell, guard)) {
         throw new IllegalArgumentException("M2 row contains an unknown qualifier");
       }
     }

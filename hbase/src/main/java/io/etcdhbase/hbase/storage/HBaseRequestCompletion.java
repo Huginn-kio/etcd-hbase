@@ -43,6 +43,11 @@ final class HBaseRequestCompletion {
       actualCompletion.complete(null);
       closeRegistration(registration, request);
       return request;
+    } catch (Error fatal) {
+      request.completeExceptionally(fatal);
+      actualCompletion.complete(null);
+      closeRegistration(registration, request);
+      throw fatal;
     }
     if (!started) {
       request.completeExceptionally(new BackendFailure(scope.isDeadlineExceeded()

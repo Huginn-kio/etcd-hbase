@@ -18,6 +18,9 @@ TESTED_PATHS = (
     "core/src/test/java/io/etcdhbase/core/commit/CommitFinalizationServiceTest.java",
     "core/src/test/java/io/etcdhbase/core/commit/CommitPublisherTest.java",
     "hbase/src/main/java/io/etcdhbase/hbase/storage/HBaseMaterializationStore.java",
+    "hbase/src/main/java/io/etcdhbase/hbase/storage/HBaseRequestCompletion.java",
+    "hbase/src/test/java/io/etcdhbase/hbase/storage/HBaseCommitControlStoreCompletionTest.java",
+    "hbase/src/test/java/io/etcdhbase/hbase/storage/HBaseMaterializationStoreTest.java",
     "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CommitMaterializationIT.java",
     "scripts/verify/j24-report.py",
     "scripts/verify/test_j24_report.py",
@@ -80,7 +83,7 @@ def collect(root: Path, output: Path) -> None:
         ],
     }
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps({key: summary[key] for key in ("phase", "scope", "base_commit", "tests")}))
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
