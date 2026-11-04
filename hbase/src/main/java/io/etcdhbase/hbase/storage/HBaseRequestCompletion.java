@@ -43,6 +43,12 @@ final class HBaseRequestCompletion {
       actualCompletion.complete(null);
       closeRegistration(registration, request);
       return request;
+    } catch (Error fatal) {
+      // No producer future owns physical completion; settle startup cleanup, then rethrow the fatal.
+      request.completeExceptionally(fatal);
+      actualCompletion.complete(null);
+      closeRegistration(registration, request);
+      throw fatal;
     }
     if (!started) {
       request.completeExceptionally(new BackendFailure(scope.isDeadlineExceeded()

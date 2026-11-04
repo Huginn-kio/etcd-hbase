@@ -3,6 +3,7 @@ package io.etcdhbase.hbase.storage;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -35,6 +36,21 @@ class HBaseCommitControlStoreCompletionTest {
     BackendFailure stillUnknown = assertInstanceOf(BackendFailure.class,
         assertThrows(CompletionException.class, request::join).getCause());
     assertEquals(BackendFailure.Category.CANCELLED, stillUnknown.category());
+  }
+
+  @Test
+  void fatalStartupFailureSettlesCleanupAndRethrowsTheOriginalError() {
+    RequestScope scope = RequestScope.withoutDeadline();
+    AssertionError fatal = new AssertionError("synthetic fatal before producer creation");
+
+    AssertionError thrown = assertThrows(AssertionError.class,
+        () -> HBaseRequestCompletion.startRequest(scope, () -> {
+          throw fatal;
+        }));
+
+    assertSame(fatal, thrown);
+    scope.close();
+    assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
   }
 
   @Test
