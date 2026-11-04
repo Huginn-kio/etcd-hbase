@@ -29,6 +29,7 @@ final class HBaseRequestCompletion {
       RequestScope scope, Supplier<CompletableFuture<T>> startProducer) {
     var request = new CompletableFuture<T>();
     var actualCompletion = new CompletableFuture<Void>();
+    scope.trackPhysicalProducer(actualCompletion);
     var registration = scope.registerScopedCleanup(
         () -> request.completeExceptionally(new BackendFailure(scope.isDeadlineExceeded()
             ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED)),

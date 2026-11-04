@@ -136,7 +136,7 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
       int maximumCandidates = Math.min(request.maximumRows(), 1024);
       var stopped = new AtomicBoolean();
       var candidates = manifests.candidatesInRange(root, bucket, request.range(), request.after(),
-          maximumCandidates, request.maximumBytes(), scope, stopped::get);
+          maximumCandidates, ManifestCatalog.MAX_RANGE_CANDIDATE_BYTES, scope, stopped::get);
       return track(new OverlayScanOperation(base, candidates, request, stopped));
     } catch (RuntimeException | Error failure) {
       if (base != null) {

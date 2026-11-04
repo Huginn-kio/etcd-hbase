@@ -49,6 +49,7 @@ final class HBasePageReader {
 
   ScanOperation start(ScanRequest request) {
     var task = new PageTask(request);
+    scope.trackPhysicalProducer(task.cleanupComplete);
     task.registration = scope.registerScopedCleanup(task::closeResources, task.cleanupComplete);
     try {
       worker.execute(task);

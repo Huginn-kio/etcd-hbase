@@ -234,6 +234,74 @@ class ReadViewRecordStoreTest {
         "scope cleanup releases the pin when the producer already completed");
   }
 
+  @Test
+  void scopeCancellationWaitsForManifestProducerBeforeReleasingRegisteredPin() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("alpha", 2, 2, 1, StorageMetadata.State.LIVE, new byte[4096])));
+    fixture.repository.blockRootRead(2);
+    RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+
+    var opening = fixture.views.open(OptionalLong.empty(), digest(9), scope);
+    assertFalse(opening.isDone(), "the post-registration root recheck owns a pending producer");
+    assertEquals(1, fixture.pinRegistrations.get());
+
+    scope.close();
+
+    assertTrue(opening.isCompletedExceptionally(), "scope cancellation completes the request result");
+    assertFalse(fixture.repository.pendingRootProducer.isDone());
+    assertEquals(0, fixture.pinCloses.get(), "the pin remains while the manifest producer is active");
+    assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+
+    fixture.repository.pendingRootProducer.complete(null);
+    scope.cleanupCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+    assertEquals(1, fixture.pinCloses.get());
+  }
+
+  @Test
+  void metadataHeadBudgetDoesNotRejectLargeCandidatePayload() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("a", 2, 2, 1, StorageMetadata.State.LIVE, new byte[4096]),
+        candidate("b", 2, 2, 1, StorageMetadata.State.LIVE, bytes("small"))));
+    fixture.physical.add(liveBytes("z", 1, 1, 64));
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      PinnedReadView pinned = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
+      ReadViewRecordStore view = fixture.readStore(pinned, scope);
+      var metadataRequest = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
+          ReadProjection.METADATA, 1, 1024, 64);
+      StoragePage metadata = view.startScan(metadataRequest).completion().toCompletableFuture().join();
+      assertEquals(List.of("a"), metadata.records().stream().map(record -> text(record.key())).toList());
+      assertFalse(metadata.records().getFirst().hasValue());
+      assertTrue(metadata.records().getFirst().retainedBytes() <= metadataRequest.maximumBytes());
+      assertEquals(4353, metadata.cost().observations().get(StoragePage.Observation.MANIFEST_CANDIDATE_BYTES));
+      var limits = new BudgetManager.Limits(4, 32, 2, 2, 2, 1_000_000, 16_000_000);
+      var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
+      var reservation = new BudgetManager.Reservation(1024, 1024, 8192, 8192);
+      var mergeRequest = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
+          ReadProjection.METADATA, 1, 1024, 64);
+      try (var account = budgets.admit("public", scope, reservation);
+          var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
+          var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account), mergeRequest,
+              1, account, scope);
+          var response = cursor.read(0).join()) {
+        assertEquals(List.of("a", "b", "z"), response.records().stream()
+            .map(record -> text(record.key())).toList());
+        assertEquals(4096, response.records().getFirst().value().orElseThrow().length,
+            "the selected value is fetched after the metadata head");
+        assertEquals(5, response.records().get(1).value().orElseThrow().length,
+            "a small candidate remains readable");
+        assertEquals(1, ExistsExecutor.point(view, key("a"), 2, account).join());
+        assertEquals(1, ExistsExecutor.point(view, key("z"), 2, account).join(),
+            "the physical-only control remains readable");
+        try (var exists = new ExistsExecutor(scheduler.bind(view, account),
+            new ScanRequest(0, KeyRange.point(key("a")), Optional.empty(), 2,
+                ReadProjection.METADATA, 1, 1024, 64), 1, scope)) {
+          assertEquals(1, exists.execute().join().count(), "range Exists uses the metadata head budget");
+        }
+      }
+    }
+    assertEquals(1, fixture.pinCloses.get());
+  }
+
   private static List<String> scanKeys(Fixture fixture, long maximumBytes, int expectedPages) {
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       PinnedReadView pinned = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
@@ -381,6 +449,9 @@ class ReadViewRecordStoreTest {
     private final ManifestPage page;
     private final Map<ByteKey, PreparedCandidate> candidates = new HashMap<>();
     private final AtomicInteger rootReads = new AtomicInteger();
+    private int blockedRootReadNumber;
+    private CompletableFuture<Optional<ManifestRoot>> pendingRootRead;
+    private CompletableFuture<Void> pendingRootProducer;
 
     private MemoryManifestRepository(ManifestRoot root, ManifestPage page,
         List<PreparedCandidate> candidates) {
@@ -404,10 +475,19 @@ class ReadViewRecordStoreTest {
     @Override public CompletableFuture<SystemRecordStore.CreateResult> seal(
         ManifestRoot value, RequestScope scope) { return created(); }
     @Override public CompletableFuture<Optional<ManifestRoot>> readRoot(ByteKey identity, RequestScope scope) {
-      rootReads.incrementAndGet();
+      int readNumber = rootReads.incrementAndGet();
+      if (readNumber == blockedRootReadNumber) {
+        pendingRootRead = new CompletableFuture<>();
+        pendingRootProducer = new CompletableFuture<>();
+        scope.trackPhysicalProducer(pendingRootProducer);
+        scope.registerScopedCleanup(() -> pendingRootRead.completeExceptionally(
+            new BackendFailure(BackendFailure.Category.CANCELLED)), pendingRootProducer);
+        return pendingRootRead;
+      }
       return CompletableFuture.completedFuture(identity.equals(root.systemIdentity())
           ? Optional.of(root) : Optional.empty());
     }
+    private void blockRootRead(int readNumber) { blockedRootReadNumber = readNumber; }
     @Override public CompletableFuture<Optional<PreparedCandidate>> readCandidate(
         ByteKey identity, RequestScope scope) {
       return CompletableFuture.completedFuture(Optional.ofNullable(candidates.get(identity)));

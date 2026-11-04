@@ -58,6 +58,7 @@ public final class BudgetManager {
       long cleanup, long queuedBytes, long reservedBytes, long allocatedBytes, long retiredScanners,
       long peakScanners, long peakAllocatedBytes) {}
 
+  /** Per-request read work; cellBytes includes returned cells and retained manifest candidates. */
   public record ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages, long pointOperations) {
     public ReadLimits {
       if (physicalRows < 1 || cellBytes < 1 || scanRpcCalls < 1 || pages < 1 || pointOperations < 1) throw new IllegalArgumentException("invalid read limits");
@@ -185,15 +186,18 @@ public final class BudgetManager {
     void charge(StoragePage.Cost cost) throws BackendFailure {
       synchronized (BudgetManager.this) {
         requireActive();
+        long candidateBytes = cost.observations().getOrDefault(
+            StoragePage.Observation.MANIFEST_CANDIDATE_BYTES, 0L);
         boolean exceeds = cost.physicalRows() > readLimits.physicalRows() - physicalRows
             || cost.returnedCellBytes() > readLimits.cellBytes() - cellBytes
+            || candidateBytes > readLimits.cellBytes() - cellBytes - cost.returnedCellBytes()
             || cost.scanRpcCalls() > readLimits.scanRpcCalls() - scanRpcCalls || pages >= readLimits.pages();
         if (exceeds) {
           readExhausted = true;
           throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
         }
         physicalRows += cost.physicalRows();
-        cellBytes += cost.returnedCellBytes();
+        cellBytes += cost.returnedCellBytes() + candidateBytes;
         scanRpcCalls += cost.scanRpcCalls();
         pages++;
       }

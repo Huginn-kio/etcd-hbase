@@ -80,7 +80,7 @@ public final class ReadViewService {
       }
       PinnedReadView pinned;
       try {
-        pinned = new PinnedReadView(capture.view().withPinGeneration(generation), pin);
+        pinned = new PinnedReadView(capture.view().withPinGeneration(generation), pin, scope);
       } catch (RuntimeException | Error failure) {
         // A failed construction must release its registered pin before preserving a fatal cause.
         try {
@@ -91,7 +91,7 @@ public final class ReadViewService {
         }
         throw failure;
       }
-      scope.registerCleanup(pinned);
+      scope.registerScopedCleanup(pinned, pinned.cleanupCompletion());
       return recheckControl(capture.view(), scope)
           .thenCompose(ignored -> recheckRoot(capture, scope))
           .thenApply(ignored -> {

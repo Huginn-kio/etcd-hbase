@@ -15,6 +15,9 @@ import java.util.function.Function;
 
 /** Verifies and streams a sealed candidate/event manifest without collecting transaction data. */
 public final class ManifestCatalog {
+  /** Maximum retained candidate payload fetched for one range slice, independent of result bytes. */
+  static final long MAX_RANGE_CANDIDATE_BYTES = 9L * 1024 * 1024;
+
   public record Summary(long count, long payloadBytes) {
     public Summary {
       if (count < 0 || payloadBytes < 0) throw new IllegalArgumentException("negative manifest summary");
@@ -86,29 +89,33 @@ public final class ManifestCatalog {
    */
   public CompletableFuture<CandidateSlice> candidatesInRange(ManifestRoot root, int bucket,
       KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
-      long maximumPayloadBytes, RequestScope scope) {
+      long maximumCandidateBytes, RequestScope scope) {
     return candidatesInRange(root, bucket, range, afterExclusive, maximumCandidates,
-        maximumPayloadBytes, scope, () -> false);
+        maximumCandidateBytes, scope, () -> false);
   }
 
-  /** Same bounded traversal with a local stop signal for a page operation being closed. */
+  /**
+   * Same bounded traversal with a local stop signal for a page operation being closed.
+   * maximumCandidateBytes bounds candidate records read; result projection bytes are bounded by
+   * the caller after projection and must not be substituted for this read budget.
+   */
   public CompletableFuture<CandidateSlice> candidatesInRange(ManifestRoot root, int bucket,
       KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
-      long maximumPayloadBytes, RequestScope scope, BooleanSupplier cancelled) {
+      long maximumCandidateBytes, RequestScope scope, BooleanSupplier cancelled) {
     Objects.requireNonNull(root, "root");
     Objects.requireNonNull(range, "range");
     Objects.requireNonNull(afterExclusive, "afterExclusive");
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(cancelled, "cancelled");
     if (bucket < 0 || maximumCandidates <= 0 || maximumCandidates > 1025
-        || maximumPayloadBytes <= 0) {
+        || maximumCandidateBytes <= 0) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid candidate slice bounds"));
     }
     if (range.isEmpty() || root.candidateDirectory().isEmpty()) {
       return CompletableFuture.completedFuture(new CandidateSlice(List.of(), true, 0, 0, 0));
     }
     var cursor = new CandidateRangeCursor(root, bucket, range, afterExclusive,
-        maximumCandidates, maximumPayloadBytes, scope, cancelled);
+        maximumCandidates, maximumCandidateBytes, scope, cancelled);
     return cursor.visit(root.candidateDirectory().orElseThrow())
         .thenApply(ignored -> cursor.slice());
   }
@@ -135,7 +142,7 @@ public final class ManifestCatalog {
     private final KeyRange range;
     private final Optional<ByteKey> after;
     private final int maximumCandidates;
-    private final long maximumPayloadBytes;
+    private final long maximumCandidateBytes;
     private final RequestScope scope;
     private final BooleanSupplier cancelled;
     private final List<PreparedCandidate> candidates = new java.util.ArrayList<>();
@@ -146,14 +153,14 @@ public final class ManifestCatalog {
     private boolean exhausted = true;
 
     private CandidateRangeCursor(ManifestRoot root, int bucket, KeyRange range,
-        Optional<ByteKey> after, int maximumCandidates, long maximumPayloadBytes,
+        Optional<ByteKey> after, int maximumCandidates, long maximumCandidateBytes,
         RequestScope scope, BooleanSupplier cancelled) {
       this.root = root;
       this.bucket = bucket;
       this.range = range;
       this.after = after;
       this.maximumCandidates = maximumCandidates;
-      this.maximumPayloadBytes = maximumPayloadBytes;
+      this.maximumCandidateBytes = maximumCandidateBytes;
       this.scope = scope;
       this.cancelled = cancelled;
     }
@@ -224,7 +231,7 @@ public final class ManifestCatalog {
           return invalid("private candidate differs from its authenticated range reference");
         }
         long retained = candidate.record().retainedBytes();
-        if (retained > maximumPayloadBytes - payloadBytes) {
+        if (retained > maximumCandidateBytes - payloadBytes) {
           if (!candidates.isEmpty()) {
             exhausted = false;
             return CompletableFuture.completedFuture(null);
