@@ -43,7 +43,6 @@ public final class PreparedEvent {
         || current.metadata().state() != (kind == Kind.PUT
             ? StorageMetadata.State.LIVE : StorageMetadata.State.TOMBSTONE)
         || current.metadata().state() == StorageMetadata.State.LIVE && !current.hasValue()
-        || current.metadata().state() == StorageMetadata.State.TOMBSTONE && current.hasValue()
         || previous.filter(value -> !value.key().equals(current.key())
             || value.metadata().modificationRevision() > baseRevision).isPresent()) {
       throw new IllegalArgumentException("event does not match its commit identity or operation kind");

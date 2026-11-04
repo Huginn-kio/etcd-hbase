@@ -17,7 +17,6 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.codec.RowKeyCodec;
-import io.etcdhbase.hbase.codec.SystemRecordKeyCodec;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -33,6 +32,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.Durability;
+import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.junit.jupiter.api.Test;
 
@@ -46,7 +46,28 @@ class J22ManifestRepositoryIT {
   void persistsPagesEventsAndSealedRootOnDisposableHBase() throws Exception {
     TableName table = TableName.valueOf("j22_" + UUID.randomUUID().toString().replace("-", ""));
     var binding = new SystemTableBinding(table, FAMILY, TABLE_GROUP, SALT_PROFILE, SALT);
-    var descriptor = TableDescriptorBuilder.newBuilder(table)
+    var descriptor = tableDescriptor(table);
+
+    try (var environment = M1TestEnvironment.start(1);
+         var scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
+      environment.create(table, descriptor, SALT.splitKeys().toArray(byte[][]::new));
+      var records = new CountingSystemRecordStore(HBaseSystemRecordStore.open(
+          environment.factory(), environment.identity(), binding, scope).join());
+      var repository = new HBaseManifestRepository(records);
+      TransactionId transactionId = TransactionId.create();
+      List<PreparedCandidate> candidates = candidatesInTwoBuckets(repository, transactionId);
+      List<PreparedEvent> events = preparedEvents(transactionId, 65);
+
+      verifyCandidatePersistence(repository, candidates, scope);
+      verifyEventPersistence(repository, events, transactionId, scope);
+      ManifestRoot restored = prepareAndReadManifest(repository, candidates, events, transactionId, scope);
+      verifyCatalogTraversal(repository, restored, candidates, events, scope);
+      verifyOversizedSystemKeyRejectedBeforePersistence(repository, records, scope);
+    }
+  }
+
+  private static TableDescriptor tableDescriptor(TableName table) {
+    return TableDescriptorBuilder.newBuilder(table)
         .setColumnFamily(ColumnFamilyDescriptorBuilder.newBuilder(FAMILY)
             .setTimeToLive(HConstants.FOREVER).setMaxVersions(1).build())
         .setDurability(Durability.SYNC_WAL)
@@ -61,85 +82,95 @@ class J22ManifestRepositoryIT {
             Integer.toString(SALT.profile().saltWidthBytes()))
         .setValue("etcdhbase.m0.record-categories", "CONTROL,INVOCATION,CANDIDATE,MANIFEST")
         .build();
+  }
 
-    try (var environment = M1TestEnvironment.start(1);
-         var scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
-      environment.create(table, descriptor, SALT.splitKeys().toArray(byte[][]::new));
-      var delegate = HBaseSystemRecordStore.open(
-          environment.factory(), environment.identity(), binding, scope).join();
-      var records = new CountingSystemRecordStore(delegate);
-      var repository = new HBaseManifestRepository(records);
-      TransactionId transactionId = TransactionId.create();
-      List<PreparedCandidate> candidates = candidatesInTwoBuckets(repository, transactionId);
-      PreparedCandidate first = candidates.getFirst();
+  private static void verifyCandidatePersistence(HBaseManifestRepository repository,
+      List<PreparedCandidate> candidates, RequestScope scope) {
+    PreparedCandidate first = candidates.getFirst();
+    assertEquals(SystemRecordStore.CreateResult.CREATED, repository.createCandidate(first, scope).join());
+    assertEquals(SystemRecordStore.CreateResult.ALREADY_PRESENT,
+        repository.createCandidate(first, scope).join());
+    assertEquals(SystemRecordStore.CreateResult.CONFLICT,
+        repository.createCandidate(candidate(first.transactionId(), first.record().key().bytes(),
+            new byte[] {9}), scope).join());
 
-      assertEquals(SystemRecordStore.CreateResult.CREATED,
-          repository.createCandidate(first, scope).join());
-      assertEquals(SystemRecordStore.CreateResult.ALREADY_PRESENT,
-          repository.createCandidate(first, scope).join());
-      assertEquals(SystemRecordStore.CreateResult.CONFLICT,
-          repository.createCandidate(candidate(transactionId, first.record().key().bytes(), new byte[] {9}),
-              scope).join());
+    TransactionId otherTransaction = TransactionId.create();
+    PreparedCandidate sameKeyOtherTransaction = candidate(otherTransaction,
+        first.record().key().bytes(), new byte[] {9});
+    assertEquals(SystemRecordStore.CreateResult.CREATED,
+        repository.createCandidate(sameKeyOtherTransaction, scope).join());
+    assertEquals(first.record().key(), repository.readCandidate(first.systemIdentity(), scope)
+        .join().orElseThrow().record().key());
+    assertEquals(first.record().key(), repository.readCandidate(
+        sameKeyOtherTransaction.systemIdentity(), scope).join().orElseThrow().record().key());
+  }
 
-      TransactionId otherTransaction = TransactionId.create();
-      PreparedCandidate sameKeyOtherTransaction = candidate(otherTransaction,
-          first.record().key().bytes(), new byte[] {9});
-      assertEquals(SystemRecordStore.CreateResult.CREATED,
-          repository.createCandidate(sameKeyOtherTransaction, scope).join());
-      assertEquals(first.record().key(), repository.readCandidate(first.systemIdentity(), scope)
-          .join().orElseThrow().record().key());
-      assertEquals(first.record().key(), repository.readCandidate(
-          sameKeyOtherTransaction.systemIdentity(), scope).join().orElseThrow().record().key());
+  private static void verifyEventPersistence(HBaseManifestRepository repository,
+      List<PreparedEvent> events, TransactionId transactionId, RequestScope scope) {
+    PreparedEvent first = events.getFirst();
+    assertEquals(SystemRecordStore.CreateResult.CREATED, repository.createEvent(first, scope).join());
+    assertEquals(SystemRecordStore.CreateResult.ALREADY_PRESENT,
+        repository.createEvent(first, scope).join());
+    assertEquals(SystemRecordStore.CreateResult.CONFLICT,
+        repository.createEvent(event(transactionId, 0, new byte[] {'x'}), scope).join());
+  }
 
-      List<PreparedEvent> events = new ArrayList<>();
-      for (int ordinal = 0; ordinal < 65; ordinal++) {
-        events.add(event(transactionId, ordinal, new byte[] {'e', (byte) (ordinal >>> 8), (byte) ordinal}));
-      }
-      PreparedEvent firstEvent = events.getFirst();
-      assertEquals(SystemRecordStore.CreateResult.CREATED,
-          repository.createEvent(firstEvent, scope).join());
-      assertEquals(SystemRecordStore.CreateResult.ALREADY_PRESENT,
-          repository.createEvent(firstEvent, scope).join());
-      assertEquals(SystemRecordStore.CreateResult.CONFLICT,
-          repository.createEvent(event(transactionId, 0, new byte[] {'x'}), scope).join());
-      ManifestRoot prepared = new ManifestPreparation(repository,
-          new ManifestPreparation.Limits(candidates.size(), candidates.size(), 65, 1_000_000))
-          .prepare(transactionId, 1, 0, 1, candidates.iterator(), events.iterator(), scope).join();
-      ManifestRoot restored = repository.readRoot(prepared.systemIdentity(), scope).join().orElseThrow();
-      assertEquals(prepared.digest(), restored.digest());
-      assertTrue(restored.candidateDirectory().orElseThrow().leafPageCount() >= 2);
-      assertTrue(restored.eventDirectory().orElseThrow().leafPageCount() >= 2);
+  private static ManifestRoot prepareAndReadManifest(HBaseManifestRepository repository,
+      List<PreparedCandidate> candidates, List<PreparedEvent> events,
+      TransactionId transactionId, RequestScope scope) {
+    ManifestRoot prepared = new ManifestPreparation(repository,
+        new ManifestPreparation.Limits(candidates.size(), candidates.size(), events.size(), 1_000_000))
+        .prepare(transactionId, 1, 0, 1, candidates.iterator(), events.iterator(), scope).join();
+    ManifestRoot restored = repository.readRoot(prepared.systemIdentity(), scope).join().orElseThrow();
+    assertEquals(prepared.digest(), restored.digest());
+    assertTrue(restored.candidateDirectory().orElseThrow().leafPageCount() >= 2);
+    assertTrue(restored.eventDirectory().orElseThrow().leafPageCount() >= 2);
+    return restored;
+  }
 
-      List<ByteKey> visitedCandidates = new ArrayList<>();
-      List<Long> visitedEvents = new ArrayList<>();
-      ManifestCatalog catalog = new ManifestCatalog(repository);
-      ManifestCatalog.Summary candidatesRead = catalog.forEachCandidate(restored, scope, value -> {
-        visitedCandidates.add(value.record().key());
-        return CompletableFuture.completedFuture(null);
-      }).join();
-      ManifestCatalog.Summary eventsRead = catalog.forEachEvent(restored, scope, value -> {
-        visitedEvents.add(value.ordinal());
-        return CompletableFuture.completedFuture(null);
-      }).join();
-      assertEquals(candidates.size(), candidatesRead.count());
-      assertEquals(65, eventsRead.count());
-      assertEquals(candidates.stream().map(value -> value.record().key()).toList(), visitedCandidates);
-      assertEquals(java.util.stream.LongStream.range(0, 65).boxed().toList(), visitedEvents);
+  private static void verifyCatalogTraversal(HBaseManifestRepository repository,
+      ManifestRoot restored, List<PreparedCandidate> candidates, List<PreparedEvent> events,
+      RequestScope scope) {
+    List<ByteKey> visitedCandidates = new ArrayList<>();
+    List<Long> visitedEvents = new ArrayList<>();
+    ManifestCatalog catalog = new ManifestCatalog(repository);
+    ManifestCatalog.Summary candidatesRead = catalog.forEachCandidate(restored, scope, value -> {
+      visitedCandidates.add(value.record().key());
+      return CompletableFuture.completedFuture(null);
+    }).join();
+    ManifestCatalog.Summary eventsRead = catalog.forEachEvent(restored, scope, value -> {
+      visitedEvents.add(value.ordinal());
+      return CompletableFuture.completedFuture(null);
+    }).join();
+    assertEquals(candidates.size(), candidatesRead.count());
+    assertEquals(events.size(), eventsRead.count());
+    assertEquals(candidates.stream().map(value -> value.record().key()).toList(), visitedCandidates);
+    assertEquals(events.stream().map(PreparedEvent::ordinal).toList(), visitedEvents);
+  }
 
-      byte[] largestKvKey = new byte[HConstants.MAX_ROW_LENGTH - SALT.profile().saltWidthBytes() - 2];
-      java.util.Arrays.fill(largestKvKey, (byte) 'x');
-      ByteKey largestLogicalKey = ByteKey.copyOf(largestKvKey);
-      assertEquals(HConstants.MAX_ROW_LENGTH,
-          new RowKeyCodec(SALT, RowKeyCodec.Shape.CURRENT).encode(largestLogicalKey, 1).length);
-      PreparedCandidate oversizedSystemKey = candidate(TransactionId.create(),
-          largestKvKey, new byte[] {1});
-      int writesBeforeOversizedKey = records.writeCalls;
-      assertThrows(CompletionException.class, () -> new ManifestPreparation(repository,
-          new ManifestPreparation.Limits(1, 1)).prepare(oversizedSystemKey.transactionId(), 1, 0, 1,
-              List.of(oversizedSystemKey).iterator(), scope).join());
-      assertEquals(writesBeforeOversizedKey, records.writeCalls,
-          "a system row too long for HBase must be rejected before persistence");
+  private static void verifyOversizedSystemKeyRejectedBeforePersistence(
+      HBaseManifestRepository repository, CountingSystemRecordStore records, RequestScope scope) {
+    byte[] largestKvKey = new byte[HConstants.MAX_ROW_LENGTH - SALT.profile().saltWidthBytes() - 2];
+    java.util.Arrays.fill(largestKvKey, (byte) 'x');
+    ByteKey largestLogicalKey = ByteKey.copyOf(largestKvKey);
+    assertEquals(HConstants.MAX_ROW_LENGTH,
+        new RowKeyCodec(SALT, RowKeyCodec.Shape.CURRENT).encode(largestLogicalKey, 1).length);
+    PreparedCandidate oversizedSystemKey = candidate(TransactionId.create(), largestKvKey, new byte[] {1});
+    int writesBefore = records.writeCalls;
+    assertThrows(CompletionException.class, () -> new ManifestPreparation(repository,
+        new ManifestPreparation.Limits(1, 1)).prepare(oversizedSystemKey.transactionId(), 1, 0, 1,
+            List.of(oversizedSystemKey).iterator(), scope).join());
+    assertEquals(writesBefore, records.writeCalls,
+        "a system row too long for HBase must be rejected before persistence");
+  }
+
+  private static List<PreparedEvent> preparedEvents(TransactionId transactionId, int count) {
+    List<PreparedEvent> result = new ArrayList<>(count);
+    for (int ordinal = 0; ordinal < count; ordinal++) {
+      result.add(event(transactionId, ordinal,
+          new byte[] {'e', (byte) (ordinal >>> 8), (byte) ordinal}));
     }
+    return List.copyOf(result);
   }
 
   private static List<PreparedCandidate> candidatesInTwoBuckets(
