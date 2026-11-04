@@ -128,7 +128,7 @@ class CommitFinalizationServiceTest {
           0, 1, 1, withCandidate ? 2 : 1, withCandidate, root.systemIdentity(), root.digest());
       control.state = state.publish(slot);
       decisions = new MemoryDecisions(decision, archiveResult);
-      ManifestRepository repository = new EmptyManifestRepository(root, candidate,
+      ManifestRepository repository = new StubManifestRepository(root, candidate,
           withCandidate ? ManifestPage.create(transactionId, 0,
               List.of(ManifestCandidateReference.from(candidate, 0))) : null);
       ManifestCatalog catalog = new ManifestCatalog(repository);
@@ -212,12 +212,12 @@ class CommitFinalizationServiceTest {
     }
   }
 
-  private static final class EmptyManifestRepository implements ManifestRepository {
+  private static final class StubManifestRepository implements ManifestRepository {
     private final ManifestRoot root;
     private final PreparedCandidate candidate;
     private final ManifestPage page;
 
-    private EmptyManifestRepository(ManifestRoot root, PreparedCandidate candidate, ManifestPage page) {
+    private StubManifestRepository(ManifestRoot root, PreparedCandidate candidate, ManifestPage page) {
       this.root = root;
       this.candidate = candidate;
       this.page = page;

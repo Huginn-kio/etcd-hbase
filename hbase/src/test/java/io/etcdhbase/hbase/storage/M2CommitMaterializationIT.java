@@ -111,6 +111,8 @@ class M2CommitMaterializationIT {
     try {
       cleanup.run();
     } catch (Throwable failure) {
+      // Include fatal Errors so one failed close does not skip the remaining cleanup; rethrow
+      // the first failure after all resources are attempted and retain later failures as suppressed.
       if (previous == null) return failure;
       if (previous != failure) previous.addSuppressed(failure);
     }

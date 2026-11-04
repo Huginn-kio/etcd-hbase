@@ -181,7 +181,7 @@ class CommitPublisherTest {
               : CompletableFuture.completedFuture(null);
         }
       };
-      var verifier = new CommitPlanVerifier(new ManifestCatalog(new EmptyManifestRepository(
+      var verifier = new CommitPlanVerifier(new ManifestCatalog(new StubManifestRepository(
           storedRootPresent ? Optional.of(manifest) : Optional.empty(), candidate, page)), materialization);
       CommitFinalizer finalizer = (invocation, publication, scope) ->
           CompletableFuture.completedFuture(publication);
@@ -252,12 +252,12 @@ class CommitPublisherTest {
     }
   }
 
-  private static final class EmptyManifestRepository implements ManifestRepository {
+  private static final class StubManifestRepository implements ManifestRepository {
     private final Optional<ManifestRoot> root;
     private final PreparedCandidate candidate;
     private final ManifestPage page;
 
-    private EmptyManifestRepository(
+    private StubManifestRepository(
         Optional<ManifestRoot> root, PreparedCandidate candidate, ManifestPage page) {
       this.root = root;
       this.candidate = candidate;

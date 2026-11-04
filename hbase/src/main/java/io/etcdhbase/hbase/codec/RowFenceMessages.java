@@ -63,12 +63,12 @@ public final class RowFenceMessages {
         .setOwnerEpoch(fence.ownerEpoch())
         .setBaseSequence(fence.baseSequence())
         .build().toByteArray();
-    requireLength(encoded.length);
+    requireEncodedLength(encoded.length);
     return encoded;
   }
 
   public static Fence decode(byte[] encoded) {
-    requireLength(encoded.length);
+    requireEncodedLength(encoded.length);
     try {
       var message = CommitProtos.RowFence.parseFrom(encoded);
       if (!message.getUnknownFields().asMap().isEmpty()
@@ -89,7 +89,8 @@ public final class RowFenceMessages {
     }
   }
 
-  private static void requireLength(int length) {
+  /** Checks a persisted fence cell length before its backing bytes are copied. */
+  public static void requireEncodedLength(int length) {
     if (length <= 0 || length > MAX_BYTES) throw invalid();
   }
 

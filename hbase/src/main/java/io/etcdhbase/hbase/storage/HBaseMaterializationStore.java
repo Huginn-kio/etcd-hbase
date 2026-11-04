@@ -149,7 +149,6 @@ public final class HBaseMaterializationStore implements MaterializationStore {
           RowFenceMessages.RowKind.HISTORY);
       if (observed.isPresent()) {
         RowFenceMessages.Fence fence = observed.orElseThrow().fence();
-        requirePresent(fence);
         if (!sameFence(fence, decision, candidate)) {
           throw new CompletionException(new IllegalStateException("history row is fenced by another version"));
         }
@@ -183,7 +182,6 @@ public final class HBaseMaterializationStore implements MaterializationStore {
           RowFenceMessages.RowKind.CURRENT);
       if (observed.isPresent()) {
         RowFenceMessages.Fence fence = observed.orElseThrow().fence();
-        requirePresent(fence);
         if (fence.appliedSequence() > decision.sequence()) {
           return CompletableFuture.completedFuture(MaterializationStore.ApplyResult.CURRENT_SUPERSEDED);
         }
@@ -211,7 +209,6 @@ public final class HBaseMaterializationStore implements MaterializationStore {
     return readNativeState(row, nativeVersionLimit, scope).thenCompose(observed -> {
       if (observed.fence().isPresent()) {
         RowFenceMessages.Fence fence = observed.fence().orElseThrow().fence();
-        requirePresent(fence);
         if (fence.appliedSequence() > decision.sequence()) {
           return CompletableFuture.completedFuture(MaterializationStore.ApplyResult.CURRENT_SUPERSEDED);
         }
@@ -248,12 +245,12 @@ public final class HBaseMaterializationStore implements MaterializationStore {
     return readVersions.thenCompose(result -> {
       Optional<ObservedFence> observed = observedNativeFence(result);
       if (observed.isEmpty()) {
-        return CompletableFuture.completedFuture(new NativeRowState(result, Optional.empty(), Result.EMPTY_RESULT));
+        return CompletableFuture.completedFuture(new NativeRowState(result, Optional.empty()));
       }
       ObservedFence fence = observed.orElseThrow();
       return readNativeVersion(row, fence.fence().revision(), scope).thenApply(latest -> {
         verifyFenceData(primary, row, latest, fence.fence());
-        return new NativeRowState(result, observed, latest);
+        return new NativeRowState(result, observed);
       });
     });
   }
@@ -283,13 +280,13 @@ public final class HBaseMaterializationStore implements MaterializationStore {
     long previousSequence = 0;
     for (Cell fenceCell : fenceVersions.stream()
         .sorted(java.util.Comparator.comparingLong(Cell::getTimestamp)).toList()) {
-      RowFenceMessages.Fence versionFence = RowFenceMessages.decode(CellUtil.cloneValue(fenceCell));
+      RowFenceMessages.Fence versionFence = RowFenceMessages.decode(copyFence(fenceCell));
       Cell metadata = metadataByTimestamp.get(fenceCell.getTimestamp());
       if (metadata == null || versionFence.rowKind() != RowFenceMessages.RowKind.NATIVE
           || versionFence.state() != RowFenceMessages.State.PRESENT
           || versionFence.revision() != RevisionTimestamp.revision(fenceCell.getTimestamp())
           || versionFence.appliedSequence() <= previousSequence
-          || StorageMessages.decodeMetadata(CellUtil.cloneValue(metadata)).modificationRevision()
+          || StorageMessages.decodeMetadata(copyMetadata(metadata)).modificationRevision()
               != versionFence.revision()) {
         throw new IllegalArgumentException("native version fence does not match its metadata version");
       }
@@ -302,7 +299,7 @@ public final class HBaseMaterializationStore implements MaterializationStore {
       }
       return Optional.empty();
     }
-    byte[] encoded = CellUtil.cloneValue(guard);
+    byte[] encoded = copyFence(guard);
     RowFenceMessages.Fence fence = RowFenceMessages.decode(encoded);
     if (fence.rowKind() != RowFenceMessages.RowKind.NATIVE) {
       throw new IllegalArgumentException("native row fence kind differs from its layout");
@@ -310,7 +307,7 @@ public final class HBaseMaterializationStore implements MaterializationStore {
     requirePresent(fence);
     long timestamp = RevisionTimestamp.timestamp(fence.revision());
     Cell timestampFence = cellAt(versions, CURRENT_FENCE, timestamp);
-    if (timestampFence == null || !Arrays.equals(CellUtil.cloneValue(timestampFence), encoded)) {
+    if (timestampFence == null || !Arrays.equals(copyFence(timestampFence), encoded)) {
       throw new IllegalArgumentException("latest native fence differs from its retained version");
     }
     return Optional.of(new ObservedFence(fence, encoded));
@@ -333,7 +330,7 @@ public final class HBaseMaterializationStore implements MaterializationStore {
       }
       return Optional.empty();
     }
-    byte[] encoded = CellUtil.cloneValue(guard);
+    byte[] encoded = copyFence(guard);
     RowFenceMessages.Fence fence = RowFenceMessages.decode(encoded);
     if (fence.rowKind() != expectedKind) {
       throw new IllegalArgumentException("row fence kind does not match its table layout");
@@ -347,12 +344,12 @@ public final class HBaseMaterializationStore implements MaterializationStore {
       RowFenceMessages.Fence fence) {
     long timestamp = RevisionTimestamp.timestamp(fence.revision());
     Cell guard = cellAt(result, guardQualifier(fence.rowKind()), timestamp);
-    if (guard == null || !Arrays.equals(CellUtil.cloneValue(guard), RowFenceMessages.encode(fence))) {
+    if (guard == null || !Arrays.equals(copyFence(guard), RowFenceMessages.encode(fence))) {
       throw new IllegalArgumentException("row fence is missing from its revision timestamp");
     }
     Cell metadata = cellAt(result, METADATA, timestamp);
     if (metadata == null) throw new IllegalArgumentException("row fence points to missing metadata");
-    byte[] encodedMetadata = CellUtil.cloneValue(metadata);
+    byte[] encodedMetadata = copyMetadata(metadata);
     StorageMetadata storageMetadata = StorageMessages.decodeMetadata(encodedMetadata);
     if (storageMetadata.modificationRevision() != fence.revision()) {
       throw new IllegalArgumentException("row fence revision differs from stored metadata");
@@ -367,7 +364,7 @@ public final class HBaseMaterializationStore implements MaterializationStore {
     if (storageMetadata.state() == StorageMetadata.State.LIVE) {
       Cell valueCell = cellAt(result, VALUE, timestamp);
       if (valueCell == null) throw new IllegalArgumentException("fenced live row is missing its value");
-      value = Optional.of(CellUtil.cloneValue(valueCell));
+      value = Optional.of(copyValuePayload(valueCell));
     } else if (cellAt(result, VALUE, timestamp) != null) {
       throw new IllegalArgumentException("fenced tombstone contains a value at its revision");
     }
@@ -457,16 +454,23 @@ public final class HBaseMaterializationStore implements MaterializationStore {
     }
   }
 
-  private static byte[] guardQualifier(RowFenceMessages.RowKind kind) {
-    return kind == RowFenceMessages.RowKind.HISTORY ? HISTORY_GUARD : CURRENT_FENCE;
+  static byte[] copyMetadata(Cell cell) {
+    StorageMessages.requireMetadataLength(cell.getValueLength());
+    return CellUtil.cloneValue(cell);
   }
 
-  private static RowFenceMessages.RowKind rowKind(StorageTableBinding binding) {
-    return switch (binding.layout()) {
-      case CURRENT -> RowFenceMessages.RowKind.CURRENT;
-      case HISTORY -> RowFenceMessages.RowKind.HISTORY;
-      case NATIVE -> RowFenceMessages.RowKind.NATIVE;
-    };
+  static byte[] copyValuePayload(Cell cell) {
+    StorageMessages.requireValuePayloadLength(cell.getValueLength());
+    return CellUtil.cloneValue(cell);
+  }
+
+  static byte[] copyFence(Cell cell) {
+    RowFenceMessages.requireEncodedLength(cell.getValueLength());
+    return CellUtil.cloneValue(cell);
+  }
+
+  private static byte[] guardQualifier(RowFenceMessages.RowKind kind) {
+    return kind == RowFenceMessages.RowKind.HISTORY ? HISTORY_GUARD : CURRENT_FENCE;
   }
 
   private static List<Cell> cells(Result row, byte[] qualifier) {
@@ -520,6 +524,5 @@ public final class HBaseMaterializationStore implements MaterializationStore {
   }
 
   private record ObservedFence(RowFenceMessages.Fence fence, byte[] encoded) {}
-  private record NativeRowState(
-      Result versions, Optional<ObservedFence> fence, Result latestVersion) {}
+  private record NativeRowState(Result versions, Optional<ObservedFence> fence) {}
 }
