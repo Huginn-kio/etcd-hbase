@@ -20,9 +20,9 @@ J29.1 通过现有 invocation、manifest、control 行 CAS、发布解析、deci
 
 以下数据未由当前 MiniCluster instrumentation 可靠提供，保持为缺口：点请求的 HBase RPC/retry 数、服务端 scan counters、WAL/HFile IO 和 compaction 成本、JVM/direct-memory 高水位、恢复 reserve 的真实账本峰值、多进程故障接管成本。应用逻辑字节不能当作网络字节或 HBase Cell 字节。
 
-## 本次验证结果
+## 原始分支观测（历史）
 
-运行环境为 HBase `2.6.6-hadoop3`、Temurin JDK `21.0.12.1+1-LTS`、单 RegionServer 和 4 个 salt bucket。固定 seed 为 `20261104`，workload SHA-256 为 `99fd421f6ecc306ec263fc2a53ee0b08523d8793b239c0d945a26a5ec50402fd`。`scripts/verify/j29.sh` 的 MiniCluster 用例通过 1 次，失败、错误和跳过均为 0；同次机器报告保存在本地忽略目录 `.artifacts/m2/j29/`。
+本节数据来自原始提交 `643cc287b3f5a0f7c76ee24893e556a73981bb9e`，其 J28 父提交为 `4e92e763d9e1e2e2ffc33ac0905e8c841a02b7a0`。它不代表合并后最新基线的测量结果。运行环境为 HBase `2.6.6-hadoop3`、Temurin JDK `21.0.12.1+1-LTS`、单 RegionServer 和 4 个 salt bucket。固定 seed 为 `20261104`，workload SHA-256 为 `99fd421f6ecc306ec263fc2a53ee0b08523d8793b239c0d945a26a5ec50402fd`。`scripts/verify/j29.sh` 的 MiniCluster 用例通过 1 次，失败、错误和跳过均为 0；同次机器报告保存在本地忽略目录 `.artifacts/m2/j29/`。
 
 下表为每类单次观测耗时，单位为微秒；没有预热和重复运行，因此这些数值只描述本次本地执行。finalization 是 publish-and-finalize 总区间的子区间，不能相加。8 个请求的队列 p99 是小样本最大值，不作为稳定尾延迟估计。
 
@@ -36,6 +36,12 @@ J29.1 通过现有 invocation、manifest、control 行 CAS、发布解析、deci
 本次请求边界采样的 heap 峰值为 HISTORY 89,176,024 B、NATIVE 58,268,784 B；direct buffer 分别为 12,592,074 B 和 12,592,070 B；线程数为 24 和 25。两个布局的候选逻辑负载峰值均为 16,710 B；扫描器峰值均为 1，pin 释放后活跃数均为 0（容量 32）。这些是稀疏请求边界采样值，不是连续 JVM 高水位。
 
 所有记录的 control CAS 均无冲突、未知结果或失败。每种布局均完成 26 次 control CAS、46 次 materialize apply；系统记录中的候选、manifest、decision、snapshot pin 操作和逻辑字节数见同目录 `summary.json`。本次仅运行一次且 HISTORY 先于 NATIVE 执行，结果不用于宣称某种物理布局更快。
+
+## 最新基线集成验证
+
+基于 PR #32 的合并提交 `db8e12fba2deb1fca351193f293678c6e616632a`，在对应源码提交 `680f0cfcf2c6d545f90356ee7f49e380f4be6ec2` 的工作树执行 `scripts/verify/j29.sh`，提交后核对测试源码哈希一致。锁定 Temurin JDK 21 和单 RegionServer MiniCluster 下，SPI 13 项、core 198 项、HBase 单测 129 项及包含两种布局的 J29 集成用例 1 项通过，失败、错误和跳过均为 0。两种布局均记录 12 次页请求、8 次重开、8 次恢复物化，pin 释放后活跃数为 0；原始机器报告留在本地忽略目录。
+
+新基线的夹具在独占的新系统表上、服务启动前显式初始化 pin 注册表，点读和扫描共用请求作用域内的有界候选预算。初始化发生在计数包装内，因此本次系统记录总量包含注册表初始化操作；读屏障和 pin 打开耗时不包含这一步。此次仍是单次合成负载，不用于比较布局性能或推断目标环境容量、p99 和恢复目标。
 
 ## 后续验收
 

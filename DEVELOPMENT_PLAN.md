@@ -730,7 +730,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J29.3** M2：模拟续租元数据提交，与业务提交竞争的近似负载报告。
     - [ ] **J29.4** M4：依赖 J40–J43，补真实 Lease/业务/到期任务混合负载并复核调度结论。
   - 验证层次：L1 存储/内核。
-  - 跟踪：J29.1–J29.3 公开实现与 MiniCluster 验证完成，维护者评审待处理；负责人=Codex；完成日期=2026-11-04；PR/commit=[PR #33](https://github.com/Reidddddd/etcd-hbase/pull/33) / 单任务提交；验证入口=`scripts/verify/j29.sh`；报告=`docs/testing/j29-public-cost-report.md`（原始 JUnit 与机器摘要留在本地忽略目录）；作者自审=通过；独立复核=未执行；评审人/结论=`Reidddddd` / 待评审。证据为 Temurin JDK 21、HBase 2.6.6-hadoop3 单 RegionServer MiniCluster，HISTORY + CURRENT 与 NATIVE 使用相同固定负载；1 项完整用例通过，失败/错误/跳过均为 0。该单次公开观测不构成布局性能结论、目标容量/p99 或恢复 reserve 验收；B04/B05 与目标环境验证仍待提供，J29.4 归 M4。
+  - 跟踪：J29.1–J29.3 公开实现与 MiniCluster 验证完成，维护者评审待处理；负责人=Codex；完成日期=2026-11-04；PR/commit=[PR #33](https://github.com/Reidddddd/etcd-hbase/pull/33)；验证入口=`scripts/verify/j29.sh`；报告=`docs/testing/j29-public-cost-report.md`（原始 JUnit 与机器摘要留在本地忽略目录）；作者自审=通过；独立复核=未执行；评审人/结论=`Reidddddd` / 待评审。原始分支 `643cc287b3f5a0f7c76ee24893e556a73981bb9e` 的单次观测保留为历史；整理到合并基线 `db8e12fba2deb1fca351193f293678c6e616632a` 后，对应源码提交 `680f0cfcf2c6d545f90356ee7f49e380f4be6ec2` 的工作树在 Temurin JDK 21、单 RegionServer MiniCluster 的两种布局上通过 1 项 J29 集成用例，SPI 13 项、core 198 项和 HBase 单测 129 项均通过，失败、错误和跳过均为 0；提交后核对测试源码哈希一致。单次公开观测不构成布局性能结论、目标容量/p99 或恢复 reserve 验收；B04/B05 与目标环境验证仍待提供，J29.4 归 M4。
 
 **退出条件：** 提交不变量、J28.1 内核历史、跨副本读保护、全部崩溃窗口与旧 owner 隔离有证据；J29.1–J29.3 提交/读/模拟续租报告支持内核选型。J28.2 归 M3、J29.4 归 M4，阶段记录保留跨阶段未完成项，完整首版仍需全部子交付。
 
