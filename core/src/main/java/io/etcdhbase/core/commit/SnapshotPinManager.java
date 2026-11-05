@@ -631,6 +631,10 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     if (slot.status() == SnapshotPinShard.Status.COMPLETED) {
       return mutation == LeaseMutation.RENEW ? failed(cancelled()) : CompletableFuture.completedFuture(null);
     }
+    if (slot.status() == SnapshotPinShard.Status.REVOKED) {
+      return mutation == LeaseMutation.RELEASE
+          ? CompletableFuture.completedFuture(null) : failed(cancelled());
+    }
     if (slot.status() != SnapshotPinShard.Status.ACTIVE) return failed(cancelled());
     long now = clock.millis();
     if (slot.expiresAtEpochMillis() <= now) {

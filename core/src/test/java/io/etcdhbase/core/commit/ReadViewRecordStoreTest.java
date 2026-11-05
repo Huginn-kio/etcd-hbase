@@ -207,18 +207,19 @@ class ReadViewRecordStoreTest {
     Fixture fixture = new Fixture(1, List.of(
         candidate("k", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
     fixture.pinCompletion = new CompletableFuture<>();
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(20))) {
       ReadViewRecordStore view = fixture.readStore(
           fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
       var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
       var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
       var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192, 8192);
       try (var account = budgets.admit("public", scope, reservation);
-          var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
+          var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(15));
           var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account),
               new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
                   ReadProjection.FULL, 4, 8192, 16), 1, account, scope)) {
         var result = cursor.read(1);
+        fixture.pinCompletionStarted.get(10, TimeUnit.SECONDS);
         assertFalse(result.isDone(), "materialized rows wait for durable pin completion");
         assertTrue(budgets.snapshot().allocatedBytes() > 0,
             "the response lease remains owned while final pin validation is pending");
@@ -240,23 +241,31 @@ class ReadViewRecordStoreTest {
   void successfulFinalPinValidationDeliversAndTransfersRangeOwnership() throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("k", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+    fixture.pinCompletion = new CompletableFuture<>();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(20))) {
       ReadViewRecordStore view = fixture.readStore(
           fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
       var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
       var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
       var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192, 8192);
       try (var account = budgets.admit("public", scope, reservation);
-          var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
+          var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(15));
           var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account),
               new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
-                  ReadProjection.FULL, 4, 8192, 16), 1, account, scope);
-          var response = cursor.read(1).join()) {
-        assertEquals(List.of("k"), response.records().stream()
-            .map(record -> text(record.key())).toList());
-        assertEquals(1, fixture.pinCompletions.get());
+                  ReadProjection.FULL, 4, 8192, 16), 1, account, scope)) {
+        var result = cursor.read(1);
+        fixture.pinCompletionStarted.get(10, TimeUnit.SECONDS);
+        assertFalse(result.isDone(), "materialized rows wait for durable pin completion");
         assertTrue(budgets.snapshot().allocatedBytes() > 0,
-            "the delivered response owns its output lease until the caller closes it");
+            "the pending response owns its output lease until pin completion");
+        fixture.pinCompletion.complete(null);
+        try (var response = result.get(10, TimeUnit.SECONDS)) {
+          assertEquals(List.of("k"), response.records().stream()
+              .map(record -> text(record.key())).toList());
+          assertEquals(1, fixture.pinCompletions.get());
+          assertTrue(budgets.snapshot().allocatedBytes() > 0,
+              "the delivered response owns its output lease until the caller closes it");
+        }
       }
       assertEquals(0, budgets.snapshot().allocatedBytes());
     }
@@ -709,6 +718,7 @@ class ReadViewRecordStoreTest {
     private final AtomicInteger pinCloses = new AtomicInteger();
     private final AtomicInteger pinRenews = new AtomicInteger();
     private final AtomicInteger pinCompletions = new AtomicInteger();
+    private final CompletableFuture<Void> pinCompletionStarted = new CompletableFuture<>();
     private volatile CompletableFuture<Void> pinRenewal = CompletableFuture.completedFuture(null);
     private volatile CompletableFuture<Void> pinCompletion = CompletableFuture.completedFuture(null);
     private final ReadViewService views;
@@ -744,6 +754,7 @@ class ReadViewRecordStoreTest {
           }
           @Override public CompletableFuture<Void> complete(RequestScope requestScope) {
             pinCompletions.incrementAndGet();
+            pinCompletionStarted.complete(null);
             return pinCompletion.whenComplete((ignored, failure) -> {
               if (failure == null) close();
             });
