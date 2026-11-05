@@ -39,8 +39,9 @@ def module_counts(directory: Path) -> dict[str, int]:
     if not reports:
         raise ValueError(f"missing test reports: {directory}")
     for report in reports:
+        suite = ET.parse(report).getroot()
         for key in totals:
-            totals[key] += int(ET.parse(report).getroot().get(key, "0"))
+            totals[key] += int(suite.get(key, "0"))
     if any(totals[key] != 0 for key in ("failures", "errors", "skipped")):
         raise ValueError(f"module tests did not pass cleanly: {directory}")
     return totals

@@ -46,73 +46,92 @@ class M2RecoveryIT {
   void freshManagerArchivesAndFinalizesSelectedMetadataOnlyPublication() throws Exception {
     try (M1TestEnvironment environment = M1TestEnvironment.start(1);
         RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(180))) {
-      String suffix = UUID.randomUUID().toString().replace("-", "");
-      TableName table = TableName.valueOf("m2_recovery_" + suffix);
-      String tableGroup = "m2-recovery-" + suffix;
-      String saltProfile = "m2-recovery-salt-" + suffix;
-      SystemTableBinding binding = new SystemTableBinding(table, FAMILY,
-          tableGroup, saltProfile, SALT);
-      environment.create(table, descriptor(binding, saltProfile), SALT.splitKeys().toArray(byte[][]::new));
-
-      HBaseSystemRecordStore records = openRecords(environment, binding, scope);
-      HBaseCommitControlStore control = openControl(environment, binding, scope);
-      InvocationRepository invocations = new HBaseInvocationRepository(records);
-      ManifestRepository manifests = new HBaseManifestRepository(records);
-      CommitDecisionRepository decisions = new HBaseCommitDecisionRepository(records);
-      assertTrue(await(control.initializeIfAbsent(
-          CommitState.initial(binding.profileFingerprint(), 7), scope)));
-
-      long recoveryNow = System.currentTimeMillis();
-      long oldClaimTime = recoveryNow - 2_000;
-      CommitState expiredOwner = CommitState.initial(binding.profileFingerprint(), 7)
-          .claimOwner("stopped-process", oldClaimTime, oldClaimTime + 1_000);
-      ControlSnapshot initialized = await(control.read(scope)).orElseThrow();
-      assertTrue(await(control.compareAndSet(initialized, expiredOwner, scope)));
-
-      var transaction = TransactionId.create();
-      InvocationId invocationId = InvocationId.create();
-      ManifestRoot root = ManifestRoot.create(transaction, expiredOwner.ownerEpoch(), 0, 7,
-          0, 0, Optional.empty());
-      InvocationBinding invocation = InvocationBinding.begin(invocationId, digest(4), digest(5),
-          transaction, expiredOwner.ownerEpoch(), 0, 7).seal(root.systemIdentity());
-      assertEquals(SystemRecordStore.CreateResult.CREATED,
-          await(invocations.createIfAbsent(invocation, scope)));
-      assertEquals(SystemRecordStore.CreateResult.CREATED, await(manifests.seal(root, scope)));
-
-      ControlSnapshot beforePublish = await(control.read(scope)).orElseThrow();
-      PublicationSlot slot = new PublicationSlot(transaction, invocationId, expiredOwner.ownerEpoch(),
-          0, 7, 1, 7, false, root.systemIdentity(), root.digest());
-      assertTrue(await(control.compareAndSet(beforePublish,
-          beforePublish.state().publish(slot), scope)));
-
-      HBaseSystemRecordStore reopenedRecords = openRecords(environment, binding, scope);
-      HBaseCommitControlStore reopenedControl = openControl(environment, binding, scope);
-      InvocationRepository reopenedInvocations = new HBaseInvocationRepository(reopenedRecords);
-      ManifestRepository reopenedManifests = new HBaseManifestRepository(reopenedRecords);
-      CommitDecisionRepository reopenedDecisions = new HBaseCommitDecisionRepository(reopenedRecords);
-      CommitOutcomeResolver outcomes = new CommitOutcomeResolver(reopenedControl, reopenedDecisions);
-      CommitFinalizationService finalizer = new CommitFinalizationService(
-          reopenedControl, outcomes, reopenedDecisions, new ManifestCatalog(reopenedManifests),
-          noCandidatesMaterialization());
-      RecoveryManager recovery = new RecoveryManager(binding.profileFingerprint(), reopenedControl,
-          new CommitOwnerService(reopenedControl), reopenedInvocations, outcomes, finalizer);
-
-      RecoveryManager.Result result = await(recovery.recover(
-          "recovery-process", recoveryNow, recoveryNow + 60_000, scope));
-
-      assertEquals(RecoveryManager.State.FINALIZED, result.state());
-      assertEquals(2, result.owner().orElseThrow().epoch());
-      CommitState recovered = await(reopenedControl.read(scope)).orElseThrow().state();
-      assertEquals(1, recovered.publishedSequence());
-      assertEquals(1, recovered.finalizedSequence());
-      assertEquals(7, recovered.publishedRevision());
-      assertEquals(7, recovered.finalizedRevision());
-      assertTrue(recovered.publication().isEmpty());
-      assertEquals(Optional.of(CommitDecision.from(slot)),
-          await(reopenedDecisions.read(1, scope)));
-      System.out.println("j27-recovery durableSelectedSlot=true archiveAndFinalize=true revisionStable=true");
+      RecoveryFixture fixture = prepareSelectedPublication(environment, scope);
+      RecoveryComponents reopened = reopenRecovery(environment, fixture.binding(), scope);
+      assertRecoveredPublication(fixture, reopened, scope);
     }
   }
+
+  private static RecoveryFixture prepareSelectedPublication(
+      M1TestEnvironment environment, RequestScope scope) throws Exception {
+    SystemTableBinding binding = createRecoveryTable(environment);
+    HBaseSystemRecordStore records = openRecords(environment, binding, scope);
+    HBaseCommitControlStore control = openControl(environment, binding, scope);
+    InvocationRepository invocations = new HBaseInvocationRepository(records);
+    ManifestRepository manifests = new HBaseManifestRepository(records);
+    assertTrue(await(control.initializeIfAbsent(
+        CommitState.initial(binding.profileFingerprint(), 7), scope)));
+
+    long recoveryNow = System.currentTimeMillis();
+    long oldClaimTime = recoveryNow - 2_000;
+    CommitState expiredOwner = CommitState.initial(binding.profileFingerprint(), 7)
+        .claimOwner("stopped-process", oldClaimTime, oldClaimTime + 1_000);
+    ControlSnapshot initialized = await(control.read(scope)).orElseThrow();
+    assertTrue(await(control.compareAndSet(initialized, expiredOwner, scope)));
+
+    var transaction = TransactionId.create();
+    InvocationId invocationId = InvocationId.create();
+    ManifestRoot root = ManifestRoot.create(transaction, expiredOwner.ownerEpoch(), 0, 7,
+        0, 0, Optional.empty());
+    InvocationBinding invocation = InvocationBinding.begin(invocationId, digest(4), digest(5),
+        transaction, expiredOwner.ownerEpoch(), 0, 7).seal(root.systemIdentity());
+    assertEquals(SystemRecordStore.CreateResult.CREATED,
+        await(invocations.createIfAbsent(invocation, scope)));
+    assertEquals(SystemRecordStore.CreateResult.CREATED, await(manifests.seal(root, scope)));
+
+    ControlSnapshot beforePublish = await(control.read(scope)).orElseThrow();
+    PublicationSlot slot = new PublicationSlot(transaction, invocationId, expiredOwner.ownerEpoch(),
+        0, 7, 1, 7, false, root.systemIdentity(), root.digest());
+    assertTrue(await(control.compareAndSet(beforePublish, beforePublish.state().publish(slot), scope)));
+    return new RecoveryFixture(binding, slot, recoveryNow);
+  }
+
+  private static SystemTableBinding createRecoveryTable(M1TestEnvironment environment) throws Exception {
+    String suffix = UUID.randomUUID().toString().replace("-", "");
+    TableName table = TableName.valueOf("m2_recovery_" + suffix);
+    String tableGroup = "m2-recovery-" + suffix;
+    String saltProfile = "m2-recovery-salt-" + suffix;
+    SystemTableBinding binding = new SystemTableBinding(table, FAMILY, tableGroup, saltProfile, SALT);
+    environment.create(table, descriptor(binding, saltProfile), SALT.splitKeys().toArray(byte[][]::new));
+    return binding;
+  }
+
+  private static RecoveryComponents reopenRecovery(M1TestEnvironment environment,
+      SystemTableBinding binding, RequestScope scope) throws Exception {
+    HBaseSystemRecordStore records = openRecords(environment, binding, scope);
+    HBaseCommitControlStore control = openControl(environment, binding, scope);
+    InvocationRepository invocations = new HBaseInvocationRepository(records);
+    ManifestRepository manifests = new HBaseManifestRepository(records);
+    CommitDecisionRepository decisions = new HBaseCommitDecisionRepository(records);
+    CommitOutcomeResolver outcomes = new CommitOutcomeResolver(control, decisions);
+    CommitFinalizationService finalizer = new CommitFinalizationService(
+        control, outcomes, decisions, new ManifestCatalog(manifests), noCandidatesMaterialization());
+    RecoveryManager recovery = new RecoveryManager(binding.profileFingerprint(), control,
+        new CommitOwnerService(control), invocations, outcomes, finalizer);
+    return new RecoveryComponents(control, decisions, recovery);
+  }
+
+  private static void assertRecoveredPublication(RecoveryFixture fixture,
+      RecoveryComponents reopened, RequestScope scope) throws Exception {
+    RecoveryManager.Result result = await(reopened.manager().recover(
+        "recovery-process", fixture.recoveryNow(), fixture.recoveryNow() + 60_000, scope));
+    assertEquals(RecoveryManager.State.FINALIZED, result.state());
+    assertEquals(2, result.owner().orElseThrow().epoch());
+    CommitState recovered = await(reopened.control().read(scope)).orElseThrow().state();
+    assertEquals(1, recovered.publishedSequence());
+    assertEquals(1, recovered.finalizedSequence());
+    assertEquals(7, recovered.publishedRevision());
+    assertEquals(7, recovered.finalizedRevision());
+    assertTrue(recovered.publication().isEmpty());
+    assertEquals(Optional.of(CommitDecision.from(fixture.slot())),
+        await(reopened.decisions().read(1, scope)));
+    System.out.println("j27-recovery durableSelectedSlot=true archiveAndFinalize=true revisionStable=true");
+  }
+
+  private record RecoveryFixture(SystemTableBinding binding, PublicationSlot slot, long recoveryNow) {}
+
+  private record RecoveryComponents(HBaseCommitControlStore control,
+      CommitDecisionRepository decisions, RecoveryManager manager) {}
 
   private static HBaseSystemRecordStore openRecords(M1TestEnvironment environment,
       SystemTableBinding binding, RequestScope scope) throws Exception {

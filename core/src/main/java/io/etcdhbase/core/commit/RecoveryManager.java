@@ -96,30 +96,40 @@ public final class RecoveryManager {
         return CompletableFuture.completedFuture(new Result(
             State.NO_PENDING_PUBLICATION, Optional.of(owner), Optional.empty()));
       }
-      PublicationSlot slot = state.publication().orElseThrow();
-      CommitDecision selected = CommitDecision.from(slot);
-      return invocations.read(slot.invocationId(), scope).thenCompose(stored -> {
-        if (stored.isEmpty()) {
-          return failed(new IllegalStateException("selected publication has no durable invocation binding"));
-        }
-        InvocationBinding invocation = stored.orElseThrow();
-        try {
-          validateBinding(slot, invocation);
-        } catch (RuntimeException failure) {
-          return failed(failure);
-        }
-        return outcomes.resolveForFinalization(invocation, scope).thenCompose(observed -> {
-          if (!selectedResolution(observed, selected)) {
-            return failed(new BackendFailure(BackendFailure.Category.UNKNOWN));
-          }
-          CompletableFuture<CommitOutcomeResolver.Resolution> finishing =
-              observed.state() == CommitOutcomeResolver.State.SELECTED_PENDING
-                  ? finalizer.finish(invocation, observed, scope)
-                  : CompletableFuture.completedFuture(observed);
-          return finishing.thenCompose(result -> verifyFinalized(owner, selected, result, scope));
-        });
-      });
+      return recoverPublication(owner, state.publication().orElseThrow(), scope);
     });
+  }
+
+  private CompletableFuture<Result> recoverPublication(CommitOwnerService.OwnerToken owner,
+      PublicationSlot slot, RequestScope scope) {
+    CommitDecision selected = CommitDecision.from(slot);
+    return invocations.read(slot.invocationId(), scope).thenCompose(stored ->
+        recoverBinding(owner, slot, selected, stored, scope));
+  }
+
+  private CompletableFuture<Result> recoverBinding(CommitOwnerService.OwnerToken owner,
+      PublicationSlot slot, CommitDecision selected, Optional<InvocationBinding> stored,
+      RequestScope scope) {
+    if (stored.isEmpty()) {
+      return failed(new IllegalStateException("selected publication has no durable invocation binding"));
+    }
+    InvocationBinding invocation = stored.orElseThrow();
+    validateBinding(slot, invocation);
+    return outcomes.resolveForFinalization(invocation, scope).thenCompose(observed ->
+        finishSelected(owner, selected, invocation, observed, scope));
+  }
+
+  private CompletableFuture<Result> finishSelected(CommitOwnerService.OwnerToken owner,
+      CommitDecision selected, InvocationBinding invocation, CommitOutcomeResolver.Resolution observed,
+      RequestScope scope) {
+    if (!selectedResolution(observed, selected)) {
+      return failed(new BackendFailure(BackendFailure.Category.UNKNOWN));
+    }
+    CompletableFuture<CommitOutcomeResolver.Resolution> finishing =
+        observed.state() == CommitOutcomeResolver.State.SELECTED_PENDING
+            ? finalizer.finish(invocation, observed, scope)
+            : CompletableFuture.completedFuture(observed);
+    return finishing.thenCompose(result -> verifyFinalized(owner, selected, result, scope));
   }
 
   private CompletableFuture<Result> verifyFinalized(CommitOwnerService.OwnerToken owner,
