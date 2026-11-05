@@ -135,8 +135,11 @@ public final class ExistsExecutor implements AutoCloseable {
     if (failure == null && completionStore != null) {
       Error primaryFatal = fatal;
       try {
-        completionStore.finishRead().whenComplete((ignored, pinFailure) ->
-            completeResult(count, pinFailure == null ? null : unwrap(pinFailure), primaryFatal));
+        completionStore.finishRead().whenComplete((ignored, pinFailure) -> {
+          Throwable observedFailure = pinFailure == null ? null : unwrapPinFailure(pinFailure);
+          Error completionFatal = observedFailure instanceof Error error ? error : primaryFatal;
+          completeResult(count, observedFailure, completionFatal);
+        });
       } catch (RuntimeException | Error pinFailure) {
         // Preserve the result future when finishRead throws synchronously; completeResult settles it
         // before rethrowing fatal Error.
@@ -182,6 +185,13 @@ public final class ExistsExecutor implements AutoCloseable {
   private static BackendFailure unwrap(Throwable failure) {
     while (failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null) failure = failure.getCause();
     return failure instanceof BackendFailure backend ? backend : new BackendFailure(BackendFailure.Category.UNKNOWN, failure);
+  }
+  private static Throwable unwrapPinFailure(Throwable failure) {
+    while (failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null) {
+      failure = failure.getCause();
+    }
+    if (failure instanceof BackendFailure || failure instanceof Error) return failure;
+    return new BackendFailure(BackendFailure.Category.UNKNOWN, failure);
   }
   private record Completion(BucketCursor.Page page, Throwable failure) {}
 }

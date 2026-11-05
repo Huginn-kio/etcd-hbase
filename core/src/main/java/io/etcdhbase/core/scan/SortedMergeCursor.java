@@ -53,24 +53,26 @@ public final class SortedMergeCursor implements AutoCloseable {
 
   public SortedMergeCursor(ScanSource source, ScanRequest template, int bucketCount,
       BudgetManager.Account account, RequestScope scope) {
-    this(source, template, bucketCount, account, scope, null);
+    this(source, template, bucketCount, account, scope, null,
+        source instanceof RecordStore recordStore ? recordStore : null);
   }
 
   public static SortedMergeCursor values(RecordStore store, ScanSource source, ScanRequest template,
       int bucketCount, BudgetManager.Account account, RequestScope scope) {
     return new SortedMergeCursor(source, template, bucketCount, account, scope,
-        java.util.Objects.requireNonNull(store, "store"));
+        java.util.Objects.requireNonNull(store, "store"), store);
   }
 
   /** Metadata-only merge that still completes the same pinned view before returning its page. */
   public static SortedMergeCursor metadata(RecordStore store, ScanSource source,
       ScanRequest template, int bucketCount, BudgetManager.Account account, RequestScope scope) {
     return new SortedMergeCursor(source, template, bucketCount, account, scope,
-        java.util.Objects.requireNonNull(store, "store"));
+        null, java.util.Objects.requireNonNull(store, "store"));
   }
 
   private SortedMergeCursor(ScanSource source, ScanRequest template, int bucketCount,
-      BudgetManager.Account account, RequestScope scope, RecordStore valueStore) {
+      BudgetManager.Account account, RequestScope scope, RecordStore valueStore,
+      RecordStore completionStore) {
     if (bucketCount < 1 || bucketCount > 4096
         || account.reservation().heads() / bucketCount < template.maximumBytes()) {
       throw new IllegalArgumentException("all bucket heads require reserved memory before scanning");
@@ -79,8 +81,7 @@ public final class SortedMergeCursor implements AutoCloseable {
     this.account = account;
     this.scope = scope;
     this.valueStore = valueStore;
-    this.completionStore = valueStore != null ? valueStore
-        : source instanceof RecordStore recordStore ? recordStore : null;
+    this.completionStore = completionStore;
     if (valueStore == null && template.projection() != ReadProjection.METADATA) {
       throw new IllegalArgumentException("full values require a pinned value reader");
     }

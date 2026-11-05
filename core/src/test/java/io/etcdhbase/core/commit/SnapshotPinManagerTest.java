@@ -1,6 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -44,11 +45,19 @@ class SnapshotPinManagerTest {
       assertEquals(1, advanced.protections().size());
       assertEquals(5, advanced.protections().getFirst().requiredRevision());
 
+      SnapshotPinManager reopened = SnapshotPinManager.open(records,
+          new SnapshotPinConfiguration(3, 2, Duration.ofSeconds(2)), scope).join();
+      SnapshotGcBoundary afterReopen = reopened.readBoundary(scope).join();
+      assertEquals(5, afterReopen.safeRevision());
+      assertEquals(4, afterReopen.safeSequence());
+      assertEquals(advanced.protections(), afterReopen.protections(),
+          "reopening must preserve active pins and durable floors");
+
       Throwable rejected = failure(() -> manager.register(stableView(7), scope).join());
       assertInstanceOf(IllegalStateException.class, rejected);
 
       pin.complete(scope).join();
-      SnapshotGcBoundary afterCompletion = manager.readBoundary(scope).join();
+      SnapshotGcBoundary afterCompletion = reopened.readBoundary(scope).join();
       assertEquals(8, afterCompletion.safeRevision());
       assertEquals(4, afterCompletion.safeSequence());
       assertTrue(afterCompletion.protections().isEmpty());
@@ -203,6 +212,52 @@ class SnapshotPinManagerTest {
       records.remove(SystemRecordType.SNAPSHOT_PIN, shardIdentity(1));
       assertInstanceOf(IllegalStateException.class,
           failure(() -> manager.readBoundary(scope).join()));
+      assertInstanceOf(IllegalStateException.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, shardIdentity(1)),
+          "reopen must not replace a missing configured shard with an empty row");
+    }
+  }
+
+  @Test
+  void interruptedInitialShardCreationCanResumeBeforeTheConfigurationReadyMarker() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(2, 2, Duration.ofSeconds(2));
+    records.failNextCreate(SystemRecordType.SNAPSHOT_PIN, shardIdentity(1));
+
+    try (RequestScope scope = scope()) {
+      assertInstanceOf(IllegalStateException.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertTrue(records.contains(SystemRecordType.SNAPSHOT_PIN, shardIdentity(0)));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()),
+          "the ready marker is written only after every initial shard exists");
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, shardIdentity(1)));
+
+      SnapshotPinManager reopened = SnapshotPinManager.open(records, configuration, scope).join();
+      SnapshotGcBoundary boundary = reopened.readBoundary(scope).join();
+      assertEquals(0, boundary.safeRevision());
+      assertEquals(0, boundary.safeSequence());
+      assertTrue(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()));
+    }
+  }
+
+  @Test
+  void missingConfigurationCannotReinitializeNonEmptyShardState() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(2, 2, Duration.ofSeconds(2));
+    SnapshotPinManager manager = open(records, configuration, Clock.systemUTC());
+
+    try (RequestScope scope = scope()) {
+      manager.advanceRegistrationFloors(8, 4, scope).join();
+      records.remove(SystemRecordType.SNAPSHOT_PIN, configurationIdentity());
+
+      assertInstanceOf(IllegalStateException.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()),
+          "a missing ready marker cannot legitimize non-empty shard state");
+      SnapshotGcBoundary retained = manager.readBoundary(scope).join();
+      assertEquals(8, retained.safeRevision());
+      assertEquals(4, retained.safeSequence());
     }
   }
 
@@ -295,6 +350,7 @@ class SnapshotPinManagerTest {
     private volatile CyclicBarrier readBarrier;
     private final AtomicInteger pausedReads = new AtomicInteger();
     private final AtomicBoolean loseCasReplyAfterWrite = new AtomicBoolean();
+    private volatile RecordKey nextCreateFailure;
     private volatile CompletableFuture<Void> casEntered;
     private volatile CompletableFuture<Void> releaseCas;
 
@@ -326,6 +382,10 @@ class SnapshotPinManagerTest {
     public synchronized CompletableFuture<CreateResult> createIfAbsent(
         SystemRecordType type, ByteKey identity, ByteKey value, RequestScope scope) {
       RecordKey key = new RecordKey(type, identity);
+      if (key.equals(nextCreateFailure)) {
+        nextCreateFailure = null;
+        return CompletableFuture.failedFuture(new IllegalStateException("synthetic create failure"));
+      }
       ByteKey existing = rows.get(key);
       if (existing == null) {
         rows.put(key, value);
@@ -387,6 +447,14 @@ class SnapshotPinManagerTest {
     private synchronized void remove(SystemRecordType type, ByteKey identity) {
       rows.remove(new RecordKey(type, identity));
     }
+
+    private synchronized boolean contains(SystemRecordType type, ByteKey identity) {
+      return rows.containsKey(new RecordKey(type, identity));
+    }
+
+    private synchronized void failNextCreate(SystemRecordType type, ByteKey identity) {
+      nextCreateFailure = new RecordKey(type, identity);
+    }
   }
 
   private record RecordKey(SystemRecordType type, ByteKey identity) {}
@@ -394,6 +462,10 @@ class SnapshotPinManagerTest {
   private static ByteKey shardIdentity(int shard) {
     return ByteKey.copyOf(java.nio.ByteBuffer.allocate(Integer.BYTES * 2)
         .putInt(1).putInt(shard).array());
+  }
+
+  private static ByteKey configurationIdentity() {
+    return ByteKey.copyOf(new byte[] {0x53, 0x50, 0x49, 0x4e, 0x01, 0x00});
   }
 
   private static final class MutableClock extends Clock {

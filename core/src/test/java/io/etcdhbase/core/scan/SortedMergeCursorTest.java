@@ -74,6 +74,27 @@ class SortedMergeCursorTest {
   }
 
   @Test
+  void metadataProjectionFitsMetadataBudgetAndStillCompletesThePinnedRead() throws Exception {
+    var record = ExistsExecutorTest.live(1, 4096);
+    var store = new FrozenRecordStore(List.of(List.of(record)));
+    var budget = budget();
+    try (var scope = RequestScope.withoutDeadline();
+        var account = budget.admit("public", scope, memory(1, 512));
+        var scheduler = new ScanScheduler(budget, Duration.ofSeconds(1));
+        var cursor = SortedMergeCursor.metadata(store, scheduler.bind(store, account),
+            template(), 1, account, scope);
+        var page = cursor.read(1).join()) {
+      assertEquals(1, page.count());
+      assertEquals(4096, page.records().getFirst().metadata().valueLength());
+      assertFalse(page.records().getFirst().hasValue());
+      assertTrue(store.gets.isEmpty(), "metadata projection must not issue a FULL point get");
+      assertEquals(1, store.finishReadCalls,
+          "metadata completion must still validate the same pinned read");
+    }
+    assertEquals(0, budget.snapshot().allocatedBytes());
+  }
+
+  @Test
   void duplicatesAndResponseExhaustionFailWithoutPartialSuccess() throws Exception {
     var one = record(new byte[] {1}, false);
     for (var buckets : List.of(List.of(List.of(one), List.of(one)), List.of(List.of(one), List.<StoredRecord>of()))) {

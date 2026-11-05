@@ -37,7 +37,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     this.clock = clock;
   }
 
-  /** Persists the immutable layout first, then creates every finite shard before accepting reads. */
+  /** Publishes the immutable layout only after first-time shard initialization is complete. */
   public static CompletableFuture<SnapshotPinManager> open(SystemRecordStore records,
       SnapshotPinConfiguration configuration, RequestScope scope) {
     return open(records, configuration, Clock.systemUTC(), scope);
@@ -51,8 +51,12 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     Objects.requireNonNull(clock, "clock");
     Objects.requireNonNull(scope, "scope");
     var manager = new SnapshotPinManager(records, configuration, clock);
-    return manager.ensureConfiguration(scope).thenCompose(ignored ->
-        manager.initializeShards(0, scope)).thenApply(ignored -> manager);
+    return manager.readConfiguration(scope).thenCompose(configured -> {
+      if (configured) return manager.readBoundary(scope).thenApply(ignored -> manager);
+      return manager.initializeShards(0, scope)
+          .thenCompose(ignored -> manager.ensureConfiguration(scope))
+          .thenApply(ignored -> manager);
+    });
   }
 
   @Override
@@ -118,6 +122,22 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
         .thenCompose(result -> resolveConfigurationCreate(result, scope));
   }
 
+  private CompletableFuture<Boolean> readConfiguration(RequestScope scope) {
+    CompletableFuture<Optional<ByteKey>> read;
+    try {
+      read = records.read(SystemRecordType.SNAPSHOT_PIN, CONFIGURATION_ID, scope);
+    } catch (RuntimeException failure) {
+      return failed(failure);
+    }
+    if (read == null) return failed(new IllegalStateException("pin store returned no configuration read future"));
+    return read.thenApply(stored -> {
+      if (stored == null) throw new IllegalStateException("pin store returned no configuration result");
+      if (stored.isEmpty()) return false;
+      validateConfiguration(stored.get());
+      return true;
+    });
+  }
+
   private CompletableFuture<Void> resolveConfigurationCreate(
       StoreResult<SystemRecordStore.CreateResult> result, RequestScope scope) {
     if (result.failure() == null && result.value() == null) {
@@ -140,11 +160,15 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     if (readFailure != null) throw unknownReadFailure(result.failure(), readFailure);
     ByteKey value = stored.orElseThrow(() -> new CompletionException(
         new BackendFailure(BackendFailure.Category.UNKNOWN)));
+    validateConfiguration(value);
+    return null;
+  }
+
+  private void validateConfiguration(ByteKey value) {
     SnapshotPinConfiguration persisted = SnapshotPinRecordCodec.decodeConfiguration(value);
     if (!persisted.equals(configuration)) {
       throw new IllegalStateException("snapshot pin geometry or lease differs from its durable format");
     }
-    return null;
   }
 
   private CompletableFuture<Void> initializeShards(int start, RequestScope scope) {
@@ -165,7 +189,16 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
         .thenCompose(created -> {
           if (created == null) return failed(new IllegalStateException("pin store returned no create result"));
           if (created != SystemRecordStore.CreateResult.CONFLICT) return CompletableFuture.completedFuture(null);
-          return readShard(shard, scope).thenApply(stored -> null);
+          return readShard(shard, scope).thenCompose(stored -> {
+            if (stored.shard().equals(empty)) return CompletableFuture.completedFuture(null);
+            return readConfiguration(scope).thenApply(configured -> {
+              if (!configured) {
+                throw new IllegalStateException(
+                    "unconfigured snapshot pin shard contains durable state");
+              }
+              return null;
+            });
+          });
         });
   }
 
