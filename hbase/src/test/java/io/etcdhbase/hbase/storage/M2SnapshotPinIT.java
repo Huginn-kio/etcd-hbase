@@ -19,6 +19,7 @@ import io.etcdhbase.core.commit.ManifestRoot;
 import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.PreparedEvent;
 import io.etcdhbase.core.commit.PinnedReadView;
+import io.etcdhbase.core.commit.ReadView;
 import io.etcdhbase.core.commit.ReadViewPinRegistry;
 import io.etcdhbase.core.commit.ReadViewRecordStore;
 import io.etcdhbase.core.commit.ReadViewService;
@@ -183,6 +184,7 @@ class M2SnapshotPinIT {
     try {
       return new PinnedView(views.open(OptionalLong.empty(), AUTHORIZATION, viewScope).join());
     } catch (RuntimeException | Error failure) {
+      // Ownership transfers to PinnedView only after open succeeds; close our scope before rethrowing.
       viewScope.close();
       throw failure;
     }
