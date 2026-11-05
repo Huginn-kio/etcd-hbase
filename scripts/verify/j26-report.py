@@ -26,6 +26,16 @@ REQUIRED_CASES = {
         "historicalReadUsesItsOwnBarrierAndCanReadDeleteThenRecreateVersions",
         "selectedRootIsPinnedAndRecheckedBeforeAnyDataRead",
         "cancellingAReadKeepsItsPinUntilThePhysicalProducerStops",
+        "byteTruncatedPhysicalPageDoesNotSkipKeysDuringOverlayMerge",
+        "byteTruncatedCandidatePageDoesNotSkipKeysDuringOverlayMerge",
+        "cancellingReadResultDoesNotCancelPinAccounting",
+        "scopeCancellationWaitsForManifestProducerBeforeReleasingRegisteredPin",
+        "metadataHeadBudgetDoesNotRejectLargeCandidatePayload",
+        "requestReadLimitStopsBeforeFetchingCandidateBeyondRemainingBytes",
+        "candidateSliceResumesAfterBoundedSlice",
+        "candidateMemoryRejectionOccursBeforeCandidateRead",
+        "candidateValueMemoryIsReservedBeforeReadAndReleasedAfterProjection",
+        "cancelledCandidateReadRetainsLeaseUntilProducerStops",
         "failedRenewalPreventsPointAndScanDataReads",
         "finalPinValidationFailureDiscardsRangeAndReleasesOutputLease",
         "successfulFinalPinValidationDeliversAndTransfersRangeOwnership",
@@ -60,7 +70,6 @@ def report_counts(root: Path, module: str, suite_name: str) -> dict[str, int]:
 
 def collect(root: Path, output: Path) -> None:
     hbase_reports = root / "hbase/target/failsafe-reports"
-    core_reports = root / "core/target/surefire-reports"
     integration = {
         "read_view": report_counts(root, "hbase", READ_VIEW_IT),
         "snapshot_pin": report_counts(root, "hbase", SNAPSHOT_PIN_IT),

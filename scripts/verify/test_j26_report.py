@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,45 @@ SCRIPT = Path(__file__).with_name("j26-report.py")
 SPEC = importlib.util.spec_from_file_location("j26_report", SCRIPT)
 j26_report = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(j26_report)
+
+EXPECTED_REQUIRED_CASES = {
+    j26_report.READ_VIEW_IT: {"readsSelectedPendingVersionsAndHistoricalRowsInBothLayouts"},
+    j26_report.SNAPSHOT_PIN_IT: {"independentManagersShareDurablePinsFloorsAndExpiryFencing"},
+    j26_report.READ_VIEW_TEST: {
+        "currentReadOverlaysOnlyTheSelectedPendingTransactionBeforeRangeMerge",
+        "historicalReadUsesItsOwnBarrierAndCanReadDeleteThenRecreateVersions",
+        "selectedRootIsPinnedAndRecheckedBeforeAnyDataRead",
+        "cancellingAReadKeepsItsPinUntilThePhysicalProducerStops",
+        "byteTruncatedPhysicalPageDoesNotSkipKeysDuringOverlayMerge",
+        "byteTruncatedCandidatePageDoesNotSkipKeysDuringOverlayMerge",
+        "cancellingReadResultDoesNotCancelPinAccounting",
+        "scopeCancellationWaitsForManifestProducerBeforeReleasingRegisteredPin",
+        "metadataHeadBudgetDoesNotRejectLargeCandidatePayload",
+        "requestReadLimitStopsBeforeFetchingCandidateBeyondRemainingBytes",
+        "candidateSliceResumesAfterBoundedSlice",
+        "candidateMemoryRejectionOccursBeforeCandidateRead",
+        "candidateValueMemoryIsReservedBeforeReadAndReleasedAfterProjection",
+        "cancelledCandidateReadRetainsLeaseUntilProducerStops",
+        "failedRenewalPreventsPointAndScanDataReads",
+        "finalPinValidationFailureDiscardsRangeAndReleasesOutputLease",
+        "successfulFinalPinValidationDeliversAndTransfersRangeOwnership",
+    },
+    j26_report.SNAPSHOT_PIN_TEST: {
+        "durableFloorsProtectExistingViewsAndRejectNewOlderViews",
+        "selectedMetadataDecisionUsesItsOwnSequenceBoundaryAndReference",
+        "expiryAloneDoesNotReleaseProtectionAndRevocationFencesTheOldLease",
+        "terminalSlotCanBeReusedOnlyWithANewerFencingGeneration",
+        "unknownCasRepliesAreResolvedFromTheDurableSlot",
+        "registrationRacesFloorAdvanceOnTheSameShardCas",
+        "storedConfigurationIsImmutableAndShardRowsMustBeComplete",
+        "corruptedDurableShardFailsClosed",
+        "completionCasLosingToDurableRevocationCannotReportSuccess",
+    },
+    j26_report.INITIALIZATION_TEST: {
+        "readsBothPublishedCandidatesRetainsTheAlternativeLayoutAndOwnsNoInput",
+        "systemTableRequiresSnapshotPinCategory",
+    },
+}
 
 
 class J26ReportTest(unittest.TestCase):
@@ -54,20 +94,24 @@ class J26ReportTest(unittest.TestCase):
         ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
         return path
 
+    def _reset_output(self):
+        shutil.rmtree(self.output)
+        self.output.mkdir()
+
     def _write_reports(self, omit_case=None, invalid_suite=None, invalid_case=None, extra_cases=(), tests_count=None):
         for suite_name in (j26_report.READ_VIEW_IT, j26_report.SNAPSHOT_PIN_IT):
-            cases = set(j26_report.REQUIRED_CASES[suite_name])
-            if omit_case == suite_name:
-                cases.clear()
+            cases = set(EXPECTED_REQUIRED_CASES[suite_name])
+            if omit_case and omit_case[0] == suite_name:
+                cases.remove(omit_case[1])
             self._write_suite(
                 "hbase", suite_name, sorted(cases),
                 invalid_case if invalid_suite == suite_name else None,
                 tests_count if invalid_suite == suite_name else None,
             )
         for suite_name in (j26_report.READ_VIEW_TEST, j26_report.SNAPSHOT_PIN_TEST, j26_report.INITIALIZATION_TEST):
-            cases = set(j26_report.REQUIRED_CASES[suite_name])
-            if omit_case == suite_name:
-                cases.remove(next(iter(cases)))
+            cases = set(EXPECTED_REQUIRED_CASES[suite_name])
+            if omit_case and omit_case[0] == suite_name:
+                cases.remove(omit_case[1])
             if suite_name == j26_report.SNAPSHOT_PIN_TEST:
                 cases.update(extra_cases)
             self._write_suite(
@@ -79,6 +123,7 @@ class J26ReportTest(unittest.TestCase):
             )
 
     def test_collect_accepts_extra_successful_cases_and_preserves_minicluster_marker(self):
+        self._reset_output()
         self._write_reports(extra_cases={"futurePinRegression"})
         j26_report.collect(self.root, self.output)
         summary = json.loads((self.output / "summary.json").read_text())
@@ -88,15 +133,24 @@ class J26ReportTest(unittest.TestCase):
                          summary["core"]["snapshot_pin"]["tests"])
         self.assertTrue((self.output / f"TEST-{j26_report.SNAPSHOT_PIN_IT}.xml").is_file())
 
+    def test_required_cases_match_independent_inventory(self):
+        self.assertEqual(EXPECTED_REQUIRED_CASES, j26_report.REQUIRED_CASES)
+
+    def _assert_report_rejects_missing_case(self, suite_name, case_name):
+        self._reset_output()
+        self._write_reports(omit_case=(suite_name, case_name))
+        with self.assertRaises(ValueError):
+            j26_report.collect(self.root, self.output)
+        self.assertFalse((self.output / "summary.json").exists())
+
     def test_report_rejects_each_missing_required_case(self):
-        for suite_name in j26_report.REQUIRED_CASES:
-            with self.subTest(suite=suite_name):
-                self._write_reports(omit_case=suite_name)
-                with self.assertRaises(ValueError):
-                    j26_report.collect(self.root, self.output)
-                self.assertFalse((self.output / "summary.json").exists())
+        for suite_name, case_names in EXPECTED_REQUIRED_CASES.items():
+            for case_name in sorted(case_names):
+                with self.subTest(suite=suite_name, case=case_name):
+                    self._assert_report_rejects_missing_case(suite_name, case_name)
 
     def test_report_rejects_suite_counter_contradiction(self):
+        self._reset_output()
         self._write_reports(invalid_suite=j26_report.SNAPSHOT_PIN_TEST, tests_count=999)
         with self.assertRaises(ValueError):
             j26_report.collect(self.root, self.output)
@@ -105,6 +159,7 @@ class J26ReportTest(unittest.TestCase):
     def test_report_rejects_failure_error_and_skip_children_with_zero_suite_counters(self):
         for result_tag in ("failure", "error", "skipped"):
             with self.subTest(result_tag=result_tag):
+                self._reset_output()
                 self._write_reports(invalid_suite=j26_report.READ_VIEW_TEST, invalid_case=result_tag)
                 with self.assertRaises(ValueError):
                     j26_report.collect(self.root, self.output)
