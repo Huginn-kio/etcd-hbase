@@ -16,6 +16,14 @@ REQUIRED_CASES = {
     MODEL: {
         "selectedUnknownTransactionIsVisibleAcrossCancellationAndRecovery",
         "unresolvedUnknownMayHaveTakenEffectOrMayNotHaveTakenEffect",
+        "unknownCompareMismatchMayHaveNoEffect",
+        "unknownNotSelectedCannotWrite",
+        "selectedUnknownMayDecideAfterCallerReturns",
+        "unresolvedUnknownMayDecideAfterCallerReturns",
+        "completedAndSelectedOutcomesKeepTheirTimeAndCompareConstraints",
+        "cancelledCallerMayObserveAServiceDecisionLater",
+        "successfulOutcomeConstrainsAnUnknownPublicationObservation",
+        "failedCompareConstrainsAnUnknownPublicationObservation",
     },
     RECOVERY: {
         "takesOverSelectedSlotAndRepeatedStartupDoesNotAllocateAnotherRevision",
@@ -82,6 +90,7 @@ def collect(root: Path, output: Path) -> None:
             "selected publication decision time constrains overlapping reads even when the caller result is unknown",
             "caller cancellation after selection leaves the selected candidate observable and replay finalizes once",
             "an unresolved unknown result is explored as either applied or not applied, subject to later reads",
+            "unknown no-effect outcomes and service decisions after caller cancellation preserve real-time constraints",
             "the stale compare fails after the selected write, and delete is reflected by a later read",
             "J25 read-view and J27 RecoveryManager core regressions pass in the same run",
         ],

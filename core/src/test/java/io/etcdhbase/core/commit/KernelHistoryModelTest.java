@@ -47,7 +47,7 @@ class KernelHistoryModelTest {
     changes.put("alpha", Mutation.put("new-alpha"));
     changes.put("beta", Mutation.put("new-beta"));
     try (PendingTransaction transaction = driver.beginCompareAndWrite(
-        "alpha", Optional.of("old-alpha"), changes)) {
+        "alpha", Optional.of("old-alpha"), changes, PublicationPause.AFTER_FIRST_CANDIDATE)) {
       assertEquals(1, driver.materialization.appliedCount());
       assertEquals(Optional.of("new-alpha"), driver.physicalValue("alpha"));
       assertEquals(Optional.of("old-beta"), driver.physicalValue("beta"));
@@ -109,6 +109,154 @@ class KernelHistoryModelTest {
         .hasLinearization(List.of(unknown, newRead)));
   }
 
+  @Test
+  void unknownCompareMismatchMayHaveNoEffect() {
+    HistoryOperation unknown = HistoryOperation.compareAndWrite(0, 1, OptionalInt.empty(),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.UNKNOWN, PublicationObservation.UNKNOWN);
+    SerialReferenceChecker checker = new SerialReferenceChecker(Map.of("alpha", "other"));
+
+    assertTrue(checker.hasLinearization(List.of(unknown,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("other")))));
+    assertFalse(checker.hasLinearization(List.of(unknown,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("new")))));
+  }
+
+  @Test
+  void unknownNotSelectedCannotWrite() {
+    HistoryOperation unknown = HistoryOperation.compareAndWrite(0, 1, OptionalInt.empty(),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.UNKNOWN, PublicationObservation.NOT_SELECTED);
+    SerialReferenceChecker checker = new SerialReferenceChecker(Map.of("alpha", "old"));
+
+    assertTrue(checker.hasLinearization(List.of(unknown,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("old")))));
+    assertFalse(checker.hasLinearization(List.of(unknown,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("new")))));
+    HistoryOperation unknownPut = new HistoryOperation(0, Kind.PUT, 0, 1, OptionalInt.empty(),
+        "alpha", Optional.empty(), Map.of("alpha", Mutation.put("new")), Optional.empty(),
+        Outcome.UNKNOWN, PublicationObservation.NOT_SELECTED);
+    assertTrue(checker.hasLinearization(List.of(unknownPut,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("old")))));
+    assertFalse(checker.hasLinearization(List.of(unknownPut,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("new")))));
+    assertTrue(new SerialReferenceChecker(Map.of("alpha", "other")).hasLinearization(List.of(
+        unknown, HistoryOperation.read(2, 3, "alpha", Optional.of("other")))));
+  }
+
+  @Test
+  void selectedUnknownMayDecideAfterCallerReturns() {
+    HistoryOperation unknown = HistoryOperation.compareAndWrite(0, 1, OptionalInt.of(4),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.UNKNOWN, PublicationObservation.SELECTED);
+    HistoryOperation oldRead = HistoryOperation.read(2, 3, "alpha", Optional.of("old"));
+    HistoryOperation newRead = HistoryOperation.read(5, 6, "alpha", Optional.of("new"));
+    SerialReferenceChecker checker = new SerialReferenceChecker(Map.of("alpha", "old"));
+
+    assertTrue(checker.hasLinearization(List.of(unknown, oldRead, newRead)));
+    assertFalse(checker.hasLinearization(List.of(unknown,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("new")))));
+    assertFalse(checker.hasLinearization(List.of(unknown,
+        HistoryOperation.read(5, 6, "alpha", Optional.of("old")))));
+  }
+
+  @Test
+  void unresolvedUnknownMayDecideAfterCallerReturns() {
+    HistoryOperation unknown = HistoryOperation.compareAndWrite(0, 1, OptionalInt.empty(),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.UNKNOWN, PublicationObservation.UNKNOWN);
+    SerialReferenceChecker checker = new SerialReferenceChecker(Map.of("alpha", "old"));
+
+    assertTrue(checker.hasLinearization(List.of(unknown,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("old")),
+        HistoryOperation.read(4, 5, "alpha", Optional.of("new")))));
+  }
+
+  @Test
+  void completedAndSelectedOutcomesKeepTheirTimeAndCompareConstraints() {
+    SerialReferenceChecker checker = new SerialReferenceChecker(Map.of("alpha", "old"));
+    HistoryOperation completed = HistoryOperation.compareAndWrite(0, 1, OptionalInt.empty(),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.COMPLETE, PublicationObservation.SELECTED);
+    assertFalse(checker.hasLinearization(List.of(completed,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("old")))));
+    assertThrows(IllegalArgumentException.class, () -> HistoryOperation.compareAndWrite(
+        0, 1, OptionalInt.of(4), "alpha", Optional.of("old"),
+        Map.of("alpha", Mutation.put("new")), Outcome.COMPLETE, PublicationObservation.SELECTED));
+
+    HistoryOperation selectedBeforeReturn = HistoryOperation.compareAndWrite(0, 2, OptionalInt.of(1),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.UNKNOWN, PublicationObservation.SELECTED);
+    assertFalse(checker.hasLinearization(List.of(selectedBeforeReturn,
+        HistoryOperation.read(3, 4, "alpha", Optional.of("old")))));
+    assertTrue(checker.hasLinearization(List.of(selectedBeforeReturn,
+        HistoryOperation.read(3, 4, "alpha", Optional.of("new")))));
+
+    HistoryOperation selectedMismatch = HistoryOperation.compareAndWrite(0, 1, OptionalInt.of(1),
+        "alpha", Optional.of("other"), Map.of("alpha", Mutation.put("new")),
+        Outcome.UNKNOWN, PublicationObservation.SELECTED);
+    assertFalse(checker.hasLinearization(List.of(selectedMismatch,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("old")))));
+  }
+
+  @Test
+  void successfulOutcomeConstrainsAnUnknownPublicationObservation() {
+    HistoryOperation complete = HistoryOperation.compareAndWrite(0, 1, OptionalInt.empty(),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.COMPLETE, PublicationObservation.UNKNOWN);
+    SerialReferenceChecker matching = new SerialReferenceChecker(Map.of("alpha", "old"));
+    assertTrue(matching.hasLinearization(List.of(complete,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("new")))));
+    assertFalse(matching.hasLinearization(List.of(complete,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("old")))));
+    HistoryOperation contradicted = HistoryOperation.compareAndWrite(0, 1, OptionalInt.empty(),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.COMPLETE, PublicationObservation.NOT_SELECTED);
+    assertFalse(matching.hasLinearization(List.of(contradicted,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("new")))));
+  }
+
+  @Test
+  void failedCompareConstrainsAnUnknownPublicationObservation() {
+    HistoryOperation compareFailed = HistoryOperation.compareAndWrite(0, 1, OptionalInt.empty(),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.COMPARE_FAILED, PublicationObservation.UNKNOWN);
+    SerialReferenceChecker mismatch = new SerialReferenceChecker(Map.of("alpha", "other"));
+    assertTrue(mismatch.hasLinearization(List.of(compareFailed,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("other")))));
+    assertFalse(mismatch.hasLinearization(List.of(compareFailed,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("new")))));
+    HistoryOperation contradicted = HistoryOperation.compareAndWrite(0, 1, OptionalInt.of(1),
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        Outcome.COMPARE_FAILED, PublicationObservation.SELECTED);
+    assertFalse(mismatch.hasLinearization(List.of(contradicted,
+        HistoryOperation.read(2, 3, "alpha", Optional.of("other")))));
+  }
+
+  @Test
+  void cancelledCallerMayObserveAServiceDecisionLater() {
+    KernelDriver driver = new KernelDriver(Map.of("alpha", "old"));
+    try (PendingTransaction transaction = driver.beginCompareAndWrite(
+        "alpha", Optional.of("old"), Map.of("alpha", Mutation.put("new")),
+        PublicationPause.BEFORE_SELECTION)) {
+      int returnedAt = transaction.cancelCallerBeforeSelection();
+      HistoryOperation before = driver.read("alpha");
+      assertEquals(Optional.of("old"), before.observedValue());
+
+      driver.control.releasePublication();
+      HistoryOperation after = driver.read("alpha");
+      assertEquals(Optional.of("new"), after.observedValue());
+      HistoryOperation laterWrite = driver.put("beta", "later");
+      HistoryOperation unknown = transaction.selectedAfterReturn(returnedAt);
+
+      assertTrue(new SerialReferenceChecker(Map.of("alpha", "old"))
+          .hasLinearization(List.of(unknown, before, after, laterWrite)));
+      assertEquals(2, driver.control.state.finalizedSequence());
+      assertTrue(transaction.handoff.serviceScope.isClosed());
+    }
+    assertEquals(driver.openedPins, driver.closedPins);
+  }
+
   private static List<HistoryOperation> withObservedValue(
       List<HistoryOperation> history, int operationId, Optional<String> value) {
     return history.stream().map(operation -> operation.id() == operationId
@@ -122,6 +270,7 @@ class KernelHistoryModelTest {
   private enum Kind { COMPARE_AND_WRITE, PUT, DELETE, READ }
   private enum Outcome { COMPLETE, COMPARE_FAILED, UNKNOWN }
   private enum PublicationObservation { SELECTED, NOT_SELECTED, UNKNOWN }
+  private enum PublicationPause { BEFORE_SELECTION, AFTER_FIRST_CANDIDATE }
   private enum MutationKind { PUT, DELETE }
 
   private record Mutation(MutationKind kind, Optional<String> value) {
@@ -158,7 +307,7 @@ class KernelHistoryModelTest {
       Objects.requireNonNull(publication, "publication");
       if (invokedAt < 0 || returnedAt <= invokedAt
           || decisionAt.isPresent() && (decisionAt.getAsInt() < invokedAt
-              || decisionAt.getAsInt() > returnedAt)) {
+              || outcome != Outcome.UNKNOWN && decisionAt.getAsInt() > returnedAt)) {
         throw new IllegalArgumentException("invalid operation interval");
       }
       if (kind == Kind.READ && (outcome != Outcome.COMPLETE || !mutations.isEmpty())) {
@@ -242,6 +391,9 @@ class KernelHistoryModelTest {
     }
 
     private static boolean mustPrecede(HistoryOperation first, HistoryOperation second) {
+      // An unknown caller result does not stop accepted service work. Only a known decision
+      // bounds that operation; otherwise it can still take effect after the caller returns.
+      if (first.outcome() == Outcome.UNKNOWN && first.decisionAt().isEmpty()) return false;
       int firstLatest = first.decisionAt().orElse(first.returnedAt());
       int secondEarliest = second.decisionAt().orElse(second.invokedAt());
       return first.id() != second.id() && firstLatest <= secondEarliest;
@@ -262,8 +414,9 @@ class KernelHistoryModelTest {
       boolean matches = Objects.equals(Optional.ofNullable(values.get(operation.key())),
           operation.expectedValue());
       if (!matches) {
-        return operation.outcome() == Outcome.COMPARE_FAILED
-            && operation.publication() == PublicationObservation.NOT_SELECTED ? List.of(values) : List.of();
+        return operation.publication() != PublicationObservation.SELECTED
+            && (operation.outcome() == Outcome.UNKNOWN || operation.outcome() == Outcome.COMPARE_FAILED)
+            ? List.of(values) : List.of();
       }
       if (operation.outcome() == Outcome.COMPARE_FAILED) return List.of();
       return applyWrite(operation, values);
@@ -272,9 +425,12 @@ class KernelHistoryModelTest {
     private static List<Map<String, String>> applyWrite(
         HistoryOperation operation, Map<String, String> values) {
       if (operation.outcome() == Outcome.COMPARE_FAILED) return List.of();
-      if (operation.publication() == PublicationObservation.SELECTED) {
-        return operation.outcome() == Outcome.COMPLETE || operation.outcome() == Outcome.UNKNOWN
-            ? List.of(applyMutations(values, operation.mutations())) : List.of();
+      if (operation.publication() == PublicationObservation.NOT_SELECTED) {
+        return operation.outcome() == Outcome.UNKNOWN ? List.of(values) : List.of();
+      }
+      if (operation.outcome() == Outcome.COMPLETE
+          || operation.publication() == PublicationObservation.SELECTED) {
+        return List.of(applyMutations(values, operation.mutations()));
       }
       if (operation.publication() == PublicationObservation.UNKNOWN
           && operation.outcome() == Outcome.UNKNOWN) {
@@ -342,22 +498,25 @@ class KernelHistoryModelTest {
     }
 
     private PendingTransaction beginCompareAndWrite(String key, Optional<String> expectedValue,
-        Map<String, Mutation> mutations) {
+        Map<String, Mutation> mutations, PublicationPause pause) {
       int invokedAt = clock.next();
       if (!readValue(key).equals(expectedValue)) {
         throw new IllegalStateException("fixture compare must pass before publication");
       }
-      materialization.blockAfterOneNewCandidate();
+      if (pause == PublicationPause.BEFORE_SELECTION) control.deferPublication();
+      else materialization.blockAfterOneNewCandidate();
       int id = nextOperationId++;
       RequestScope requestScope = RequestScope.withoutDeadline();
       TestHandoff handoff = new TestHandoff();
-      CompletableFuture<CommitOutcomeResolver.Resolution> result =
-          publish(mutations, requestScope, handoff);
-      if (result.isDone() || control.state.publication().isEmpty()) {
-        throw new IllegalStateException("the selected publication must remain in progress");
+      PublicationAttempt attempt = publish(mutations, requestScope, handoff);
+      CompletableFuture<CommitOutcomeResolver.Resolution> result = attempt.result();
+      boolean atWrongBoundary = pause == PublicationPause.BEFORE_SELECTION
+          ? control.state.publication().isPresent() : control.state.publication().isEmpty();
+      if (result.isDone() || atWrongBoundary) {
+        throw new IllegalStateException("the publication must stop at the requested boundary");
       }
       return new PendingTransaction(this, id, invokedAt, key, expectedValue,
-          immutableMutations(mutations), control.lastDecisionAt, requestScope, handoff, result);
+          immutableMutations(mutations), attempt.transactionId(), requestScope, handoff, result);
     }
 
     private HistoryOperation compareAndWrite(String key, Optional<String> expectedValue,
@@ -384,18 +543,18 @@ class KernelHistoryModelTest {
     private HistoryOperation publishAndFinalize(Kind kind, String key, Mutation mutation) {
       int invokedAt = clock.next();
       try (RequestScope requestScope = RequestScope.withoutDeadline()) {
-        CommitOutcomeResolver.Resolution result =
-            publish(Map.of(key, mutation), requestScope, new TestHandoff()).join();
+        PublicationAttempt attempt = publish(Map.of(key, mutation), requestScope, new TestHandoff());
+        CommitOutcomeResolver.Resolution result = attempt.result().join();
         int returnedAt = clock.next();
         if (result.state() != CommitOutcomeResolver.State.SELECTED_FINALIZED) {
           throw new IllegalStateException("the fixture write did not finish finalization");
         }
         return HistoryOperation.mutation(nextOperationId++, kind, invokedAt, returnedAt,
-            key, mutation, OptionalInt.of(control.lastDecisionAt));
+            key, mutation, OptionalInt.of(control.decisionAt(attempt.transactionId())));
       }
     }
 
-    private CompletableFuture<CommitOutcomeResolver.Resolution> publish(
+    private PublicationAttempt publish(
         Map<String, Mutation> mutations, RequestScope requestScope, TestHandoff handoff) {
       CommitState base = control.state;
       if (base.publication().isPresent()) {
@@ -430,7 +589,7 @@ class KernelHistoryModelTest {
           new CommitPlanVerifier(catalog, materialization), handoff, finalizer);
       CommitOwnerService.OwnerToken owner = new CommitOwnerService.OwnerToken(
           base.ownerInstance().orElseThrow(), base.ownerEpoch());
-      return publisher.publish(binding, owner, root, requestScope);
+      return new PublicationAttempt(transaction, publisher.publish(binding, owner, root, requestScope));
     }
 
     private HistoryOperation read(String key) {
@@ -468,6 +627,9 @@ class KernelHistoryModelTest {
     }
   }
 
+  private record PublicationAttempt(
+      TransactionId transactionId, CompletableFuture<CommitOutcomeResolver.Resolution> result) {}
+
   private static final class PendingTransaction implements AutoCloseable {
     private final KernelDriver driver;
     private final int id;
@@ -475,13 +637,13 @@ class KernelHistoryModelTest {
     private final String key;
     private final Optional<String> expectedValue;
     private final Map<String, Mutation> mutations;
-    private final int decisionAt;
+    private final TransactionId transactionId;
     private final RequestScope requestScope;
     private final TestHandoff handoff;
     private final CompletableFuture<CommitOutcomeResolver.Resolution> result;
 
     private PendingTransaction(KernelDriver driver, int id, int invokedAt, String key,
-        Optional<String> expectedValue, Map<String, Mutation> mutations, int decisionAt,
+        Optional<String> expectedValue, Map<String, Mutation> mutations, TransactionId transactionId,
         RequestScope requestScope, TestHandoff handoff,
         CompletableFuture<CommitOutcomeResolver.Resolution> result) {
       this.driver = driver;
@@ -490,7 +652,7 @@ class KernelHistoryModelTest {
       this.key = key;
       this.expectedValue = expectedValue;
       this.mutations = mutations;
-      this.decisionAt = decisionAt;
+      this.transactionId = transactionId;
       this.requestScope = requestScope;
       this.handoff = handoff;
       this.result = result;
@@ -500,15 +662,37 @@ class KernelHistoryModelTest {
       if (driver.materialization.appliedCount() != 1 || driver.control.state.publication().isEmpty()) {
         throw new IllegalStateException("cancellation requires a partially materialized selection");
       }
+      int returnedAt = cancelCaller();
+      return selectedHistory(returnedAt);
+    }
+
+    private int cancelCallerBeforeSelection() {
+      if (driver.control.state.publication().isPresent() || driver.control.hasDecision(transactionId)) {
+        throw new IllegalStateException("cancellation must precede the publication decision");
+      }
+      return cancelCaller();
+    }
+
+    private int cancelCaller() {
       requestScope.cancel();
       Throwable failure = assertThrows(CompletionException.class, result::join).getCause();
       assertTrue(failure instanceof CancellationException);
       assertTrue(requestScope.isCancelled());
       assertFalse(handoff.serviceScope.isClosed());
-      int returnedAt = driver.clock.next();
-      // Cancellation is the observed caller result. The durable slot separately proves selection.
+      return driver.clock.next();
+    }
+
+    private HistoryOperation selectedAfterReturn(int returnedAt) {
+      if (driver.control.decisionAt(transactionId) <= returnedAt) {
+        throw new IllegalStateException("publication must be decided after the caller returned");
+      }
+      return selectedHistory(returnedAt);
+    }
+
+    private HistoryOperation selectedHistory(int returnedAt) {
+      // Cancellation is the observed caller result; the control CAS separately proves selection.
       return new HistoryOperation(id, Kind.COMPARE_AND_WRITE, invokedAt, returnedAt,
-          OptionalInt.of(decisionAt), key, expectedValue, mutations, Optional.empty(),
+          OptionalInt.of(driver.control.decisionAt(transactionId)), key, expectedValue, mutations, Optional.empty(),
           Outcome.UNKNOWN, PublicationObservation.SELECTED);
     }
 
@@ -559,7 +743,8 @@ class KernelHistoryModelTest {
     private CommitState state;
     private final EventClock clock;
     private int version;
-    private int lastDecisionAt = -1;
+    private final Map<TransactionId, Integer> decisionTimes = new HashMap<>();
+    private CompletableFuture<Void> publicationGate = CompletableFuture.completedFuture(null);
 
     private MemoryControl(CommitState state, EventClock clock) {
       this.state = state;
@@ -577,14 +762,44 @@ class KernelHistoryModelTest {
 
     @Override public CompletableFuture<Boolean> compareAndSet(
         ControlSnapshot observed, CommitState replacement, RequestScope scope) {
+      if (state.publication().isEmpty() && replacement.publication().isPresent()
+          && !publicationGate.isDone()) {
+        CompletableFuture<Void> gate = publicationGate;
+        scope.registerCleanup(() -> gate.completeExceptionally(
+            new BackendFailure(BackendFailure.Category.CANCELLED)));
+        return gate.thenCompose(ignored -> compareAndSet(observed, replacement, scope));
+      }
       if (!Arrays.equals(observed.comparisonToken(), token())) {
         return CompletableFuture.completedFuture(false);
       }
-      boolean selected = state.publication().isEmpty() && replacement.publication().isPresent();
+      Optional<TransactionId> selected = state.publication().isEmpty()
+          ? replacement.publication().map(PublicationSlot::transactionId) : Optional.empty();
+      if (selected.filter(decisionTimes::containsKey).isPresent()) {
+        throw new IllegalStateException("transaction already has a publication decision");
+      }
       state = replacement;
       version++;
-      if (selected) lastDecisionAt = clock.next();
+      selected.ifPresent(transaction -> decisionTimes.put(transaction, clock.next()));
       return CompletableFuture.completedFuture(true);
+    }
+
+    private boolean hasDecision(TransactionId transaction) {
+      return decisionTimes.containsKey(transaction);
+    }
+
+    private int decisionAt(TransactionId transaction) {
+      Integer decisionAt = decisionTimes.get(transaction);
+      if (decisionAt == null) throw new IllegalStateException("publication decision is missing");
+      return decisionAt;
+    }
+
+    private void deferPublication() {
+      if (!publicationGate.isDone()) throw new IllegalStateException("publication is already deferred");
+      publicationGate = new CompletableFuture<>();
+    }
+
+    private void releasePublication() {
+      if (!publicationGate.complete(null)) throw new IllegalStateException("publication was not deferred");
     }
 
     private byte[] token() { return ByteBuffer.allocate(Integer.BYTES).putInt(version).array(); }

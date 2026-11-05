@@ -21,6 +21,14 @@ EXPECTED_CASES = {
     MODEL: {
         "selectedUnknownTransactionIsVisibleAcrossCancellationAndRecovery",
         "unresolvedUnknownMayHaveTakenEffectOrMayNotHaveTakenEffect",
+        "unknownCompareMismatchMayHaveNoEffect",
+        "unknownNotSelectedCannotWrite",
+        "selectedUnknownMayDecideAfterCallerReturns",
+        "unresolvedUnknownMayDecideAfterCallerReturns",
+        "completedAndSelectedOutcomesKeepTheirTimeAndCompareConstraints",
+        "cancelledCallerMayObserveAServiceDecisionLater",
+        "successfulOutcomeConstrainsAnUnknownPublicationObservation",
+        "failedCompareConstrainsAnUnknownPublicationObservation",
     },
     RECOVERY: {
         "takesOverSelectedSlotAndRepeatedStartupDoesNotAllocateAnotherRevision",
@@ -89,7 +97,8 @@ class J28ReportTest(unittest.TestCase):
         j28_report.collect(self.root, self.output)
         summary = json.loads((self.output / "summary.json").read_text())
         self.assertEqual(5, summary["read_view_regression"]["tests"])
-        self.assertEqual(14, summary["core_tests"]["tests"])
+        self.assertEqual(sum(map(len, EXPECTED_CASES.values())) + 1,
+                         summary["core_tests"]["tests"])
 
     def test_rejects_each_missing_required_case(self):
         for name, cases in EXPECTED_CASES.items():

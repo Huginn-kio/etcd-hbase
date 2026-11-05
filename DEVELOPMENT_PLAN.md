@@ -718,7 +718,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [ ] **J28.1** M2：基于 J07/J25/J27 以内核最小操作驱动模型检查，覆盖并发、取消与恢复。
     - [ ] **J28.2** M3：依赖 J30–J33 的真实 RPC 路径，验证 Go client 并发历史；与内核证据分别记录，不形成 M2 等待 M3 的循环。
   - 验证层次：J28.1 为 L1；J28.2 为 L2，不互相替代。
-  - J28.1 跟踪：状态=公开内核模型实现已提交，PR 评审与 M2 验收待完成；负责人=Codex；完成日期=2026-11-04；PR/commit=[PR #32](https://github.com/Reidddddd/etcd-hbase/pull/32) / 本层及评审修正提交；验证入口=`scripts/verify/j28.sh`；结果=Temurin JDK 21 下 core 190 项通过，零失败/错误/跳过；模型历史 2 项、J27 RecoveryManager 7 项及 J25 ReadViewRecordStore 17 项均通过；验证报告=`.artifacts/m2/j28/` 本地忽略目录；作者自审=通过；独立复核=待安排；评审人/结论=`Reidddddd` / 待评审。范围为有界测试驱动与生产发布、读视图和恢复组件；准备、存储、pin 和交接使用测试夹具，未覆盖完整业务事务、真实 HBase RPC、跨进程/WAL 故障；J28.2 仍属 M3，真实 Go client 并发历史未实现。
+  - J28.1 跟踪：状态=公开内核模型实现已提交，PR 评审与 M2 验收待完成；负责人=Codex；完成日期=2026-11-04；PR/commit=[PR #32](https://github.com/Reidddddd/etcd-hbase/pull/32) / 本层及评审修正提交；验证入口=`scripts/verify/j28.sh`；结果=Temurin JDK 21 下 core 198 项通过，零失败/错误/跳过；模型历史 10 项、J27 RecoveryManager 7 项及 J25 ReadViewRecordStore 17 项均通过；验证报告=`.artifacts/m2/j28/` 本地忽略目录；作者自审=通过；独立复核=待安排；评审人/结论=`Reidddddd` / 待复查。范围为有界测试驱动与生产发布、读视图和恢复组件；准备、存储、pin 和交接使用测试夹具，未覆盖完整业务事务、真实 HBase RPC、跨进程/WAL 故障；J28.2 仍属 M3，真实 Go client 并发历史未实现。
   - J28.2 跟踪：状态=M3 未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
 
 - [ ] **J29｜提交、读视图与续租调度负载报告**
