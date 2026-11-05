@@ -660,4 +660,13 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
         base.scanRpcCalls(), observations);
   }
 
+  private static Throwable unwrap(Throwable failure) {
+    if (failure instanceof Error) return failure;
+    Throwable current = failure;
+    while (current instanceof CompletionException && current.getCause() != null) {
+      current = current.getCause();
+    }
+    return current;
+  }
+
 }
