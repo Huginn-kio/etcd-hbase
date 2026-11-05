@@ -204,6 +204,8 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
         try {
           releaseReader(release);
         } catch (RuntimeException | Error closeFailure) {
+          // Settle finishFuture so callers observe this release failure or the original failure
+          // with the release failure suppressed.
           if (failure == null) failure = closeFailure;
           else if (failure != closeFailure) failure.addSuppressed(closeFailure);
         }

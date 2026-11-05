@@ -138,6 +138,8 @@ public final class ExistsExecutor implements AutoCloseable {
         completionStore.finishRead().whenComplete((ignored, pinFailure) ->
             completeResult(count, pinFailure == null ? null : unwrap(pinFailure), primaryFatal));
       } catch (RuntimeException | Error pinFailure) {
+        // Preserve the result future when finishRead throws synchronously; completeResult settles it
+        // before rethrowing fatal Error.
         if (fatal == null && pinFailure instanceof Error error) fatal = error;
         completeResult(count, pinFailure, fatal);
       }
