@@ -40,6 +40,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
   private final PinnedReadView.ReaderLease readerLease;
   private final CompletableFuture<Void> termination = new CompletableFuture<>();
   private final Set<ScanOperation> activeScans = Collections.newSetFromMap(new IdentityHashMap<>());
+  private CompletableFuture<Void> finishFuture;
   private boolean closed;
   private boolean readerReleased;
   private int inFlight;
@@ -81,9 +82,8 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     if (!beginOperation()) return failed(inactiveFailure());
     CompletableFuture<Optional<StoredRecord>> read;
     try {
-      synchronized (this) {
-        read = getAtView(key, revisionUpperBound, projection, account);
-      }
+      read = pinned.renew(scope)
+          .thenCompose(ignored -> getAtView(key, revisionUpperBound, projection, account));
     } catch (RuntimeException | Error failure) {
       // beginOperation already incremented the lease; settle it before rethrowing any fatal Error.
       completeAfterSynchronousFailure(failure);
@@ -131,8 +131,12 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       return failedOperation(new IllegalArgumentException("scan budget belongs to another request scope"));
     }
     if (!beginOperation()) return failedOperation(inactiveFailure());
+    return track(new DeferredScanOperation(request, account));
+  }
+
+  private ScanOperation startScanAfterRenew(ScanRequest request, BudgetManager.Account account) {
+    if (!isActive()) return failedOperation(inactiveFailure());
     if (request.bucket() >= bucketCount) {
-      completeOperation();
       return failedOperation(new IllegalArgumentException("scan bucket exceeds the configured bucket count"));
     }
     ReadView view = pinned.view();
@@ -141,11 +145,8 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     ScanRequest baseRequest = withUpperBound(request, stableUpper);
     if (!includesSelectedCandidate(view, upper) || request.range().isEmpty()) {
       try {
-        return track(physical.startScan(baseRequest));
-      } catch (RuntimeException | Error failure) {
-        // startScan has already incremented inFlight; balance it before preserving a fatal Error.
-        completeAfterSynchronousFailure(failure);
-        if (failure instanceof Error fatal) throw fatal;
+        return physical.startScan(baseRequest);
+      } catch (RuntimeException failure) {
         return failedOperation(failure);
       }
     }
@@ -158,8 +159,9 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       var stopped = new AtomicBoolean();
       var candidates = manifests.candidatesInRange(root, bucket, request.range(), request.after(),
           maximumCandidates, ManifestCatalog.MAX_RANGE_CANDIDATE_BYTES, scope, stopped::get, account);
-      return track(new OverlayScanOperation(base, candidates, request, stopped));
+      return new OverlayScanOperation(base, candidates, request, stopped);
     } catch (RuntimeException | Error failure) {
+      // Close the already-open physical producer before preserving a setup Error as fatal.
       if (base != null) {
         try {
           base.close();
@@ -168,11 +170,50 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
           if (failure != cleanup) failure.addSuppressed(cleanup);
         }
       }
-      // Finish local ownership even when setup failed after opening the physical scanner.
-      completeAfterSynchronousFailure(failure);
       if (failure instanceof Error fatal) throw fatal;
       return failedOperation(failure);
     }
+  }
+
+  @Override
+  public CompletableFuture<Void> finishRead() {
+    synchronized (this) {
+      if (finishFuture != null) return finishFuture.copy();
+      if (closed || inFlight != 0 || !activeScans.isEmpty()) {
+        return CompletableFuture.failedFuture(inactiveFailure());
+      }
+      closed = true;
+      finishFuture = new CompletableFuture<>();
+    }
+    CompletableFuture<Void> completion;
+    try {
+      completion = pinned.complete(scope);
+    } catch (RuntimeException | Error failure) {
+      // Keep finishRead's asynchronous contract and still release the reader lease below.
+      completion = CompletableFuture.failedFuture(failure);
+    }
+    completion.whenComplete((ignored, failure) -> {
+      PinnedReadView.ReaderLease release = null;
+      synchronized (ReadViewRecordStore.this) {
+        if (!readerReleased) {
+          readerReleased = true;
+          release = readerLease;
+        }
+      }
+      if (release != null) {
+        try {
+          releaseReader(release);
+        } catch (RuntimeException | Error closeFailure) {
+          // Settle finishFuture so callers observe this release failure or the original failure
+          // with the release failure suppressed.
+          if (failure == null) failure = closeFailure;
+          else if (failure != closeFailure) failure.addSuppressed(closeFailure);
+        }
+      }
+      if (failure == null) finishFuture.complete(null);
+      else finishFuture.completeExceptionally(CompletionFailures.unwrapCompletion(failure));
+    });
+    return finishFuture.copy();
   }
 
   @Override
@@ -279,8 +320,10 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     if (stop) {
       try {
         operation.close();
-      } catch (RuntimeException failure) {
+      } catch (RuntimeException | Error failure) {
+        // Record close failure for finishRead; the owner must still observe a fatal Error now.
         recordCloseFailure(failure);
+        if (failure instanceof Error fatal) throw fatal;
       }
     }
     return operation;
@@ -324,17 +367,25 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
   }
 
   private void releaseReader(PinnedReadView.ReaderLease release) {
-    Throwable failure;
     try {
       release.close();
     } catch (RuntimeException | Error closeError) {
       // Record the fatal release failure, settle the termination signal, then rethrow it below.
       recordCloseFailure(closeError);
     }
-    synchronized (this) { failure = closeFailure; }
-    if (failure == null) termination.complete(null);
-    else termination.completeExceptionally(failure);
-    if (failure instanceof Error fatal) throw fatal;
+    // RequestScope owns PinnedReadView; finishing one view must not close sibling views in it.
+    pinned.termination().whenComplete((ignored, pinFailure) -> {
+      Throwable failure = pinFailure;
+      synchronized (ReadViewRecordStore.this) {
+        if (closeFailure != null) {
+          if (failure == null) failure = closeFailure;
+          else if (failure != closeFailure) failure.addSuppressed(closeFailure);
+        }
+      }
+      if (failure == null) termination.complete(null);
+      else termination.completeExceptionally(failure);
+      if (failure instanceof Error fatal) throw fatal;
+    });
   }
 
   private static ScanRequest withUpperBound(ScanRequest request, long upper) {
@@ -368,6 +419,80 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       }
       @Override public void close() {}
     };
+  }
+
+  private final class DeferredScanOperation implements ScanOperation {
+    private final ScanRequest request;
+    private final BudgetManager.Account account;
+    private final AtomicBoolean stopped = new AtomicBoolean();
+    private final AtomicBoolean delegateClosed = new AtomicBoolean();
+    private final CompletableFuture<StoragePage> result = new CompletableFuture<>();
+    private volatile ScanOperation delegate;
+    private volatile Throwable closeFailure;
+
+    private DeferredScanOperation(ScanRequest request, BudgetManager.Account account) {
+      this.request = request;
+      this.account = account;
+      CompletableFuture<Void> renewal;
+      try {
+        renewal = pinned.renew(scope);
+      } catch (RuntimeException | Error failure) {
+        // The returned scan operation is the observer; its completion also settles inFlight.
+        result.completeExceptionally(failure);
+        return;
+      }
+      renewal.whenComplete((ignored, failure) -> {
+        if (failure != null) {
+          result.completeExceptionally(CompletionFailures.unwrapCompletion(failure));
+          return;
+        }
+        if (stopped.get() || !isActive()) {
+          result.completeExceptionally(inactiveFailure());
+          return;
+        }
+        ScanOperation opened;
+        try {
+          opened = startScanAfterRenew(request, account);
+        } catch (RuntimeException | Error openFailure) {
+          // Preserve the async scan contract; track() observes this result to release its lease.
+          result.completeExceptionally(openFailure);
+          return;
+        }
+        delegate = opened;
+        if (stopped.get()) closeDelegate();
+        opened.completion().whenComplete((page, operationFailure) -> {
+          Throwable terminal = operationFailure == null ? closeFailure
+              : CompletionFailures.unwrapCompletion(operationFailure);
+          if (terminal == null && (stopped.get() || !isActive())) terminal = inactiveFailure();
+          if (closeFailure != null && terminal != closeFailure) terminal.addSuppressed(closeFailure);
+          if (terminal == null) result.complete(page);
+          else result.completeExceptionally(terminal);
+        });
+      });
+    }
+
+    @Override
+    public CompletionStage<StoragePage> completion() {
+      return result.minimalCompletionStage();
+    }
+
+    @Override
+    public void close() {
+      stopped.set(true);
+      closeDelegate();
+    }
+
+    private void closeDelegate() {
+      ScanOperation current = delegate;
+      if (current == null || !delegateClosed.compareAndSet(false, true)) return;
+      try {
+        current.close();
+      } catch (RuntimeException | Error failure) {
+        // The operation completion callback also reports this close failure to its async observer.
+        closeFailure = failure;
+        if (failure instanceof Error fatal) throw fatal;
+      }
+    }
   }
 
   private final class OverlayScanOperation implements ScanOperation {

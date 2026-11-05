@@ -38,7 +38,8 @@ public final class InitializationConfigurationValidator {
           RecordCategory.CONTROL,
           RecordCategory.INVOCATION,
           RecordCategory.CANDIDATE,
-          RecordCategory.MANIFEST);
+          RecordCategory.MANIFEST,
+          RecordCategory.SNAPSHOT_PIN);
 
   private InitializationConfigurationValidator() {}
 

@@ -2,6 +2,7 @@ package io.etcdhbase.core.scan;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
@@ -26,6 +27,7 @@ public final class SortedMergeCursor implements AutoCloseable {
   private final BudgetManager.Account account;
   private final RequestScope scope;
   private final RequestScope.ScopedCleanup registration;
+  private final RecordStore completionStore;
   private final PriorityQueue<Head> heap = new PriorityQueue<>(Comparator.comparing(head -> head.record.key()));
   private final Head[] heads;
   private final boolean[] exhausted;
@@ -51,16 +53,26 @@ public final class SortedMergeCursor implements AutoCloseable {
 
   public SortedMergeCursor(ScanSource source, ScanRequest template, int bucketCount,
       BudgetManager.Account account, RequestScope scope) {
-    this(source, template, bucketCount, account, scope, null);
+    this(source, template, bucketCount, account, scope, null,
+        source instanceof RecordStore recordStore ? recordStore : null);
   }
 
   public static SortedMergeCursor values(RecordStore store, ScanSource source, ScanRequest template,
       int bucketCount, BudgetManager.Account account, RequestScope scope) {
-    return new SortedMergeCursor(source, template, bucketCount, account, scope, java.util.Objects.requireNonNull(store, "store"));
+    return new SortedMergeCursor(source, template, bucketCount, account, scope,
+        java.util.Objects.requireNonNull(store, "store"), store);
+  }
+
+  /** Metadata-only merge that still completes the same pinned view before returning its page. */
+  public static SortedMergeCursor metadata(RecordStore store, ScanSource source,
+      ScanRequest template, int bucketCount, BudgetManager.Account account, RequestScope scope) {
+    return new SortedMergeCursor(source, template, bucketCount, account, scope,
+        null, java.util.Objects.requireNonNull(store, "store"));
   }
 
   private SortedMergeCursor(ScanSource source, ScanRequest template, int bucketCount,
-      BudgetManager.Account account, RequestScope scope, RecordStore valueStore) {
+      BudgetManager.Account account, RequestScope scope, RecordStore valueStore,
+      RecordStore completionStore) {
     if (bucketCount < 1 || bucketCount > 4096
         || account.reservation().heads() / bucketCount < template.maximumBytes()) {
       throw new IllegalArgumentException("all bucket heads require reserved memory before scanning");
@@ -69,6 +81,7 @@ public final class SortedMergeCursor implements AutoCloseable {
     this.account = account;
     this.scope = scope;
     this.valueStore = valueStore;
+    this.completionStore = completionStore;
     if (valueStore == null && template.projection() != ReadProjection.METADATA) {
       throw new IllegalArgumentException("full values require a pinned value reader");
     }
@@ -105,6 +118,7 @@ public final class SortedMergeCursor implements AutoCloseable {
       } catch (Exception failure) {
         finish(false, failure);
       } catch (Error fatal) {
+        // Drain every cursor and settle the public result before propagating the fatal Error.
         finish(false, fatal);
         throw fatal;
       }
@@ -148,7 +162,8 @@ public final class SortedMergeCursor implements AutoCloseable {
     else {
       selected = head;
       waiting = true;
-      PointRead.get(valueStore, head.record.key(), head.record.metadata().modificationRevision(), ReadProjection.FULL, account)
+      PointRead.get(valueStore, head.record.key(), head.record.metadata().modificationRevision(),
+          ReadProjection.FULL, account, false)
           .whenComplete((record, failure) -> { valueCompletion.set(new ValueCompletion(record, failure)); drain(); });
     }
     return true;
@@ -205,53 +220,160 @@ public final class SortedMergeCursor implements AutoCloseable {
   private void finish(boolean more, Throwable failure) {
     if (terminal) return;
     terminal = true;
-    for (var bucket : buckets) {
-      try { bucket.close(); }
-      catch (RuntimeException | Error cleanup) {
-        if (failure == null) failure = cleanup;
-        else if (failure != cleanup) failure.addSuppressed(cleanup);
-      }
-    }
-    for (Head head : heads) if (head != null) head.lease.close();
-    java.util.Arrays.fill(heads, null);
+    Throwable terminalFailure = closeBuckets(failure);
+    terminalFailure = releaseHeads(terminalFailure);
     heap.clear();
     selected = null;
     previous = null;
-    RangePage response = null;
-    if (failure == null) {
-      try { response = new RangePage(output, outputLeases, more, cost, pagePointReads, scope); }
-      catch (RuntimeException | Error allocationFailure) { failure = allocationFailure; }
-    }
-    if (failure != null) for (var lease : outputLeases) lease.close();
+    ResponseBuild built = buildResponse(more, terminalFailure);
+    terminalFailure = built.failure();
+    if (built.response() == null) terminalFailure = releaseOutputLeases(terminalFailure);
     output.clear();
     outputLeases.clear();
-    try {
-      if (registration != null) registration.close();
-    } catch (Exception cleanup) {
-      if (failure == null) failure = cleanup;
-      else failure.addSuppressed(cleanup);
-    }
-    if (failure == null) {
-      boolean deadlineExceeded = scope.isDeadlineExceeded();
-      if (scope.isClosed() || deadlineExceeded) {
-        failure = new BackendFailure(deadlineExceeded
-            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+    terminalFailure = closeRegistration(terminalFailure);
+    terminalFailure = scopeFailure(terminalFailure);
+    deliver(built.response(), terminalFailure);
+  }
+
+  private Throwable closeBuckets(Throwable failure) {
+    for (var bucket : buckets) {
+      try {
+        bucket.close();
+      } catch (RuntimeException | Error cleanup) {
+        // Keep closing all buckets; finish settles the result before rethrowing a fatal Error.
+        failure = combine(failure, cleanup);
       }
     }
+    return failure;
+  }
+
+  private Throwable releaseHeads(Throwable failure) {
+    for (Head head : heads) {
+      if (head == null) continue;
+      try {
+        head.lease.close();
+      } catch (RuntimeException | Error cleanup) {
+        // Keep releasing all retained heads; the result observes the combined failure.
+        failure = combine(failure, cleanup);
+      }
+    }
+    java.util.Arrays.fill(heads, null);
+    return failure;
+  }
+
+  private ResponseBuild buildResponse(boolean more, Throwable failure) {
+    if (failure != null) return new ResponseBuild(null, failure);
+    try {
+      return new ResponseBuild(new RangePage(output, outputLeases, more, cost,
+          pagePointReads, scope), null);
+    } catch (RuntimeException | Error allocationFailure) {
+      // Until construction succeeds, this cursor still owns the output leases and must release them.
+      return new ResponseBuild(null, allocationFailure);
+    }
+  }
+
+  private Throwable releaseOutputLeases(Throwable failure) {
+    for (BudgetManager.Lease lease : outputLeases) {
+      try {
+        lease.close();
+      } catch (RuntimeException | Error cleanup) {
+        // Keep releasing all output leases; the result observes the combined failure.
+        failure = combine(failure, cleanup);
+      }
+    }
+    return failure;
+  }
+
+  private Throwable closeRegistration(Throwable failure) {
+    try {
+      if (registration != null) registration.close();
+    } catch (Exception | Error cleanup) {
+      // Finish records this cleanup failure before settling the public result.
+      failure = combine(failure, cleanup);
+    }
+    return failure;
+  }
+
+  private Throwable scopeFailure(Throwable failure) {
+    if (failure != null) return failure;
+    boolean deadlineExceeded = scope.isDeadlineExceeded();
+    if (scope.isClosed() || deadlineExceeded) {
+      return new BackendFailure(deadlineExceeded
+          ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+    }
+    return null;
+  }
+
+  private void deliver(RangePage response, Throwable failure) {
     if (failure != null) {
-      if (response != null) response.close();
-      result.completeExceptionally(failure);
-    } else result.complete(response);
+      failResponse(response, failure);
+      return;
+    }
+    if (completionStore == null) {
+      result.complete(response);
+      return;
+    }
+    CompletableFuture<Void> pinCompletion;
+    try {
+      pinCompletion = completionStore.finishRead();
+    } catch (RuntimeException | Error pinFailure) {
+      // Settle the caller and release the response lease before a synchronous fatal error escapes.
+      failResponse(response, pinFailure);
+      return;
+    }
+    pinCompletion.whenComplete((ignored, pinFailure) -> {
+      Throwable terminal = pinFailure == null ? null : unwrapTerminal(pinFailure);
+      if (terminal == null && (scope.isClosed() || scope.isDeadlineExceeded())) {
+        terminal = new BackendFailure(scope.isDeadlineExceeded()
+            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+      }
+      if (terminal != null) {
+        failResponse(response, terminal);
+      } else {
+        result.complete(response);
+      }
+    });
+  }
+
+  private void failResponse(RangePage response, Throwable failure) {
+    Throwable terminal = failure;
+    Error fatal = failure instanceof Error error ? error : null;
+    if (response != null) {
+      try {
+        response.close();
+      } catch (RuntimeException | Error cleanup) {
+        // Settle the read future before rethrowing a fatal response-cleanup Error.
+        terminal = combine(terminal, cleanup);
+        if (fatal == null && cleanup instanceof Error error) fatal = error;
+      }
+    }
+    result.completeExceptionally(terminal);
+    if (fatal != null) throw fatal;
+  }
+
+  private static Throwable combine(Throwable primary, Throwable cleanup) {
+    if (primary == null) return cleanup;
+    if (primary != cleanup) primary.addSuppressed(cleanup);
+    return primary;
+  }
+
+  private static Throwable unwrapTerminal(Throwable failure) {
+    Throwable cause = CompletionFailures.unwrapCompletion(failure);
+    if (cause instanceof Error || cause instanceof BackendFailure) return cause;
+    return new BackendFailure(BackendFailure.Category.UNKNOWN, cause);
   }
 
   @Override public void close() { stopRequested.set(true); drain(); }
 
   private static BackendFailure unwrap(Throwable failure) {
-    while (failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null) failure = failure.getCause();
-    return failure instanceof BackendFailure backend ? backend : new BackendFailure(BackendFailure.Category.UNKNOWN, failure);
+    failure = CompletionFailures.unwrapCompletion(failure);
+    if (failure instanceof Error fatal) throw fatal;
+    return failure instanceof BackendFailure backend ? backend
+        : new BackendFailure(BackendFailure.Category.UNKNOWN, failure);
   }
   private static BackendFailure resourceLimit() { return new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT); }
   private record Head(int bucket, StoredRecord record, BudgetManager.Lease lease) {}
   private record Completion(int bucket, BucketCursor.Page page, Throwable failure) {}
   private record ValueCompletion(Optional<StoredRecord> record, Throwable failure) {}
+  private record ResponseBuild(RangePage response, Throwable failure) {}
 }

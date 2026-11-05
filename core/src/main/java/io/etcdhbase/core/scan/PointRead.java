@@ -14,6 +14,12 @@ final class PointRead {
 
   static CompletableFuture<Optional<StoredRecord>> get(RecordStore store, ByteKey key, long upper,
       ReadProjection projection, BudgetManager.Account account) {
+    return get(store, key, upper, projection, account, true);
+  }
+
+  /** Allows a multi-key aggregate to defer its single final pin check until every value is held. */
+  static CompletableFuture<Optional<StoredRecord>> get(RecordStore store, ByteKey key, long upper,
+      ReadProjection projection, BudgetManager.Account account, boolean finishRead) {
     BudgetManager.Lease io = null;
     BudgetManager.Lease work = null;
     var result = new CompletableFuture<Optional<StoredRecord>>();
@@ -35,7 +41,10 @@ final class PointRead {
       throw fatal;
     }
     // A dependent cancellation never settles or cancels the backend producer.
-    return result.copy();
+    CompletableFuture<Optional<StoredRecord>> read = result.copy();
+    return finishRead
+        ? read.thenCompose(record -> store.finishRead().thenApply(ignored -> record))
+        : read;
   }
 
   private static void complete(CompletableFuture<Optional<StoredRecord>> result, Optional<StoredRecord> record,

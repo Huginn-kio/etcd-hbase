@@ -155,6 +155,57 @@ class ExistsExecutorTest {
     }
   }
 
+  @Test
+  void finalPinnedReadPreservesAnAsynchronousFatalError() {
+    var store = new FrozenRecordStore(List.of(List.of(live(1, 0))));
+    var finish = new CompletableFuture<Void>();
+    var fatal = new AssertionError("synthetic asynchronous pin completion fatal");
+    store.finishReadFuture = finish;
+    try (var scope = RequestScope.withoutDeadline();
+        var executor = new ExistsExecutor(store, SortedMergeCursorTest.template(), 1, scope, store)) {
+      var query = executor.execute();
+      assertFalse(query.isDone());
+      finish.completeExceptionally(fatal);
+
+      assertSame(fatal, assertThrows(CompletionException.class, query::join).getCause());
+      assertEquals(1, store.finishReadCalls);
+    }
+  }
+
+  @Test
+  void finalPinnedReadPreservesAnAsynchronousBackendFailure() {
+    var store = new FrozenRecordStore(List.of(List.of(live(1, 0))));
+    var backend = new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    store.finishReadFuture = CompletableFuture.failedFuture(backend);
+    try (var scope = RequestScope.withoutDeadline();
+        var executor = new ExistsExecutor(store, SortedMergeCursorTest.template(), 1, scope, store)) {
+      var query = executor.execute();
+
+      assertSame(backend, assertThrows(CompletionException.class, query::join).getCause());
+      assertEquals(1, store.finishReadCalls);
+    }
+  }
+
+  @Test
+  void finalPinnedReadPreservesASynchronouslyThrownError() {
+    var store = new FrozenRecordStore(List.of(List.of(live(1, 0))));
+    var fatal = new AssertionError("synthetic synchronous pin completion fatal");
+    store.synchronousFinishReadError = fatal;
+    var physical = new CompletableFuture<StoragePage>();
+    var closes = new AtomicInteger();
+    try (var scope = RequestScope.withoutDeadline();
+        var executor = new ExistsExecutor(controlled(physical, closes, null),
+            SortedMergeCursorTest.template(), 1, scope, store)) {
+      var query = executor.execute();
+      physical.complete(new StoragePage(List.of(live(1, 0)), true,
+          new StoragePage.Cost(1, 1, 1)));
+
+      assertSame(fatal, assertThrows(CompletionException.class, query::join).getCause());
+      assertEquals(1, store.finishReadCalls);
+      assertEquals(1, closes.get());
+    }
+  }
+
   private static ScanSource controlled(CompletableFuture<StoragePage> physical, AtomicInteger closes,
       Throwable closeFailure) {
     return request -> new ScanOperation() {

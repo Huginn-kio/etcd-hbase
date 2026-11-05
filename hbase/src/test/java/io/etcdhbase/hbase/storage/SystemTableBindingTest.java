@@ -20,7 +20,7 @@ class SystemTableBindingTest {
   private static final String TABLE_GROUP = "system-group";
   private static final String SALT_PROFILE = "system-salt";
   private static final String REQUIRED_CATEGORIES =
-      "CONTROL,INVOCATION,CANDIDATE,MANIFEST,DECISION";
+      "CONTROL,INVOCATION,CANDIDATE,MANIFEST,DECISION,SNAPSHOT_PIN";
   private static final HashSaltStrategy SALT = new HashSaltStrategy();
   private static final SystemTableBinding BINDING =
       new SystemTableBinding(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, SALT);

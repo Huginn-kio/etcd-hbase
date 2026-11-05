@@ -82,7 +82,7 @@ class J22ManifestRepositoryIT {
         .setValue("etcdhbase.m0.salt-width-bytes",
             Integer.toString(SALT.profile().saltWidthBytes()))
         .setValue("etcdhbase.m0.record-categories",
-            "CONTROL,INVOCATION,CANDIDATE,MANIFEST,DECISION")
+            "CONTROL,INVOCATION,CANDIDATE,MANIFEST,DECISION,SNAPSHOT_PIN")
         .build();
   }
 

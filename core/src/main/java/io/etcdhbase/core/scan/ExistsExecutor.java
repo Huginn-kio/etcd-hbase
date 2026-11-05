@@ -2,6 +2,7 @@ package io.etcdhbase.core.scan;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
@@ -24,6 +25,7 @@ public final class ExistsExecutor implements AutoCloseable {
   private final ScanRequest template;
   private final int bucketCount;
   private final RequestScope scope;
+  private final RecordStore completionStore;
   private final RequestScope.ScopedCleanup registration;
   private final CompletableFuture<Result> result = new CompletableFuture<>();
   private final AtomicBoolean started = new AtomicBoolean();
@@ -41,11 +43,19 @@ public final class ExistsExecutor implements AutoCloseable {
   private StoragePage.Cost cost = new StoragePage.Cost(0, 0, 0);
 
   public ExistsExecutor(ScanSource source, ScanRequest template, int bucketCount, RequestScope scope) {
+    this(source, template, bucketCount, scope,
+        source instanceof RecordStore store ? store : null);
+  }
+
+  /** Supplies the pinned view whose unary result must be fenced before it is returned. */
+  public ExistsExecutor(ScanSource source, ScanRequest template, int bucketCount,
+      RequestScope scope, RecordStore completionStore) {
     if (bucketCount < 1 || bucketCount > 4096) throw new IllegalArgumentException("invalid bucket count");
     this.source = source;
     this.template = template;
     this.bucketCount = bucketCount;
     this.scope = scope;
+    this.completionStore = completionStore;
     registration = scope.registerScopedCleanup(this::closeFromScope);
   }
 
@@ -123,6 +133,26 @@ public final class ExistsExecutor implements AutoCloseable {
     } finally {
       synchronized (outcomeLock) { releasingRegistration = false; }
     }
+    if (failure == null && completionStore != null) {
+      Error primaryFatal = fatal;
+      try {
+        completionStore.finishRead().whenComplete((ignored, pinFailure) -> {
+          Throwable observedFailure = pinFailure == null ? null : unwrapPinFailure(pinFailure);
+          Error completionFatal = observedFailure instanceof Error error ? error : primaryFatal;
+          completeResult(count, observedFailure, completionFatal);
+        });
+      } catch (RuntimeException | Error pinFailure) {
+        // Preserve the result future when finishRead throws synchronously; completeResult settles it
+        // before rethrowing fatal Error.
+        if (fatal == null && pinFailure instanceof Error error) fatal = error;
+        completeResult(count, pinFailure, fatal);
+      }
+      return;
+    }
+    completeResult(count, failure, fatal);
+  }
+
+  private void completeResult(int count, Throwable failure, Error fatal) {
     synchronized (outcomeLock) {
       if (failure == null && (stopRequested.get() || scope.isClosed() || scope.isDeadlineExceeded())) {
         failure = new BackendFailure(scope.isDeadlineExceeded()
@@ -156,6 +186,11 @@ public final class ExistsExecutor implements AutoCloseable {
   private static BackendFailure unwrap(Throwable failure) {
     while (failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null) failure = failure.getCause();
     return failure instanceof BackendFailure backend ? backend : new BackendFailure(BackendFailure.Category.UNKNOWN, failure);
+  }
+  private static Throwable unwrapPinFailure(Throwable failure) {
+    failure = CompletionFailures.unwrapCompletion(failure);
+    if (failure instanceof BackendFailure || failure instanceof Error) return failure;
+    return new BackendFailure(BackendFailure.Category.UNKNOWN, failure);
   }
   private record Completion(BucketCursor.Page page, Throwable failure) {}
 }

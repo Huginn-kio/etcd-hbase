@@ -13,6 +13,11 @@ public interface RecordStore extends ScanSource {
   CompletableFuture<List<BatchWriteResult>> putBatch(List<StoredRecord> records);
   ScanOperation startScan(ScanRequest request);
 
+  /** Fences a pinned unary result after all data bytes have been materialized; ordinary stores need no action. */
+  default CompletableFuture<Void> finishRead() {
+    return CompletableFuture.completedFuture(null);
+  }
+
   default CompletableFuture<StoragePage> scan(ScanRequest request) {
     return startScan(request).completion().toCompletableFuture();
   }

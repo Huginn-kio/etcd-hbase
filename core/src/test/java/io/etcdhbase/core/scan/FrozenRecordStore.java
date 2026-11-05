@@ -20,6 +20,9 @@ final class FrozenRecordStore implements RecordStore {
   boolean mismatch;
   boolean fatal;
   CompletableFuture<Optional<StoredRecord>> pending;
+  int finishReadCalls;
+  CompletableFuture<Void> finishReadFuture = CompletableFuture.completedFuture(null);
+  Error synchronousFinishReadError;
 
   FrozenRecordStore(List<List<StoredRecord>> buckets) {
     scans = new FrozenScanSource(buckets);
@@ -38,5 +41,10 @@ final class FrozenRecordStore implements RecordStore {
   @Override public CompletableFuture<Void> put(StoredRecord record) { throw new UnsupportedOperationException(); }
   @Override public CompletableFuture<Boolean> compareAndSet(ByteKey key, Optional<StorageMetadata> expected, StoredRecord record) { throw new UnsupportedOperationException(); }
   @Override public CompletableFuture<List<BatchWriteResult>> putBatch(List<StoredRecord> records) { throw new UnsupportedOperationException(); }
+  @Override public CompletableFuture<Void> finishRead() {
+    finishReadCalls++;
+    if (synchronousFinishReadError != null) throw synchronousFinishReadError;
+    return finishReadFuture;
+  }
   record Get(ByteKey key, long upper, ReadProjection projection) {}
 }

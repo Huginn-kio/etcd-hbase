@@ -36,6 +36,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
@@ -49,9 +50,9 @@ class ReadViewRecordStoreTest {
       ReadViewRecordStore view = fixture.readStore(pinned, scope);
       assertSelectedPointReads(view, account);
       assertCurrentScanPage(view, pinned, account);
-      assertRangeMergeAndExists(view, scope);
+      assertRangeMergeAndExists(fixture, view, scope);
     }
-    assertEquals(1, fixture.pinCloses.get());
+    assertEquals(4, fixture.pinCloses.get());
   }
 
   private static Fixture currentReadFixture() {
@@ -94,8 +95,8 @@ class ReadViewRecordStoreTest {
     assertEquals(1, pinned.view().stableRevision());
   }
 
-  private static void assertRangeMergeAndExists(ReadViewRecordStore view, RequestScope scope)
-      throws BackendFailure {
+  private static void assertRangeMergeAndExists(Fixture fixture, ReadViewRecordStore view,
+      RequestScope scope) throws BackendFailure {
     var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
     var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
     var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192, 8192);
@@ -110,14 +111,23 @@ class ReadViewRecordStoreTest {
           .map(record -> text(record.key())).toList());
       assertEquals("new-gamma", new String(response.records().getLast().value().orElseThrow()));
       assertEquals(2, response.pointReads(), "selected heads fetch values through the same pinned view");
-      assertEquals(1, ExistsExecutor.point(view, key("gamma"), 2, account).join());
-      assertEquals(0, ExistsExecutor.point(view, key("doomed"), 2, account).join());
-      try (var exists = new ExistsExecutor(scheduler.bind(view, account),
+      PinnedReadView gammaPin = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
+      try (ReadViewRecordStore gammaView = fixture.readStore(gammaPin, scope)) {
+        assertEquals(1, ExistsExecutor.point(gammaView, key("gamma"), 2, account).join());
+      }
+      PinnedReadView doomedPin = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
+      try (ReadViewRecordStore doomedView = fixture.readStore(doomedPin, scope)) {
+        assertEquals(0, ExistsExecutor.point(doomedView, key("doomed"), 2, account).join());
+      }
+      PinnedReadView rangeExistsPin = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
+      try (ReadViewRecordStore rangeExistsView = fixture.readStore(rangeExistsPin, scope);
+          var exists = new ExistsExecutor(scheduler.bind(rangeExistsView, account),
           new ScanRequest(0, KeyRange.point(key("gamma")), Optional.empty(), 2,
-              ReadProjection.METADATA, 1, 1024, 64), 1, scope)) {
+              ReadProjection.METADATA, 1, 1024, 64), 1, scope, rangeExistsView)) {
         assertEquals(1, exists.execute().join().count());
       }
     }
+    assertEquals(4, fixture.pinCloses.get());
   }
 
   @Test
@@ -160,6 +170,104 @@ class ReadViewRecordStoreTest {
       assertEquals(2, fixture.repository.rootReads.get(), "the selected root is rechecked after pinning");
       assertEquals(1, fixture.pinRegistrations.get());
       assertEquals(17, pinned.view().pinGeneration());
+    }
+    assertEquals(1, fixture.pinCloses.get());
+  }
+
+  @Test
+  void failedRenewalPreventsPointAndScanDataReads() {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("k", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
+    fixture.pinRenewal = CompletableFuture.failedFuture(
+        new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      ReadViewRecordStore view = fixture.readStore(
+          fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+      BackendFailure pointFailure = assertInstanceOf(BackendFailure.class,
+          completionFailure(() -> view.get(key("k"), 2, ReadProjection.FULL).join()));
+      assertEquals(BackendFailure.Category.UNAVAILABLE, pointFailure.category());
+      assertEquals(0, fixture.physical.getCalls.get());
+      assertEquals(0, fixture.repository.candidateReads.get());
+
+      ScanOperation scan = view.startScan(new ScanRequest(0, KeyRange.all(), Optional.empty(),
+          2, ReadProjection.FULL, 4, 8192, 16));
+      BackendFailure scanFailure = assertInstanceOf(BackendFailure.class,
+          completionFailure(() -> scan.completion().toCompletableFuture().join()));
+      assertEquals(BackendFailure.Category.UNAVAILABLE, scanFailure.category());
+      assertEquals(0, fixture.physical.scanCalls.get());
+      assertEquals(0, fixture.repository.candidateReads.get());
+    }
+    assertEquals(2, fixture.pinRenews.get());
+    assertEquals(1, fixture.pinCloses.get());
+  }
+
+  @Test
+  void finalPinValidationFailureDiscardsRangeAndReleasesOutputLease() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("k", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
+    fixture.pinCompletion = new CompletableFuture<>();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(20))) {
+      ReadViewRecordStore view = fixture.readStore(
+          fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+      var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+      var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
+      var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 8192, 8192);
+      try (var account = budgets.admit("public", scope, reservation);
+          var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(15));
+          var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account),
+              new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
+                  ReadProjection.FULL, 4, 8192, 16), 1, account, scope)) {
+        var result = cursor.read(1);
+        fixture.pinCompletionStarted.get(10, TimeUnit.SECONDS);
+        assertFalse(result.isDone(), "materialized rows wait for durable pin completion");
+        assertTrue(budgets.snapshot().allocatedBytes() > 0,
+            "the response lease remains owned while final pin validation is pending");
+
+        fixture.pinCompletion.completeExceptionally(
+            new BackendFailure(BackendFailure.Category.CANCELLED));
+        BackendFailure rejected = assertInstanceOf(BackendFailure.class,
+            completionFailure(() -> result.join()));
+        assertEquals(BackendFailure.Category.CANCELLED, rejected.category());
+        assertEquals(0, budgets.snapshot().allocatedBytes(),
+            "failed validation discards the materialized response and releases its lease");
+      }
+    }
+    assertEquals(1, fixture.pinCompletions.get());
+    assertEquals(1, fixture.pinCloses.get());
+  }
+
+  @Test
+  void successfulFinalPinValidationDeliversAndTransfersRangeOwnership() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("k", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
+    fixture.pinCompletion = new CompletableFuture<>();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(20))) {
+      ReadViewRecordStore view = fixture.readStore(
+          fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+      var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+      var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
+      var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 8192, 8192);
+      try (var account = budgets.admit("public", scope, reservation);
+          var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(15));
+          var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account),
+              new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
+                  ReadProjection.FULL, 4, 8192, 16), 1, account, scope)) {
+        var result = cursor.read(1);
+        fixture.pinCompletionStarted.get(10, TimeUnit.SECONDS);
+        assertFalse(result.isDone(), "materialized rows wait for durable pin completion");
+        assertTrue(budgets.snapshot().allocatedBytes() > 0,
+            "the pending response owns its output lease until pin completion");
+        fixture.pinCompletion.complete(null);
+        try (var response = result.get(10, TimeUnit.SECONDS)) {
+          assertEquals(List.of("k"), response.records().stream()
+              .map(record -> text(record.key())).toList());
+          assertEquals(1, fixture.pinCompletions.get());
+          assertTrue(budgets.snapshot().allocatedBytes() > 0,
+              "the delivered response owns its output lease until the caller closes it");
+        }
+      }
+      assertEquals(0, budgets.snapshot().allocatedBytes());
     }
     assertEquals(1, fixture.pinCloses.get());
   }
@@ -283,11 +391,11 @@ class ReadViewRecordStoreTest {
       var reservation = new BudgetManager.Reservation(1024, 1024, 8192, 8192, 8192);
       try (var metadataAccount = budgets.admit("public", scope, reservation)) {
         assertMetadataHeadBudget(view, metadataAccount, metadataRequest);
-        assertFullMergeAndPointExists(view, budgets, scope, reservation);
-        assertRangeExistsUsesMetadataHeadBudget(view, budgets, scope, reservation);
+        assertFullMergeAndPointExists(fixture, budgets, scope, reservation);
+        assertRangeExistsUsesMetadataHeadBudget(fixture, budgets, scope, reservation);
       }
     }
-    assertEquals(1, fixture.pinCloses.get());
+    assertEquals(5, fixture.pinCloses.get());
   }
 
   private static void assertMetadataHeadBudget(ReadViewRecordStore view,
@@ -302,15 +410,17 @@ class ReadViewRecordStoreTest {
         .get(StoragePage.Observation.MANIFEST_CANDIDATE_BYTES));
   }
 
-  private static void assertFullMergeAndPointExists(ReadViewRecordStore view,
+  private static void assertFullMergeAndPointExists(Fixture fixture,
       BudgetManager budgets, RequestScope scope, BudgetManager.Reservation reservation)
       throws BackendFailure {
     var mergeRequest = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
         ReadProjection.METADATA, 1, 1024, 64);
+    ReadViewRecordStore mergeView = fixture.readStore(
+        fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
     try (var account = budgets.admit("public", scope, reservation);
         var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
-        var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account), mergeRequest,
-            1, account, scope);
+        var cursor = SortedMergeCursor.values(mergeView,
+            scheduler.bind(mergeView, account), mergeRequest, 1, account, scope);
         var response = cursor.read(0).join()) {
       assertEquals(List.of("a", "b", "z"), response.records().stream()
           .map(record -> text(record.key())).toList());
@@ -318,20 +428,30 @@ class ReadViewRecordStoreTest {
           "the selected value is fetched after the metadata head");
       assertEquals(5, response.records().get(1).value().orElseThrow().length,
           "a small candidate remains readable");
-      assertEquals(1, ExistsExecutor.point(view, key("a"), 2, account).join());
-      assertEquals(1, ExistsExecutor.point(view, key("z"), 2, account).join(),
+    }
+    ReadViewRecordStore candidateView = fixture.readStore(
+        fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+    try (var account = budgets.admit("public", scope, reservation)) {
+      assertEquals(1, ExistsExecutor.point(candidateView, key("a"), 2, account).join());
+    }
+    ReadViewRecordStore physicalView = fixture.readStore(
+        fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+    try (var account = budgets.admit("public", scope, reservation)) {
+      assertEquals(1, ExistsExecutor.point(physicalView, key("z"), 2, account).join(),
           "the physical-only control remains readable");
     }
   }
 
-  private static void assertRangeExistsUsesMetadataHeadBudget(ReadViewRecordStore view,
+  private static void assertRangeExistsUsesMetadataHeadBudget(Fixture fixture,
       BudgetManager budgets, RequestScope scope, BudgetManager.Reservation reservation)
       throws BackendFailure {
+    ReadViewRecordStore view = fixture.readStore(
+        fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
     try (var account = budgets.admit("public", scope, reservation);
         var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
         var exists = new ExistsExecutor(scheduler.bind(view, account),
             new ScanRequest(0, KeyRange.point(key("a")), Optional.empty(), 2,
-                ReadProjection.METADATA, 1, 1024, 64), 1, scope)) {
+                ReadProjection.METADATA, 1, 1024, 64), 1, scope, view)) {
       assertEquals(1, exists.execute().join().count(),
           "range Exists uses the metadata head budget");
     }
@@ -494,6 +614,12 @@ class ReadViewRecordStoreTest {
     return List.copyOf(keys);
   }
 
+  private static Throwable completionFailure(Runnable action) {
+    CompletionException completion = assertThrows(CompletionException.class, action::run);
+    Throwable cause = completion.getCause();
+    return cause == null ? completion : cause;
+  }
+
   private static List<String> scanKeys(Fixture fixture, long maximumBytes, int expectedPages)
       throws BackendFailure {
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
@@ -590,6 +716,11 @@ class ReadViewRecordStoreTest {
     private final MemoryControl control;
     private final AtomicInteger pinRegistrations = new AtomicInteger();
     private final AtomicInteger pinCloses = new AtomicInteger();
+    private final AtomicInteger pinRenews = new AtomicInteger();
+    private final AtomicInteger pinCompletions = new AtomicInteger();
+    private final CompletableFuture<Void> pinCompletionStarted = new CompletableFuture<>();
+    private volatile CompletableFuture<Void> pinRenewal = CompletableFuture.completedFuture(null);
+    private volatile CompletableFuture<Void> pinCompletion = CompletableFuture.completedFuture(null);
     private final ReadViewService views;
     private final MemoryRecordStore physical = new MemoryRecordStore();
 
@@ -614,10 +745,25 @@ class ReadViewRecordStoreTest {
       ManifestCatalog catalog = new ManifestCatalog(repository);
       ReadViewPinRegistry pinRegistry = (view, scope) -> {
         pinRegistrations.incrementAndGet();
-        return CompletableFuture.completedFuture(new ReadViewPinRegistry.Pin() {
+        AtomicBoolean closed = new AtomicBoolean();
+        ReadViewPinRegistry.Pin pin = new ReadViewPinRegistry.Pin() {
           @Override public long generation() { return 17; }
-          @Override public void close() { pinCloses.incrementAndGet(); }
-        });
+          @Override public CompletableFuture<Void> renew(RequestScope requestScope) {
+            pinRenews.incrementAndGet();
+            return pinRenewal;
+          }
+          @Override public CompletableFuture<Void> complete(RequestScope requestScope) {
+            pinCompletions.incrementAndGet();
+            pinCompletionStarted.complete(null);
+            return pinCompletion.whenComplete((ignored, failure) -> {
+              if (failure == null) close();
+            });
+          }
+          @Override public void close() {
+            if (closed.compareAndSet(false, true)) pinCloses.incrementAndGet();
+          }
+        };
+        return CompletableFuture.completedFuture(pin);
       };
       views = new ReadViewService(control, catalog, pinRegistry, profile);
     }
@@ -739,6 +885,8 @@ class ReadViewRecordStoreTest {
 
   private static final class MemoryRecordStore implements RecordStore {
     private final Map<ByteKey, List<StoredRecord>> versions = new HashMap<>();
+    private final AtomicInteger getCalls = new AtomicInteger();
+    private final AtomicInteger scanCalls = new AtomicInteger();
     private ByteKey blockedKey;
     private CompletableFuture<Optional<StoredRecord>> pendingGet;
     private void blockNextGet(ByteKey key) {
@@ -752,6 +900,7 @@ class ReadViewRecordStoreTest {
     }
     @Override public CompletableFuture<Optional<StoredRecord>> get(
         ByteKey key, long upper, ReadProjection projection) {
+      getCalls.incrementAndGet();
       if (key.equals(blockedKey)) return pendingGet;
       return CompletableFuture.completedFuture(versions.getOrDefault(key, List.of()).stream()
           .filter(record -> record.metadata().modificationRevision() <= upper)
@@ -759,6 +908,7 @@ class ReadViewRecordStoreTest {
               ? StoredRecord.metadataOnly(record.key(), record.metadata()) : record));
     }
     @Override public ScanOperation startScan(ScanRequest request) {
+      scanCalls.incrementAndGet();
       Map<ByteKey, StoredRecord> latest = new HashMap<>();
       for (List<StoredRecord> history : versions.values()) {
         for (StoredRecord record : history) {

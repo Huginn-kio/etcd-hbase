@@ -138,6 +138,15 @@ class InitializationConfigurationLoaderTest {
   }
 
   @Test
+  void systemTableRequiresSnapshotPinCategory() throws Exception {
+    ObjectNode tree = exampleTree();
+    var categories = ((ObjectNode) tree.at("/table_groups/0/system_table"))
+        .withArray("record_categories");
+    categories.remove(categories.size() - 1);
+    assertThrows(IllegalArgumentException.class, () -> load(tree));
+  }
+
+  @Test
   void detectsSiblingTableOverlapAcrossEquivalentLoopbackProfiles() throws Exception {
     ObjectNode tree = exampleTree();
     ObjectNode profile = tree.withArray("hbase_profiles").get(0).deepCopy();
