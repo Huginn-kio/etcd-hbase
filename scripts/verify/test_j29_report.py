@@ -60,6 +60,18 @@ def measurement_lines():
     return lines
 
 
+def history_read_lines(**overrides):
+    lines = measurement_lines()
+    for index, line in enumerate(lines):
+        marker, payload = line.split(" ", 1)
+        row = json.loads(payload)
+        if marker == "j29-read" and row["layout"] == "HISTORY":
+            row.update(overrides)
+            lines[index] = f"{marker} {json.dumps(row)}"
+            return lines
+    raise AssertionError("missing HISTORY read fixture")
+
+
 class J29ReportTest(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -133,6 +145,29 @@ class J29ReportTest(unittest.TestCase):
     def test_rejects_duplicate_layout_measurement(self):
         lines = measurement_lines()
         self.write_report(lines=lines + [lines[0]])
+        self.assert_rejected()
+
+    def test_rejects_read_contract_boundary_violations(self):
+        invalid_values = (
+            ("returnedKeys", 7), ("bucketCount", 3), ("pageRequests", 11), ("pageReopens", 7),
+            ("pagesWhileRecoveryActive", 7), ("pagesWhileRecoveryActive", 13),
+            ("recoveryMaterializationCalls", 7), ("recoveryElapsedMicros", 0),
+            ("recoveryPending", False), ("partiallyMaterialized", False),
+            ("pinRegisterCalls", 0), ("pinRenewCalls", 0), ("pinCompleteCalls", 0),
+            ("peakPinOccupancy", 0),
+        )
+        for key, value in invalid_values:
+            with self.subTest(field=key, value=value):
+                self.write_report(lines=history_read_lines(**{key: value}))
+                self.assert_rejected()
+
+    def test_accepts_upper_recovery_boundary_and_additional_pin_operations(self):
+        self.write_report(lines=history_read_lines(
+            pagesWhileRecoveryActive=12, pinRenewCalls=2, pinCompleteCalls=2))
+        j29_report.collect(self.root, self.output)
+
+    def test_read_validation_keeps_early_failure_short_circuit(self):
+        self.write_report(lines=history_read_lines(returnedKeys=7, pagesWhileRecoveryActive=None))
         self.assert_rejected()
 
     def test_does_not_accept_measurements_from_another_case(self):

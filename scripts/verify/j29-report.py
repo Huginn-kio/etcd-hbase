@@ -86,16 +86,26 @@ def validate_baseline(layout: str, baseline: dict) -> None:
         raise ValueError(f"{layout} commit baseline is incomplete")
 
 
+def invalid_read_pages(read: dict) -> bool:
+    return (read.get("returnedKeys") != 8 or read.get("bucketCount") != 4
+            or read.get("pageRequests") != 12 or read.get("pageReopens") != 8)
+
+
+def invalid_recovery_overlap(read: dict) -> bool:
+    return (not 8 <= read.get("pagesWhileRecoveryActive", 0) <= 12
+            or read.get("recoveryMaterializationCalls") != 8
+            or read.get("recoveryElapsedMicros", 0) <= 0
+            or read.get("recoveryPending") is not True
+            or read.get("partiallyMaterialized") is not True)
+
+
+def invalid_pin_lifecycle(read: dict) -> bool:
+    return (read.get("pinRegisterCalls") != 1 or read.get("pinRenewCalls", 0) < 1
+            or read.get("pinCompleteCalls", 0) < 1 or read.get("peakPinOccupancy") != 1)
+
+
 def validate_read(layout: str, read: dict) -> None:
-    if read.get("returnedKeys") != 8 or read.get("bucketCount") != 4 \
-            or read.get("pageRequests") != 12 or read.get("pageReopens") != 8 \
-            or not 8 <= read.get("pagesWhileRecoveryActive", 0) <= 12 \
-            or read.get("recoveryMaterializationCalls") != 8 \
-            or read.get("recoveryElapsedMicros", 0) <= 0 \
-            or read.get("recoveryPending") is not True \
-            or read.get("partiallyMaterialized") is not True \
-            or read.get("pinRegisterCalls") != 1 or read.get("pinRenewCalls", 0) < 1 \
-            or read.get("pinCompleteCalls", 0) < 1 or read.get("peakPinOccupancy") != 1:
+    if invalid_read_pages(read) or invalid_recovery_overlap(read) or invalid_pin_lifecycle(read):
         raise ValueError(f"{layout} pending/recovery read profile is incomplete")
 
 
