@@ -292,11 +292,11 @@ class ReadViewRecordStoreTest {
       var reservation = new BudgetManager.Reservation(1024, 1024, 8192, 8192, 8192);
       try (var metadataAccount = budgets.admit("public", scope, reservation)) {
         assertMetadataHeadBudget(view, metadataAccount, metadataRequest);
-        assertFullMergeAndPointExists(view, budgets, scope, reservation);
-        assertRangeExistsUsesMetadataHeadBudget(view, budgets, scope, reservation);
+        assertFullMergeAndPointExists(fixture, budgets, scope, reservation);
+        assertRangeExistsUsesMetadataHeadBudget(fixture, budgets, scope, reservation);
       }
     }
-    assertEquals(1, fixture.pinCloses.get());
+    assertEquals(5, fixture.pinCloses.get());
   }
 
   private static void assertMetadataHeadBudget(ReadViewRecordStore view,
@@ -311,15 +311,17 @@ class ReadViewRecordStoreTest {
         .get(StoragePage.Observation.MANIFEST_CANDIDATE_BYTES));
   }
 
-  private static void assertFullMergeAndPointExists(ReadViewRecordStore view,
+  private static void assertFullMergeAndPointExists(Fixture fixture,
       BudgetManager budgets, RequestScope scope, BudgetManager.Reservation reservation)
       throws BackendFailure {
     var mergeRequest = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
         ReadProjection.METADATA, 1, 1024, 64);
+    ReadViewRecordStore mergeView = fixture.readStore(
+        fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
     try (var account = budgets.admit("public", scope, reservation);
         var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
-        var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account), mergeRequest,
-            1, account, scope);
+        var cursor = SortedMergeCursor.values(mergeView,
+            scheduler.bind(mergeView, account), mergeRequest, 1, account, scope);
         var response = cursor.read(0).join()) {
       assertEquals(List.of("a", "b", "z"), response.records().stream()
           .map(record -> text(record.key())).toList());
@@ -327,20 +329,30 @@ class ReadViewRecordStoreTest {
           "the selected value is fetched after the metadata head");
       assertEquals(5, response.records().get(1).value().orElseThrow().length,
           "a small candidate remains readable");
-      assertEquals(1, ExistsExecutor.point(view, key("a"), 2, account).join());
-      assertEquals(1, ExistsExecutor.point(view, key("z"), 2, account).join(),
+    }
+    ReadViewRecordStore candidateView = fixture.readStore(
+        fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+    try (var account = budgets.admit("public", scope, reservation)) {
+      assertEquals(1, ExistsExecutor.point(candidateView, key("a"), 2, account).join());
+    }
+    ReadViewRecordStore physicalView = fixture.readStore(
+        fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+    try (var account = budgets.admit("public", scope, reservation)) {
+      assertEquals(1, ExistsExecutor.point(physicalView, key("z"), 2, account).join(),
           "the physical-only control remains readable");
     }
   }
 
-  private static void assertRangeExistsUsesMetadataHeadBudget(ReadViewRecordStore view,
+  private static void assertRangeExistsUsesMetadataHeadBudget(Fixture fixture,
       BudgetManager budgets, RequestScope scope, BudgetManager.Reservation reservation)
       throws BackendFailure {
+    ReadViewRecordStore view = fixture.readStore(
+        fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
     try (var account = budgets.admit("public", scope, reservation);
         var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
         var exists = new ExistsExecutor(scheduler.bind(view, account),
             new ScanRequest(0, KeyRange.point(key("a")), Optional.empty(), 2,
-                ReadProjection.METADATA, 1, 1024, 64), 1, scope)) {
+                ReadProjection.METADATA, 1, 1024, 64), 1, scope, view)) {
       assertEquals(1, exists.execute().join().count(),
           "range Exists uses the metadata head budget");
     }
