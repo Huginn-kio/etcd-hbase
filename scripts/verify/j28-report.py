@@ -78,6 +78,7 @@ def collect(root: Path, output: Path) -> None:
         "read_view_regression": read_view,
         "verified": [
             "an independent bounded serial model accepts real-time-compatible Compare/Put/Delete/Read histories",
+            "controlled stores drive the production publication, read-view, and recovery components",
             "selected publication decision time constrains overlapping reads even when the caller result is unknown",
             "caller cancellation after selection leaves the selected candidate observable and replay finalizes once",
             "an unresolved unknown result is explored as either applied or not applied, subject to later reads",
@@ -85,7 +86,7 @@ def collect(root: Path, output: Path) -> None:
             "J25 read-view and J27 RecoveryManager core regressions pass in the same run",
         ],
         "unverified": [
-            "real CommitPublisher/HBase RPC histories, network ambiguity, and Go client behavior; J28.2 is M3",
+            "end-to-end business transactions, production handoff, HBase RPC network ambiguity, and Go client behavior; J28.2 is M3",
             "cross-process crash, HDFS/WAL persistence, and production target acceptance",
             "maintainer review",
         ],

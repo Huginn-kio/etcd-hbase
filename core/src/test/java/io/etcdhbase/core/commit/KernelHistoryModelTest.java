@@ -2,12 +2,27 @@ package io.etcdhbase.core.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.storage.BatchWriteResult;
+import io.etcdhbase.core.storage.ReadProjection;
+import io.etcdhbase.core.storage.RecordStore;
+import io.etcdhbase.core.storage.ScanOperation;
+import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.StorageMetadata;
+import io.etcdhbase.core.storage.StoredRecord;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -15,10 +30,15 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.function.Function;
 import org.junit.jupiter.api.Test;
 
-/** Bounded history checks for the M2 control transition and minimal KV operation contract. */
+/** Bounded histories through the M2 publication, read-view, and recovery components. */
 class KernelHistoryModelTest {
   @Test
   void selectedUnknownTransactionIsVisibleAcrossCancellationAndRecovery() {
@@ -26,43 +46,53 @@ class KernelHistoryModelTest {
     Map<String, Mutation> changes = new LinkedHashMap<>();
     changes.put("alpha", Mutation.put("new-alpha"));
     changes.put("beta", Mutation.put("new-beta"));
-    PendingTransaction transaction = driver.beginCompareAndWrite(
-        0, "alpha", Optional.of("old-alpha"), changes);
-    transaction.materializePrefix(1);
-    assertEquals(1, transaction.materializedCount);
-    assertEquals("new-alpha", driver.physical.get("alpha"));
-    assertEquals("old-beta", driver.physical.get("beta"));
+    try (PendingTransaction transaction = driver.beginCompareAndWrite(
+        "alpha", Optional.of("old-alpha"), changes)) {
+      assertEquals(1, driver.materialization.appliedCount());
+      assertEquals(Optional.of("new-alpha"), driver.physicalValue("alpha"));
+      assertEquals(Optional.of("old-beta"), driver.physicalValue("beta"));
 
-    HistoryOperation alphaRead = driver.read(1, 2, "alpha");
-    assertEquals(Optional.of("new-alpha"), alphaRead.observedValue());
-    RequestScope callerScope = RequestScope.withoutDeadline();
-    HistoryOperation cancelled = transaction.cancelCallerAfterSelection(callerScope, 2);
-    assertTrue(callerScope.isCancelled());
-    HistoryOperation betaRead = driver.read(3, 4, "beta");
-    assertEquals(Optional.of("new-beta"), betaRead.observedValue());
+      HistoryOperation alphaRead = driver.read("alpha");
+      assertEquals(Optional.of("new-alpha"), alphaRead.observedValue());
+      HistoryOperation cancelled = transaction.cancelCallerAfterSelection();
+      HistoryOperation betaRead = driver.read("beta");
+      assertEquals(Optional.of("new-beta"), betaRead.observedValue());
 
-    driver.recoverSelectedPublication();
-    driver.recoverSelectedPublication();
-    HistoryOperation staleCompare = driver.compareAndWrite(5, 6, "alpha", Optional.of("old-alpha"),
-        Map.of("alpha", Mutation.put("stale")));
-    HistoryOperation put = driver.put(7, 8, "gamma", "created");
-    HistoryOperation putRead = driver.read(9, 10, "gamma");
-    HistoryOperation delete = driver.delete(11, 12, "beta");
-    HistoryOperation deletedRead = driver.read(13, 14, "beta");
+      // A missing selected candidate must fail the actual view read rather than return the stale row.
+      driver.manifests.missingKey = key("beta");
+      CompletionException missing = assertThrows(CompletionException.class, () -> driver.read("beta"));
+      assertEquals("private candidate referenced by a sealed manifest is missing",
+          assertInstanceOf(IllegalStateException.class, missing.getCause()).getMessage());
+      driver.manifests.missingKey = null;
 
-    List<HistoryOperation> history = List.of(
-        cancelled, alphaRead, betaRead, staleCompare, put, putRead, delete, deletedRead);
-    SerialReferenceChecker checker = new SerialReferenceChecker(Map.of(
-        "alpha", "old-alpha", "beta", "old-beta"));
+      transaction.stopServiceForRecovery();
+      assertEquals(RecoveryManager.State.FINALIZED, driver.recoverSelectedPublication());
+      assertEquals(RecoveryManager.State.NO_PENDING_PUBLICATION, driver.recoverSelectedPublication());
+      assertEquals(2, driver.materialization.appliedCount());
+      HistoryOperation staleCompare = driver.compareAndWrite("alpha", Optional.of("old-alpha"),
+          Map.of("alpha", Mutation.put("stale")));
+      HistoryOperation put = driver.put("gamma", "created");
+      HistoryOperation putRead = driver.read("gamma");
+      HistoryOperation delete = driver.delete("beta");
+      HistoryOperation deletedRead = driver.read("beta");
 
-    assertTrue(checker.hasLinearization(history));
-    assertFalse(checker.hasLinearization(withObservedValue(history, alphaRead.id(), Optional.of("old-alpha"))));
-    assertTrue(driver.control.publication().isEmpty());
-    assertEquals(driver.control.finalizedSequence(), driver.control.publishedSequence());
-    assertEquals(3, driver.control.publishedSequence(),
-        "the selected unknown transaction, put, and delete each advance the commit sequence once");
-    assertEquals(4, driver.control.publishedRevision(),
-        "replaying recovery must not allocate a second revision");
+      List<HistoryOperation> history = List.of(
+          cancelled, alphaRead, betaRead, staleCompare, put, putRead, delete, deletedRead);
+      SerialReferenceChecker checker = new SerialReferenceChecker(Map.of(
+          "alpha", "old-alpha", "beta", "old-beta"));
+
+      assertTrue(checker.hasLinearization(history));
+      assertFalse(checker.hasLinearization(withObservedValue(history, alphaRead.id(), Optional.of("old-alpha"))));
+      assertFalse(checker.hasLinearization(withObservedValue(history, betaRead.id(), Optional.of("old-beta"))));
+      assertTrue(driver.control.state.publication().isEmpty());
+      assertEquals(driver.control.state.finalizedSequence(), driver.control.state.publishedSequence());
+      assertEquals(3, driver.control.state.publishedSequence(),
+          "the selected unknown transaction, put, and delete each advance the commit sequence once");
+      assertEquals(4, driver.control.state.publishedRevision(),
+          "replaying recovery must not allocate a second revision");
+      assertTrue(driver.openedPins > 0);
+      assertEquals(driver.openedPins, driver.closedPins);
+    }
   }
 
   @Test
@@ -266,160 +296,498 @@ class KernelHistoryModelTest {
     }
   }
 
-  /** Drives the production immutable control state while keeping reference semantics separate. */
+  /** The stores are deterministic fakes; publication, view capture, and recovery are real. */
   private static final class KernelDriver {
     private static final ByteKey PROFILE = ByteKey.copyOf(new byte[32]);
 
-    private final Map<String, String> physical = new HashMap<>();
-    private Map<String, Mutation> selectedCandidates = Map.of();
-    private CommitState control = CommitState.initial(PROFILE, 1).claimOwner("history-owner", 1, 100);
+    private final EventClock clock = new EventClock();
+    private final MemoryControl control = new MemoryControl(
+        CommitState.initial(PROFILE, 1).claimOwner("history-owner", 1, 100), clock);
+    private final MemoryInvocations invocations = new MemoryInvocations();
+    private final MemoryDecisions decisions = new MemoryDecisions();
+    private final MemoryManifests manifests = new MemoryManifests();
+    private final MemoryRecords physical = new MemoryRecords();
+    private final MemoryMaterialization materialization = new MemoryMaterialization(physical);
+    private final BudgetManager.Limits limits =
+        new BudgetManager.Limits(4, 32, 2, 2, 2, 1_000_000, 16_000_000);
+    private final BudgetManager budgets = new BudgetManager(limits, Map.of("public", limits), limits);
+    private final ManifestCatalog catalog = new ManifestCatalog(manifests);
+    private final CommitOutcomeResolver outcomes = new CommitOutcomeResolver(control, decisions);
+    private final CommitFinalizationService finalizer = new CommitFinalizationService(
+        control, outcomes, decisions, catalog, materialization);
+    private final RecoveryManager recovery = new RecoveryManager(
+        PROFILE, control, new CommitOwnerService(control), invocations, outcomes, finalizer);
+    private int openedPins;
+    private int closedPins;
+    private final ReadViewService views = new ReadViewService(control, catalog,
+        (view, scope) -> {
+          openedPins++;
+          return CompletableFuture.completedFuture(new ReadViewPinRegistry.Pin() {
+            private boolean closed;
+            @Override public long generation() { return 1; }
+            @Override public void close() {
+              if (!closed) {
+                closed = true;
+                closedPins++;
+              }
+            }
+          });
+        }, PROFILE);
     private int nextOperationId = 1;
     private int nextIdentity = 1;
 
     private KernelDriver(Map<String, String> initialValues) {
-      physical.putAll(initialValues);
+      initialValues.forEach((key, value) ->
+          physical.add(record(key, Optional.of(value), 1, Optional.empty())));
     }
 
-    private PendingTransaction beginCompareAndWrite(int invokedAt, String key,
-        Optional<String> expectedValue, Map<String, Mutation> mutations) {
-      if (!Objects.equals(Optional.ofNullable(visible(key)), expectedValue)) {
+    private PendingTransaction beginCompareAndWrite(String key, Optional<String> expectedValue,
+        Map<String, Mutation> mutations) {
+      int invokedAt = clock.next();
+      if (!readValue(key).equals(expectedValue)) {
         throw new IllegalStateException("fixture compare must pass before publication");
       }
-      CommitState base = control;
-      TransactionId transaction = transactionId(nextIdentity);
-      InvocationId invocation = invocationId(nextIdentity++);
-      ByteKey root = ByteKey.copyOf(new byte[] {(byte) nextIdentity});
-      ByteKey digest = ByteKey.copyOf(new byte[32]);
-      PublicationSlot slot = new PublicationSlot(transaction, invocation, base.ownerEpoch(),
-          base.publishedSequence(), base.publishedRevision(),
-          Math.addExact(base.publishedSequence(), 1), Math.addExact(base.publishedRevision(), 1),
-          true, root, digest);
-      control = base.publish(slot);
-      selectedCandidates = immutableMutations(mutations);
+      materialization.blockAfterOneNewCandidate();
       int id = nextOperationId++;
-      return new PendingTransaction(this, id, invokedAt, key, expectedValue,
-          immutableMutations(mutations), slot);
-    }
-
-    private HistoryOperation compareAndWrite(int invokedAt, int returnedAt, String key,
-        Optional<String> expectedValue, Map<String, Mutation> mutations) {
-      int id = nextOperationId++;
-      if (!Objects.equals(Optional.ofNullable(visible(key)), expectedValue)) {
-        return new HistoryOperation(id, Kind.COMPARE_AND_WRITE, invokedAt, returnedAt,
-            OptionalInt.empty(), key, expectedValue, mutations, Optional.empty(),
-            Outcome.COMPARE_FAILED, PublicationObservation.NOT_SELECTED);
+      RequestScope requestScope = RequestScope.withoutDeadline();
+      TestHandoff handoff = new TestHandoff();
+      CompletableFuture<CommitOutcomeResolver.Resolution> result =
+          publish(mutations, requestScope, handoff);
+      if (result.isDone() || control.state.publication().isEmpty()) {
+        throw new IllegalStateException("the selected publication must remain in progress");
       }
-      throw new IllegalStateException("this bounded driver only accepts comparisons that fail after selection");
+      return new PendingTransaction(this, id, invokedAt, key, expectedValue,
+          immutableMutations(mutations), control.lastDecisionAt, requestScope, handoff, result);
     }
 
-    private HistoryOperation delete(int invokedAt, int returnedAt, String key) {
-      Mutation mutation = Mutation.delete();
-      publishAndFinalize(key, mutation);
-      return HistoryOperation.mutation(nextOperationId++, Kind.DELETE, invokedAt, returnedAt,
-          key, mutation, OptionalInt.of(invokedAt + 1));
+    private HistoryOperation compareAndWrite(String key, Optional<String> expectedValue,
+        Map<String, Mutation> mutations) {
+      int invokedAt = clock.next();
+      boolean matches = readValue(key).equals(expectedValue);
+      int returnedAt = clock.next();
+      if (matches) {
+        throw new IllegalStateException("this bounded driver expects the stale comparison to fail");
+      }
+      return new HistoryOperation(nextOperationId++, Kind.COMPARE_AND_WRITE, invokedAt, returnedAt,
+          OptionalInt.empty(), key, expectedValue, mutations, Optional.empty(),
+          Outcome.COMPARE_FAILED, PublicationObservation.NOT_SELECTED);
     }
 
-    private HistoryOperation put(int invokedAt, int returnedAt, String key, String value) {
-      Mutation mutation = Mutation.put(value);
-      publishAndFinalize(key, mutation);
-      return HistoryOperation.mutation(nextOperationId++, Kind.PUT, invokedAt, returnedAt,
-          key, mutation, OptionalInt.of(invokedAt + 1));
+    private HistoryOperation delete(String key) {
+      return publishAndFinalize(Kind.DELETE, key, Mutation.delete());
     }
 
-    private void publishAndFinalize(String key, Mutation mutation) {
-      if (control.publication().isPresent()) throw new IllegalStateException("publication must be finalized first");
-      CommitState base = control;
+    private HistoryOperation put(String key, String value) {
+      return publishAndFinalize(Kind.PUT, key, Mutation.put(value));
+    }
+
+    private HistoryOperation publishAndFinalize(Kind kind, String key, Mutation mutation) {
+      int invokedAt = clock.next();
+      try (RequestScope requestScope = RequestScope.withoutDeadline()) {
+        CommitOutcomeResolver.Resolution result =
+            publish(Map.of(key, mutation), requestScope, new TestHandoff()).join();
+        int returnedAt = clock.next();
+        if (result.state() != CommitOutcomeResolver.State.SELECTED_FINALIZED) {
+          throw new IllegalStateException("the fixture write did not finish finalization");
+        }
+        return HistoryOperation.mutation(nextOperationId++, kind, invokedAt, returnedAt,
+            key, mutation, OptionalInt.of(control.lastDecisionAt));
+      }
+    }
+
+    private CompletableFuture<CommitOutcomeResolver.Resolution> publish(
+        Map<String, Mutation> mutations, RequestScope requestScope, TestHandoff handoff) {
+      CommitState base = control.state;
+      if (base.publication().isPresent()) {
+        throw new IllegalStateException("publication must be finalized first");
+      }
       TransactionId transaction = transactionId(nextIdentity);
-      InvocationId invocation = invocationId(nextIdentity++);
-      ByteKey root = ByteKey.copyOf(new byte[] {(byte) nextIdentity});
-      PublicationSlot slot = new PublicationSlot(transaction, invocation, base.ownerEpoch(),
-          base.publishedSequence(), base.publishedRevision(),
-          Math.addExact(base.publishedSequence(), 1), Math.addExact(base.publishedRevision(), 1),
-          true, root, ByteKey.copyOf(new byte[32]));
-      control = base.publish(slot);
-      selectedCandidates = Map.of(key, mutation);
-      applySelected(selectedCandidates);
-      control = control.finalizePublication(transaction);
-      selectedCandidates = Map.of();
+      InvocationId invocationId = invocationId(nextIdentity++);
+      List<PreparedCandidate> candidates = mutations.entrySet().stream()
+          .sorted(Map.Entry.comparingByKey())
+          .map(entry -> new PreparedCandidate(transaction, base.ownerEpoch(),
+              base.publishedSequence(), base.publishedRevision(),
+              record(entry.getKey(), entry.getValue().value(),
+                  base.publishedRevision() + 1, physical.latest(key(entry.getKey())))))
+          .toList();
+      List<ManifestCandidateReference> references = candidates.stream()
+          .map(candidate -> ManifestCandidateReference.from(candidate, 0)).toList();
+      ManifestPage page = ManifestPage.create(transaction, 0, references);
+      long totalValueBytes = candidates.stream()
+          .mapToLong(candidate -> candidate.record().metadata().valueLength()).sum();
+      ManifestRoot root = ManifestRoot.create(transaction, base.ownerEpoch(),
+          base.publishedSequence(), base.publishedRevision(), candidates.size(), totalValueBytes,
+          Optional.of(page.reference()));
+      manifests.add(root, page, candidates);
+      InvocationBinding binding = InvocationBinding.begin(invocationId, PROFILE, PROFILE,
+          transaction, base.ownerEpoch(), base.publishedSequence(), base.publishedRevision())
+          .seal(root.systemIdentity());
+      if (invocations.createIfAbsent(binding, requestScope).join()
+          != SystemRecordStore.CreateResult.CREATED) {
+        throw new IllegalStateException("fixture invocation identity is not unique");
+      }
+      CommitPublisher publisher = new CommitPublisher(control, outcomes,
+          new CommitPlanVerifier(catalog, materialization), handoff, finalizer);
+      CommitOwnerService.OwnerToken owner = new CommitOwnerService.OwnerToken(
+          base.ownerInstance().orElseThrow(), base.ownerEpoch());
+      return publisher.publish(binding, owner, root, requestScope);
     }
 
-    private HistoryOperation read(int invokedAt, int returnedAt, String key) {
+    private HistoryOperation read(String key) {
+      int invokedAt = clock.next();
+      Optional<String> value = readValue(key);
+      int returnedAt = clock.next();
       return new HistoryOperation(nextOperationId++, Kind.READ, invokedAt, returnedAt,
-          OptionalInt.empty(), key, Optional.empty(), Map.of(), Optional.ofNullable(visible(key)),
+          OptionalInt.empty(), key, Optional.empty(), Map.of(), value,
           Outcome.COMPLETE, PublicationObservation.NOT_SELECTED);
     }
 
-    private String visible(String key) {
-      if (control.publication().isPresent() && selectedCandidates.containsKey(key)) {
-        Mutation selected = selectedCandidates.get(key);
-        return selected.kind() == MutationKind.PUT ? selected.value().orElseThrow() : null;
+    private Optional<String> readValue(String key) {
+      try (RequestScope scope = RequestScope.withoutDeadline()) {
+        PinnedReadView pinned = views.open(OptionalLong.empty(), PROFILE, scope).join();
+        var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 8192, 8192);
+        try (BudgetManager.Account account = budgets.admit("public", scope, reservation);
+            ReadViewRecordStore view = new ReadViewRecordStore(
+                pinned, physical, catalog, ignored -> 0, 1, scope)) {
+          return logicalValue(view.get(key(key), pinned.view().targetRevision(),
+              ReadProjection.FULL, account).join());
+        }
+      } catch (BackendFailure failure) {
+        throw new CompletionException(failure);
       }
-      return physical.get(key);
     }
 
-    private void applySelected(Map<String, Mutation> mutations) {
-      mutations.forEach((key, mutation) -> {
-        if (mutation.kind() == MutationKind.PUT) physical.put(key, mutation.value().orElseThrow());
-        else physical.remove(key);
-      });
+    private Optional<String> physicalValue(String key) {
+      return logicalValue(physical.latest(key(key)));
     }
 
-    private void recoverSelectedPublication() {
-      if (control.publication().isEmpty()) return;
-      PublicationSlot slot = control.publication().orElseThrow();
-      applySelected(selectedCandidates);
-      control = control.finalizePublication(slot.transactionId());
-      selectedCandidates = Map.of();
+    private RecoveryManager.State recoverSelectedPublication() {
+      try (RequestScope scope = RequestScope.withoutDeadline()) {
+        return recovery.recover("recovery-owner", 200, 500, scope).join().state();
+      }
     }
   }
 
-  private static final class PendingTransaction {
+  private static final class PendingTransaction implements AutoCloseable {
     private final KernelDriver driver;
     private final int id;
     private final int invokedAt;
     private final String key;
     private final Optional<String> expectedValue;
     private final Map<String, Mutation> mutations;
-    private final PublicationSlot slot;
-    private boolean materialized;
-    private int materializedCount;
+    private final int decisionAt;
+    private final RequestScope requestScope;
+    private final TestHandoff handoff;
+    private final CompletableFuture<CommitOutcomeResolver.Resolution> result;
 
-    private PendingTransaction(KernelDriver driver, int id, int invokedAt, String key, Optional<String> expectedValue,
-        Map<String, Mutation> mutations, PublicationSlot slot) {
+    private PendingTransaction(KernelDriver driver, int id, int invokedAt, String key,
+        Optional<String> expectedValue, Map<String, Mutation> mutations, int decisionAt,
+        RequestScope requestScope, TestHandoff handoff,
+        CompletableFuture<CommitOutcomeResolver.Resolution> result) {
       this.driver = driver;
       this.id = id;
       this.invokedAt = invokedAt;
       this.key = key;
       this.expectedValue = expectedValue;
       this.mutations = mutations;
-      this.slot = slot;
+      this.decisionAt = decisionAt;
+      this.requestScope = requestScope;
+      this.handoff = handoff;
+      this.result = result;
     }
 
-    private void materializePrefix(int count) {
-      if (count < 0 || count >= mutations.size()) {
-        throw new IllegalArgumentException("partial materialization must leave a candidate pending");
+    private HistoryOperation cancelCallerAfterSelection() {
+      if (driver.materialization.appliedCount() != 1 || driver.control.state.publication().isEmpty()) {
+        throw new IllegalStateException("cancellation requires a partially materialized selection");
       }
-      int applied = 0;
-      for (Map.Entry<String, Mutation> entry : mutations.entrySet()) {
-        if (applied++ == count) break;
-        Mutation mutation = entry.getValue();
-        if (mutation.kind() == MutationKind.PUT) driver.physical.put(entry.getKey(), mutation.value().orElseThrow());
-        else driver.physical.remove(entry.getKey());
-        materialized = true;
-        materializedCount++;
-      }
-    }
-
-    private HistoryOperation cancelCallerAfterSelection(RequestScope callerScope, int returnedAt) {
-      Objects.requireNonNull(callerScope, "callerScope");
-      if (!materialized || driver.control.publication().filter(slot::equals).isEmpty()) {
-        throw new IllegalStateException("cancellation must follow a selected and partially materialized transaction");
-      }
-      callerScope.cancel();
+      requestScope.cancel();
+      Throwable failure = assertThrows(CompletionException.class, result::join).getCause();
+      assertTrue(failure instanceof CancellationException);
+      assertTrue(requestScope.isCancelled());
+      assertFalse(handoff.serviceScope.isClosed());
+      int returnedAt = driver.clock.next();
+      // Cancellation is the observed caller result. The durable slot separately proves selection.
       return new HistoryOperation(id, Kind.COMPARE_AND_WRITE, invokedAt, returnedAt,
-          OptionalInt.of(invokedAt + 1), key, expectedValue, mutations, Optional.empty(),
+          OptionalInt.of(decisionAt), key, expectedValue, mutations, Optional.empty(),
           Outcome.UNKNOWN, PublicationObservation.SELECTED);
     }
+
+    private void stopServiceForRecovery() {
+      handoff.stopService();
+    }
+
+    @Override public void close() {
+      requestScope.close();
+      handoff.closeService();
+    }
+  }
+
+  /** Test adapter: the request result is cancellable, while accepted work is service-owned. */
+  private static final class TestHandoff implements PublicationHandoff {
+    private RequestScope serviceScope;
+
+    @Override
+    public <T> CompletableFuture<T> transfer(InvocationBinding invocation, RequestScope requestScope,
+        Function<RequestScope, CompletableFuture<T>> work) {
+      serviceScope = RequestScope.withoutDeadline();
+      CompletableFuture<T> result = requestScope.track(new CompletableFuture<>());
+      work.apply(serviceScope).whenComplete((value, failure) -> {
+        if (failure == null) result.complete(value);
+        else result.completeExceptionally(failure);
+        serviceScope.close();
+      });
+      return result;
+    }
+
+    private void stopService() {
+      if (serviceScope == null || !serviceScope.cancel()) {
+        throw new IllegalStateException("the in-flight service scope was not stopped");
+      }
+    }
+
+    private void closeService() {
+      if (serviceScope != null) serviceScope.close();
+    }
+  }
+
+  private static final class EventClock {
+    private int next;
+    private int next() { return next++; }
+  }
+
+  private static final class MemoryControl implements CommitControlStore {
+    private CommitState state;
+    private final EventClock clock;
+    private int version;
+    private int lastDecisionAt = -1;
+
+    private MemoryControl(CommitState state, EventClock clock) {
+      this.state = state;
+      this.clock = clock;
+    }
+
+    @Override public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(state, token())));
+    }
+
+    @Override public CompletableFuture<Boolean> initializeIfAbsent(
+        CommitState initialState, RequestScope scope) {
+      return CompletableFuture.completedFuture(false);
+    }
+
+    @Override public CompletableFuture<Boolean> compareAndSet(
+        ControlSnapshot observed, CommitState replacement, RequestScope scope) {
+      if (!Arrays.equals(observed.comparisonToken(), token())) {
+        return CompletableFuture.completedFuture(false);
+      }
+      boolean selected = state.publication().isEmpty() && replacement.publication().isPresent();
+      state = replacement;
+      version++;
+      if (selected) lastDecisionAt = clock.next();
+      return CompletableFuture.completedFuture(true);
+    }
+
+    private byte[] token() { return ByteBuffer.allocate(Integer.BYTES).putInt(version).array(); }
+  }
+
+  private static final class MemoryInvocations implements InvocationRepository {
+    private final Map<InvocationId, InvocationBinding> bindings = new HashMap<>();
+
+    @Override public CompletableFuture<Optional<InvocationBinding>> read(
+        InvocationId id, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.ofNullable(bindings.get(id)));
+    }
+
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+        InvocationBinding value, RequestScope scope) {
+      InvocationBinding previous = bindings.putIfAbsent(value.invocationId(), value);
+      return CompletableFuture.completedFuture(previous == null
+          ? SystemRecordStore.CreateResult.CREATED : SystemRecordStore.CreateResult.CONFLICT);
+    }
+
+    @Override public CompletableFuture<Boolean> compareAndSet(
+        InvocationBinding expected, InvocationBinding replacement, RequestScope scope) {
+      return CompletableFuture.completedFuture(bindings.replace(
+          expected.invocationId(), expected, replacement));
+    }
+  }
+
+  private static final class MemoryDecisions implements CommitDecisionRepository {
+    private final Map<Long, CommitDecision> values = new HashMap<>();
+
+    @Override public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.ofNullable(values.get(sequence)));
+    }
+
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+        CommitDecision decision, RequestScope scope) {
+      CommitDecision previous = values.putIfAbsent(decision.sequence(), decision);
+      return CompletableFuture.completedFuture(previous == null
+          ? SystemRecordStore.CreateResult.CREATED
+          : previous.equals(decision) ? SystemRecordStore.CreateResult.ALREADY_PRESENT
+              : SystemRecordStore.CreateResult.CONFLICT);
+    }
+  }
+
+  private static final class MemoryManifests implements ManifestRepository {
+    private final Map<ByteKey, ManifestRoot> roots = new HashMap<>();
+    private final Map<ByteKey, ManifestPage> pages = new HashMap<>();
+    private final Map<ByteKey, PreparedCandidate> candidates = new HashMap<>();
+    private ByteKey missingKey;
+
+    private void add(ManifestRoot root, ManifestPage page, List<PreparedCandidate> values) {
+      roots.put(root.systemIdentity(), root);
+      pages.put(page.systemIdentity(), page);
+      values.forEach(candidate -> candidates.put(candidate.systemIdentity(), candidate));
+    }
+
+    @Override public int candidateBucket(PreparedCandidate candidate) { return 0; }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createCandidate(
+        PreparedCandidate candidate, RequestScope scope) { return unsupported(); }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createPage(
+        ManifestPage page, RequestScope scope) { return unsupported(); }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createDirectoryPage(
+        ManifestDirectoryPage page, RequestScope scope) { return unsupported(); }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createEvent(
+        PreparedEvent event, RequestScope scope) { return unsupported(); }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createEventPage(
+        EventPage page, RequestScope scope) { return unsupported(); }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createEventDirectoryPage(
+        EventDirectoryPage page, RequestScope scope) { return unsupported(); }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> seal(
+        ManifestRoot root, RequestScope scope) { return unsupported(); }
+    @Override public CompletableFuture<Optional<ManifestRoot>> readRoot(ByteKey id, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.ofNullable(roots.get(id)));
+    }
+    @Override public CompletableFuture<Optional<PreparedCandidate>> readCandidate(
+        ByteKey id, RequestScope scope) {
+      PreparedCandidate candidate = candidates.get(id);
+      return CompletableFuture.completedFuture(candidate != null
+          && !candidate.record().key().equals(missingKey) ? Optional.of(candidate) : Optional.empty());
+    }
+    @Override public CompletableFuture<Optional<ManifestPage>> readPage(ByteKey id, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.ofNullable(pages.get(id)));
+    }
+    @Override public CompletableFuture<Optional<ManifestDirectoryPage>> readDirectoryPage(
+        ByteKey id, RequestScope scope) { return empty(); }
+    @Override public CompletableFuture<Optional<PreparedEvent>> readEvent(
+        ByteKey id, RequestScope scope) { return empty(); }
+    @Override public CompletableFuture<Optional<EventPage>> readEventPage(
+        ByteKey id, RequestScope scope) { return empty(); }
+    @Override public CompletableFuture<Optional<EventDirectoryPage>> readEventDirectoryPage(
+        ByteKey id, RequestScope scope) { return empty(); }
+
+    private static <T> CompletableFuture<T> unsupported() {
+      return CompletableFuture.failedFuture(new UnsupportedOperationException("unexpected manifest write"));
+    }
+    private static <T> CompletableFuture<Optional<T>> empty() {
+      return CompletableFuture.completedFuture(Optional.empty());
+    }
+  }
+
+  private static final class MemoryRecords implements RecordStore {
+    private final Map<ByteKey, List<StoredRecord>> versions = new HashMap<>();
+
+    private void add(StoredRecord record) {
+      versions.computeIfAbsent(record.key(), ignored -> new ArrayList<>()).add(record);
+    }
+
+    private Optional<StoredRecord> latest(ByteKey key) {
+      return latestAt(key, Long.MAX_VALUE);
+    }
+
+    private Optional<StoredRecord> latestAt(ByteKey key, long upper) {
+      return versions.getOrDefault(key, List.of()).stream()
+          .filter(record -> record.metadata().modificationRevision() <= upper)
+          .max(Comparator.comparingLong(record -> record.metadata().modificationRevision()));
+    }
+
+    @Override public CompletableFuture<Optional<StoredRecord>> get(
+        ByteKey key, long upper, ReadProjection projection) {
+      return CompletableFuture.completedFuture(latestAt(key, upper).map(record ->
+          projection == ReadProjection.METADATA && record.hasValue()
+              ? StoredRecord.metadataOnly(record.key(), record.metadata()) : record));
+    }
+    @Override public ScanOperation startScan(ScanRequest request) {
+      throw new UnsupportedOperationException("the bounded history performs point reads only");
+    }
+    @Override public CompletableFuture<Void> put(StoredRecord record) { return unsupported(); }
+    @Override public CompletableFuture<Boolean> compareAndSet(
+        ByteKey key, Optional<StorageMetadata> expected, StoredRecord replacement) {
+      return unsupported();
+    }
+    @Override public CompletableFuture<List<BatchWriteResult>> putBatch(List<StoredRecord> records) {
+      return unsupported();
+    }
+    private static <T> CompletableFuture<T> unsupported() {
+      return CompletableFuture.failedFuture(new UnsupportedOperationException("unexpected record write"));
+    }
+  }
+
+  private static final class MemoryMaterialization implements MaterializationStore {
+    private final MemoryRecords physical;
+    private final Map<ByteKey, Long> appliedSequence = new HashMap<>();
+    private boolean blockAfterOne;
+    private int newSinceBlock;
+    private int appliedCount;
+
+    private MemoryMaterialization(MemoryRecords physical) { this.physical = physical; }
+    private int appliedCount() { return appliedCount; }
+
+    private void blockAfterOneNewCandidate() {
+      blockAfterOne = true;
+      newSinceBlock = 0;
+    }
+
+    @Override public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope scope) {
+      return CompletableFuture.completedFuture(null);
+    }
+
+    @Override public CompletableFuture<ApplyResult> applySelected(
+        CommitDecision decision, PreparedCandidate candidate, RequestScope scope) {
+      ByteKey key = candidate.record().key();
+      Long previous = appliedSequence.get(key);
+      if (previous != null && previous == decision.sequence()) {
+        return CompletableFuture.completedFuture(ApplyResult.ALREADY_APPLIED);
+      }
+      if (previous != null && previous > decision.sequence()) {
+        return CompletableFuture.completedFuture(ApplyResult.CURRENT_SUPERSEDED);
+      }
+      if (blockAfterOne && newSinceBlock == 1) {
+        blockAfterOne = false;
+        CompletableFuture<ApplyResult> pending = new CompletableFuture<>();
+        scope.registerCleanup(() -> pending.completeExceptionally(
+            new BackendFailure(BackendFailure.Category.CANCELLED)));
+        return pending;
+      }
+      physical.add(candidate.record());
+      appliedSequence.put(key, decision.sequence());
+      appliedCount++;
+      if (blockAfterOne) newSinceBlock++;
+      return CompletableFuture.completedFuture(ApplyResult.APPLIED);
+    }
+  }
+
+  private static StoredRecord record(String key, Optional<String> value, long revision,
+      Optional<StoredRecord> prior) {
+    boolean wasLive = prior.filter(record ->
+        record.metadata().state() == StorageMetadata.State.LIVE).isPresent();
+    long createRevision = wasLive ? prior.orElseThrow().metadata().createRevision() : revision;
+    long version = wasLive ? prior.orElseThrow().metadata().version() + 1 : 1;
+    byte[] bytes = value.map(text -> text.getBytes(StandardCharsets.UTF_8)).orElseGet(() -> new byte[0]);
+    StorageMetadata metadata = new StorageMetadata(createRevision, revision, version, 0,
+        value.isPresent() ? StorageMetadata.State.LIVE : StorageMetadata.State.TOMBSTONE, bytes.length);
+    return value.isPresent() ? StoredRecord.live(key(key), metadata, bytes)
+        : StoredRecord.metadataOnly(key(key), metadata);
+  }
+
+  private static Optional<String> logicalValue(Optional<StoredRecord> record) {
+    return record.filter(value -> value.metadata().state() == StorageMetadata.State.LIVE)
+        .map(value -> new String(value.value().orElseThrow(), StandardCharsets.UTF_8));
+  }
+
+  private static ByteKey key(String value) {
+    return ByteKey.copyOf(value.getBytes(StandardCharsets.UTF_8));
   }
 
   private static TransactionId transactionId(int value) {
