@@ -10,9 +10,10 @@ GO_PACKAGES = {"cmd/m0driver", "cmd/native-etcd", "internal/client", "internal/c
 GO_MODULE = "github.com/Reidddddd/etcd-hbase/testkit/go/"
 
 
-def java_reports(root, required, modules=JAVA_MODULES, required_cases=None):
+def java_reports(root, required, modules=JAVA_MODULES, required_cases=None,
+                 report_kinds=("surefire-reports", "failsafe-reports")):
     required_cases = required_cases or {}
-    paths = [path for module in modules for kind in ("surefire-reports", "failsafe-reports")
+    paths = [path for module in modules for kind in report_kinds
              for path in sorted((root / module / "target" / kind).glob("TEST-*.xml"))]
     suites = {}
     for path in paths:

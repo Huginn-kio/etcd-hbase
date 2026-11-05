@@ -11,5 +11,7 @@ scripts/dev/mvn21.sh -B -ntp -pl core -am clean test > "$REPORT/maven.log" 2>&1 
   tail -n 100 "$REPORT/maven.log" >&2
   exit 1
 }
+python3 scripts/verify/test_j28_report.py
+python3 scripts/verify/test_evidence.py
 python3 scripts/verify/j28-report.py "$REPORT"
 git diff --check HEAD

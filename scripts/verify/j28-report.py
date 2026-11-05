@@ -6,48 +6,18 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 
+from evidence import java_reports
 
-def read_suite(path: Path, required_cases: set[str]) -> dict[str, int]:
-    if not path.is_file():
-        raise ValueError(f"missing test report: {path.name}")
-    suite = ET.parse(path).getroot()
-    counts = {
-        key: int(suite.get(key, "0"))
-        for key in ("tests", "failures", "errors", "skipped")
-    }
-    names = {case.get("name") for case in suite.iter("testcase")}
-    if counts["tests"] != len(required_cases) or any(
-        counts[key] != 0 for key in ("failures", "errors", "skipped")
-    ):
-        raise ValueError(f"J28.1 suite did not pass exactly: {path.name}")
-    if not required_cases.issubset(names):
-        raise ValueError(f"required history checks are missing: {path.name}")
-    return counts
-
-
-def core_totals(directory: Path) -> dict[str, int]:
-    totals = {key: 0 for key in ("tests", "failures", "errors", "skipped")}
-    reports = sorted(directory.glob("TEST-*.xml"))
-    if not reports:
-        raise ValueError("core test reports are missing")
-    for path in reports:
-        suite = ET.parse(path).getroot()
-        for key in totals:
-            totals[key] += int(suite.get(key, "0"))
-    if any(totals[key] for key in ("failures", "errors", "skipped")):
-        raise ValueError("core tests contain failures, errors, or skipped cases")
-    return totals
-
-
-def collect(root: Path, output: Path) -> None:
-    reports = root / "core/target/surefire-reports"
-    model = read_suite(reports / "TEST-io.etcdhbase.core.commit.KernelHistoryModelTest.xml", {
+MODEL = "io.etcdhbase.core.commit.KernelHistoryModelTest"
+RECOVERY = "io.etcdhbase.core.commit.RecoveryManagerTest"
+READ_VIEW = "io.etcdhbase.core.commit.ReadViewRecordStoreTest"
+REQUIRED_CASES = {
+    MODEL: {
         "selectedUnknownTransactionIsVisibleAcrossCancellationAndRecovery",
         "unresolvedUnknownMayHaveTakenEffectOrMayNotHaveTakenEffect",
-    })
-    recovery = read_suite(reports / "TEST-io.etcdhbase.core.commit.RecoveryManagerTest.xml", {
+    },
+    RECOVERY: {
         "takesOverSelectedSlotAndRepeatedStartupDoesNotAllocateAnotherRevision",
         "recoveryFinalizesSelectedWorkAfterCallerResultWindowCloses",
         "recoveryResumesAfterTheDecisionArchiveWasPersisted",
@@ -55,16 +25,34 @@ def collect(root: Path, output: Path) -> None:
         "doesNotPreemptAnotherLiveOwnerOrScanInvocations",
         "rejectsProfileMismatchBeforeClaimingAnOwnerEpoch",
         "missingSelectedInvocationFailsClosedAfterOwnerFence",
-    })
-    read_view = read_suite(reports / "TEST-io.etcdhbase.core.commit.ReadViewRecordStoreTest.xml", {
+    },
+    READ_VIEW: {
         "currentReadOverlaysOnlyTheSelectedPendingTransactionBeforeRangeMerge",
         "historicalReadUsesItsOwnBarrierAndCanReadDeleteThenRecreateVersions",
         "selectedRootIsPinnedAndRecheckedBeforeAnyDataRead",
         "cancellingAReadKeepsItsPinUntilThePhysicalProducerStops",
-    })
+    },
+}
+
+
+def collect(root: Path, output: Path) -> None:
+    reports = root / "core/target/surefire-reports"
+    for name in REQUIRED_CASES:
+        if not (reports / f"TEST-{name}.xml").is_file():
+            raise ValueError(f"required core unit suite is missing: {name}")
+    _, suites = java_reports(root, set(REQUIRED_CASES), modules=("core",),
+                             required_cases=REQUIRED_CASES, report_kinds=("surefire-reports",))
+    model = suites[MODEL]
+    recovery = suites[RECOVERY]
+    read_view = suites[READ_VIEW]
+    core_tests = {key: sum(counts[key] for counts in suites.values())
+                  for key in ("tests", "failures", "errors", "skipped")}
     tracked = [
         "core/src/test/java/io/etcdhbase/core/commit/KernelHistoryModelTest.java",
         "scripts/verify/j28-report.py",
+        "scripts/verify/test_j28_report.py",
+        "scripts/verify/evidence.py",
+        "scripts/verify/test_evidence.py",
         "scripts/verify/j28.sh",
         "docs/testing/j28-kernel-history.md",
     ]
@@ -84,7 +72,7 @@ def collect(root: Path, output: Path) -> None:
         ).stdout.strip(),
         "implementation_sha256": digest.hexdigest(),
         "ended_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "core_tests": core_totals(reports),
+        "core_tests": core_tests,
         "history_model": model,
         "recovery_regression": recovery,
         "read_view_regression": read_view,
