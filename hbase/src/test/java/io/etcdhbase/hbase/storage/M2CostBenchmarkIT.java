@@ -110,7 +110,6 @@ class M2CostBenchmarkIT {
     private final M1TestEnvironment environment;
     private final StorageTableBinding.Layout layout;
     private final StorageTableBinding primary;
-    private final Optional<StorageTableBinding> current;
     private final SystemTableBinding systemBinding;
     private final M2CostMetrics metrics;
     private final LongAdder finalizationNanos = new LongAdder();
@@ -132,15 +131,13 @@ class M2CostBenchmarkIT {
     private int transactionNumber;
 
     private Profile(M1TestEnvironment environment, StorageTableBinding.Layout layout,
-        StorageTableBinding primary, Optional<StorageTableBinding> current,
-        SystemTableBinding systemBinding, M2CostMetrics metrics, SystemRecordStore records,
+        StorageTableBinding primary, SystemTableBinding systemBinding, M2CostMetrics metrics, SystemRecordStore records,
         M2CostMetrics.Control control, InvocationRepository invocations,
         ManifestRepository manifests, CommitDecisionRepository decisions,
         MaterializationStore materialization, CommitOwnerService.OwnerToken owner) {
       this.environment = environment;
       this.layout = layout;
       this.primary = primary;
-      this.current = current;
       this.systemBinding = systemBinding;
       this.metrics = metrics;
       this.records = records;
@@ -198,7 +195,7 @@ class M2CostBenchmarkIT {
         long now = System.currentTimeMillis();
         var owner = await(ownerService.claim("j29-minicluster-" + suffix, now,
             now + Duration.ofHours(1).toMillis(), openScope)).orElseThrow();
-        Profile profile = new Profile(environment, layout, primary, current, system, metrics, records,
+        Profile profile = new Profile(environment, layout, primary, system, metrics, records,
             control, invocations, manifests, decisions, materialization, owner);
         return profile;
       }
@@ -248,6 +245,7 @@ class M2CostBenchmarkIT {
           try {
             work = serviceWork.apply(serviceScope);
           } catch (RuntimeException | Error failure) {
+            // The transferred service scope must close even when setup fails fatally.
             serviceScope.close();
             if (failure instanceof Error fatal) throw fatal;
             return CompletableFuture.failedFuture(failure);

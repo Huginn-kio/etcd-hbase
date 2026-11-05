@@ -43,22 +43,8 @@ final class M2CostFairQueue {
     try {
       for (Work work : schedule) {
         long enqueuedAt = System.nanoTime();
-        submitted.add(CompletableFuture.supplyAsync(() -> {
-          long started = System.nanoTime();
-          Work previous = previousWork.get();
-          long priorCompletion = previousCompletion.get();
-          long switchGap = previous != null && previous.renewal() != work.renewal()
-              ? Math.max(0, started - priorCompletion) : 0;
-          try {
-            long serviceNanos = action.run(work);
-            previousWork.set(work);
-            previousCompletion.set(System.nanoTime());
-            return new Sample(work.kind(), work.renewal(), work.candidates(),
-                Math.max(0, started - enqueuedAt), switchGap, serviceNanos);
-          } catch (Exception failure) {
-            throw new java.util.concurrent.CompletionException(failure);
-          }
-        }, singleActive));
+        submitted.add(CompletableFuture.supplyAsync(
+            () -> execute(work, action, previousWork, previousCompletion, enqueuedAt), singleActive));
       }
 
       print(layout, seed, workloadDigest, submitted.stream().map(CompletableFuture::join).toList());
@@ -67,6 +53,24 @@ final class M2CostFairQueue {
       if (!singleActive.awaitTermination(20, TimeUnit.SECONDS)) {
         throw new IllegalStateException("J29 single-active workload thread did not stop");
       }
+    }
+  }
+
+  private static Sample execute(Work work, CommitAction action, AtomicReference<Work> previousWork,
+      AtomicLong previousCompletion, long enqueuedAt) {
+    long started = System.nanoTime();
+    Work previous = previousWork.get();
+    long priorCompletion = previousCompletion.get();
+    long switchGap = previous != null && previous.renewal() != work.renewal()
+        ? Math.max(0, started - priorCompletion) : 0;
+    try {
+      long serviceNanos = action.run(work);
+      previousWork.set(work);
+      previousCompletion.set(System.nanoTime());
+      return new Sample(work.kind(), work.renewal(), work.candidates(),
+          Math.max(0, started - enqueuedAt), switchGap, serviceNanos);
+    } catch (Exception failure) {
+      throw new java.util.concurrent.CompletionException(failure);
     }
   }
 

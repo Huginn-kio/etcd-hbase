@@ -8,20 +8,26 @@ import shutil
 import sys
 import xml.etree.ElementTree as ET
 
+from evidence import java_reports
 
-def suite_counts(path: Path) -> tuple[dict[str, int], str]:
+
+SUITE = "io.etcdhbase.hbase.storage.M2CostBenchmarkIT"
+WORKLOAD_CASE = "reportsCommitReadAndSimulatedRenewalCostsForBothLayouts"
+
+
+def load_workload_report(root: Path) -> tuple[Path, dict[str, int], str]:
+    path = root / "hbase/target/failsafe-reports" / f"TEST-{SUITE}.xml"
     if not path.is_file():
         raise ValueError(f"missing J29 MiniCluster report: {path.name}")
+    _, suites = java_reports(root, {SUITE}, modules=("hbase",),
+                             required_cases={SUITE: {WORKLOAD_CASE}},
+                             report_kinds=("failsafe-reports",))
     suite = ET.parse(path).getroot()
-    counts = {name: int(suite.get(name, "0"))
-              for name in ("tests", "failures", "errors", "skipped")}
-    cases = {test.get("name") for test in suite.iter("testcase")}
-    if counts != {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}:
-        raise ValueError("J29 MiniCluster test did not pass exactly once")
-    if "reportsCommitReadAndSimulatedRenewalCostsForBothLayouts" not in cases:
-        raise ValueError("J29 workload case did not execute")
-    stdout = "\n".join(node.text or "" for node in suite.iter("system-out"))
-    return counts, stdout
+    if suite.get("name") != SUITE:
+        raise ValueError("J29 workload report has an unexpected suite name")
+    case = next(case for case in suite.findall("testcase") if case.get("name") == WORKLOAD_CASE)
+    stdout = "\n".join(node.text or "" for node in [*suite.findall("system-out"), *case.iter("system-out")])
+    return path, suites[SUITE], stdout
 
 
 def observations(stdout: str) -> dict[str, list[dict]]:
@@ -36,7 +42,7 @@ def observations(stdout: str) -> dict[str, list[dict]]:
 
 def require_layout_rows(rows: list[dict], layouts: set[str], marker: str) -> dict[str, dict]:
     selected = {row.get("layout"): row for row in rows}
-    if set(selected) != layouts:
+    if len(rows) != len(layouts) or set(selected) != layouts:
         raise ValueError(f"{marker} does not contain both HISTORY and NATIVE profiles")
     digests = {row.get("workloadSha256") for row in selected.values()}
     seeds = {row.get("seed") for row in selected.values()}
@@ -51,11 +57,15 @@ def source_hash(root: Path) -> str:
         "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CostBenchmarkIT.java",
         "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CostFairQueue.java",
         "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CostMetrics.java",
+        "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CostMetricsTest.java",
         "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CostPinObservations.java",
         "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CostReadProfile.java",
         "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CostRecoveryInterlock.java",
         "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CostRuntimeSampler.java",
         "scripts/verify/j29-report.py",
+        "scripts/verify/test_j29_report.py",
+        "scripts/verify/evidence.py",
+        "scripts/verify/test_evidence.py",
         "scripts/verify/j29.sh",
         "docs/testing/j29-public-cost-report.md",
     ]
@@ -69,74 +79,83 @@ def source_hash(root: Path) -> str:
     return digest.hexdigest()
 
 
-def collect(root: Path, output: Path) -> None:
-    test_report = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hbase.storage.M2CostBenchmarkIT.xml"
-    counts, stdout = suite_counts(test_report)
-    observed = observations(stdout)
-    required = {"j29-commit-baseline", "j29-read", "j29-queue", "j29-layout", "j29-resource"}
-    if not required.issubset(observed):
+def validate_baseline(layout: str, baseline: dict) -> None:
+    if {sample["kind"] for sample in baseline["samples"]} != {
+        "SHORT_KV", "LARGE_KV", "SIMULATED_RENEWAL"
+    }:
+        raise ValueError(f"{layout} commit baseline is incomplete")
+
+
+def validate_read(layout: str, read: dict) -> None:
+    if read.get("returnedKeys") != 8 or read.get("bucketCount") != 4 \
+            or read.get("pageRequests") != 12 or read.get("pageReopens") != 8 \
+            or not 8 <= read.get("pagesWhileRecoveryActive", 0) <= 12 \
+            or read.get("recoveryMaterializationCalls") != 8 \
+            or read.get("recoveryElapsedMicros", 0) <= 0 \
+            or read.get("recoveryPending") is not True \
+            or read.get("partiallyMaterialized") is not True \
+            or read.get("pinRegisterCalls") != 1 or read.get("pinRenewCalls", 0) < 1 \
+            or read.get("pinCompleteCalls", 0) < 1 or read.get("peakPinOccupancy") != 1:
+        raise ValueError(f"{layout} pending/recovery read profile is incomplete")
+
+
+def validate_queue(layout: str, queue: dict) -> None:
+    if queue.get("submitted") != 8 or len(queue.get("samples", [])) != 8 \
+            or queue.get("classSwitches", 0) < 1 \
+            or queue.get("maxConsecutiveBusiness") > 3 \
+            or queue.get("maxConsecutiveRenewals") > 1:
+        raise ValueError(f"{layout} bounded-fair queue profile is incomplete")
+
+
+def validate_resources(layout: str, resource: dict) -> None:
+    if resource.get("activePinsAfterRelease") != 0 or resource.get("peakActiveScanners") != 1 \
+            or resource.get("pinCapacity") != 32 \
+            or any(resource.get(key, -1) < 0 for key in (
+                "sampledPeakHeapBytes", "sampledPeakDirectBufferBytes",
+                "sampledPeakThreadCount", "peakLogicalCandidatePayloadBytes")):
+        raise ValueError(f"{layout} resource and cleanup evidence is incomplete")
+
+
+def validate_totals(layout: str, total: dict) -> None:
+    metrics = total.get("metrics", {})
+    if total.get("publishedSequence") != 12 or total.get("publishedRevision") != 10:
+        raise ValueError(f"{layout} publication and metadata-only revision totals differ")
+    required = {
+        "control.cas", "system.CANDIDATE.create", "system.MANIFEST.create",
+        "system.DECISION.create", "system.SNAPSHOT_PIN.cas",
+        "materialize.preflight", "materialize.apply",
+    }
+    if not required.issubset(metrics):
+        raise ValueError(f"{layout} protocol operation counters are incomplete")
+    if any(metric["unknown"] or metric["failed"] for metric in metrics.values()):
+        raise ValueError(f"{layout} observed a failed or unknown application operation")
+    if metrics["control.cas"]["conflicts"] != 0:
+        raise ValueError(f"{layout} serial profile unexpectedly had a control CAS conflict")
+
+
+def validate_measurements(observed: dict[str, list[dict]]) -> dict[str, dict[str, dict]]:
+    required = ("j29-commit-baseline", "j29-read", "j29-queue", "j29-layout", "j29-resource")
+    if not set(required).issubset(observed):
         raise ValueError("one or more J29 measurements are missing")
     layouts = {"HISTORY", "NATIVE"}
-    baselines = require_layout_rows(observed["j29-commit-baseline"], layouts, "commit baseline")
-    reads = require_layout_rows(observed["j29-read"], layouts, "read profile")
-    queues = require_layout_rows(observed["j29-queue"], layouts, "queue profile")
-    totals = require_layout_rows(observed["j29-layout"], layouts, "operation totals")
-    resources = require_layout_rows(observed["j29-resource"], layouts, "resource profile")
+    profiles = {marker: require_layout_rows(observed[marker], layouts, marker) for marker in required}
     environment_profiles = {
         (row.get("hbaseVersion"), row.get("java"), row.get("bucketCount"))
-        for row in totals.values()
+        for row in profiles["j29-layout"].values()
     }
     if len(environment_profiles) != 1 or next(iter(environment_profiles))[2] != 4:
         raise ValueError("layout profiles were not measured on the same HBase/JDK/bucket setup")
-
     for layout in layouts:
-        baseline = baselines[layout]
-        if {sample["kind"] for sample in baseline["samples"]} != {
-            "SHORT_KV", "LARGE_KV", "SIMULATED_RENEWAL"
-        }:
-            raise ValueError(f"{layout} commit baseline is incomplete")
-        read = reads[layout]
-        if read.get("returnedKeys") != 8 or read.get("bucketCount") != 4 \
-                or read.get("pageRequests") != 12 or read.get("pageReopens") != 8 \
-                or not 8 <= read.get("pagesWhileRecoveryActive", 0) <= 12 \
-                or read.get("recoveryMaterializationCalls") != 8 \
-                or read.get("recoveryElapsedMicros", 0) <= 0 \
-                or read.get("recoveryPending") is not True \
-                or read.get("partiallyMaterialized") is not True \
-                or read.get("pinRegisterCalls") != 1 or read.get("pinRenewCalls", 0) < 1 \
-                or read.get("pinCompleteCalls", 0) < 1 or read.get("peakPinOccupancy") != 1:
-            raise ValueError(f"{layout} pending/recovery read profile is incomplete")
-        queue = queues[layout]
-        if queue.get("submitted") != 8 or len(queue.get("samples", [])) != 8 \
-                or queue.get("classSwitches", 0) < 1 \
-                or queue.get("maxConsecutiveBusiness") > 3 \
-                or queue.get("maxConsecutiveRenewals") > 1:
-            raise ValueError(f"{layout} bounded-fair queue profile is incomplete")
-        resource = resources[layout]
-        if resource.get("activePinsAfterRelease") != 0 or resource.get("peakActiveScanners") != 1 \
-                or resource.get("pinCapacity") != 32 \
-                or any(resource.get(key, -1) < 0 for key in (
-                    "sampledPeakHeapBytes", "sampledPeakDirectBufferBytes",
-                    "sampledPeakThreadCount", "peakLogicalCandidatePayloadBytes")):
-            raise ValueError(f"{layout} resource and cleanup evidence is incomplete")
-        metrics = totals[layout].get("metrics", {})
-        if totals[layout].get("publishedSequence") != 12 \
-                or totals[layout].get("publishedRevision") != 10:
-            raise ValueError(f"{layout} publication and metadata-only revision totals differ")
-        required_metrics = {
-            "control.cas", "system.CANDIDATE.create", "system.MANIFEST.create",
-            "system.DECISION.create", "system.SNAPSHOT_PIN.cas",
-            "materialize.preflight", "materialize.apply",
-        }
-        if not required_metrics.issubset(metrics):
-            raise ValueError(f"{layout} protocol operation counters are incomplete")
-        if any(metric["unknown"] or metric["failed"] for metric in metrics.values()):
-            raise ValueError(f"{layout} observed a failed or unknown application operation")
-        if metrics["control.cas"]["conflicts"] != 0:
-            raise ValueError(f"{layout} serial profile unexpectedly had a control CAS conflict")
+        validate_baseline(layout, profiles["j29-commit-baseline"][layout])
+        validate_read(layout, profiles["j29-read"][layout])
+        validate_queue(layout, profiles["j29-queue"][layout])
+        validate_resources(layout, profiles["j29-resource"][layout])
+        validate_totals(layout, profiles["j29-layout"][layout])
+    return profiles
 
-    shutil.copyfile(test_report, output / test_report.name)
-    summary = {
+
+def build_summary(root: Path, counts: dict[str, int], profiles: dict[str, dict[str, dict]]) -> dict:
+    return {
         "phase": "J29.1-J29.3",
         "scope": "public-local-minicluster",
         "ended_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -144,13 +163,13 @@ def collect(root: Path, output: Path) -> None:
         "minicluster_test": counts,
         "profiles": {
             layout: {
-                "commit_baseline": baselines[layout],
-                "pending_read": reads[layout],
-                "simulated_renewal_queue": queues[layout],
-                "sampled_resources": resources[layout],
-                "application_operation_totals": totals[layout],
+                "commit_baseline": profiles["j29-commit-baseline"][layout],
+                "pending_read": profiles["j29-read"][layout],
+                "simulated_renewal_queue": profiles["j29-queue"][layout],
+                "sampled_resources": profiles["j29-resource"][layout],
+                "application_operation_totals": profiles["j29-layout"][layout],
             }
-            for layout in sorted(layouts)
+            for layout in sorted(profiles["j29-layout"])
         },
         "verified": [
             "full M2 invocation, manifest preparation, control publication, archive, materialization and finalization path",
@@ -169,18 +188,25 @@ def collect(root: Path, output: Path) -> None:
             "maintainer review and target HBase acceptance",
         ],
     }
+
+
+def collect(root: Path, output: Path) -> None:
+    test_report, counts, stdout = load_workload_report(root)
+    profiles = validate_measurements(observations(stdout))
+    summary = build_summary(root, counts, profiles)
+    shutil.copyfile(test_report, output / test_report.name)
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({
         "phase": summary["phase"],
         "scope": summary["scope"],
         "minicluster_test": counts,
-        "layouts": sorted(layouts),
-        "workloadSha256": baselines["HISTORY"]["workloadSha256"],
+        "layouts": sorted(profiles["j29-layout"]),
+        "workloadSha256": profiles["j29-commit-baseline"]["HISTORY"]["workloadSha256"],
     }))
 
 
 if __name__ == "__main__":
     try:
         collect(Path(__file__).resolve().parents[2], Path(sys.argv[1]))
-    except (ValueError, OSError, KeyError, IndexError, json.JSONDecodeError):
+    except (ValueError, OSError, KeyError, IndexError, ET.ParseError, json.JSONDecodeError):
         raise SystemExit("J29 verification evidence rejected") from None

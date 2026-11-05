@@ -72,10 +72,10 @@ final class M2CostReadProfile {
       List<io.etcdhbase.core.commit.PreparedCandidate> candidates,
       long recoveryNowEpochMillis) {}
 
-  private record ReadMeasurements(long openNanos, long pointReadNanos, long scanNanos,
-      long physicalRows, long returnedCellBytes, long scanRpcCalls, long returnedKeys,
-      long directoryPages, long leafPages, long candidateBytes,
-      int scanPageRequests, int scanPageReopens, M2CostPinObservations pins) {}
+  private record PreparedRead(ReadViewRecordStore view, M2CostPinObservations pins, long openNanos) {}
+
+  private record ReadMeasurements(long openNanos, long pointReadNanos, long returnedKeys,
+      ScanTotals totals, M2CostPinObservations pins) {}
 
   private static final class RecoveryRun implements AutoCloseable {
     private final RequestScope scope;
@@ -112,10 +112,10 @@ final class M2CostReadProfile {
       assertEquals(RecoveryManager.State.FINALIZED, recovered.state());
       assertTrue(recovered.owner().orElseThrow().epoch() > pending.slot().ownerEpoch());
       assertEquals(pending.candidates().size(), interlock.recoveryApplications());
-      assertEquals(context.bucketCount() * 3, read.scanPageRequests());
-      assertEquals(context.bucketCount() * 2, read.scanPageReopens());
+      assertEquals(context.bucketCount() * 3, read.totals().pageRequests);
+      assertEquals(context.bucketCount() * 2, read.totals().pageReopens);
       assertTrue(interlock.readerPagesDuringRecovery() >= interlock.recoveryApplications());
-      assertTrue(interlock.readerPagesDuringRecovery() <= read.scanPageRequests());
+      assertTrue(interlock.readerPagesDuringRecovery() <= read.totals().pageRequests);
       if (read.pins().activePins() != 0) {
         throw new IllegalStateException("J29 read profile leaked a durable pin");
       }
@@ -171,6 +171,7 @@ final class M2CostReadProfile {
           pending.recoveryNowEpochMillis(), leaseDeadline, scope)
           .whenComplete((ignored, failure) -> interlock.recoveryCompleted());
     } catch (RuntimeException | Error failure) {
+      // A fatal setup failure must also release the recovery scope before it propagates.
       interlock.recoveryCompleted();
       scope.close();
       throw failure;
@@ -181,62 +182,55 @@ final class M2CostReadProfile {
   private static ReadMeasurements readSelectedPublication(Context context, Pending pending,
       M2CostRecoveryInterlock interlock) throws Exception {
     assertTrue(interlock.recoveryInFlight());
-    long openNanos;
-    long pointReadNanos = 0;
-    long scanNanos = 0;
-    long physicalRows = 0;
-    long returnedCellBytes = 0;
-    long scanRpcCalls = 0;
-    long returnedKeys;
-    long directoryPages = 0;
-    long leafPages = 0;
-    long candidateBytes = 0;
-    ScanTotals totals = new ScanTotals();
-    M2CostPinObservations pins;
     try (RequestScope scope = RequestScope.withTimeout(context.operationTimeout());
         BudgetManager.Account account = readBudget(scope)) {
-      context.runtime().sample();
-      SnapshotPinManager manager = await(SnapshotPinManager.open(
-          context.records(), PIN_CONFIGURATION, scope));
-      pins = new M2CostPinObservations(manager);
-      ReadViewService views = new ReadViewService(context.control(), context.catalog(), pins,
-          context.systemBinding().profileFingerprint());
-      HBaseRecordStore physical = context.environment().store(context.primary(), scope);
-      long openStarted = System.nanoTime();
-      PinnedReadView pinned = await(views.open(OptionalLong.empty(),
-          context.authorizationDigest(), scope));
-      openNanos = System.nanoTime() - openStarted;
-      context.runtime().sample();
-      ReadViewRecordStore view = new ReadViewRecordStore(pinned, physical, context.catalog(),
-          context.primary().codec()::bucket, context.bucketCount(), scope);
+      PreparedRead read = openSelectedRead(context, scope);
+      ScanTotals totals = new ScanTotals();
+      ReadMeasurements measurements;
       try {
-        long pointStarted = System.nanoTime();
-        StoredRecord selected = await(view.get(pending.candidates().getFirst().record().key(),
-            pending.slot().revision(), ReadProjection.FULL, account)).orElseThrow();
-        pointReadNanos = System.nanoTime() - pointStarted;
-        assertArrayEquals(pending.candidates().getFirst().record().value().orElseThrow(),
-            selected.value().orElseThrow());
-        List<StoredRecord> records = scanBuckets(context, pending, view, account, interlock, totals);
-        records.sort(Comparator.comparing(StoredRecord::key));
-        assertEquals(pending.candidates().stream()
-            .map(candidate -> candidate.record().key()).sorted().toList(),
-            records.stream().map(StoredRecord::key).toList());
-        returnedKeys = records.size();
-        scanNanos = totals.elapsedNanos;
-        physicalRows = totals.physicalRows;
-        returnedCellBytes = totals.returnedCellBytes;
-        scanRpcCalls = totals.scanRpcCalls;
-        directoryPages = totals.directoryPages;
-        leafPages = totals.leafPages;
-        candidateBytes = totals.candidateBytes;
+        long pointNanos = measureSelectedPoint(read.view(), pending, account);
+        List<StoredRecord> records = scanBuckets(context, pending, read.view(), account, interlock, totals);
+        verifySelectedKeys(pending, records);
+        measurements = new ReadMeasurements(read.openNanos(), pointNanos, records.size(), totals, read.pins());
       } finally {
-        await(view.finishRead());
+        await(read.view().finishRead());
       }
-      assertTrue(pins.completionCount() > 0);
+      assertTrue(read.pins().completionCount() > 0);
+      return measurements;
     }
-    return new ReadMeasurements(openNanos, pointReadNanos, scanNanos, physicalRows,
-        returnedCellBytes, scanRpcCalls, returnedKeys, directoryPages, leafPages,
-        candidateBytes, totals.pageRequests, totals.pageReopens, pins);
+  }
+
+  private static PreparedRead openSelectedRead(Context context, RequestScope scope) throws Exception {
+    context.runtime().sample();
+    SnapshotPinManager manager = await(SnapshotPinManager.open(context.records(), PIN_CONFIGURATION, scope));
+    M2CostPinObservations pins = new M2CostPinObservations(manager);
+    ReadViewService views = new ReadViewService(context.control(), context.catalog(), pins,
+        context.systemBinding().profileFingerprint());
+    HBaseRecordStore physical = context.environment().store(context.primary(), scope);
+    long started = System.nanoTime();
+    PinnedReadView pinned = await(views.open(OptionalLong.empty(), context.authorizationDigest(), scope));
+    long openNanos = System.nanoTime() - started;
+    context.runtime().sample();
+    ReadViewRecordStore view = new ReadViewRecordStore(pinned, physical, context.catalog(),
+        context.primary().codec()::bucket, context.bucketCount(), scope);
+    return new PreparedRead(view, pins, openNanos);
+  }
+
+  private static long measureSelectedPoint(ReadViewRecordStore view, Pending pending,
+      BudgetManager.Account account) throws Exception {
+    long started = System.nanoTime();
+    StoredRecord selected = await(view.get(pending.candidates().getFirst().record().key(),
+        pending.slot().revision(), ReadProjection.FULL, account)).orElseThrow();
+    long elapsed = System.nanoTime() - started;
+    assertArrayEquals(pending.candidates().getFirst().record().value().orElseThrow(),
+        selected.value().orElseThrow());
+    return elapsed;
+  }
+
+  private static void verifySelectedKeys(Pending pending, List<StoredRecord> records) {
+    records.sort(Comparator.comparing(StoredRecord::key));
+    assertEquals(pending.candidates().stream().map(candidate -> candidate.record().key()).sorted().toList(),
+        records.stream().map(StoredRecord::key).toList());
   }
 
   private static BudgetManager.Account readBudget(RequestScope scope) throws Exception {
@@ -323,11 +317,12 @@ final class M2CostReadProfile {
         read.pins().registrationCount(), read.pins().registrationTimeNanos() / 1000,
         read.pins().renewalCount(), read.pins().renewalTimeNanos() / 1000,
         read.pins().completionCount(), read.pins().completionTimeNanos() / 1000,
-        read.pins().peakPins(), read.pointReadNanos() / 1000, read.scanNanos() / 1000,
-        context.bucketCount(), read.scanPageRequests(), read.scanPageReopens(),
+        read.pins().peakPins(), read.pointReadNanos() / 1000, read.totals().elapsedNanos / 1000,
+        context.bucketCount(), read.totals().pageRequests, read.totals().pageReopens,
         interlock.readerPagesDuringRecovery(), interlock.recoveryApplications(), recoveryNanos / 1000,
-        read.returnedKeys(), read.physicalRows(), read.returnedCellBytes(),
-        read.scanRpcCalls(), read.directoryPages(), read.leafPages(), read.candidateBytes());
+        read.returnedKeys(), read.totals().physicalRows, read.totals().returnedCellBytes,
+        read.totals().scanRpcCalls, read.totals().directoryPages, read.totals().leafPages,
+        read.totals().candidateBytes);
   }
 
   private static void printResources(Context context, long seed, String workloadDigest,

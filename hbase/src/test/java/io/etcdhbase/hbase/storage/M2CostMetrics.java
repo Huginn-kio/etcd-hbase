@@ -9,6 +9,7 @@ import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.codec.CommitControlMessages;
 import java.util.Map;
@@ -53,6 +54,7 @@ final class M2CostMetrics {
       future = operation.get();
       if (future == null) throw new IllegalStateException("measured operation returned a null future");
     } catch (RuntimeException | Error failure) {
+      // Fatal synchronous failures still belong in the observation before they propagate.
       recordFailure(counter, failure, started);
       if (failure instanceof Error fatal) throw fatal;
       return CompletableFuture.failedFuture(failure);
@@ -80,11 +82,7 @@ final class M2CostMetrics {
   }
 
   private static boolean isUnknown(Throwable failure) {
-    Throwable current = failure;
-    while ((current instanceof java.util.concurrent.CompletionException
-        || current instanceof java.util.concurrent.ExecutionException) && current.getCause() != null) {
-      current = current.getCause();
-    }
+    Throwable current = CompletionFailures.unwrapCompletion(failure);
     if (!(current instanceof BackendFailure backend)) return false;
     return switch (backend.category()) {
       case TIMEOUT, CANCELLED, UNAVAILABLE, UNKNOWN -> true;

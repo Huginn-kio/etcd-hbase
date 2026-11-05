@@ -78,6 +78,7 @@ final class M2CostPinObservations implements ReadViewPinRegistry {
     try {
       future = operation.get();
     } catch (RuntimeException | Error failure) {
+      // Preserve elapsed time for fatal synchronous failures before propagating them.
       nanos.add(System.nanoTime() - started);
       if (failure instanceof Error fatal) throw fatal;
       return CompletableFuture.failedFuture(failure);
