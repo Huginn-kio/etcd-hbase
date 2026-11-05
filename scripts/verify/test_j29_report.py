@@ -73,6 +73,17 @@ def history_read_lines(**overrides):
     raise AssertionError("missing HISTORY read fixture")
 
 
+def marker_workload_lines(changed_marker, digest):
+    lines = []
+    for line in measurement_lines():
+        marker, payload = line.split(" ", 1)
+        row = json.loads(payload)
+        if marker == changed_marker:
+            row["workloadSha256"] = digest
+        lines.append(f"{marker} {json.dumps(row)}")
+    return lines
+
+
 class J29ReportTest(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -151,14 +162,7 @@ class J29ReportTest(unittest.TestCase):
     def test_rejects_cross_marker_workload_mismatch(self):
         for changed_marker in MARKERS:
             with self.subTest(marker=changed_marker):
-                lines = []
-                for line in measurement_lines():
-                    marker, payload = line.split(" ", 1)
-                    row = json.loads(payload)
-                    if marker == changed_marker:
-                        row["workloadSha256"] = "b" * 64
-                    lines.append(f"{marker} {json.dumps(row)}")
-                self.write_report(lines=lines)
+                self.write_report(lines=marker_workload_lines(changed_marker, "b" * 64))
                 self.assert_rejected()
 
     def test_rejects_workload_mismatch_between_layouts(self):
