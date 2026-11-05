@@ -182,6 +182,8 @@ class M2CostBenchmarkIT {
       try (RequestScope openScope = RequestScope.withTimeout(OPERATION_TIMEOUT)) {
         SystemRecordStore records = new M2CostMetrics.Records(await(HBaseSystemRecordStore.open(
             environment.factory(), environment.identity(), system, openScope)), metrics);
+        // The UUID-named system table is fresh and no service has started using it.
+        M2CostReadProfile.initializeFreshPins(records, openScope);
         M2CostMetrics.Control control = new M2CostMetrics.Control(await(HBaseCommitControlStore.open(
             environment.factory(), environment.identity(), system, openScope)), metrics);
         InvocationRepository invocations = new HBaseInvocationRepository(records);

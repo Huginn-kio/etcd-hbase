@@ -32,6 +32,7 @@ import io.etcdhbase.core.commit.SnapshotPinManager;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.ScanRequest;
@@ -45,6 +46,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
@@ -53,8 +55,8 @@ import java.util.function.LongSupplier;
 /** Exercises the pinned read path while a selected transaction is only partly materialized. */
 final class M2CostReadProfile {
   private static final ByteKey REQUEST_DIGEST = digest("j29-pending-read-request");
-  private static final int PIN_SHARDS = 2;
-  private static final int SLOTS_PER_SHARD = 16;
+  private static final SnapshotPinConfiguration PIN_CONFIGURATION =
+      new SnapshotPinConfiguration(2, 16, Duration.ofSeconds(60));
 
   record Context(M1TestEnvironment environment, StorageTableBinding.Layout layout,
       StorageTableBinding primary, SystemTableBinding systemBinding, int bucketCount,
@@ -94,6 +96,10 @@ final class M2CostReadProfile {
   }
 
   private M2CostReadProfile() {}
+
+  static void initializeFreshPins(SystemRecordStore records, RequestScope scope) throws Exception {
+    await(SnapshotPinManager.initializeFresh(records, PIN_CONFIGURATION, scope));
+  }
 
   static void run(Context context, long seed, String workloadDigest) throws Exception {
     Pending pending = createPendingPublication(context);
@@ -187,10 +193,11 @@ final class M2CostReadProfile {
     long candidateBytes = 0;
     ScanTotals totals = new ScanTotals();
     M2CostPinObservations pins;
-    try (RequestScope scope = RequestScope.withTimeout(context.operationTimeout())) {
+    try (RequestScope scope = RequestScope.withTimeout(context.operationTimeout());
+        BudgetManager.Account account = readBudget(scope)) {
       context.runtime().sample();
-      SnapshotPinManager manager = await(SnapshotPinManager.open(context.records(),
-          new SnapshotPinConfiguration(PIN_SHARDS, SLOTS_PER_SHARD, Duration.ofSeconds(60)), scope));
+      SnapshotPinManager manager = await(SnapshotPinManager.open(
+          context.records(), PIN_CONFIGURATION, scope));
       pins = new M2CostPinObservations(manager);
       ReadViewService views = new ReadViewService(context.control(), context.catalog(), pins,
           context.systemBinding().profileFingerprint());
@@ -205,11 +212,11 @@ final class M2CostReadProfile {
       try {
         long pointStarted = System.nanoTime();
         StoredRecord selected = await(view.get(pending.candidates().getFirst().record().key(),
-            pending.slot().revision(), ReadProjection.FULL)).orElseThrow();
+            pending.slot().revision(), ReadProjection.FULL, account)).orElseThrow();
         pointReadNanos = System.nanoTime() - pointStarted;
         assertArrayEquals(pending.candidates().getFirst().record().value().orElseThrow(),
             selected.value().orElseThrow());
-        List<StoredRecord> records = scanBuckets(context, pending, view, scope, interlock, totals);
+        List<StoredRecord> records = scanBuckets(context, pending, view, account, interlock, totals);
         records.sort(Comparator.comparing(StoredRecord::key));
         assertEquals(pending.candidates().stream()
             .map(candidate -> candidate.record().key()).sorted().toList(),
@@ -232,6 +239,13 @@ final class M2CostReadProfile {
         candidateBytes, totals.pageRequests, totals.pageReopens, pins);
   }
 
+  private static BudgetManager.Account readBudget(RequestScope scope) throws Exception {
+    var limits = new BudgetManager.Limits(4, 16, 2, 2, 2, 1_000_000, 16L << 20);
+    var manager = new BudgetManager(limits, Map.of("public", limits), limits);
+    return manager.admit("public", scope,
+        new BudgetManager.Reservation(128 * 1024, 128 * 1024, 1L << 20, 1L << 20, 1L << 20));
+  }
+
   private static final class ScanTotals {
     private long elapsedNanos;
     private long physicalRows;
@@ -245,7 +259,7 @@ final class M2CostReadProfile {
   }
 
   private static List<StoredRecord> scanBuckets(Context context, Pending pending,
-      ReadViewRecordStore view, RequestScope scope, M2CostRecoveryInterlock interlock,
+      ReadViewRecordStore view, BudgetManager.Account account, M2CostRecoveryInterlock interlock,
       ScanTotals totals) throws Exception {
     List<StoredRecord> records = new ArrayList<>();
     KeyRange range = KeyRange.prefix(ByteKey.copyOf(("pending/"
@@ -258,7 +272,7 @@ final class M2CostReadProfile {
             pending.slot().revision(), ReadProjection.FULL, 1, 1L << 20, 512);
         if (after.isPresent()) totals.pageReopens++;
         long started = System.nanoTime();
-        ScanOperation scan = view.startScan(request);
+        ScanOperation scan = view.startScan(request, account);
         StoragePage page;
         try {
           page = await(scan.completion().toCompletableFuture());
@@ -327,7 +341,7 @@ final class M2CostReadProfile {
         context.layout(), seed, workloadDigest, context.runtime().peakHeapBytes(),
         context.runtime().peakDirectBytes(), context.runtime().peakThreadCount(),
         context.maximumCandidatePayloadBytes().getAsLong(), pins.activePins(),
-        PIN_SHARDS * SLOTS_PER_SHARD);
+        PIN_CONFIGURATION.shardCount() * PIN_CONFIGURATION.slotsPerShard());
   }
 
   private static List<io.etcdhbase.core.commit.PreparedCandidate> candidates(Context context,
