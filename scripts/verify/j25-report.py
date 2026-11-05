@@ -25,7 +25,10 @@ REQUIRED_CORE_CASES = {
     "scopeCancellationWaitsForManifestProducerBeforeReleasingRegisteredPin",
     "metadataHeadBudgetDoesNotRejectLargeCandidatePayload",
     "requestReadLimitStopsBeforeFetchingCandidateBeyondRemainingBytes",
+    "candidateSliceResumesAfterBoundedSlice",
+    "candidateMemoryRejectionOccursBeforeCandidateRead",
     "candidateValueMemoryIsReservedBeforeReadAndReleasedAfterProjection",
+    "cancelledCandidateReadRetainsLeaseUntilProducerStops",
 }
 
 

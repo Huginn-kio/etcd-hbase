@@ -3,6 +3,7 @@ package io.etcdhbase.core.commit;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -10,7 +11,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
@@ -36,11 +36,6 @@ public final class ManifestCatalog {
     private final List<BudgetManager.Lease> leases;
     private final AtomicBoolean closed = new AtomicBoolean();
 
-    public CandidateSlice(List<PreparedCandidate> candidates, boolean exhausted,
-        int directoryPages, int leafPages, long payloadBytes) {
-      this(candidates, exhausted, directoryPages, leafPages, payloadBytes, List.of());
-    }
-
     private CandidateSlice(List<PreparedCandidate> candidates, boolean exhausted,
         int directoryPages, int leafPages, long payloadBytes, List<BudgetManager.Lease> leases) {
       this.candidates = List.copyOf(candidates);
@@ -54,13 +49,21 @@ public final class ManifestCatalog {
       this.leases = List.copyOf(leases);
     }
 
+    private static CandidateSlice empty() {
+      return new CandidateSlice(List.of(), true, 0, 0, 0, List.of());
+    }
+
     public List<PreparedCandidate> candidates() { return candidates; }
     public boolean exhausted() { return exhausted; }
     public int directoryPages() { return directoryPages; }
     public int leafPages() { return leafPages; }
     public long payloadBytes() { return payloadBytes; }
 
-    /** Releases candidate-buffer ownership after the consumer has projected or transferred it. */
+    /**
+     * Releases candidate-buffer ownership after the consumer has projected or transferred it.
+     * Every lease is attempted even when cleanup throws; the first failure remains primary and
+     * later cleanup failures are suppressed before the slice owner observes the failure.
+     */
     @Override public void close() {
       if (!closed.compareAndSet(false, true)) return;
       candidates = List.of();
@@ -69,6 +72,8 @@ public final class ManifestCatalog {
         try {
           lease.close();
         } catch (RuntimeException | Error cleanup) {
+          // Capture fatal cleanup failures only long enough to settle every sibling lease; the
+          // first failure is rethrown after the loop and later failures remain suppressed.
           if (failure == null) failure = cleanup;
           else if (failure != cleanup) failure.addSuppressed(cleanup);
         }
@@ -129,27 +134,9 @@ public final class ManifestCatalog {
   /**
    * Reads only candidate leaves that can intersect a bucket/range. The caller resumes after the
    * last returned key; a full slice reports non-exhaustion conservatively until the next read.
+   * Candidate memory is reserved before each immutable value is fetched. The request stop signal
+   * prevents more reads after its page operation is closed.
    */
-  public CompletableFuture<CandidateSlice> candidatesInRange(ManifestRoot root, int bucket,
-      KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
-      long maximumCandidateBytes, RequestScope scope) {
-    return candidatesInRange(root, bucket, range, afterExclusive, maximumCandidates,
-        maximumCandidateBytes, scope, () -> false);
-  }
-
-  /**
-   * Same bounded traversal with a local stop signal for a page operation being closed.
-   * maximumCandidateBytes bounds candidate records read; result projection bytes are bounded by
-   * the caller after projection and must not be substituted for this read budget.
-   */
-  public CompletableFuture<CandidateSlice> candidatesInRange(ManifestRoot root, int bucket,
-      KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
-      long maximumCandidateBytes, RequestScope scope, BooleanSupplier cancelled) {
-    return candidatesInRange(root, bucket, range, afterExclusive, maximumCandidates,
-        maximumCandidateBytes, scope, cancelled, null);
-  }
-
-  /** Same traversal with candidate memory reserved before each immutable value is fetched. */
   public CompletableFuture<CandidateSlice> candidatesInRange(ManifestRoot root, int bucket,
       KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
       long maximumCandidateBytes, RequestScope scope, BooleanSupplier cancelled,
@@ -168,7 +155,7 @@ public final class ManifestCatalog {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid candidate slice bounds"));
     }
     if (range.isEmpty() || root.candidateDirectory().isEmpty()) {
-      return CompletableFuture.completedFuture(new CandidateSlice(List.of(), true, 0, 0, 0));
+      return CompletableFuture.completedFuture(CandidateSlice.empty());
     }
     var callerCancelled = new AtomicBoolean();
     var cursor = new CandidateRangeCursor(root, bucket, range, afterExclusive,
@@ -179,12 +166,15 @@ public final class ManifestCatalog {
     try {
       traversal = cursor.visit(root.candidateDirectory().orElseThrow());
     } catch (RuntimeException | Error failure) {
+      // Preserve the future-based API while draining cursor ownership; callers observe the same
+      // fatal Error through the exceptional result after deferred producer cleanup is registered.
       result.completeExceptionally(cursor.releaseAfterFailure(failure));
       return result;
     }
     traversal.whenComplete((ignored, failure) -> {
       if (failure != null) {
-        result.completeExceptionally(cursor.releaseAfterFailure(unwrap(failure)));
+        result.completeExceptionally(
+            cursor.releaseAfterFailure(CompletionFailures.unwrapCompletion(failure)));
       } else {
         CandidateSlice slice = cursor.slice();
         if (!result.complete(slice)) slice.close();
@@ -194,14 +184,6 @@ public final class ManifestCatalog {
       if (result.isCancelled()) callerCancelled.set(true);
     });
     return result;
-  }
-
-  private static Throwable unwrap(Throwable failure) {
-    Throwable terminal = failure;
-    while (terminal instanceof CompletionException && terminal.getCause() != null) {
-      terminal = terminal.getCause();
-    }
-    return terminal;
   }
 
   private boolean candidateMatchesReference(ManifestRoot root,
@@ -220,6 +202,12 @@ public final class ManifestCatalog {
             == reference.tombstone();
   }
 
+  /**
+   * Owns candidate leases until {@link #slice()} transfers them. Read, validation, and cleanup
+   * failures remain exceptional outcomes of {@code candidatesInRange}; if a closed scope still
+   * has physical producers, lease release waits for their completion and any later close failure
+   * is suppressed on the same terminal throwable. Scope cleanup separately tracks producer drain.
+   */
   private final class CandidateRangeCursor {
     private final ManifestRoot root;
     private final int bucket;
@@ -298,10 +286,15 @@ public final class ManifestCatalog {
         List<ManifestCandidateReference> references, int index) {
       if (index == references.size() || stopped()) return CompletableFuture.completedFuture(null);
       if (cancelled.getAsBoolean() || scope.isClosed() || scope.isDeadlineExceeded()) {
-        return CompletableFuture.failedFuture(new BackendFailure(scope.isDeadlineExceeded()
-            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
+        return CompletableFuture.failedFuture(stopFailure());
       }
       ManifestCandidateReference reference = references.get(index);
+      return visitCandidateReference(references, index, reference);
+    }
+
+    private CompletableFuture<Void> visitCandidateReference(
+        List<ManifestCandidateReference> references, int index,
+        ManifestCandidateReference reference) {
       if (reference.bucket() != bucket) {
         return invalid("manifest leaf contains a candidate from another bucket");
       }
@@ -312,14 +305,21 @@ public final class ManifestCatalog {
       if (lastKey != null && lastKey.compareTo(key) >= 0) {
         return invalid("manifest range candidates are duplicated or unordered");
       }
+      return readCandidate(references, index, reference, key);
+    }
+
+    private CompletableFuture<Void> readCandidate(List<ManifestCandidateReference> references,
+        int index, ManifestCandidateReference reference, ByteKey key) {
       long retained = reference.retainedBytes();
       if (retained > maximumCandidateBytes - payloadBytes) {
-        if (!candidates.isEmpty()) {
-          exhausted = false;
-          return CompletableFuture.completedFuture(null);
-        }
-        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+        return stopAtCandidateLimit();
       }
+      return reserveCandidateBeforeRead(references, index, reference, key, retained);
+    }
+
+    private CompletableFuture<Void> reserveCandidateBeforeRead(
+        List<ManifestCandidateReference> references, int index,
+        ManifestCandidateReference reference, ByteKey key, long retained) {
       if (account == null) {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
       }
@@ -330,50 +330,78 @@ public final class ManifestCatalog {
         return CompletableFuture.failedFuture(failure);
       }
       if (lease == null) {
-        if (!candidates.isEmpty()) {
-          exhausted = false;
-          return CompletableFuture.completedFuture(null);
-        }
-        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+        return stopAtCandidateLimit();
       }
       try {
         account.chargeCandidateRead(retained);
-      } catch (BackendFailure | RuntimeException failure) {
+      } catch (BackendFailure | RuntimeException | Error failure) {
+        // Once admitted, release this lease before exposing any accounting failure through the
+        // traversal future, including a fatal Error.
         return failedCandidate(lease, failure);
       }
+      return fetchCandidate(references, index, reference, key, retained, lease);
+    }
+
+    private CompletableFuture<Void> fetchCandidate(List<ManifestCandidateReference> references,
+        int index, ManifestCandidateReference reference, ByteKey key, long retained,
+        BudgetManager.Lease lease) {
       CompletableFuture<Optional<PreparedCandidate>> read;
       try {
         read = Objects.requireNonNull(repository.readCandidate(reference.candidateIdentity(), scope),
             "candidate read future");
       } catch (RuntimeException | Error failure) {
+        // A synchronous producer failure has no future to own cleanup; return it through the
+        // traversal result after releasing this read's lease.
         return failedCandidate(lease, failure);
       }
       return read.handle((stored, failure) -> {
-        if (failure != null) return failedCandidate(lease, unwrap(failure));
-        try {
-          if (cancelled.getAsBoolean() || scope.isClosed() || scope.isDeadlineExceeded()) {
-            return failedCandidate(lease, new BackendFailure(scope.isDeadlineExceeded()
-                ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
-          }
-          PreparedCandidate candidate = stored.orElseThrow(() -> missing("private candidate"));
-          if (!candidateMatchesReference(root, reference, candidate)
-              || candidate.record().retainedBytes() != retained) {
-            return failedCandidate(lease, new IllegalStateException(
-                "private candidate differs from its authenticated range reference"));
-          }
-          candidates.add(candidate);
-          leases.add(lease);
-          payloadBytes = Math.addExact(payloadBytes, retained);
-          lastKey = key;
-          if (candidates.size() == maximumCandidates) {
-            exhausted = false;
-            return CompletableFuture.<Void>completedFuture(null);
-          }
-          return visitCandidates(references, index + 1);
-        } catch (RuntimeException | Error problem) {
-          return failedCandidate(lease, problem);
+        if (failure != null) {
+          return failedCandidate(lease, CompletionFailures.unwrapCompletion(failure));
         }
+        return acceptCandidate(references, index, reference, key, retained, lease, stored);
       }).thenCompose(stage -> stage);
+    }
+
+    private CompletableFuture<Void> acceptCandidate(List<ManifestCandidateReference> references,
+        int index, ManifestCandidateReference reference, ByteKey key, long retained,
+        BudgetManager.Lease lease, Optional<PreparedCandidate> stored) {
+      try {
+        if (cancelled.getAsBoolean() || scope.isClosed() || scope.isDeadlineExceeded()) {
+          return failedCandidate(lease, stopFailure());
+        }
+        PreparedCandidate candidate = stored.orElseThrow(() -> missing("private candidate"));
+        if (!candidateMatchesReference(root, reference, candidate)) {
+          return failedCandidate(lease, new IllegalStateException(
+              "private candidate differs from its authenticated range reference"));
+        }
+        candidates.add(candidate);
+        leases.add(lease);
+        payloadBytes = Math.addExact(payloadBytes, retained);
+        lastKey = key;
+        if (candidates.size() == maximumCandidates) {
+          exhausted = false;
+          return CompletableFuture.completedFuture(null);
+        }
+        return visitCandidates(references, index + 1);
+      } catch (RuntimeException | Error failure) {
+        // Keep fatal failures observable through the traversal future, but settle this read's
+        // ownership first; failedCandidate defers release if a physical producer is still active.
+        return failedCandidate(lease, failure);
+      }
+    }
+
+    private CompletableFuture<Void> stopAtCandidateLimit() {
+      if (candidates.isEmpty()) {
+        return CompletableFuture.failedFuture(
+            new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+      }
+      exhausted = false;
+      return CompletableFuture.completedFuture(null);
+    }
+
+    private BackendFailure stopFailure() {
+      return new BackendFailure(scope.isDeadlineExceeded()
+          ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
     }
 
     private CompletableFuture<Void> failedCandidate(BudgetManager.Lease lease, Throwable failure) {
@@ -397,6 +425,8 @@ public final class ManifestCatalog {
       try {
         lease.close();
       } catch (RuntimeException | Error cleanup) {
+        // Keep the original candidate failure as the future's cause; deferred cleanup failures
+        // remain attached to that same throwable after physical-producer drain.
         if (cleanup != failure) failure.addSuppressed(cleanup);
       }
     }

@@ -282,39 +282,59 @@ class ReadViewRecordStoreTest {
       var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
       var reservation = new BudgetManager.Reservation(1024, 1024, 8192, 8192, 8192);
       try (var metadataAccount = budgets.admit("public", scope, reservation)) {
-        StoragePage metadata = view.startScan(metadataRequest, metadataAccount)
-            .completion().toCompletableFuture().join();
-        assertEquals(List.of("a"), metadata.records().stream()
-            .map(record -> text(record.key())).toList());
-        assertFalse(metadata.records().getFirst().hasValue());
-        assertTrue(metadata.records().getFirst().retainedBytes() <= metadataRequest.maximumBytes());
-        assertEquals(4353, metadata.cost().observations()
-            .get(StoragePage.Observation.MANIFEST_CANDIDATE_BYTES));
-        var mergeRequest = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
-            ReadProjection.METADATA, 1, 1024, 64);
-        try (var account = budgets.admit("public", scope, reservation);
-            var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
-            var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account), mergeRequest,
-                1, account, scope);
-            var response = cursor.read(0).join()) {
-          assertEquals(List.of("a", "b", "z"), response.records().stream()
-              .map(record -> text(record.key())).toList());
-          assertEquals(4096, response.records().getFirst().value().orElseThrow().length,
-              "the selected value is fetched after the metadata head");
-          assertEquals(5, response.records().get(1).value().orElseThrow().length,
-              "a small candidate remains readable");
-          assertEquals(1, ExistsExecutor.point(view, key("a"), 2, account).join());
-          assertEquals(1, ExistsExecutor.point(view, key("z"), 2, account).join(),
-              "the physical-only control remains readable");
-          try (var exists = new ExistsExecutor(scheduler.bind(view, account),
-              new ScanRequest(0, KeyRange.point(key("a")), Optional.empty(), 2,
-                  ReadProjection.METADATA, 1, 1024, 64), 1, scope)) {
-            assertEquals(1, exists.execute().join().count(), "range Exists uses the metadata head budget");
-          }
-        }
+        assertMetadataHeadBudget(view, metadataAccount, metadataRequest);
+        assertFullMergeAndPointExists(view, budgets, scope, reservation);
+        assertRangeExistsUsesMetadataHeadBudget(view, budgets, scope, reservation);
       }
     }
     assertEquals(1, fixture.pinCloses.get());
+  }
+
+  private static void assertMetadataHeadBudget(ReadViewRecordStore view,
+      BudgetManager.Account account, ScanRequest request) {
+    StoragePage metadata = view.startScan(request, account).completion()
+        .toCompletableFuture().join();
+    assertEquals(List.of("a"), metadata.records().stream()
+        .map(record -> text(record.key())).toList());
+    assertFalse(metadata.records().getFirst().hasValue());
+    assertTrue(metadata.records().getFirst().retainedBytes() <= request.maximumBytes());
+    assertEquals(4353, metadata.cost().observations()
+        .get(StoragePage.Observation.MANIFEST_CANDIDATE_BYTES));
+  }
+
+  private static void assertFullMergeAndPointExists(ReadViewRecordStore view,
+      BudgetManager budgets, RequestScope scope, BudgetManager.Reservation reservation)
+      throws BackendFailure {
+    var mergeRequest = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
+        ReadProjection.METADATA, 1, 1024, 64);
+    try (var account = budgets.admit("public", scope, reservation);
+        var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
+        var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account), mergeRequest,
+            1, account, scope);
+        var response = cursor.read(0).join()) {
+      assertEquals(List.of("a", "b", "z"), response.records().stream()
+          .map(record -> text(record.key())).toList());
+      assertEquals(4096, response.records().getFirst().value().orElseThrow().length,
+          "the selected value is fetched after the metadata head");
+      assertEquals(5, response.records().get(1).value().orElseThrow().length,
+          "a small candidate remains readable");
+      assertEquals(1, ExistsExecutor.point(view, key("a"), 2, account).join());
+      assertEquals(1, ExistsExecutor.point(view, key("z"), 2, account).join(),
+          "the physical-only control remains readable");
+    }
+  }
+
+  private static void assertRangeExistsUsesMetadataHeadBudget(ReadViewRecordStore view,
+      BudgetManager budgets, RequestScope scope, BudgetManager.Reservation reservation)
+      throws BackendFailure {
+    try (var account = budgets.admit("public", scope, reservation);
+        var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(1));
+        var exists = new ExistsExecutor(scheduler.bind(view, account),
+            new ScanRequest(0, KeyRange.point(key("a")), Optional.empty(), 2,
+                ReadProjection.METADATA, 1, 1024, 64), 1, scope)) {
+      assertEquals(1, exists.execute().join().count(),
+          "range Exists uses the metadata head budget");
+    }
   }
 
   @Test
@@ -338,7 +358,7 @@ class ReadViewRecordStoreTest {
                   8, 16L << 20, 8), scope)) {
         try (BucketCursor.Page page = cursor.fetch().join()) {
           assertEquals(List.of("a", "b"), pageRecords(page));
-          assertFalse(page.exhausted(), "the 9 MiB candidate slice must resume after b");
+          assertFalse(page.exhausted(), "the first candidate slice stops after b");
         }
         assertEquals(2, fixture.repository.candidateReads.get(),
             "the first 8 MiB slice stays below the 10 MiB request limit");
@@ -350,7 +370,10 @@ class ReadViewRecordStoreTest {
             "c must be rejected from authenticated reference lengths before value I/O");
       }
     }
+  }
 
+  @Test
+  void candidateSliceResumesAfterBoundedSlice() throws Exception {
     Fixture sliceBounded = new Fixture(1, List.of(
         candidate("a", 2, 2, 1, StorageMetadata.State.LIVE, new byte[4 * 1024 * 1024]),
         candidate("b", 2, 2, 1, StorageMetadata.State.LIVE, new byte[4 * 1024 * 1024]),
@@ -385,7 +408,7 @@ class ReadViewRecordStoreTest {
   }
 
   @Test
-  void candidateValueMemoryIsReservedBeforeReadAndReleasedAfterProjection() throws Exception {
+  void candidateMemoryRejectionOccursBeforeCandidateRead() throws Exception {
     Fixture large = new Fixture(1, List.of(
         candidate("a", 2, 2, 1, StorageMetadata.State.LIVE, new byte[4 * 1024 * 1024])));
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
@@ -406,7 +429,10 @@ class ReadViewRecordStoreTest {
         assertEquals(0, budgets.snapshot().allocatedBytes(), "a rejected point read releases output and I/O leases");
       }
     }
+  }
 
+  @Test
+  void candidateValueMemoryIsReservedBeforeReadAndReleasedAfterProjection() throws Exception {
     Fixture small = new Fixture(1, List.of(
         candidate("a", 2, 2, 1, StorageMetadata.State.LIVE, new byte[64])));
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
@@ -428,7 +454,10 @@ class ReadViewRecordStoreTest {
         assertEquals(0, budgets.snapshot().allocatedBytes(), "closing the point result releases output capacity");
       }
     }
+  }
 
+  @Test
+  void cancelledCandidateReadRetainsLeaseUntilProducerStops() throws Exception {
     Fixture cancelled = new Fixture(1, List.of(
         candidate("a", 2, 2, 1, StorageMetadata.State.LIVE, new byte[64])));
     RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));

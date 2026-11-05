@@ -108,15 +108,13 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     ManifestRoot root = view.selectedRoot().orElseThrow();
     return manifests.candidatesInRange(root, bucket, KeyRange.point(key), Optional.empty(), 2,
         Long.MAX_VALUE, scope, this::isInactive, account).thenCompose(slice -> {
-          try {
+          try (slice) {
             if (!isActive()) return failed(inactiveFailure());
             if (slice.candidates().isEmpty()) {
               return physicalGet(key, Math.min(upper, view.stableRevision()), projection);
             }
             PreparedCandidate candidate = slice.candidates().getFirst();
             return CompletableFuture.completedFuture(Optional.of(project(candidate.record(), projection)));
-          } finally {
-            slice.close();
           }
         });
   }
@@ -419,7 +417,8 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
           terminal = inactiveFailure();
         }
       } catch (RuntimeException | Error problem) {
-        // Settle the result and close the physical scanner before propagating any unwrapped fatal error.
+        // Keep RuntimeException and Error observable on result; first settle the scanner and slice
+        // ownership, then complete result exceptionally before rethrowing a fatal Error below.
         terminal = CompletionFailures.unwrapCompletion(problem);
       } finally {
         closeBase();
@@ -427,6 +426,8 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
           try {
             candidateSlice.close();
           } catch (RuntimeException | Error cleanup) {
+            // CandidateSlice attempts every lease and suppresses later cleanup failures. Preserve
+            // the operation failure as primary; result below is the asynchronous observer.
             if (terminal == null) terminal = cleanup;
             else if (terminal != cleanup) terminal.addSuppressed(cleanup);
           }
@@ -446,7 +447,8 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       try {
         base.close();
       } catch (RuntimeException | Error failure) {
-        // The completion path must settle the result; retain close failure to attach before fatal propagation.
+        // Do not let close skip result settlement. Finish preserves this failure on the result and
+        // rethrows it after settlement when it remains the terminal fatal Error.
         closeFailure = failure;
       }
     }
