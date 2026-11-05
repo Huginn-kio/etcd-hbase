@@ -55,6 +55,19 @@ class EvidenceTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     java_reports(self.root, {"scope"})
 
+    def test_java_can_restrict_report_kind_without_changing_default(self):
+        for kind, name in (("surefire-reports", "unit"), ("failsafe-reports", "integration")):
+            path = self.root / "core" / "target" / kind / f"TEST-{name}.xml"
+            path.parent.mkdir(parents=True)
+            suite = ET.Element("testsuite", name=name, tests="1", failures="0", errors="0", skipped="0")
+            ET.SubElement(suite, "testcase", name="case")
+            ET.ElementTree(suite).write(path)
+        self.assertEqual({"unit", "integration"}, set(java_reports(self.root, {"unit"})[1]))
+        self.assertEqual({"unit"}, set(java_reports(
+            self.root, {"unit"}, report_kinds=("surefire-reports",))[1]))
+        with self.assertRaises(ValueError):
+            java_reports(self.root, {"integration"}, report_kinds=("surefire-reports",))
+
     def test_go_requires_every_package_and_executed_tests(self):
         path = self.root / "go.jsonl"
         events = []
