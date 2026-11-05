@@ -137,7 +137,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
 
   private Void validateStoredConfiguration(StoreResult<SystemRecordStore.CreateResult> result,
       Optional<ByteKey> stored, Throwable readFailure) {
-    if (readFailure != null) throw configurationReadFailure(result, readFailure);
+    if (readFailure != null) throw unknownReadFailure(result.failure(), readFailure);
     ByteKey value = stored.orElseThrow(() -> new CompletionException(
         new BackendFailure(BackendFailure.Category.UNKNOWN)));
     SnapshotPinConfiguration persisted = SnapshotPinRecordCodec.decodeConfiguration(value);
@@ -145,17 +145,6 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
       throw new IllegalStateException("snapshot pin geometry or lease differs from its durable format");
     }
     return null;
-  }
-
-  private static CompletionException configurationReadFailure(
-      StoreResult<SystemRecordStore.CreateResult> result, Throwable readFailure) {
-    Throwable readCause = CompletionFailures.unwrapCompletion(readFailure);
-    if (readCause instanceof Error fatal) throw fatal;
-    Throwable cause = result.failure() == null
-        ? readCause : CompletionFailures.unwrapCompletion(result.failure());
-    if (cause instanceof Error fatal) throw fatal;
-    if (result.failure() != null) cause.addSuppressed(readCause);
-    return new CompletionException(new BackendFailure(BackendFailure.Category.UNKNOWN, cause));
   }
 
   private CompletableFuture<Void> initializeShards(int start, RequestScope scope) {
@@ -290,7 +279,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
 
   private Pin resolveObservedRegistration(StoredShard stored, Throwable readFailure, int shard,
       ByteKey pinId, PinRequirement requirement, RequestScope scope, Throwable priorFailure) {
-    if (readFailure != null) throw registrationReadFailure(priorFailure, readFailure);
+    if (readFailure != null) throw unknownReadFailure(priorFailure, readFailure);
     PinLease existing = findActivePin(stored.shard(), shard, pinId, requirement);
     if (existing != null) return existing;
     if (priorFailure != null && !active(scope)) throw new CompletionException(inactive(scope));
@@ -311,17 +300,6 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
       }
     }
     return null;
-  }
-
-  private static CompletionException registrationReadFailure(Throwable priorFailure,
-      Throwable readFailure) {
-    Throwable readCause = CompletionFailures.unwrapCompletion(readFailure);
-    if (readCause instanceof Error fatal) throw fatal;
-    Throwable cause = priorFailure == null
-        ? readCause : CompletionFailures.unwrapCompletion(priorFailure);
-    if (cause instanceof Error fatal) throw fatal;
-    if (priorFailure != null) cause.addSuppressed(readCause);
-    return new CompletionException(new BackendFailure(BackendFailure.Category.UNKNOWN, cause));
   }
 
   private CompletableFuture<Void> transitionExpiredSlot(StoredShard stored, int slotIndex,
@@ -552,6 +530,17 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
         || cause instanceof IOException;
   }
 
+  private static CompletionException unknownReadFailure(Throwable priorFailure,
+      Throwable readFailure) {
+    Throwable readCause = CompletionFailures.unwrapCompletion(readFailure);
+    if (readCause instanceof Error fatal) throw fatal;
+    Throwable cause = priorFailure == null
+        ? readCause : CompletionFailures.unwrapCompletion(priorFailure);
+    if (cause instanceof Error fatal) throw fatal;
+    if (priorFailure != null) cause.addSuppressed(readCause);
+    return new CompletionException(new BackendFailure(BackendFailure.Category.UNKNOWN, cause));
+  }
+
   private static <T> CompletableFuture<T> failed(Throwable failure) {
     return CompletableFuture.failedFuture(failure);
   }
@@ -703,15 +692,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
   private CompletableFuture<Void> resolveLeaseMutation(PinLease pin, LeaseMutation mutation,
       RequestScope scope, int attempt, Throwable priorFailure) {
     return readShard(pin.shard, scope).handle((stored, readFailure) -> {
-      if (readFailure != null) {
-        Throwable readCause = CompletionFailures.unwrapCompletion(readFailure);
-        if (readCause instanceof Error fatal) throw fatal;
-        Throwable cause = priorFailure == null
-            ? readCause : CompletionFailures.unwrapCompletion(priorFailure);
-        if (cause instanceof Error fatal) throw fatal;
-        if (priorFailure != null) cause.addSuppressed(CompletionFailures.unwrapCompletion(readFailure));
-        throw new CompletionException(new BackendFailure(BackendFailure.Category.UNKNOWN, cause));
-      }
+      if (readFailure != null) throw unknownReadFailure(priorFailure, readFailure);
       SnapshotPinShard.Slot current = stored.shard().slots().get(pin.slot);
       if (!current.matches(pin.pinId, pin.generation)) throw new CompletionException(cancelled());
       if (current.status() == SnapshotPinShard.Status.COMPLETED) {
