@@ -92,7 +92,7 @@ class M2SnapshotPinIT {
     SystemRecordStore firstStore = openStore(environment, binding, scope);
     SystemRecordStore secondStore = openStore(environment, binding, scope);
     MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
-    return new PinFixture(binding, openManager(firstStore, clock, scope),
+    return new PinFixture(binding, SnapshotPinManager.initializeFresh(firstStore, CONFIGURATION, clock, scope).join(),
         openManager(secondStore, clock, scope), clock);
   }
 

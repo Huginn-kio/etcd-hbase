@@ -228,7 +228,7 @@ class SnapshotPinManagerTest {
 
     try (RequestScope scope = scope()) {
       assertInstanceOf(IllegalStateException.class,
-          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+          failure(() -> SnapshotPinManager.initializeFresh(records, configuration, scope).join()));
       assertTrue(records.containsAnyShard(0));
       assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()),
           "the ready marker is written only after every initial shard exists");
@@ -250,7 +250,7 @@ class SnapshotPinManagerTest {
 
     try (RequestScope scope = scope()) {
       BackendFailure unknown = assertInstanceOf(BackendFailure.class,
-          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+          failure(() -> SnapshotPinManager.initializeFresh(records, configuration, scope).join()));
       assertEquals(BackendFailure.Category.UNKNOWN, unknown.category());
       assertEquals(0, SnapshotPinManager.open(records, configuration, scope).join()
           .readBoundary(scope).join().safeRevision());
@@ -264,7 +264,7 @@ class SnapshotPinManagerTest {
     records.loseNextSealReplyAfterWrite();
 
     try (RequestScope scope = scope()) {
-      SnapshotPinManager manager = SnapshotPinManager.open(records, configuration, scope).join();
+      SnapshotPinManager manager = SnapshotPinManager.initializeFresh(records, configuration, scope).join();
       assertEquals(0, manager.readBoundary(scope).join().safeRevision());
       assertEquals(0, SnapshotPinManager.open(records, configuration, scope).join()
           .readBoundary(scope).join().safeRevision());
@@ -279,7 +279,7 @@ class SnapshotPinManagerTest {
 
     try (RequestScope scope = scope()) {
       BackendFailure denied = assertInstanceOf(BackendFailure.class,
-          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+          failure(() -> SnapshotPinManager.initializeFresh(records, configuration, scope).join()));
       assertEquals(BackendFailure.Category.PERMISSION, denied.category());
       assertEquals(0, SnapshotPinManager.open(records, configuration, scope).join()
           .readBoundary(scope).join().safeRevision());
@@ -300,6 +300,20 @@ class SnapshotPinManagerTest {
   }
 
   @Test
+  void emptyStoreRequiresExplicitBootstrap() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 1, Duration.ofSeconds(2));
+
+    try (RequestScope scope = scope()) {
+      assertInstanceOf(IllegalStateException.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, initializationIdentity()));
+      assertEquals(0, SnapshotPinManager.initializeFresh(records, configuration, scope).join()
+          .readBoundary(scope).join().safeRevision());
+    }
+  }
+
+  @Test
   void abandonedInitializationGenerationsAreBounded() {
     var records = new MemoryRecords();
     var configuration = new SnapshotPinConfiguration(2, 1, Duration.ofSeconds(2));
@@ -308,7 +322,7 @@ class SnapshotPinManagerTest {
       for (int attempt = 0; attempt < 32; attempt++) {
         records.failNextShardCreate(1);
         assertInstanceOf(IllegalStateException.class,
-            failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+            failure(() -> SnapshotPinManager.initializeFresh(records, configuration, scope).join()));
       }
       assertEquals(32, records.countShardRows(0));
       BackendFailure exhausted = assertInstanceOf(BackendFailure.class,
@@ -330,7 +344,7 @@ class SnapshotPinManagerTest {
       records.createIfAbsent(SystemRecordType.SNAPSHOT_PIN, legacy,
           ByteKey.copyOf(new byte[] {1}), scope).join();
       assertInstanceOf(IllegalStateException.class,
-          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+          failure(() -> SnapshotPinManager.initializeFresh(records, configuration, scope).join()));
       assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()));
       assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, initializationIdentity()));
     }
@@ -366,6 +380,25 @@ class SnapshotPinManagerTest {
           failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
       assertEquals(8, manager.readBoundary(scope).join().safeRevision());
       assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, initializationIdentity()));
+    }
+  }
+
+  @Test
+  void missingBothMetadataRecordsDoesNotBootstrapAnActiveRegistry() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(2, 2, Duration.ofSeconds(2));
+    SnapshotPinManager manager = open(records, configuration, Clock.systemUTC());
+
+    try (RequestScope scope = scope()) {
+      manager.advanceRegistrationFloors(8, 4, scope).join();
+      records.remove(SystemRecordType.SNAPSHOT_PIN, configurationIdentity());
+      records.remove(SystemRecordType.SNAPSHOT_PIN, initializationIdentity());
+
+      assertInstanceOf(IllegalStateException.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, initializationIdentity()));
+      assertEquals(8, manager.readBoundary(scope).join().safeRevision());
     }
   }
 
@@ -412,10 +445,7 @@ class SnapshotPinManagerTest {
             "a failed reopen must not recreate the missing shard before finding durable state");
         assertEquals(retainedValue, records.value(SystemRecordType.SNAPSHOT_PIN, retainedShard));
         assertInstanceOf(IllegalStateException.class, failure(() -> manager.readBoundary(scope).join()));
-        for (int attempt = 0; attempt < 8; attempt++) {
-          assertInstanceOf(IllegalStateException.class,
-              failure(() -> manager.register(stableView(5), scope).join()));
-        }
+        assertOlderViewsRejected(manager, scope);
       } finally {
         pin.close();
         pin.releaseCompletion().toCompletableFuture().join();
@@ -430,7 +460,8 @@ class SnapshotPinManagerTest {
 
     try (RequestScope scope = scope()) {
       records.pauseNextShardCreates(2);
-      CompletableFuture<SnapshotPinManager> delayed = SnapshotPinManager.open(records, configuration, scope);
+      CompletableFuture<SnapshotPinManager> delayed =
+          SnapshotPinManager.initializeFresh(records, configuration, scope);
       try {
         records.createEntered().get(5, TimeUnit.SECONDS);
         SnapshotPinManager established = SnapshotPinManager.open(records, configuration, scope).join();
@@ -452,10 +483,7 @@ class SnapshotPinManagerTest {
           assertInstanceOf(IllegalStateException.class,
               failure(() -> established.readBoundary(scope).join()));
           assertInstanceOf(IllegalStateException.class, failure(delayed::join));
-          for (int attempt = 0; attempt < 8; attempt++) {
-            assertInstanceOf(IllegalStateException.class,
-                failure(() -> established.register(stableView(5), scope).join()));
-          }
+          assertOlderViewsRejected(established, scope);
         } finally {
           pin.close();
           pin.releaseCompletion().toCompletableFuture().join();
@@ -511,7 +539,7 @@ class SnapshotPinManagerTest {
   private static SnapshotPinManager open(MemoryRecords records,
       SnapshotPinConfiguration configuration, Clock clock) {
     try (RequestScope scope = scope()) {
-      return SnapshotPinManager.open(records, configuration, clock, scope).join();
+      return SnapshotPinManager.initializeFresh(records, configuration, clock, scope).join();
     }
   }
 
@@ -533,6 +561,13 @@ class SnapshotPinManagerTest {
   }
 
   private static RequestScope scope() { return RequestScope.withTimeout(Duration.ofSeconds(5)); }
+
+  private static void assertOlderViewsRejected(SnapshotPinManager manager, RequestScope scope) {
+    for (int attempt = 0; attempt < 8; attempt++) {
+      assertInstanceOf(IllegalStateException.class,
+          failure(() -> manager.register(stableView(5), scope).join()));
+    }
+  }
 
   private static ByteKey digest(int value) {
     byte[] bytes = new byte[32];

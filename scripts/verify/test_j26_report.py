@@ -53,6 +53,8 @@ EXPECTED_REQUIRED_CASES = {
         "abandonedInitializationGenerationsAreBounded",
         "legacyConfigurationRequiresExplicitMigration",
         "missingInitializationWitnessCannotReopenConfiguredShards",
+        "missingBothMetadataRecordsDoesNotBootstrapAnActiveRegistry",
+        "emptyStoreRequiresExplicitBootstrap",
         "corruptedDurableShardFailsClosed",
         "completionCasLosingToDurableRevocationCannotReportSuccess",
     },

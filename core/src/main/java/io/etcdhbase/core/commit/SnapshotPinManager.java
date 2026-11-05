@@ -42,11 +42,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     this.registryId = registryId;
   }
 
-  /**
-   * Opens a sealed registry or initializes one in an isolated generation. Abandoned staging
-   * generations are bounded; exhaustion requires explicit recovery rather than a fresh reset.
-   * The prior unsealed format requires an explicit migration before this version can open it.
-   */
+  /** Opens an established registry or resumes an initialization with a durable witness. */
   public static CompletableFuture<SnapshotPinManager> open(SystemRecordStore records,
       SnapshotPinConfiguration configuration, RequestScope scope) {
     return open(records, configuration, Clock.systemUTC(), scope);
@@ -55,13 +51,35 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
   /** Clock injection keeps lease expiry and fencing deterministic in core tests. */
   public static CompletableFuture<SnapshotPinManager> open(SystemRecordStore records,
       SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
+    return start(records, configuration, clock, scope, false);
+  }
+
+  /**
+   * Bootstraps a verified new table group. The caller must confirm that the table is fresh, exclude
+   * existing services and other bootstrap attempts, and wait for earlier bootstrap writes to stop.
+   * Absent metadata alone cannot prove that an old registry never existed.
+   * Abandoned staging generations are bounded and the prior format needs explicit migration.
+   */
+  public static CompletableFuture<SnapshotPinManager> initializeFresh(SystemRecordStore records,
+      SnapshotPinConfiguration configuration, RequestScope scope) {
+    return initializeFresh(records, configuration, Clock.systemUTC(), scope);
+  }
+
+  /** Clock injection keeps initial creation deterministic in core tests. */
+  public static CompletableFuture<SnapshotPinManager> initializeFresh(SystemRecordStore records,
+      SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
+    return start(records, configuration, clock, scope, true);
+  }
+
+  private static CompletableFuture<SnapshotPinManager> start(SystemRecordStore records,
+      SnapshotPinConfiguration configuration, Clock clock, RequestScope scope, boolean bootstrap) {
     Objects.requireNonNull(records, "records");
     Objects.requireNonNull(configuration, "configuration");
     Objects.requireNonNull(clock, "clock");
     Objects.requireNonNull(scope, "scope");
     var manager = new SnapshotPinManager(records, configuration, clock,
         ByteKey.copyOf(TransactionId.create().bytes()));
-    return manager.openRegistry(scope);
+    return manager.openRegistry(scope, bootstrap);
   }
 
   @Override
@@ -114,23 +132,26 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     return readBoundaryBatch(0, new ArrayList<>(), scope).thenApply(this::boundary);
   }
 
-  private CompletableFuture<SnapshotPinManager> openRegistry(RequestScope scope) {
+  private CompletableFuture<SnapshotPinManager> openRegistry(RequestScope scope, boolean bootstrap) {
     if (!active(scope)) return failed(inactive(scope));
     return readConfiguration(scope).thenCompose(stored ->
         readInitialization(scope).thenCompose(initialization ->
-            openObserved(stored, initialization, scope)));
+            openObserved(stored, initialization, scope, bootstrap)));
   }
 
   private CompletableFuture<SnapshotPinManager> openObserved(
       Optional<StoredConfiguration> stored, Optional<StoredInitialization> initialization,
-      RequestScope scope) {
+      RequestScope scope, boolean bootstrap) {
     if (stored.isPresent()) {
       if (initialization.isEmpty()) {
         return failed(new IllegalStateException("snapshot pin initialization witness is missing"));
       }
       return finishOpen(stored.orElseThrow(), scope);
     }
-    if (initialization.isEmpty()) return beginFirstInitialization(scope);
+    if (initialization.isEmpty()) {
+      return bootstrap ? beginFirstInitialization(scope)
+          : failed(new IllegalStateException("snapshot pin registry requires explicit bootstrap"));
+    }
     if (initialization.orElseThrow().value().sealedRegistryId().isPresent()) {
       // The configuration read preceded the witness read; allow a concurrent publication.
       return readConfiguration(scope).thenCompose(latest -> latest.isPresent()
@@ -143,7 +164,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
   private CompletableFuture<SnapshotPinManager> beginFirstInitialization(RequestScope scope) {
     return checkLegacyShards(0, scope)
         .thenCompose(ignored -> createInitializationWitness(scope))
-        .thenCompose(ignored -> openRegistry(scope));
+        .thenCompose(ignored -> openRegistry(scope, false));
   }
 
   private CompletableFuture<Void> checkLegacyShards(int start, RequestScope scope) {
@@ -192,7 +213,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     ByteKey next = SnapshotPinRecordCodec.encodeInitialization(
         new SnapshotPinRecordCodec.Initialization(attempts + 1, Optional.empty()));
     return compareInitialization(initialization.encoded(), next, scope).thenCompose(updated -> {
-      if (!updated) return openRegistry(scope);
+      if (!updated) return openRegistry(scope, false);
       return stageOrAdopt(scope);
     });
   }
@@ -203,7 +224,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
       return readInitialization(scope).thenCompose(initialization -> {
         if (initialization.isEmpty()
             || initialization.orElseThrow().value().sealedRegistryId().isPresent()) {
-          return openRegistry(scope);
+          return openRegistry(scope, false);
         }
         return initializeShards(0, scope)
             .thenCompose(ignored -> ensureConfiguration(scope))
