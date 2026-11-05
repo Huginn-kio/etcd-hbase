@@ -9,78 +9,74 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
+from evidence import java_reports
 
-def report_counts(path: Path, expected_tests: int, required_cases: set[str]) -> dict[str, int]:
-    if not path.is_file():
-        raise ValueError(f"missing test report: {path.name}")
-    suite = ET.parse(path).getroot()
-    counts = {
-        key: int(suite.get(key, "0"))
-        for key in ("tests", "failures", "errors", "skipped")
-    }
-    cases = {case.get("name") for case in suite.iter("testcase")}
-    if counts != {"tests": expected_tests, "failures": 0, "errors": 0, "skipped": 0}:
-        raise ValueError(f"test report did not pass exactly: {path.name}")
-    if not required_cases.issubset(cases):
-        raise ValueError(f"required cases are missing: {path.name}")
-    return counts
+
+READ_VIEW_IT = "io.etcdhbase.hbase.storage.M2ReadViewIT"
+SNAPSHOT_PIN_IT = "io.etcdhbase.hbase.storage.M2SnapshotPinIT"
+READ_VIEW_TEST = "io.etcdhbase.core.commit.ReadViewRecordStoreTest"
+SNAPSHOT_PIN_TEST = "io.etcdhbase.core.commit.SnapshotPinManagerTest"
+INITIALIZATION_TEST = "io.etcdhbase.admin.config.InitializationConfigurationLoaderTest"
+
+REQUIRED_CASES = {
+    READ_VIEW_IT: {"readsSelectedPendingVersionsAndHistoricalRowsInBothLayouts"},
+    SNAPSHOT_PIN_IT: {"independentManagersShareDurablePinsFloorsAndExpiryFencing"},
+    READ_VIEW_TEST: {
+        "currentReadOverlaysOnlyTheSelectedPendingTransactionBeforeRangeMerge",
+        "historicalReadUsesItsOwnBarrierAndCanReadDeleteThenRecreateVersions",
+        "selectedRootIsPinnedAndRecheckedBeforeAnyDataRead",
+        "cancellingAReadKeepsItsPinUntilThePhysicalProducerStops",
+        "failedRenewalPreventsPointAndScanDataReads",
+        "finalPinValidationFailureDiscardsRangeAndReleasesOutputLease",
+        "successfulFinalPinValidationDeliversAndTransfersRangeOwnership",
+    },
+    SNAPSHOT_PIN_TEST: {
+        "durableFloorsProtectExistingViewsAndRejectNewOlderViews",
+        "selectedMetadataDecisionUsesItsOwnSequenceBoundaryAndReference",
+        "expiryAloneDoesNotReleaseProtectionAndRevocationFencesTheOldLease",
+        "terminalSlotCanBeReusedOnlyWithANewerFencingGeneration",
+        "unknownCasRepliesAreResolvedFromTheDurableSlot",
+        "registrationRacesFloorAdvanceOnTheSameShardCas",
+        "storedConfigurationIsImmutableAndShardRowsMustBeComplete",
+        "corruptedDurableShardFailsClosed",
+        "completionCasLosingToDurableRevocationCannotReportSuccess",
+    },
+    INITIALIZATION_TEST: {
+        "readsBothPublishedCandidatesRetainsTheAlternativeLayoutAndOwnsNoInput",
+        "systemTableRequiresSnapshotPinCategory",
+    },
+}
+
+
+def report_counts(root: Path, module: str, suite_name: str) -> dict[str, int]:
+    _, suites = java_reports(
+        root,
+        required={suite_name},
+        modules=(module,),
+        required_cases={suite_name: REQUIRED_CASES[suite_name]},
+    )
+    return suites[suite_name]
 
 
 def collect(root: Path, output: Path) -> None:
     hbase_reports = root / "hbase/target/failsafe-reports"
     core_reports = root / "core/target/surefire-reports"
     integration = {
-        "read_view": report_counts(
-            hbase_reports / "TEST-io.etcdhbase.hbase.storage.M2ReadViewIT.xml",
-            1,
-            {"readsSelectedPendingVersionsAndHistoricalRowsInBothLayouts"},
-        ),
-        "snapshot_pin": report_counts(
-            hbase_reports / "TEST-io.etcdhbase.hbase.storage.M2SnapshotPinIT.xml",
-            1,
-            {"independentManagersShareDurablePinsFloorsAndExpiryFencing"},
-        ),
+        "read_view": report_counts(root, "hbase", READ_VIEW_IT),
+        "snapshot_pin": report_counts(root, "hbase", SNAPSHOT_PIN_IT),
     }
     core = {
-        "read_view": report_counts(
-            core_reports / "TEST-io.etcdhbase.core.commit.ReadViewRecordStoreTest.xml",
-            4,
-            {
-                "currentReadOverlaysOnlyTheSelectedPendingTransactionBeforeRangeMerge",
-                "historicalReadUsesItsOwnBarrierAndCanReadDeleteThenRecreateVersions",
-                "selectedRootIsPinnedAndRecheckedBeforeAnyDataRead",
-                "cancellingAReadKeepsItsPinUntilThePhysicalProducerStops",
-            },
-        ),
-        "snapshot_pin": report_counts(
-            core_reports / "TEST-io.etcdhbase.core.commit.SnapshotPinManagerTest.xml",
-            7,
-            {
-                "durableFloorsProtectExistingViewsAndRejectNewOlderViews",
-                "selectedMetadataDecisionUsesItsOwnSequenceBoundaryAndReference",
-                "expiryAloneDoesNotReleaseProtectionAndRevocationFencesTheOldLease",
-                "terminalSlotCanBeReusedOnlyWithANewerFencingGeneration",
-                "unknownCasRepliesAreResolvedFromTheDurableSlot",
-                "registrationRacesFloorAdvanceOnTheSameShardCas",
-                "storedConfigurationIsImmutableAndShardRowsMustBeComplete",
-            },
-        ),
+        "read_view": report_counts(root, "core", READ_VIEW_TEST),
+        "snapshot_pin": report_counts(root, "core", SNAPSHOT_PIN_TEST),
     }
-    admin = report_counts(
-        root / "admin/target/surefire-reports/"
-        "TEST-io.etcdhbase.admin.config.InitializationConfigurationLoaderTest.xml",
-        6,
-        {
-            "readsBothPublishedCandidatesRetainsTheAlternativeLayoutAndOwnsNoInput",
-            "systemTableRequiresSnapshotPinCategory",
-        },
-    )
+    admin = report_counts(root, "admin", INITIALIZATION_TEST)
     minicluster = hbase_reports / "TEST-io.etcdhbase.hbase.storage.M2SnapshotPinIT.xml"
     stdout = "\n".join(
         element.text or ""
         for element in ET.parse(minicluster).getroot().iter("system-out")
     )
-    if "j26-snapshot-pin sharedRows=true floorsDurable=true expiryRequiresRevocation=true" not in stdout:
+    marker = "j26-snapshot-pin sharedRows=true floorsDurable=true expiryRequiresRevocation=true"
+    if marker not in stdout:
         raise ValueError("J26 MiniCluster evidence marker is missing")
 
     implementation_files = [

@@ -7,7 +7,7 @@ import java.io.IOException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
-/** Shared canonical encoding and SHA-256 helpers for immutable manifest records. */
+/** Shared canonical encoding and SHA-256 helpers for immutable core records. */
 final class ManifestDigest {
   @FunctionalInterface
   interface Encoder {

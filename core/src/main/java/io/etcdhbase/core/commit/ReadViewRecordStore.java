@@ -24,7 +24,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.ToIntFunction;
@@ -146,8 +145,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     if (!includesSelectedCandidate(view, upper) || request.range().isEmpty()) {
       try {
         return physical.startScan(baseRequest);
-      } catch (RuntimeException | Error failure) {
-        if (failure instanceof Error fatal) throw fatal;
+      } catch (RuntimeException failure) {
         return failedOperation(failure);
       }
     }
@@ -162,6 +160,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
           maximumCandidates, ManifestCatalog.MAX_RANGE_CANDIDATE_BYTES, scope, stopped::get, account);
       return new OverlayScanOperation(base, candidates, request, stopped);
     } catch (RuntimeException | Error failure) {
+      // Close the already-open physical producer before preserving a setup Error as fatal.
       if (base != null) {
         try {
           base.close();
@@ -189,6 +188,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     try {
       completion = pinned.complete(scope);
     } catch (RuntimeException | Error failure) {
+      // Keep finishRead's asynchronous contract and still release the reader lease below.
       completion = CompletableFuture.failedFuture(failure);
     }
     completion.whenComplete((ignored, failure) -> {
@@ -208,7 +208,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
         }
       }
       if (failure == null) finishFuture.complete(null);
-      else finishFuture.completeExceptionally(unwrap(failure));
+      else finishFuture.completeExceptionally(CompletionFailures.unwrapCompletion(failure));
     });
     return finishFuture.copy();
   }
@@ -318,6 +318,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       try {
         operation.close();
       } catch (RuntimeException | Error failure) {
+        // Record close failure for finishRead; the owner must still observe a fatal Error now.
         recordCloseFailure(failure);
         if (failure instanceof Error fatal) throw fatal;
       }
@@ -433,12 +434,13 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       try {
         renewal = pinned.renew(scope);
       } catch (RuntimeException | Error failure) {
+        // The returned scan operation is the observer; its completion also settles inFlight.
         result.completeExceptionally(failure);
         return;
       }
       renewal.whenComplete((ignored, failure) -> {
         if (failure != null) {
-          result.completeExceptionally(unwrap(failure));
+          result.completeExceptionally(CompletionFailures.unwrapCompletion(failure));
           return;
         }
         if (stopped.get() || !isActive()) {
@@ -449,13 +451,15 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
         try {
           opened = startScanAfterRenew(request, account);
         } catch (RuntimeException | Error openFailure) {
+          // Preserve the async scan contract; track() observes this result to release its lease.
           result.completeExceptionally(openFailure);
           return;
         }
         delegate = opened;
         if (stopped.get()) closeDelegate();
         opened.completion().whenComplete((page, operationFailure) -> {
-          Throwable terminal = operationFailure == null ? closeFailure : unwrap(operationFailure);
+          Throwable terminal = operationFailure == null ? closeFailure
+              : CompletionFailures.unwrapCompletion(operationFailure);
           if (terminal == null && (stopped.get() || !isActive())) terminal = inactiveFailure();
           if (closeFailure != null && terminal != closeFailure) terminal.addSuppressed(closeFailure);
           if (terminal == null) result.complete(page);
@@ -481,6 +485,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       try {
         current.close();
       } catch (RuntimeException | Error failure) {
+        // The operation completion callback also reports this close failure to its async observer.
         closeFailure = failure;
         if (failure instanceof Error fatal) throw fatal;
       }
@@ -658,15 +663,6 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
         candidates.payloadBytes(), Math::addExact);
     return new StoragePage.Cost(base.physicalRows(), base.returnedCellBytes(),
         base.scanRpcCalls(), observations);
-  }
-
-  private static Throwable unwrap(Throwable failure) {
-    if (failure instanceof Error) return failure;
-    Throwable current = failure;
-    while (current instanceof CompletionException && current.getCause() != null) {
-      current = current.getCause();
-    }
-    return current;
   }
 
 }

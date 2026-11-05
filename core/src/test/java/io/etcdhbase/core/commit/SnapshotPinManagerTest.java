@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import java.time.Clock;
 import java.time.Duration;
@@ -15,9 +16,11 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -153,7 +156,12 @@ class SnapshotPinManagerTest {
         try {
           return Optional.of(manager.register(stableView(5), scope).join());
         } catch (CompletionException rejected) {
-          return Optional.empty();
+          Throwable cause = CompletionFailures.unwrapCompletion(rejected);
+          if (cause instanceof IllegalStateException
+              && "read view is below the durable snapshot registration floor".equals(cause.getMessage())) {
+            return Optional.empty();
+          }
+          throw rejected;
         }
       }
     });
@@ -194,16 +202,53 @@ class SnapshotPinManagerTest {
     }
   }
 
+  @Test
+  void corruptedDurableShardFailsClosed() {
+    var records = new MemoryRecords();
+    SnapshotPinManager manager = open(records,
+        new SnapshotPinConfiguration(1, 2, Duration.ofSeconds(2)), Clock.systemUTC());
+    records.corrupt(SystemRecordType.SNAPSHOT_PIN, shardIdentity(0));
+
+    try (RequestScope scope = scope()) {
+      assertInstanceOf(IllegalArgumentException.class,
+          failure(() -> manager.readBoundary(scope).join()));
+    }
+  }
+
+  @Test
+  void completionCasLosingToDurableRevocationCannotReportSuccess() throws Exception {
+    var records = new MemoryRecords();
+    var clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+    SnapshotPinManager manager = open(records,
+        new SnapshotPinConfiguration(1, 1, Duration.ofSeconds(1)), clock);
+
+    try (RequestScope scope = scope()) {
+      ReadViewPinRegistry.Pin pin = manager.register(stableView(5), scope).join();
+      records.pauseNextCompareAndSet();
+      CompletableFuture<Void> casEntered = records.casEntered();
+      CompletableFuture<Void> completion = pin.complete(scope);
+      casEntered.get(5, TimeUnit.SECONDS);
+
+      clock.advance(Duration.ofSeconds(2));
+      SnapshotGcBoundary revoked = manager.revokeExpiredPins(scope).join();
+      assertTrue(revoked.protections().isEmpty());
+
+      records.releaseCompareAndSet();
+      BackendFailure rejected = assertInstanceOf(BackendFailure.class,
+          failure(() -> completion.join()));
+      assertEquals(BackendFailure.Category.CANCELLED, rejected.category());
+      assertTrue(manager.readBoundary(scope).join().protections().isEmpty());
+
+      pin.close();
+      pin.releaseCompletion().toCompletableFuture().join();
+    }
+  }
+
   private static SnapshotPinManager open(MemoryRecords records,
       SnapshotPinConfiguration configuration, Clock clock) {
     try (RequestScope scope = scope()) {
       return SnapshotPinManager.open(records, configuration, clock, scope).join();
     }
-  }
-
-  private static SnapshotPinManager open(MemoryRecords records,
-      SnapshotPinConfiguration configuration, RequestScope scope) {
-    return SnapshotPinManager.open(records, configuration, scope).join();
   }
 
   private static ReadView stableView(long revision) {
@@ -246,6 +291,8 @@ class SnapshotPinManagerTest {
     private volatile CyclicBarrier readBarrier;
     private final AtomicInteger pausedReads = new AtomicInteger();
     private final AtomicBoolean loseCasReplyAfterWrite = new AtomicBoolean();
+    private volatile CompletableFuture<Void> casEntered;
+    private volatile CompletableFuture<Void> releaseCas;
 
     @Override
     public CompletableFuture<Optional<ByteKey>> read(
@@ -258,7 +305,10 @@ class SnapshotPinManagerTest {
           Math.max(0, count - 1)) > 0) {
         try {
           readBarrier.await(5, TimeUnit.SECONDS);
-        } catch (Exception failure) {
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          return CompletableFuture.failedFuture(interrupted);
+        } catch (BrokenBarrierException | TimeoutException failure) {
           return CompletableFuture.failedFuture(failure);
         }
       }
@@ -282,16 +332,28 @@ class SnapshotPinManagerTest {
     }
 
     @Override
-    public synchronized CompletableFuture<Boolean> compareAndSet(SystemRecordType type,
+    public CompletableFuture<Boolean> compareAndSet(SystemRecordType type,
         ByteKey identity, Optional<ByteKey> expected, ByteKey replacement, RequestScope scope) {
+      CompletableFuture<Void> entered = casEntered;
+      CompletableFuture<Void> release = releaseCas;
+      if (entered != null && casEntered == entered) {
+        casEntered = null;
+        entered.complete(null);
+        return release.thenCompose(ignored ->
+            compareAndSetNow(type, identity, expected, replacement));
+      }
+      return compareAndSetNow(type, identity, expected, replacement);
+    }
+
+    private synchronized CompletableFuture<Boolean> compareAndSetNow(SystemRecordType type, ByteKey identity,
+        Optional<ByteKey> expected, ByteKey replacement) {
       RecordKey key = new RecordKey(type, identity);
       ByteKey existing = rows.get(key);
-      if (!expected.equals(Optional.ofNullable(existing))) {
-        return CompletableFuture.completedFuture(false);
-      }
+      if (!expected.equals(Optional.ofNullable(existing))) return CompletableFuture.completedFuture(false);
       rows.put(key, replacement);
       if (loseCasReplyAfterWrite.compareAndSet(true, false)) {
-        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+        return CompletableFuture.failedFuture(
+            new BackendFailure(BackendFailure.Category.UNKNOWN));
       }
       return CompletableFuture.completedFuture(true);
     }
@@ -302,6 +364,21 @@ class SnapshotPinManagerTest {
     }
 
     private void loseNextCasReplyAfterWrite() { loseCasReplyAfterWrite.set(true); }
+
+    private void pauseNextCompareAndSet() {
+      casEntered = new CompletableFuture<>();
+      releaseCas = new CompletableFuture<>();
+    }
+
+    private CompletableFuture<Void> casEntered() { return casEntered; }
+    private void releaseCompareAndSet() { releaseCas.complete(null); }
+
+    private synchronized void corrupt(SystemRecordType type, ByteKey identity) {
+      RecordKey key = new RecordKey(type, identity);
+      byte[] value = rows.get(key).bytes();
+      value[value.length - 1] ^= 0x1;
+      rows.put(key, ByteKey.copyOf(value));
+    }
 
     private synchronized void remove(SystemRecordType type, ByteKey identity) {
       rows.remove(new RecordKey(type, identity));

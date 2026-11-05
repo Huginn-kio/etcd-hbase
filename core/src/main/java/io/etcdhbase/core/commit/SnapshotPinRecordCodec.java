@@ -2,12 +2,10 @@ package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -178,8 +176,7 @@ final class SnapshotPinRecordCodec {
     if (bytes.length > MAX_ROOT_ID_BYTES) {
       throw new IllegalArgumentException("snapshot pin reference exceeds its bound");
     }
-    out.writeInt(bytes.length);
-    out.write(bytes);
+    ManifestDigest.writeBytes(out, bytes);
   }
 
   private static ByteKey readBytes(DataInputStream input, int maximum) throws IOException {
@@ -192,22 +189,15 @@ final class SnapshotPinRecordCodec {
     return ByteKey.copyOf(bytes);
   }
 
-  private static ByteKey checksum(IoConsumer<DataOutputStream> writer) {
-    try {
-      var body = new ByteArrayOutputStream();
-      try (var output = new DataOutputStream(body)) {
-        writer.accept(output);
-      }
-      byte[] content = body.toByteArray();
-      if (content.length + CHECKSUM_BYTES > MAX_RECORD_BYTES) {
-        throw new IllegalArgumentException("snapshot pin record exceeds its byte budget");
-      }
-      byte[] result = Arrays.copyOf(content, content.length + CHECKSUM_BYTES);
-      System.arraycopy(sha256(content), 0, result, content.length, CHECKSUM_BYTES);
-      return ByteKey.copyOf(result);
-    } catch (IOException impossible) {
-      throw new IllegalStateException("snapshot pin encoding failed", impossible);
+  private static ByteKey checksum(ManifestDigest.Encoder writer) {
+    byte[] content = ManifestDigest.encode(writer::write);
+    if (content.length + CHECKSUM_BYTES > MAX_RECORD_BYTES) {
+      throw new IllegalArgumentException("snapshot pin record exceeds its byte budget");
     }
+    byte[] result = Arrays.copyOf(content, content.length + CHECKSUM_BYTES);
+    System.arraycopy(ManifestDigest.sha256(content).bytes(), 0, result, content.length,
+        CHECKSUM_BYTES);
+    return ByteKey.copyOf(result);
   }
 
   private static <T> T decode(ByteKey encoded, Decoder<T> decoder) {
@@ -218,7 +208,7 @@ final class SnapshotPinRecordCodec {
     int bodyLength = bytes.length - CHECKSUM_BYTES;
     byte[] body = Arrays.copyOf(bytes, bodyLength);
     byte[] expected = Arrays.copyOfRange(bytes, bodyLength, bytes.length);
-    if (!MessageDigest.isEqual(sha256(body), expected)) {
+    if (!MessageDigest.isEqual(ManifestDigest.sha256(body).bytes(), expected)) {
       throw new IllegalArgumentException("snapshot pin record checksum mismatch");
     }
     try (var input = new DataInputStream(new ByteArrayInputStream(body))) {
@@ -229,17 +219,6 @@ final class SnapshotPinRecordCodec {
       throw new IllegalArgumentException("truncated snapshot pin record", truncated);
     }
   }
-
-  private static byte[] sha256(byte[] bytes) {
-    try {
-      return MessageDigest.getInstance("SHA-256").digest(bytes);
-    } catch (NoSuchAlgorithmException impossible) {
-      throw new IllegalStateException("SHA-256 is unavailable", impossible);
-    }
-  }
-
-  @FunctionalInterface
-  private interface IoConsumer<T> { void accept(T value) throws IOException; }
 
   @FunctionalInterface
   private interface Decoder<T> { T read(DataInputStream input) throws IOException; }

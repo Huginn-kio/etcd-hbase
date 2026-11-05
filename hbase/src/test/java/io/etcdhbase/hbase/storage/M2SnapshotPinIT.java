@@ -1,5 +1,6 @@
 package io.etcdhbase.hbase.storage;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -17,7 +18,9 @@ import io.etcdhbase.core.commit.ManifestRepository;
 import io.etcdhbase.core.commit.ManifestRoot;
 import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.PreparedEvent;
+import io.etcdhbase.core.commit.PinnedReadView;
 import io.etcdhbase.core.commit.ReadViewPinRegistry;
+import io.etcdhbase.core.commit.ReadViewRecordStore;
 import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.commit.SnapshotGcBoundary;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
@@ -25,8 +28,15 @@ import io.etcdhbase.core.commit.SnapshotPinManager;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.scan.DirectRecordReader;
+import io.etcdhbase.core.scan.PointResult;
+import io.etcdhbase.core.storage.ReadProjection;
+import io.etcdhbase.core.storage.StorageMetadata;
+import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -57,67 +67,129 @@ class M2SnapshotPinIT {
   void independentManagersShareDurablePinsFloorsAndExpiryFencing() throws Exception {
     try (M1TestEnvironment environment = M1TestEnvironment.start(1);
         RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(180))) {
-      String suffix = UUID.randomUUID().toString().replace("-", "");
-      TableName table = TableName.valueOf("m2_pin_" + suffix);
-      String tableGroup = "m2-pin-" + suffix;
-      String saltProfile = "m2-pin-salt-" + suffix;
-      SystemTableBinding binding = new SystemTableBinding(table, FAMILY,
-          tableGroup, saltProfile, SALT);
-      environment.create(table, descriptor(binding, saltProfile),
-          SALT.splitKeys().toArray(byte[][]::new));
-
-      SystemRecordStore firstStore = openStore(environment, binding, scope);
-      SystemRecordStore secondStore = openStore(environment, binding, scope);
-      MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
-      SnapshotPinManager first = openManager(firstStore, clock, scope);
-      SnapshotPinManager second = openManager(secondStore, clock, scope);
-
-      PinnedView old = openView(binding, first, 5, scope);
-      SnapshotGcBoundary observedBySecond = second.readBoundary(scope).join();
-      assertEquals(1, observedBySecond.protections().size());
-      assertEquals(0, observedBySecond.safeRevision(), "GC stays disabled until a floor is persisted");
-
-      SnapshotGcBoundary advanced = second.advanceRegistrationFloors(8, 4, scope).join();
-      assertEquals(5, advanced.safeRevision());
-      assertEquals(4, advanced.safeSequence());
-      assertEquals(1, advanced.protections().size());
-      old.close();
-      SnapshotGcBoundary released = second.readBoundary(scope).join();
-      assertEquals(8, released.safeRevision());
-      assertTrue(released.protections().isEmpty());
+      PinFixture fixture = prepareFixture(environment, scope);
+      ReadView oldView = verifySharedFloors(fixture, scope);
+      verifyExpiryFencingAndRestart(environment, fixture, scope);
+      assertPointReadCompletesPin(environment, fixture, scope);
       assertInstanceOf(IllegalStateException.class,
-          failure(() -> second.register(old.view(), scope).join()));
-
-      PinnedView current = openView(binding, first, 8, scope);
-      ReadViewPinRegistry.Pin expiring = first.register(current.view(), scope).join();
-      current.close();
-      clock.advance(Duration.ofSeconds(2));
-      SnapshotGcBoundary expiredStillProtected = second.readBoundary(scope).join();
-      assertEquals(8, expiredStillProtected.safeRevision());
-      assertEquals(1, expiredStillProtected.protections().size());
-      SnapshotGcBoundary revoked = second.revokeExpiredPins(scope).join();
-      assertTrue(revoked.protections().isEmpty());
-      assertEquals(8, revoked.safeRevision());
-      BackendFailure renewalFailure = assertInstanceOf(BackendFailure.class,
-          failure(() -> expiring.renew(scope).join()));
-      assertEquals(BackendFailure.Category.CANCELLED, renewalFailure.category());
-
-      SnapshotPinManager restarted = openManager(openStore(environment, binding, scope), clock, scope);
-      SnapshotGcBoundary afterRestart = restarted.readBoundary(scope).join();
-      assertEquals(8, afterRestart.safeRevision());
-      assertEquals(4, afterRestart.safeSequence());
-      assertTrue(afterRestart.protections().isEmpty());
+          failure(() -> fixture.second().register(oldView, scope).join()));
       System.out.println("j26-snapshot-pin sharedRows=true floorsDurable=true expiryRequiresRevocation=true");
     }
   }
 
+  private static PinFixture prepareFixture(M1TestEnvironment environment, RequestScope scope)
+      throws Exception {
+    String suffix = UUID.randomUUID().toString().replace("-", "");
+    TableName table = TableName.valueOf("m2_pin_" + suffix);
+    String tableGroup = "m2-pin-" + suffix;
+    String saltProfile = "m2-pin-salt-" + suffix;
+    SystemTableBinding binding = new SystemTableBinding(table, FAMILY,
+        tableGroup, saltProfile, SALT);
+    environment.create(table, descriptor(binding, saltProfile),
+        SALT.splitKeys().toArray(byte[][]::new));
+
+    SystemRecordStore firstStore = openStore(environment, binding, scope);
+    SystemRecordStore secondStore = openStore(environment, binding, scope);
+    MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+    return new PinFixture(binding, openManager(firstStore, clock, scope),
+        openManager(secondStore, clock, scope), clock);
+  }
+
+  private static ReadView verifySharedFloors(PinFixture fixture, RequestScope scope)
+      throws Exception {
+    ReadView oldView;
+    try (PinnedView old = openView(fixture.binding(), fixture.first(), 5)) {
+      oldView = old.view();
+      SnapshotGcBoundary observed = fixture.second().readBoundary(scope).join();
+      assertEquals(1, observed.protections().size());
+      assertEquals(0, observed.safeRevision(), "GC stays disabled until a floor is persisted");
+
+      SnapshotGcBoundary advanced = fixture.second().advanceRegistrationFloors(8, 4, scope).join();
+      assertEquals(5, advanced.safeRevision());
+      assertEquals(4, advanced.safeSequence());
+      assertEquals(1, advanced.protections().size());
+    }
+    SnapshotGcBoundary released = fixture.second().readBoundary(scope).join();
+    assertEquals(8, released.safeRevision());
+    assertTrue(released.protections().isEmpty());
+    return oldView;
+  }
+
+  private static void verifyExpiryFencingAndRestart(M1TestEnvironment environment,
+      PinFixture fixture, RequestScope scope) throws Exception {
+    ReadViewPinRegistry.Pin expiring;
+    try (PinnedView current = openView(fixture.binding(), fixture.first(), 8)) {
+      expiring = fixture.first().register(current.view(), scope).join();
+    }
+    fixture.clock().advance(Duration.ofSeconds(2));
+    SnapshotGcBoundary expired = fixture.second().readBoundary(scope).join();
+    assertEquals(8, expired.safeRevision());
+    assertEquals(1, expired.protections().size());
+
+    SnapshotGcBoundary revoked = fixture.second().revokeExpiredPins(scope).join();
+    assertTrue(revoked.protections().isEmpty());
+    assertEquals(8, revoked.safeRevision());
+    BackendFailure renewalFailure = assertInstanceOf(BackendFailure.class,
+        failure(() -> expiring.renew(scope).join()));
+    assertEquals(BackendFailure.Category.CANCELLED, renewalFailure.category());
+
+    SnapshotPinManager restarted = openManager(
+        openStore(environment, fixture.binding(), scope), fixture.clock(), scope);
+    SnapshotGcBoundary afterRestart = restarted.readBoundary(scope).join();
+    assertEquals(8, afterRestart.safeRevision());
+    assertEquals(4, afterRestart.safeSequence());
+    assertTrue(afterRestart.protections().isEmpty());
+  }
+
+  private static void assertPointReadCompletesPin(M1TestEnvironment environment,
+      PinFixture fixture, RequestScope scope) throws Exception {
+    StorageTableBinding dataBinding = new StorageTableBinding(
+        TableName.valueOf("m2_pin_query_" + UUID.randomUUID().toString().replace("-", "")),
+        FAMILY, StorageTableBinding.Layout.HISTORY, SALT);
+    environment.create(dataBinding, SALT.splitKeys().toArray(byte[][]::new));
+    var physical = environment.store(dataBinding, scope);
+    ByteKey key = ByteKey.copyOf(bytes("j26-pinned-query"));
+    byte[] value = bytes("read-through-final-pin-cas");
+    M1TestEnvironment.await(physical.put(StoredRecord.live(key,
+        new StorageMetadata(1, 8, 1, 0, StorageMetadata.State.LIVE, value.length), value)));
+
+    CommitState state = CommitState.initial(fixture.binding().profileFingerprint(), 8);
+    ManifestCatalog catalog = new ManifestCatalog(new EmptyManifestRepository());
+    ReadViewService views = new ReadViewService(new StaticControl(state), catalog,
+        fixture.first(), fixture.binding().profileFingerprint());
+    PinnedReadView pinned = views.open(OptionalLong.empty(), AUTHORIZATION, scope).join();
+    ReadViewRecordStore view = new ReadViewRecordStore(pinned, physical, catalog,
+        dataBinding.codec()::bucket, SALT.profile().bucketCount(), scope);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budgets = new BudgetManager(limits, java.util.Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192, 8192);
+    try (BudgetManager.Account account = budgets.admit("public", scope, reservation);
+        PointResult result = new DirectRecordReader(view, account, 8192)
+            .read(key, 8, ReadProjection.FULL).get(30, TimeUnit.SECONDS)) {
+      assertArrayEquals(value, result.record().orElseThrow().value().orElseThrow());
+    }
+    SnapshotGcBoundary completed = fixture.first().readBoundary(scope).join();
+    assertEquals(8, completed.safeRevision());
+    assertTrue(completed.protections().isEmpty(),
+        "the real point-read result is returned only after the durable completion CAS");
+  }
+
   private static PinnedView openView(SystemTableBinding binding, SnapshotPinManager pins,
-      long revision, RequestScope scope) {
+      long revision) {
     CommitState state = CommitState.initial(binding.profileFingerprint(), revision);
     ReadViewService views = new ReadViewService(new StaticControl(state),
         new ManifestCatalog(new EmptyManifestRepository()), pins, binding.profileFingerprint());
-    return new PinnedView(views.open(OptionalLong.empty(), AUTHORIZATION, scope).join());
+    RequestScope viewScope = RequestScope.withTimeout(Duration.ofSeconds(30));
+    try {
+      return new PinnedView(views.open(OptionalLong.empty(), AUTHORIZATION, viewScope).join());
+    } catch (RuntimeException | Error failure) {
+      viewScope.close();
+      throw failure;
+    }
   }
+
+  private record PinFixture(SystemTableBinding binding, SnapshotPinManager first,
+      SnapshotPinManager second, MutableClock clock) {}
 
   private static SystemRecordStore openStore(M1TestEnvironment environment,
       SystemTableBinding binding, RequestScope scope) throws Exception {
@@ -156,7 +228,9 @@ class M2SnapshotPinIT {
     return ByteKey.copyOf(bytes);
   }
 
-  private static RequestScope scope() { return RequestScope.withTimeout(Duration.ofSeconds(5)); }
+  private static byte[] bytes(String value) {
+    return value.getBytes(StandardCharsets.UTF_8);
+  }
 
   private static Throwable failure(Runnable action) {
     try {
@@ -168,9 +242,10 @@ class M2SnapshotPinIT {
     throw new AssertionError("expected operation to fail");
   }
 
-  private record PinnedView(io.etcdhbase.core.commit.PinnedReadView pinned) {
+  private record PinnedView(PinnedReadView pinned) implements AutoCloseable {
     private io.etcdhbase.core.commit.ReadView view() { return pinned.view(); }
-    private void close() throws Exception {
+    @Override
+    public void close() throws Exception {
       pinned.close();
       pinned.termination().toCompletableFuture().get(30, TimeUnit.SECONDS);
     }

@@ -57,6 +57,7 @@ public final class PinnedReadView implements AutoCloseable {
     try {
       completion = Objects.requireNonNull(pin.complete(scope), "pin completion future");
     } catch (RuntimeException | Error failure) {
+      // Restore the state guard before a fatal Error escapes; readers may still need to release.
       synchronized (this) { completionInProgress = false; }
       if (failure instanceof Error fatal) throw fatal;
       return CompletableFuture.failedFuture(failure);
@@ -130,6 +131,7 @@ public final class PinnedReadView implements AutoCloseable {
       try {
         pin.close();
       } catch (RuntimeException | Error failure) {
+        // Settle both lifecycle observers before rethrowing a fatal Error from pin cleanup.
         termination.completeExceptionally(failure);
         cleanupCompletion.completeExceptionally(failure);
         if (failure instanceof Error fatal) throw fatal;

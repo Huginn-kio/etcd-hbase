@@ -703,7 +703,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J25。
   - 完成标准：pin 注册/过期/读超时竞争时不返回损坏快照。
   - 验证层次：L1 存储/内核。
-  - 跟踪：状态=公开实现及本地验证完成，待评审和目标验收；负责人=Codex；完成日期=2026-11-04；PR/commit=[PR #30](https://github.com/Reidddddd/etcd-hbase/pull/30)；验证入口=`scripts/verify/j26.sh`；结果=core 107 项、HBase 119 项、admin 单测 39 项全部通过；admin 配置用例 6 项通过，admin MiniCluster 集成 7 项通过，J25/J26 MiniCluster 各 1 项通过，零失败/错误/跳过；评审人/结论=`Reidddddd`（`reidchan@apache.org`）/待评审。多主机/进程故障、目标 HBase 和实际历史删除 GC 未验收；本交付只提供保守边界接口，不运行物理回收。
+  - 跟踪：状态=公开实现已交付；旧提交验证记录待复核；本轮反馈修复待重新验证；目标验收未完成；负责人=Codex；完成日期=2026-11-04；PR/commit=[PR #30](https://github.com/Reidddddd/etcd-hbase/pull/30)；验证入口=`scripts/verify/j26.sh`；历史文档记录的数量为 core 107 项、HBase 119 项、admin 单测 39 项全部通过，admin 配置用例 6 项通过，admin MiniCluster 集成 7 项通过，J25/J26 MiniCluster 各 1 项通过，零失败/错误/跳过；这些数量未关联到可核实的源码 SHA，不作为本轮反馈修复证据；评审人/结论=`Reidddddd`（`reidchan@apache.org`）/待评审。本轮 6648595383 修改仍须重新定向验证并等待新 head CI。多主机/进程故障、目标 HBase 和实际历史删除 GC 未验收；本交付只提供保守边界接口，不运行物理回收。
 
 - [ ] **J27｜RecoveryManager 与幂等落地检查点**
   - 依赖：J20–J26。
