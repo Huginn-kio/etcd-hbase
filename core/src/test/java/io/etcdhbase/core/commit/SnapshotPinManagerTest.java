@@ -151,20 +151,8 @@ class SnapshotPinManagerTest {
     SnapshotPinManager manager = open(records, configuration, Clock.systemUTC());
     records.pauseNextShardReads(2);
 
-    CompletableFuture<Optional<ReadViewPinRegistry.Pin>> registration = CompletableFuture.supplyAsync(() -> {
-      try (RequestScope scope = scope()) {
-        try {
-          return Optional.of(manager.register(stableView(5), scope).join());
-        } catch (CompletionException rejected) {
-          Throwable cause = CompletionFailures.unwrapCompletion(rejected);
-          if (cause instanceof IllegalStateException
-              && "read view is below the durable snapshot registration floor".equals(cause.getMessage())) {
-            return Optional.empty();
-          }
-          throw rejected;
-        }
-      }
-    });
+    CompletableFuture<Optional<ReadViewPinRegistry.Pin>> registration = CompletableFuture.supplyAsync(
+        () -> registerUnlessFloorAdvanced(manager));
     CompletableFuture<SnapshotGcBoundary> floorAdvance = CompletableFuture.supplyAsync(() -> {
       try (RequestScope scope = scope()) {
         return manager.advanceRegistrationFloors(6, 0, scope).join();
@@ -181,6 +169,22 @@ class SnapshotPinManagerTest {
     } else {
       assertEquals(6, boundary.safeRevision());
       assertTrue(boundary.protections().isEmpty());
+    }
+  }
+
+  private static Optional<ReadViewPinRegistry.Pin> registerUnlessFloorAdvanced(
+      SnapshotPinManager manager) {
+    try (RequestScope scope = scope()) {
+      try {
+        return Optional.of(manager.register(stableView(5), scope).join());
+      } catch (CompletionException rejected) {
+        Throwable cause = CompletionFailures.unwrapCompletion(rejected);
+        if (cause instanceof IllegalStateException
+            && "read view is below the durable snapshot registration floor".equals(cause.getMessage())) {
+          return Optional.empty();
+        }
+        throw rejected;
+      }
     }
   }
 

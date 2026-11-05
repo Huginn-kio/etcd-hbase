@@ -115,40 +115,47 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     }
     if (create == null) return failed(new IllegalStateException("pin store returned no create future"));
     return create.handle((result, failure) -> new StoreResult<>(result, failure))
-        .thenCompose(result -> {
-          if (result.failure() == null && result.value() == null) {
-            return failed(new IllegalStateException("pin store returned no create result"));
-          }
-          if (result.failure() == null
-              && result.value() != SystemRecordStore.CreateResult.CONFLICT) {
-            return CompletableFuture.completedFuture(null);
-          }
-          if (result.failure() != null
-              && CompletionFailures.unwrapCompletion(result.failure()) instanceof Error fatal) {
-            return failed(fatal);
-          }
-          return records.read(SystemRecordType.SNAPSHOT_PIN, CONFIGURATION_ID, scope)
-              .handle((stored, readFailure) -> {
-                if (readFailure != null) {
-                  Throwable readCause = CompletionFailures.unwrapCompletion(readFailure);
-                  if (readCause instanceof Error fatal) throw fatal;
-                  Throwable cause = result.failure() == null
-                      ? readCause : CompletionFailures.unwrapCompletion(result.failure());
-                  if (cause instanceof Error fatal) throw fatal;
-                  if (result.failure() != null) {
-                    cause.addSuppressed(CompletionFailures.unwrapCompletion(readFailure));
-                  }
-                  throw new CompletionException(new BackendFailure(BackendFailure.Category.UNKNOWN, cause));
-                }
-                ByteKey value = stored.orElseThrow(() -> new CompletionException(
-                    new BackendFailure(BackendFailure.Category.UNKNOWN)));
-                SnapshotPinConfiguration persisted = SnapshotPinRecordCodec.decodeConfiguration(value);
-                if (!persisted.equals(configuration)) {
-                  throw new IllegalStateException("snapshot pin geometry or lease differs from its durable format");
-                }
-                return null;
-              });
-        });
+        .thenCompose(result -> resolveConfigurationCreate(result, scope));
+  }
+
+  private CompletableFuture<Void> resolveConfigurationCreate(
+      StoreResult<SystemRecordStore.CreateResult> result, RequestScope scope) {
+    if (result.failure() == null && result.value() == null) {
+      return failed(new IllegalStateException("pin store returned no create result"));
+    }
+    if (result.failure() == null
+        && result.value() != SystemRecordStore.CreateResult.CONFLICT) {
+      return CompletableFuture.completedFuture(null);
+    }
+    if (result.failure() != null
+        && CompletionFailures.unwrapCompletion(result.failure()) instanceof Error fatal) {
+      return failed(fatal);
+    }
+    return records.read(SystemRecordType.SNAPSHOT_PIN, CONFIGURATION_ID, scope)
+        .handle((stored, readFailure) -> validateStoredConfiguration(result, stored, readFailure));
+  }
+
+  private Void validateStoredConfiguration(StoreResult<SystemRecordStore.CreateResult> result,
+      Optional<ByteKey> stored, Throwable readFailure) {
+    if (readFailure != null) throw configurationReadFailure(result, readFailure);
+    ByteKey value = stored.orElseThrow(() -> new CompletionException(
+        new BackendFailure(BackendFailure.Category.UNKNOWN)));
+    SnapshotPinConfiguration persisted = SnapshotPinRecordCodec.decodeConfiguration(value);
+    if (!persisted.equals(configuration)) {
+      throw new IllegalStateException("snapshot pin geometry or lease differs from its durable format");
+    }
+    return null;
+  }
+
+  private static CompletionException configurationReadFailure(
+      StoreResult<SystemRecordStore.CreateResult> result, Throwable readFailure) {
+    Throwable readCause = CompletionFailures.unwrapCompletion(readFailure);
+    if (readCause instanceof Error fatal) throw fatal;
+    Throwable cause = result.failure() == null
+        ? readCause : CompletionFailures.unwrapCompletion(result.failure());
+    if (cause instanceof Error fatal) throw fatal;
+    if (result.failure() != null) cause.addSuppressed(readCause);
+    return new CompletionException(new BackendFailure(BackendFailure.Category.UNKNOWN, cause));
   }
 
   private CompletableFuture<Void> initializeShards(int start, RequestScope scope) {
@@ -273,33 +280,48 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     if (priorFailure != null && !outcomeUnknown(priorFailure)) {
       return failed(CompletionFailures.unwrapCompletion(priorFailure));
     }
-    return readShard(shard, scope).handle((stored, readFailure) -> {
-      if (readFailure != null) {
-        Throwable readCause = CompletionFailures.unwrapCompletion(readFailure);
-        if (readCause instanceof Error fatal) throw fatal;
-        Throwable cause = priorFailure == null
-            ? readCause : CompletionFailures.unwrapCompletion(priorFailure);
-        if (cause instanceof Error fatal) throw fatal;
-        if (priorFailure != null) cause.addSuppressed(CompletionFailures.unwrapCompletion(readFailure));
-        throw new CompletionException(new BackendFailure(BackendFailure.Category.UNKNOWN, cause));
-      }
-      SnapshotPinShard current = stored.shard();
-      for (int index = 0; index < current.slots().size(); index++) {
-        SnapshotPinShard.Slot slot = current.slots().get(index);
-        if (slot.status() == SnapshotPinShard.Status.ACTIVE && slot.pinId().equals(pinId)) {
-          if (!matches(slot, requirement)) {
-            throw new CompletionException(new IllegalStateException("pin identity is bound to another read view"));
-          }
-          if (slot.expiresAtEpochMillis() > clock.millis()) {
-            return new PinLease(shard, index, slot.generation(), pinId);
-          }
-        }
-      }
-      if (priorFailure != null && !active(scope)) throw new CompletionException(inactive(scope));
-      return null;
-    }).thenCompose(resolved -> resolved != null
+    return readShard(shard, scope)
+        .handle((stored, readFailure) -> resolveObservedRegistration(stored, readFailure,
+            shard, pinId, requirement, scope, priorFailure))
+        .thenCompose(resolved -> resolved != null
         ? CompletableFuture.completedFuture(resolved)
         : registerAttempt(shard, pinId, requirement, scope, attempt));
+  }
+
+  private Pin resolveObservedRegistration(StoredShard stored, Throwable readFailure, int shard,
+      ByteKey pinId, PinRequirement requirement, RequestScope scope, Throwable priorFailure) {
+    if (readFailure != null) throw registrationReadFailure(priorFailure, readFailure);
+    PinLease existing = findActivePin(stored.shard(), shard, pinId, requirement);
+    if (existing != null) return existing;
+    if (priorFailure != null && !active(scope)) throw new CompletionException(inactive(scope));
+    return null;
+  }
+
+  private PinLease findActivePin(SnapshotPinShard current, int shard, ByteKey pinId,
+      PinRequirement requirement) {
+    long now = clock.millis();
+    for (int index = 0; index < current.slots().size(); index++) {
+      SnapshotPinShard.Slot slot = current.slots().get(index);
+      if (slot.status() != SnapshotPinShard.Status.ACTIVE || !slot.pinId().equals(pinId)) continue;
+      if (!matches(slot, requirement)) {
+        throw new CompletionException(new IllegalStateException("pin identity is bound to another read view"));
+      }
+      if (slot.expiresAtEpochMillis() > now) {
+        return new PinLease(shard, index, slot.generation(), pinId);
+      }
+    }
+    return null;
+  }
+
+  private static CompletionException registrationReadFailure(Throwable priorFailure,
+      Throwable readFailure) {
+    Throwable readCause = CompletionFailures.unwrapCompletion(readFailure);
+    if (readCause instanceof Error fatal) throw fatal;
+    Throwable cause = priorFailure == null
+        ? readCause : CompletionFailures.unwrapCompletion(priorFailure);
+    if (cause instanceof Error fatal) throw fatal;
+    if (priorFailure != null) cause.addSuppressed(readCause);
+    return new CompletionException(new BackendFailure(BackendFailure.Category.UNKNOWN, cause));
   }
 
   private CompletableFuture<Void> transitionExpiredSlot(StoredShard stored, int slotIndex,
