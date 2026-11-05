@@ -185,7 +185,7 @@ class ReadViewRecordStoreTest {
       ReadViewRecordStore view = fixture.readStore(
           fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
       BackendFailure pointFailure = assertInstanceOf(BackendFailure.class,
-          failure(() -> view.get(key("k"), 2, ReadProjection.FULL).join()));
+          completionFailure(() -> view.get(key("k"), 2, ReadProjection.FULL).join()));
       assertEquals(BackendFailure.Category.UNAVAILABLE, pointFailure.category());
       assertEquals(0, fixture.physical.getCalls.get());
       assertEquals(0, fixture.repository.candidateReads.get());
@@ -193,7 +193,7 @@ class ReadViewRecordStoreTest {
       ScanOperation scan = view.startScan(new ScanRequest(0, KeyRange.all(), Optional.empty(),
           2, ReadProjection.FULL, 4, 8192, 16));
       BackendFailure scanFailure = assertInstanceOf(BackendFailure.class,
-          failure(() -> scan.completion().toCompletableFuture().join()));
+          completionFailure(() -> scan.completion().toCompletableFuture().join()));
       assertEquals(BackendFailure.Category.UNAVAILABLE, scanFailure.category());
       assertEquals(0, fixture.physical.scanCalls.get());
       assertEquals(0, fixture.repository.candidateReads.get());
@@ -226,7 +226,7 @@ class ReadViewRecordStoreTest {
         fixture.pinCompletion.completeExceptionally(
             new BackendFailure(BackendFailure.Category.CANCELLED));
         BackendFailure rejected = assertInstanceOf(BackendFailure.class,
-            failure(() -> result.join()));
+            completionFailure(() -> result.join()));
         assertEquals(BackendFailure.Category.CANCELLED, rejected.category());
         assertEquals(0, budgets.snapshot().allocatedBytes(),
             "failed validation discards the materialized response and releases its lease");
@@ -603,6 +603,12 @@ class ReadViewRecordStoreTest {
     Optional<StoredRecord> record;
     while ((record = page.next()).isPresent()) keys.add(text(record.orElseThrow().key()));
     return List.copyOf(keys);
+  }
+
+  private static Throwable completionFailure(Runnable action) {
+    CompletionException completion = assertThrows(CompletionException.class, action::run);
+    Throwable cause = completion.getCause();
+    return cause == null ? completion : cause;
   }
 
   private static List<String> scanKeys(Fixture fixture, long maximumBytes, int expectedPages)
