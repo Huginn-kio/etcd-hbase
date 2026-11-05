@@ -42,7 +42,7 @@ public final class CommitFinalizationService implements CommitFinalizer {
     if (publication.state() != CommitOutcomeResolver.State.SELECTED_PENDING) {
       return CompletableFuture.completedFuture(publication);
     }
-    return outcomes.resolve(invocation, serviceScope).thenCompose(current -> {
+    return outcomes.resolveForFinalization(invocation, serviceScope).thenCompose(current -> {
       if (current.state() != CommitOutcomeResolver.State.SELECTED_PENDING) {
         return CompletableFuture.completedFuture(current);
       }
@@ -125,7 +125,7 @@ public final class CommitFinalizationService implements CommitFinalizer {
           if (result != MaterializationStore.ApplyResult.CURRENT_SUPERSEDED) {
             return CompletableFuture.completedFuture(null);
           }
-          return outcomes.resolve(invocation, scope).thenCompose(current ->
+          return outcomes.resolveForFinalization(invocation, scope).thenCompose(current ->
               current.state() == CommitOutcomeResolver.State.SELECTED_FINALIZED
                   ? CompletableFuture.completedFuture(null)
                   : CompletableFuture.failedFuture(new IllegalStateException(
@@ -135,7 +135,7 @@ public final class CommitFinalizationService implements CommitFinalizer {
 
   private CompletableFuture<CommitOutcomeResolver.Resolution> finalizeControl(
       InvocationBinding invocation, CommitDecision decision, RequestScope scope, int attempt) {
-    if (attempt >= MAX_FINALIZE_ATTEMPTS) return outcomes.resolve(invocation, scope);
+    if (attempt >= MAX_FINALIZE_ATTEMPTS) return outcomes.resolveForFinalization(invocation, scope);
     return control.read(scope).thenCompose(snapshot -> {
       if (snapshot.isEmpty()) {
         return CompletableFuture.failedFuture(
@@ -143,7 +143,9 @@ public final class CommitFinalizationService implements CommitFinalizer {
       }
       ControlSnapshot observed = snapshot.orElseThrow();
       CommitState state = observed.state();
-      if (state.finalizedSequence() >= decision.sequence()) return outcomes.resolve(invocation, scope);
+      if (state.finalizedSequence() >= decision.sequence()) {
+        return outcomes.resolveForFinalization(invocation, scope);
+      }
       if (state.publication().isEmpty()
           || !CommitDecision.from(state.publication().orElseThrow()).equals(decision)) {
         return CompletableFuture.failedFuture(
@@ -158,7 +160,9 @@ public final class CommitFinalizationService implements CommitFinalizer {
               if (!isUnknown(failure)) return CompletableFuture.failedFuture(failure);
               return resolveAndRetry(invocation, decision, scope, attempt);
             }
-            if (Boolean.TRUE.equals(result.updated())) return outcomes.resolve(invocation, scope);
+            if (Boolean.TRUE.equals(result.updated())) {
+              return outcomes.resolveForFinalization(invocation, scope);
+            }
             if (result.updated() == null) {
               return resolveAndRetry(invocation, decision, scope, attempt);
             }
@@ -169,7 +173,7 @@ public final class CommitFinalizationService implements CommitFinalizer {
 
   private CompletableFuture<CommitOutcomeResolver.Resolution> resolveAndRetry(
       InvocationBinding invocation, CommitDecision decision, RequestScope scope, int attempt) {
-    return outcomes.resolve(invocation, scope).thenCompose(current -> {
+    return outcomes.resolveForFinalization(invocation, scope).thenCompose(current -> {
       if (current.state() == CommitOutcomeResolver.State.SELECTED_FINALIZED) {
         return CompletableFuture.completedFuture(current);
       }

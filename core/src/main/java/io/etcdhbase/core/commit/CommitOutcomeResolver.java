@@ -55,6 +55,25 @@ public final class CommitOutcomeResolver {
       return CompletableFuture.completedFuture(new Resolution(
           State.WINDOW_CLOSED, Optional.empty(), Optional.empty()));
     }
+    return resolveDurable(invocation, scope);
+  }
+
+  /** Resolves durable publication state for recovery even after the caller query window closed. */
+  CompletableFuture<Resolution> resolveForFinalization(
+      InvocationBinding invocation, RequestScope scope) {
+    Objects.requireNonNull(invocation, "invocation");
+    return resolveDurable(invocation, scope);
+  }
+
+  private CompletableFuture<Resolution> resolveDurable(InvocationBinding invocation, RequestScope scope) {
+    if (invocation.state() == InvocationBinding.State.WINDOW_CLOSED) {
+      // A closed result window still retains the immutable binding needed to finish an
+      // already-selected publication. The public resolve() method hides it from callers.
+      if (invocation.manifestRoot().isEmpty()) {
+        return CompletableFuture.completedFuture(new Resolution(
+            State.WINDOW_CLOSED, Optional.empty(), Optional.empty()));
+      }
+    }
     return control.read(scope).thenCompose(snapshot -> {
       if (snapshot.isEmpty()) {
         return CompletableFuture.failedFuture(
