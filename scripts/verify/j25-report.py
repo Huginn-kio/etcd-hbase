@@ -24,6 +24,8 @@ REQUIRED_CORE_CASES = {
     "cancellingReadResultDoesNotCancelPinAccounting",
     "scopeCancellationWaitsForManifestProducerBeforeReleasingRegisteredPin",
     "metadataHeadBudgetDoesNotRejectLargeCandidatePayload",
+    "requestReadLimitStopsBeforeFetchingCandidateBeyondRemainingBytes",
+    "candidateValueMemoryIsReservedBeforeReadAndReleasedAfterProjection",
 }
 
 
@@ -74,6 +76,8 @@ def collect(root: Path, output: Path) -> None:
             "same-key unselected private candidates remain invisible",
             "Range head/value and point/range Exists use the same read view",
             "read cancellation retains the pin until physical producer completion",
+            "request candidate-byte limits reject reads before fetching values beyond remaining allowance",
+            "candidate buffers reserve request/group/global memory before reads and retain charges through cancelled physical producers",
         ],
         "minicluster_verified": [
             "HISTORY and NATIVE physical layouts",

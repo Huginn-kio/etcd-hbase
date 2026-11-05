@@ -254,7 +254,8 @@ public final class ScanScheduler implements AutoCloseable {
         synchronized (ScanScheduler.this) { stopped = stopRequested; }
         if (stopped) { finish(null, cancelled()); return; }
         account.requireActive();
-        ScanOperation opened = Objects.requireNonNull(source.startScan(request), "physical operation");
+        ScanOperation opened = Objects.requireNonNull(source instanceof BudgetedRecordStore budgeted
+            ? budgeted.startScan(request, account) : source.startScan(request), "physical operation");
         boolean stop;
         synchronized (ScanScheduler.this) { physical = opened; stop = stopRequested; }
         opened.completion().whenComplete(this::finish);

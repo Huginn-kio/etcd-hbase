@@ -28,6 +28,7 @@ import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -70,8 +71,10 @@ class M2ReadViewIT {
     try (M1TestEnvironment environment = M1TestEnvironment.start(1);
         RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(180))) {
       ReadFixture fixture = prepareLayout(layout, environment, scope);
-      assertCurrentPointReads(fixture);
-      assertCurrentRange(fixture);
+      try (BudgetManager.Account account = budget(scope)) {
+        assertCurrentPointReads(fixture, account);
+        assertCurrentRange(fixture, account);
+      }
       assertHistoricalReads(fixture);
       System.out.printf("j25-readview layout=%s selectedPending=true historical=true"
           + " deleteVisible=true unselectedIsolated=true%n", layout);
@@ -133,31 +136,31 @@ class M2ReadViewIT {
         candidate(transactionId, live(keys.recreated(), 3, 3, 1, "after-recreate")));
   }
 
-  private static void assertCurrentPointReads(ReadFixture fixture) {
+  private static void assertCurrentPointReads(ReadFixture fixture, BudgetManager.Account account) {
     ReadViewRecordStore current = fixture.current();
     ReadKeys keys = fixture.keys();
-    StoredRecord visibleUpdate = current.get(keys.updated(), 3, ReadProjection.FULL).join().orElseThrow();
+    StoredRecord visibleUpdate = current.get(keys.updated(), 3, ReadProjection.FULL, account).join().orElseThrow();
     assertEquals(1, visibleUpdate.metadata().createRevision());
     assertEquals(3, visibleUpdate.metadata().modificationRevision());
     assertEquals(3, visibleUpdate.metadata().version());
     assertEquals("selected-value", text(visibleUpdate.value().orElseThrow()));
-    StoredRecord visibleDelete = current.get(keys.deleted(), 3, ReadProjection.METADATA).join().orElseThrow();
+    StoredRecord visibleDelete = current.get(keys.deleted(), 3, ReadProjection.METADATA, account).join().orElseThrow();
     assertEquals(StorageMetadata.State.TOMBSTONE, visibleDelete.metadata().state());
     assertFalse(visibleDelete.hasValue());
-    assertTrue(current.get(keys.unselected(), 3, ReadProjection.FULL).join().isEmpty());
-    StoredRecord visibleRecreate = current.get(keys.recreated(), 3, ReadProjection.FULL)
+    assertTrue(current.get(keys.unselected(), 3, ReadProjection.FULL, account).join().isEmpty());
+    StoredRecord visibleRecreate = current.get(keys.recreated(), 3, ReadProjection.FULL, account)
         .join().orElseThrow();
     assertEquals(3, visibleRecreate.metadata().createRevision());
     assertEquals(1, visibleRecreate.metadata().version());
     assertEquals("after-recreate", text(visibleRecreate.value().orElseThrow()));
-    assertEquals("selected-insert", text(current.get(keys.inserted(), 3, ReadProjection.FULL)
+    assertEquals("selected-insert", text(current.get(keys.inserted(), 3, ReadProjection.FULL, account)
         .join().orElseThrow().value().orElseThrow()));
   }
 
-  private static void assertCurrentRange(ReadFixture fixture) {
+  private static void assertCurrentRange(ReadFixture fixture, BudgetManager.Account account) {
     ReadKeys keys = fixture.keys();
     StoragePage page = fixture.current().startScan(new ScanRequest(0,
-        KeyRange.all(), Optional.empty(), 3, ReadProjection.FULL, 16, 64 * 1024, 64))
+        KeyRange.all(), Optional.empty(), 3, ReadProjection.FULL, 16, 64 * 1024, 64), account)
         .completion().toCompletableFuture().join();
     assertEquals(List.of(keys.updated(), keys.deleted(), keys.inserted(), keys.recreated()).stream()
         .sorted().toList(), page.records().stream().map(StoredRecord::key).sorted().toList());
@@ -168,6 +171,13 @@ class M2ReadViewIT {
         .filter(record -> record.key().equals(keys.deleted())).findFirst().orElseThrow()
         .metadata().state());
     assertTrue(page.exhausted());
+  }
+
+  private static BudgetManager.Account budget(RequestScope scope) throws Exception {
+    var limits = new BudgetManager.Limits(4, 16, 2, 2, 2, 1_000_000, 16L << 20);
+    var manager = new BudgetManager(limits, Map.of("public", limits), limits);
+    return manager.admit("public", scope,
+        new BudgetManager.Reservation(128 * 1024, 128 * 1024, 1L << 20, 1L << 20, 1L << 20));
   }
 
   private static void assertHistoricalReads(ReadFixture fixture) {

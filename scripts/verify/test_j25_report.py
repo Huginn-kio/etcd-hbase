@@ -24,6 +24,8 @@ CORE_CASES = {
     "cancellingReadResultDoesNotCancelPinAccounting",
     "scopeCancellationWaitsForManifestProducerBeforeReleasingRegisteredPin",
     "metadataHeadBudgetDoesNotRejectLargeCandidatePayload",
+    "requestReadLimitStopsBeforeFetchingCandidateBeyondRemainingBytes",
+    "candidateValueMemoryIsReservedBeforeReadAndReleasedAfterProjection",
 }
 
 
@@ -78,11 +80,11 @@ class J25ReportTest(unittest.TestCase):
             invalid_case if invalid_suite == "core" else None,
         )
 
-    def test_collect_accepts_all_nine_core_cases_and_both_layout_markers(self):
+    def test_collect_accepts_all_eleven_core_cases_and_both_layout_markers(self):
         j25_report.collect(self.root, self.output)
         summary = json.loads((self.output / "summary.json").read_text())
         self.assertEqual(1, summary["tests"])
-        self.assertEqual(9, summary["core_tests"])
+        self.assertEqual(11, summary["core_tests"])
         self.assertEqual("J25", summary["phase"])
         self.assertTrue(summary["source_commit"])
         self.assertTrue(summary["source_report_sha256"])
@@ -91,12 +93,14 @@ class J25ReportTest(unittest.TestCase):
         self._write_reports(extra_core_cases={"futureReadViewRegression"})
         j25_report.collect(self.root, self.output)
         summary = json.loads((self.output / "summary.json").read_text())
-        self.assertEqual(10, summary["core_tests"])
+        self.assertEqual(12, summary["core_tests"])
 
     def test_report_rejects_each_missing_new_required_core_case(self):
         newly_required_cases = (
             "scopeCancellationWaitsForManifestProducerBeforeReleasingRegisteredPin",
             "metadataHeadBudgetDoesNotRejectLargeCandidatePayload",
+            "requestReadLimitStopsBeforeFetchingCandidateBeyondRemainingBytes",
+            "candidateValueMemoryIsReservedBeforeReadAndReleasedAfterProjection",
         )
         for missing_case in newly_required_cases:
             with self.subTest(missing_case=missing_case):

@@ -5,6 +5,8 @@ import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.scan.BudgetedRecordStore;
 import io.etcdhbase.core.storage.BatchWriteResult;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
@@ -28,7 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.ToIntFunction;
 
 /** Read-only physical-store view that overlays one pinned selected publication before query logic. */
-public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
+public final class ReadViewRecordStore implements RecordStore, BudgetedRecordStore, AutoCloseable {
   private final PinnedReadView pinned;
   private final RecordStore physical;
   private final ManifestCatalog manifests;
@@ -62,8 +64,17 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
   @Override
   public CompletableFuture<Optional<StoredRecord>> get(
       ByteKey key, long revisionUpperBound, ReadProjection projection) {
+    return get(key, revisionUpperBound, projection, null);
+  }
+
+  @Override
+  public CompletableFuture<Optional<StoredRecord>> get(ByteKey key, long revisionUpperBound,
+      ReadProjection projection, BudgetManager.Account account) {
     Objects.requireNonNull(key, "key");
     Objects.requireNonNull(projection, "projection");
+    if (account != null && !account.belongsTo(scope)) {
+      return failed(new IllegalArgumentException("read budget belongs to another request scope"));
+    }
     if (revisionUpperBound <= 0) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("revision bound must be positive"));
     }
@@ -71,7 +82,7 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
     CompletableFuture<Optional<StoredRecord>> read;
     try {
       synchronized (this) {
-        read = getAtView(key, revisionUpperBound, projection);
+        read = getAtView(key, revisionUpperBound, projection, account);
       }
     } catch (RuntimeException | Error failure) {
       // beginOperation already incremented the lease; settle it before rethrowing any fatal Error.
@@ -83,7 +94,7 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
   }
 
   private CompletableFuture<Optional<StoredRecord>> getAtView(
-      ByteKey key, long revisionUpperBound, ReadProjection projection) {
+      ByteKey key, long revisionUpperBound, ReadProjection projection, BudgetManager.Account account) {
     if (!isActive()) return failed(inactiveFailure());
     ReadView view = pinned.view();
     long upper = Math.min(revisionUpperBound, view.targetRevision());
@@ -96,19 +107,31 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
     }
     ManifestRoot root = view.selectedRoot().orElseThrow();
     return manifests.candidatesInRange(root, bucket, KeyRange.point(key), Optional.empty(), 2,
-        Long.MAX_VALUE, scope, this::isInactive).thenCompose(slice -> {
-          if (!isActive()) return failed(inactiveFailure());
-          if (slice.candidates().isEmpty()) {
-            return physicalGet(key, Math.min(upper, view.stableRevision()), projection);
+        Long.MAX_VALUE, scope, this::isInactive, account).thenCompose(slice -> {
+          try {
+            if (!isActive()) return failed(inactiveFailure());
+            if (slice.candidates().isEmpty()) {
+              return physicalGet(key, Math.min(upper, view.stableRevision()), projection);
+            }
+            PreparedCandidate candidate = slice.candidates().getFirst();
+            return CompletableFuture.completedFuture(Optional.of(project(candidate.record(), projection)));
+          } finally {
+            slice.close();
           }
-          PreparedCandidate candidate = slice.candidates().getFirst();
-          return CompletableFuture.completedFuture(Optional.of(project(candidate.record(), projection)));
         });
   }
 
   @Override
   public synchronized ScanOperation startScan(ScanRequest request) {
+    return startScan(request, null);
+  }
+
+  @Override
+  public synchronized ScanOperation startScan(ScanRequest request, BudgetManager.Account account) {
     Objects.requireNonNull(request, "request");
+    if (account != null && !account.belongsTo(scope)) {
+      return failedOperation(new IllegalArgumentException("scan budget belongs to another request scope"));
+    }
     if (!beginOperation()) return failedOperation(inactiveFailure());
     if (request.bucket() >= bucketCount) {
       completeOperation();
@@ -136,7 +159,7 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
       int maximumCandidates = Math.min(request.maximumRows(), 1024);
       var stopped = new AtomicBoolean();
       var candidates = manifests.candidatesInRange(root, bucket, request.range(), request.after(),
-          maximumCandidates, ManifestCatalog.MAX_RANGE_CANDIDATE_BYTES, scope, stopped::get);
+          maximumCandidates, ManifestCatalog.MAX_RANGE_CANDIDATE_BYTES, scope, stopped::get, account);
       return track(new OverlayScanOperation(base, candidates, request, stopped));
     } catch (RuntimeException | Error failure) {
       if (base != null) {
@@ -384,8 +407,11 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
 
     private void finish(CompletableFuture<StoragePage> baseResult,
         CompletableFuture<ManifestCatalog.CandidateSlice> candidateResult, Throwable failure) {
-      Throwable terminal = failure;
+      Throwable terminal = failure == null ? null : CompletionFailures.unwrapCompletion(failure);
       StoragePage merged = null;
+      ManifestCatalog.CandidateSlice candidateSlice = candidateResult.isDone()
+          && !candidateResult.isCompletedExceptionally() && !candidateResult.isCancelled()
+          ? candidateResult.getNow(null) : null;
       try {
         if (terminal == null && !stopped.get()) {
           merged = merge(baseResult.join(), candidateResult.join(), request);
@@ -397,6 +423,14 @@ public final class ReadViewRecordStore implements RecordStore, AutoCloseable {
         terminal = CompletionFailures.unwrapCompletion(problem);
       } finally {
         closeBase();
+        if (candidateSlice != null) {
+          try {
+            candidateSlice.close();
+          } catch (RuntimeException | Error cleanup) {
+            if (terminal == null) terminal = cleanup;
+            else if (terminal != cleanup) terminal.addSuppressed(cleanup);
+          }
+        }
       }
       if (closeFailure != null) {
         if (terminal == null) terminal = closeFailure;

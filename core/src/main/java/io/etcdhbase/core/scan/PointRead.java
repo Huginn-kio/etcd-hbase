@@ -23,7 +23,10 @@ final class PointRead {
       account.chargePoint();
       var ownedIo = io;
       var ownedWork = work;
-      store.get(key, upper, projection).whenComplete((record, failure) ->
+      CompletableFuture<Optional<StoredRecord>> producer = store instanceof BudgetedRecordStore budgeted
+          ? budgeted.get(key, upper, projection, account)
+          : store.get(key, upper, projection);
+      producer.whenComplete((record, failure) ->
           complete(result, record, failure, ownedWork, ownedIo, account));
     } catch (BackendFailure | RuntimeException failure) {
       complete(result, null, failure, work, io, account);
