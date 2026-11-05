@@ -20,24 +20,33 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** Durable, bounded, cross-replica read protection with independent GC revision and sequence floors. */
 public final class SnapshotPinManager implements ReadViewPinRegistry {
   private static final int MAX_CAS_ATTEMPTS = 32;
+  private static final int MAX_INITIALIZATION_ATTEMPTS = 32;
   private static final int INITIALIZATION_BATCH = 8;
   private static final int BOUNDARY_BATCH = 16;
   private static final Duration RELEASE_TIMEOUT = Duration.ofSeconds(5);
   private static final ByteKey CONFIGURATION_ID = ByteKey.copyOf(
       new byte[] {0x53, 0x50, 0x49, 0x4e, 0x01, 0x00});
+  private static final ByteKey INITIALIZATION_ID = ByteKey.copyOf(
+      new byte[] {0x53, 0x50, 0x49, 0x4e, 0x01, 0x01});
 
   private final SystemRecordStore records;
   private final SnapshotPinConfiguration configuration;
   private final Clock clock;
+  private final ByteKey registryId;
 
   private SnapshotPinManager(SystemRecordStore records, SnapshotPinConfiguration configuration,
-      Clock clock) {
+      Clock clock, ByteKey registryId) {
     this.records = records;
     this.configuration = configuration;
     this.clock = clock;
+    this.registryId = registryId;
   }
 
-  /** Publishes the immutable layout only after first-time shard initialization is complete. */
+  /**
+   * Opens a sealed registry or initializes one in an isolated generation. Abandoned staging
+   * generations are bounded; exhaustion requires explicit recovery rather than a fresh reset.
+   * The prior unsealed format requires an explicit migration before this version can open it.
+   */
   public static CompletableFuture<SnapshotPinManager> open(SystemRecordStore records,
       SnapshotPinConfiguration configuration, RequestScope scope) {
     return open(records, configuration, Clock.systemUTC(), scope);
@@ -50,13 +59,9 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     Objects.requireNonNull(configuration, "configuration");
     Objects.requireNonNull(clock, "clock");
     Objects.requireNonNull(scope, "scope");
-    var manager = new SnapshotPinManager(records, configuration, clock);
-    return manager.readConfiguration(scope).thenCompose(configured -> {
-      if (configured) return manager.readBoundary(scope).thenApply(ignored -> manager);
-      return manager.initializeShards(0, scope)
-          .thenCompose(ignored -> manager.ensureConfiguration(scope))
-          .thenApply(ignored -> manager);
-    });
+    var manager = new SnapshotPinManager(records, configuration, clock,
+        ByteKey.copyOf(TransactionId.create().bytes()));
+    return manager.openRegistry(scope);
   }
 
   @Override
@@ -109,8 +114,192 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     return readBoundaryBatch(0, new ArrayList<>(), scope).thenApply(this::boundary);
   }
 
-  private CompletableFuture<Void> ensureConfiguration(RequestScope scope) {
-    ByteKey expected = SnapshotPinRecordCodec.encodeConfiguration(configuration);
+  private CompletableFuture<SnapshotPinManager> openRegistry(RequestScope scope) {
+    if (!active(scope)) return failed(inactive(scope));
+    return readConfiguration(scope).thenCompose(stored ->
+        readInitialization(scope).thenCompose(initialization ->
+            openObserved(stored, initialization, scope)));
+  }
+
+  private CompletableFuture<SnapshotPinManager> openObserved(
+      Optional<StoredConfiguration> stored, Optional<StoredInitialization> initialization,
+      RequestScope scope) {
+    if (stored.isPresent()) {
+      if (initialization.isEmpty()) {
+        return failed(new IllegalStateException("snapshot pin initialization witness is missing"));
+      }
+      return finishOpen(stored.orElseThrow(), scope);
+    }
+    if (initialization.isEmpty()) return beginFirstInitialization(scope);
+    if (initialization.orElseThrow().value().sealedRegistryId().isPresent()) {
+      // The configuration read preceded the witness read; allow a concurrent publication.
+      return readConfiguration(scope).thenCompose(latest -> latest.isPresent()
+          ? finishOpen(latest.orElseThrow(), scope)
+          : failed(new IllegalStateException("configured snapshot pin registry is missing")));
+    }
+    return reserveInitialization(initialization.orElseThrow(), scope);
+  }
+
+  private CompletableFuture<SnapshotPinManager> beginFirstInitialization(RequestScope scope) {
+    return checkLegacyShards(0, scope)
+        .thenCompose(ignored -> createInitializationWitness(scope))
+        .thenCompose(ignored -> openRegistry(scope));
+  }
+
+  private CompletableFuture<Void> checkLegacyShards(int start, RequestScope scope) {
+    if (!active(scope)) return failed(inactive(scope));
+    if (start == SnapshotPinConfiguration.MAX_SHARDS) return CompletableFuture.completedFuture(null);
+    int end = Math.min(SnapshotPinConfiguration.MAX_SHARDS, start + BOUNDARY_BATCH);
+    var batch = new ArrayList<CompletableFuture<Void>>(end - start);
+    for (int shard = start; shard < end; shard++) {
+      batch.add(readMarker(legacyShardIdentity(shard), scope).thenApply(value -> {
+        if (value.isPresent()) {
+          throw new IllegalStateException("legacy snapshot pin state requires explicit migration");
+        }
+        return null;
+      }));
+    }
+    return CompletableFuture.allOf(batch.toArray(CompletableFuture[]::new))
+        .thenCompose(ignored -> checkLegacyShards(end, scope));
+  }
+
+  private CompletableFuture<Void> createInitializationWitness(RequestScope scope) {
+    if (!active(scope)) return failed(inactive(scope));
+    ByteKey initial = SnapshotPinRecordCodec.encodeInitialization(
+        new SnapshotPinRecordCodec.Initialization(0, Optional.empty()));
+    CompletableFuture<SystemRecordStore.CreateResult> create;
+    try {
+      create = records.createIfAbsent(SystemRecordType.SNAPSHOT_PIN, INITIALIZATION_ID, initial, scope);
+    } catch (RuntimeException failure) {
+      return failed(failure);
+    }
+    if (create == null) return failed(new IllegalStateException("pin store returned no create future"));
+    return create.thenApply(result -> {
+      if (result == null) throw new IllegalStateException("pin store returned no create result");
+      return null;
+    });
+  }
+
+  private CompletableFuture<SnapshotPinManager> reserveInitialization(
+      StoredInitialization initialization, RequestScope scope) {
+    // Staging rows from abandoned attempts remain isolated; the durable count bounds them.
+    int attempts = initialization.value().attempts();
+    if (attempts >= MAX_INITIALIZATION_ATTEMPTS) {
+      return readConfiguration(scope).thenCompose(stored -> stored.isPresent()
+          ? finishOpen(stored.orElseThrow(), scope)
+          : failed(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT)));
+    }
+    ByteKey next = SnapshotPinRecordCodec.encodeInitialization(
+        new SnapshotPinRecordCodec.Initialization(attempts + 1, Optional.empty()));
+    return compareInitialization(initialization.encoded(), next, scope).thenCompose(updated -> {
+      if (!updated) return openRegistry(scope);
+      return stageOrAdopt(scope);
+    });
+  }
+
+  private CompletableFuture<SnapshotPinManager> stageOrAdopt(RequestScope scope) {
+    return readConfiguration(scope).thenCompose(stored -> {
+      if (stored.isPresent()) return finishOpen(stored.orElseThrow(), scope);
+      return readInitialization(scope).thenCompose(initialization -> {
+        if (initialization.isEmpty()
+            || initialization.orElseThrow().value().sealedRegistryId().isPresent()) {
+          return openRegistry(scope);
+        }
+        return initializeShards(0, scope)
+            .thenCompose(ignored -> ensureConfiguration(scope))
+            .thenCompose(selected -> finishOpen(selected, scope));
+      });
+    });
+  }
+
+  private CompletableFuture<SnapshotPinManager> finishOpen(
+      StoredConfiguration selected, RequestScope scope) {
+    // A manager is returned only after the witness seals the selected shard namespace.
+    var manager = new SnapshotPinManager(records, configuration, clock, selected.value().registryId());
+    return manager.readBoundary(scope)
+        .thenCompose(ignored -> manager.sealInitialization(scope, 0))
+        .thenCompose(ignored -> manager.confirmConfiguration(selected.encoded(), scope))
+        .thenCompose(ignored -> manager.readBoundary(scope))
+        .thenApply(ignored -> manager);
+  }
+
+  private CompletableFuture<Void> sealInitialization(RequestScope scope, int attempt) {
+    if (attempt >= MAX_CAS_ATTEMPTS) return failed(new BackendFailure(BackendFailure.Category.UNKNOWN));
+    return readInitialization(scope).thenCompose(initialization -> {
+      StoredInitialization stored = initialization.orElseThrow(
+          () -> new IllegalStateException("snapshot pin initialization witness is missing"));
+      Optional<ByteKey> sealed = stored.value().sealedRegistryId();
+      if (sealed.isPresent()) {
+        if (!sealed.orElseThrow().equals(registryId)) {
+          return failed(new IllegalStateException("snapshot pin initialization witness differs"));
+        }
+        return CompletableFuture.completedFuture(null);
+      }
+      if (stored.value().attempts() == 0) {
+        return failed(new IllegalStateException("snapshot pin configuration has no initialization attempt"));
+      }
+      ByteKey sealedValue = SnapshotPinRecordCodec.encodeInitialization(
+          new SnapshotPinRecordCodec.Initialization(stored.value().attempts(), Optional.of(registryId)));
+      return compareInitialization(stored.encoded(), sealedValue, scope)
+          .handle((updated, failure) -> new StoreResult<>(updated, failure))
+          .thenCompose(result -> resolveSeal(result, scope, attempt));
+    });
+  }
+
+  private CompletableFuture<Void> resolveSeal(StoreResult<Boolean> result, RequestScope scope,
+      int attempt) {
+    if (result.failure() != null) {
+      Throwable cause = CompletionFailures.unwrapCompletion(result.failure());
+      if (cause instanceof Error fatal) return failed(fatal);
+      if (!outcomeUnknown(cause)) return failed(cause);
+      return readInitialization(scope).handle((stored, readFailure) -> {
+        if (readFailure != null) throw unknownReadFailure(result.failure(), readFailure);
+        if (stored.isPresent()
+            && stored.orElseThrow().value().sealedRegistryId().filter(registryId::equals).isPresent()) {
+          return null;
+        }
+        throw new CompletionException(new BackendFailure(BackendFailure.Category.UNKNOWN, cause));
+      });
+    }
+    if (result.value() == null) return failed(new IllegalStateException("pin store returned no CAS result"));
+    return result.value() ? CompletableFuture.completedFuture(null) : sealInitialization(scope, attempt + 1);
+  }
+
+  private CompletableFuture<Boolean> compareInitialization(ByteKey expected, ByteKey replacement,
+      RequestScope scope) {
+    if (!active(scope)) return failed(inactive(scope));
+    CompletableFuture<Boolean> compare;
+    try {
+      compare = records.compareAndSet(SystemRecordType.SNAPSHOT_PIN, INITIALIZATION_ID,
+          Optional.of(expected), replacement, scope);
+    } catch (RuntimeException failure) {
+      return failed(failure);
+    }
+    if (compare == null) return failed(new IllegalStateException("pin store returned no CAS future"));
+    return compare.thenApply(updated -> {
+      if (updated == null) throw new IllegalStateException("pin store returned no CAS result");
+      return updated;
+    });
+  }
+
+  private CompletableFuture<Void> confirmConfiguration(ByteKey expected, RequestScope scope) {
+    return readConfiguration(scope).thenCompose(stored -> {
+      if (stored.isEmpty() || !stored.orElseThrow().encoded().equals(expected)) {
+        return failed(new IllegalStateException("snapshot pin configuration changed during open"));
+      }
+      return readInitialization(scope).thenApply(initialization -> {
+        if (initialization.isEmpty()
+            || initialization.orElseThrow().value().sealedRegistryId().filter(registryId::equals).isEmpty()) {
+          throw new IllegalStateException("snapshot pin initialization witness differs");
+        }
+        return null;
+      });
+    });
+  }
+
+  private CompletableFuture<StoredConfiguration> ensureConfiguration(RequestScope scope) {
+    if (!active(scope)) return failed(inactive(scope));
+    ByteKey expected = SnapshotPinRecordCodec.encodeConfiguration(configuration, registryId);
     CompletableFuture<SystemRecordStore.CreateResult> create;
     try {
       create = records.createIfAbsent(SystemRecordType.SNAPSHOT_PIN, CONFIGURATION_ID, expected, scope);
@@ -119,59 +308,72 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     }
     if (create == null) return failed(new IllegalStateException("pin store returned no create future"));
     return create.handle((result, failure) -> new StoreResult<>(result, failure))
-        .thenCompose(result -> resolveConfigurationCreate(result, scope));
+        .thenCompose(result -> resolveConfigurationCreate(result, expected, scope));
   }
 
-  private CompletableFuture<Boolean> readConfiguration(RequestScope scope) {
+  private CompletableFuture<Optional<StoredConfiguration>> readConfiguration(RequestScope scope) {
+    return readMarker(CONFIGURATION_ID, scope)
+        .thenApply(stored -> stored.map(this::decodeStoredConfiguration));
+  }
+
+  private StoredConfiguration decodeStoredConfiguration(ByteKey encoded) {
+    SnapshotPinRecordCodec.RegistryConfiguration decoded = SnapshotPinRecordCodec.decodeConfiguration(encoded);
+    if (!decoded.configuration().equals(configuration)) {
+      throw new IllegalStateException("snapshot pin geometry or lease differs from its durable format");
+    }
+    return new StoredConfiguration(decoded, encoded);
+  }
+
+  private CompletableFuture<Optional<StoredInitialization>> readInitialization(RequestScope scope) {
+    return readMarker(INITIALIZATION_ID, scope).thenApply(stored -> stored.map(encoded -> {
+      SnapshotPinRecordCodec.Initialization decoded = SnapshotPinRecordCodec.decodeInitialization(encoded);
+      if (decoded.attempts() > MAX_INITIALIZATION_ATTEMPTS
+          || decoded.attempts() == 0 && decoded.sealedRegistryId().isPresent()) {
+        throw new IllegalStateException("snapshot pin initialization count exceeds its bound");
+      }
+      return new StoredInitialization(decoded, encoded);
+    }));
+  }
+
+  private CompletableFuture<Optional<ByteKey>> readMarker(ByteKey identity, RequestScope scope) {
+    if (!active(scope)) return failed(inactive(scope));
     CompletableFuture<Optional<ByteKey>> read;
     try {
-      read = records.read(SystemRecordType.SNAPSHOT_PIN, CONFIGURATION_ID, scope);
+      read = records.read(SystemRecordType.SNAPSHOT_PIN, identity, scope);
     } catch (RuntimeException failure) {
       return failed(failure);
     }
-    if (read == null) return failed(new IllegalStateException("pin store returned no configuration read future"));
+    if (read == null) return failed(new IllegalStateException("pin store returned no marker read future"));
     return read.thenApply(stored -> {
-      if (stored == null) throw new IllegalStateException("pin store returned no configuration result");
-      if (stored.isEmpty()) return false;
-      validateConfiguration(stored.get());
-      return true;
+      if (stored == null) throw new IllegalStateException("pin store returned no marker result");
+      return stored;
     });
   }
 
-  private CompletableFuture<Void> resolveConfigurationCreate(
-      StoreResult<SystemRecordStore.CreateResult> result, RequestScope scope) {
+  private CompletableFuture<StoredConfiguration> resolveConfigurationCreate(
+      StoreResult<SystemRecordStore.CreateResult> result, ByteKey expected, RequestScope scope) {
     if (result.failure() == null && result.value() == null) {
       return failed(new IllegalStateException("pin store returned no create result"));
     }
     if (result.failure() == null
         && result.value() != SystemRecordStore.CreateResult.CONFLICT) {
-      return CompletableFuture.completedFuture(null);
+      return CompletableFuture.completedFuture(new StoredConfiguration(
+          SnapshotPinRecordCodec.decodeConfiguration(expected), expected));
     }
     if (result.failure() != null
         && CompletionFailures.unwrapCompletion(result.failure()) instanceof Error fatal) {
       return failed(fatal);
     }
-    return records.read(SystemRecordType.SNAPSHOT_PIN, CONFIGURATION_ID, scope)
-        .handle((stored, readFailure) -> validateStoredConfiguration(result, stored, readFailure));
-  }
-
-  private Void validateStoredConfiguration(StoreResult<SystemRecordStore.CreateResult> result,
-      Optional<ByteKey> stored, Throwable readFailure) {
-    if (readFailure != null) throw unknownReadFailure(result.failure(), readFailure);
-    ByteKey value = stored.orElseThrow(() -> new CompletionException(
-        new BackendFailure(BackendFailure.Category.UNKNOWN)));
-    validateConfiguration(value);
-    return null;
-  }
-
-  private void validateConfiguration(ByteKey value) {
-    SnapshotPinConfiguration persisted = SnapshotPinRecordCodec.decodeConfiguration(value);
-    if (!persisted.equals(configuration)) {
-      throw new IllegalStateException("snapshot pin geometry or lease differs from its durable format");
-    }
+    return readMarker(CONFIGURATION_ID, scope).handle((stored, readFailure) -> {
+      if (readFailure != null) throw unknownReadFailure(result.failure(), readFailure);
+      ByteKey value = stored.orElseThrow(() -> new CompletionException(
+          new BackendFailure(BackendFailure.Category.UNKNOWN)));
+      return decodeStoredConfiguration(value);
+    });
   }
 
   private CompletableFuture<Void> initializeShards(int start, RequestScope scope) {
+    if (!active(scope)) return failed(inactive(scope));
     if (start == configuration.shardCount()) return CompletableFuture.completedFuture(null);
     int end = Math.min(configuration.shardCount(), start + INITIALIZATION_BATCH);
     var batch = new ArrayList<CompletableFuture<Void>>(end - start);
@@ -181,32 +383,22 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
   }
 
   private CompletableFuture<Void> ensureShard(int shard, RequestScope scope) {
+    if (!active(scope)) return failed(inactive(scope));
     SnapshotPinShard empty = new SnapshotPinShard(shard, 0, 0, 0,
         java.util.Collections.nCopies(configuration.slotsPerShard(), SnapshotPinShard.Slot.empty()));
     ByteKey identity = shardIdentity(shard);
     ByteKey encoded = SnapshotPinRecordCodec.encodeShard(empty);
-    return records.createIfAbsent(SystemRecordType.SNAPSHOT_PIN, identity, encoded, scope)
-        .thenCompose(created -> {
-          if (created == null) return failed(new IllegalStateException("pin store returned no create result"));
-          if (created != SystemRecordStore.CreateResult.CONFLICT) return CompletableFuture.completedFuture(null);
-          return acceptExistingShard(shard, empty, scope);
-        });
-  }
-
-  private CompletableFuture<Void> acceptExistingShard(int shard, SnapshotPinShard empty,
-      RequestScope scope) {
-    return readShard(shard, scope).thenCompose(stored -> {
-      if (stored.shard().equals(empty)) return CompletableFuture.completedFuture(null);
-      return requireConfiguredRegistry(scope);
-    });
-  }
-
-  private CompletableFuture<Void> requireConfiguredRegistry(RequestScope scope) {
-    return readConfiguration(scope).thenApply(configured -> {
-      if (!configured) {
-        throw new IllegalStateException("unconfigured snapshot pin shard contains durable state");
-      }
-      return null;
+    CompletableFuture<SystemRecordStore.CreateResult> create;
+    try {
+      create = records.createIfAbsent(SystemRecordType.SNAPSHOT_PIN, identity, encoded, scope);
+    } catch (RuntimeException failure) {
+      return failed(failure);
+    }
+    if (create == null) return failed(new IllegalStateException("pin store returned no create future"));
+    return create.thenCompose(created -> {
+      if (created == null) return failed(new IllegalStateException("pin store returned no create result"));
+      if (created != SystemRecordStore.CreateResult.CONFLICT) return CompletableFuture.completedFuture(null);
+      return failed(new IllegalStateException("snapshot pin initialization shard conflicts"));
     });
   }
 
@@ -521,7 +713,12 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     }
   }
 
-  private static ByteKey shardIdentity(int shard) {
+  private ByteKey shardIdentity(int shard) {
+    return ByteKey.copyOf(ByteBuffer.allocate(Integer.BYTES * 2 + 16)
+        .putInt(2).put(registryId.bytes()).putInt(shard).array());
+  }
+
+  private static ByteKey legacyShardIdentity(int shard) {
     return ByteKey.copyOf(ByteBuffer.allocate(Integer.BYTES * 2).putInt(1).putInt(shard).array());
   }
 
@@ -587,6 +784,8 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
   }
 
   private record StoreResult<T>(T value, Throwable failure) {}
+  private record StoredConfiguration(SnapshotPinRecordCodec.RegistryConfiguration value, ByteKey encoded) {}
+  private record StoredInitialization(SnapshotPinRecordCodec.Initialization value, ByteKey encoded) {}
   private record StoredShard(SnapshotPinShard shard, ByteKey encoded) {}
   private record PinRequirement(long requiredRevision, long requiredSequence, ByteKey viewDigest,
       Optional<TransactionId> transactionId, Optional<ByteKey> rootIdentity,

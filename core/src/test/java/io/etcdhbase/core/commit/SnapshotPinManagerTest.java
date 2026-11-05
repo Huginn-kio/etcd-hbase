@@ -209,12 +209,13 @@ class SnapshotPinManagerTest {
       assertInstanceOf(IllegalStateException.class, mismatch);
       SnapshotPinManager manager = SnapshotPinManager.open(records, configuration, scope).join();
       assertEquals(0, manager.readBoundary(scope).join().safeRevision());
-      records.remove(SystemRecordType.SNAPSHOT_PIN, shardIdentity(1));
+      ByteKey missingShard = activeShardIdentity(records, 1);
+      records.remove(SystemRecordType.SNAPSHOT_PIN, missingShard);
       assertInstanceOf(IllegalStateException.class,
           failure(() -> manager.readBoundary(scope).join()));
       assertInstanceOf(IllegalStateException.class,
           failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
-      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, shardIdentity(1)),
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, missingShard),
           "reopen must not replace a missing configured shard with an empty row");
     }
   }
@@ -223,21 +224,148 @@ class SnapshotPinManagerTest {
   void interruptedInitialShardCreationCanResumeBeforeTheConfigurationReadyMarker() {
     var records = new MemoryRecords();
     var configuration = new SnapshotPinConfiguration(2, 2, Duration.ofSeconds(2));
-    records.failNextCreate(SystemRecordType.SNAPSHOT_PIN, shardIdentity(1));
+    records.failNextShardCreate(1);
 
     try (RequestScope scope = scope()) {
       assertInstanceOf(IllegalStateException.class,
           failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
-      assertTrue(records.contains(SystemRecordType.SNAPSHOT_PIN, shardIdentity(0)));
+      assertTrue(records.containsAnyShard(0));
       assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()),
           "the ready marker is written only after every initial shard exists");
-      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, shardIdentity(1)));
+      assertFalse(records.containsAnyShard(1));
 
       SnapshotPinManager reopened = SnapshotPinManager.open(records, configuration, scope).join();
       SnapshotGcBoundary boundary = reopened.readBoundary(scope).join();
       assertEquals(0, boundary.safeRevision());
       assertEquals(0, boundary.safeSequence());
       assertTrue(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()));
+    }
+  }
+
+  @Test
+  void unknownInitializationReservationCanBeRetried() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 1, Duration.ofSeconds(2));
+    records.loseNextCasReplyAfterWrite();
+
+    try (RequestScope scope = scope()) {
+      BackendFailure unknown = assertInstanceOf(BackendFailure.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertEquals(BackendFailure.Category.UNKNOWN, unknown.category());
+      assertEquals(0, SnapshotPinManager.open(records, configuration, scope).join()
+          .readBoundary(scope).join().safeRevision());
+    }
+  }
+
+  @Test
+  void unknownInitializationSealIsResolvedFromTheDurableWitness() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 1, Duration.ofSeconds(2));
+    records.loseNextSealReplyAfterWrite();
+
+    try (RequestScope scope = scope()) {
+      SnapshotPinManager manager = SnapshotPinManager.open(records, configuration, scope).join();
+      assertEquals(0, manager.readBoundary(scope).join().safeRevision());
+      assertEquals(0, SnapshotPinManager.open(records, configuration, scope).join()
+          .readBoundary(scope).join().safeRevision());
+    }
+  }
+
+  @Test
+  void definiteInitializationSealFailureKeepsItsCategory() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 1, Duration.ofSeconds(2));
+    records.failNextSealBeforeWrite(BackendFailure.Category.PERMISSION);
+
+    try (RequestScope scope = scope()) {
+      BackendFailure denied = assertInstanceOf(BackendFailure.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertEquals(BackendFailure.Category.PERMISSION, denied.category());
+      assertEquals(0, SnapshotPinManager.open(records, configuration, scope).join()
+          .readBoundary(scope).join().safeRevision());
+    }
+  }
+
+  @Test
+  void cancelledOpenDoesNotCreateInitializationState() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 1, Duration.ofSeconds(2));
+    RequestScope scope = scope();
+    scope.close();
+
+    BackendFailure cancelled = assertInstanceOf(BackendFailure.class,
+        failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+    assertEquals(BackendFailure.Category.CANCELLED, cancelled.category());
+    assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, initializationIdentity()));
+  }
+
+  @Test
+  void abandonedInitializationGenerationsAreBounded() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(2, 1, Duration.ofSeconds(2));
+
+    try (RequestScope scope = scope()) {
+      for (int attempt = 0; attempt < 32; attempt++) {
+        records.failNextShardCreate(1);
+        assertInstanceOf(IllegalStateException.class,
+            failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      }
+      assertEquals(32, records.countShardRows(0));
+      BackendFailure exhausted = assertInstanceOf(BackendFailure.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT, exhausted.category());
+      assertEquals(32, records.countShardRows(0));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()));
+    }
+  }
+
+  @Test
+  void legacyShardWithoutConfigurationFailsClosed() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 1, Duration.ofSeconds(2));
+    ByteKey legacy = ByteKey.copyOf(java.nio.ByteBuffer.allocate(Integer.BYTES * 2)
+        .putInt(1).putInt(0).array());
+
+    try (RequestScope scope = scope()) {
+      records.createIfAbsent(SystemRecordType.SNAPSHOT_PIN, legacy,
+          ByteKey.copyOf(new byte[] {1}), scope).join();
+      assertInstanceOf(IllegalStateException.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, initializationIdentity()));
+    }
+  }
+
+  @Test
+  void legacyConfigurationRequiresExplicitMigration() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 1, Duration.ofSeconds(2));
+    ByteKey legacy = ByteKey.copyOf(java.util.HexFormat.of().parseHex(
+        "5350433100000001000000010000000100000000000007d0"
+            + "eadf97e14e5dce29fc77ab614c34877e6e882de742275f7bc8a0fea717da58bc"));
+
+    try (RequestScope scope = scope()) {
+      records.createIfAbsent(SystemRecordType.SNAPSHOT_PIN, configurationIdentity(), legacy, scope).join();
+      assertInstanceOf(IllegalArgumentException.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertEquals(legacy, records.value(SystemRecordType.SNAPSHOT_PIN, configurationIdentity()));
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, initializationIdentity()));
+    }
+  }
+
+  @Test
+  void missingInitializationWitnessCannotReopenConfiguredShards() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 1, Duration.ofSeconds(2));
+    SnapshotPinManager manager = open(records, configuration, Clock.systemUTC());
+
+    try (RequestScope scope = scope()) {
+      manager.advanceRegistrationFloors(8, 4, scope).join();
+      records.remove(SystemRecordType.SNAPSHOT_PIN, initializationIdentity());
+      assertInstanceOf(IllegalStateException.class,
+          failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+      assertEquals(8, manager.readBoundary(scope).join().safeRevision());
+      assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, initializationIdentity()));
     }
   }
 
@@ -262,11 +390,88 @@ class SnapshotPinManagerTest {
   }
 
   @Test
+  void missingConfigurationAndShardCannotChangeAnActiveRegistryBeforeOpenFails() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(2, 2, Duration.ofSeconds(2));
+    SnapshotPinManager manager = open(records, configuration, Clock.systemUTC());
+
+    try (RequestScope scope = scope()) {
+      ReadViewPinRegistry.Pin pin = manager.register(stableView(5), scope).join();
+      try {
+        SnapshotGcBoundary before = manager.advanceRegistrationFloors(8, 4, scope).join();
+        int retainedIndex = before.protections().getFirst().shard();
+        ByteKey retainedShard = activeShardIdentity(records, retainedIndex);
+        ByteKey retainedValue = records.value(SystemRecordType.SNAPSHOT_PIN, retainedShard);
+        ByteKey missingShard = activeShardIdentity(records, 1 - retainedIndex);
+        records.remove(SystemRecordType.SNAPSHOT_PIN, configurationIdentity());
+        records.remove(SystemRecordType.SNAPSHOT_PIN, missingShard);
+
+        assertInstanceOf(IllegalStateException.class,
+            failure(() -> SnapshotPinManager.open(records, configuration, scope).join()));
+        assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, missingShard),
+            "a failed reopen must not recreate the missing shard before finding durable state");
+        assertEquals(retainedValue, records.value(SystemRecordType.SNAPSHOT_PIN, retainedShard));
+        assertInstanceOf(IllegalStateException.class, failure(() -> manager.readBoundary(scope).join()));
+        for (int attempt = 0; attempt < 8; attempt++) {
+          assertInstanceOf(IllegalStateException.class,
+              failure(() -> manager.register(stableView(5), scope).join()));
+        }
+      } finally {
+        pin.close();
+        pin.releaseCompletion().toCompletableFuture().join();
+      }
+    }
+  }
+
+  @Test
+  void lateInitialCreateCannotRestoreAMissingShardOfAnEstablishedRegistry() throws Exception {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(2, 2, Duration.ofSeconds(2));
+
+    try (RequestScope scope = scope()) {
+      records.pauseNextShardCreates(2);
+      CompletableFuture<SnapshotPinManager> delayed = SnapshotPinManager.open(records, configuration, scope);
+      try {
+        records.createEntered().get(5, TimeUnit.SECONDS);
+        SnapshotPinManager established = SnapshotPinManager.open(records, configuration, scope).join();
+        ReadViewPinRegistry.Pin pin = established.register(stableView(5), scope).join();
+        try {
+          SnapshotGcBoundary advanced = established.advanceRegistrationFloors(8, 4, scope).join();
+          assertEquals(5, advanced.safeRevision());
+          assertEquals(4, advanced.safeSequence());
+          int retainedIndex = advanced.protections().getFirst().shard();
+          ByteKey missingShard = activeShardIdentity(records, 1 - retainedIndex);
+          ByteKey retainedShard = activeShardIdentity(records, retainedIndex);
+          ByteKey retainedValue = records.value(SystemRecordType.SNAPSHOT_PIN, retainedShard);
+          records.remove(SystemRecordType.SNAPSHOT_PIN, missingShard);
+          records.releaseCreate();
+
+          assertFalse(records.contains(SystemRecordType.SNAPSHOT_PIN, missingShard),
+              "a delayed first-initialization write must not recreate the established shard");
+          assertEquals(retainedValue, records.value(SystemRecordType.SNAPSHOT_PIN, retainedShard));
+          assertInstanceOf(IllegalStateException.class,
+              failure(() -> established.readBoundary(scope).join()));
+          assertInstanceOf(IllegalStateException.class, failure(delayed::join));
+          for (int attempt = 0; attempt < 8; attempt++) {
+            assertInstanceOf(IllegalStateException.class,
+                failure(() -> established.register(stableView(5), scope).join()));
+          }
+        } finally {
+          pin.close();
+          pin.releaseCompletion().toCompletableFuture().join();
+        }
+      } finally {
+        records.releaseCreate();
+      }
+    }
+  }
+
+  @Test
   void corruptedDurableShardFailsClosed() {
     var records = new MemoryRecords();
     SnapshotPinManager manager = open(records,
         new SnapshotPinConfiguration(1, 2, Duration.ofSeconds(2)), Clock.systemUTC());
-    records.corrupt(SystemRecordType.SNAPSHOT_PIN, shardIdentity(0));
+    records.corrupt(SystemRecordType.SNAPSHOT_PIN, activeShardIdentity(records, 0));
 
     try (RequestScope scope = scope()) {
       assertInstanceOf(IllegalArgumentException.class,
@@ -350,7 +555,12 @@ class SnapshotPinManagerTest {
     private volatile CyclicBarrier readBarrier;
     private final AtomicInteger pausedReads = new AtomicInteger();
     private final AtomicBoolean loseCasReplyAfterWrite = new AtomicBoolean();
-    private volatile RecordKey nextCreateFailure;
+    private final AtomicBoolean loseSealReplyAfterWrite = new AtomicBoolean();
+    private BackendFailure.Category failSealBeforeWrite;
+    private Integer nextFailedShard;
+    private int pausedShardCreates;
+    private CompletableFuture<Void> createEntered;
+    private CompletableFuture<Void> releaseCreate;
     private volatile CompletableFuture<Void> casEntered;
     private volatile CompletableFuture<Void> releaseCas;
 
@@ -379,11 +589,22 @@ class SnapshotPinManagerTest {
     public int bucket(SystemRecordType type, ByteKey identity) { return 0; }
 
     @Override
-    public synchronized CompletableFuture<CreateResult> createIfAbsent(
+    public CompletableFuture<CreateResult> createIfAbsent(
         SystemRecordType type, ByteKey identity, ByteKey value, RequestScope scope) {
       RecordKey key = new RecordKey(type, identity);
-      if (key.equals(nextCreateFailure)) {
-        nextCreateFailure = null;
+      CompletableFuture<Void> release;
+      synchronized (this) {
+        if (pausedShardCreates == 0 || shardIndex(key) < 0) return createNow(key, value);
+        pausedShardCreates--;
+        release = releaseCreate;
+        if (pausedShardCreates == 0) createEntered.complete(null);
+      }
+      return release.thenCompose(ignored -> createNow(key, value));
+    }
+
+    private synchronized CompletableFuture<CreateResult> createNow(RecordKey key, ByteKey value) {
+      if (matchesShard(key, nextFailedShard)) {
+        nextFailedShard = null;
         return CompletableFuture.failedFuture(new IllegalStateException("synthetic create failure"));
       }
       ByteKey existing = rows.get(key);
@@ -414,8 +635,16 @@ class SnapshotPinManagerTest {
       RecordKey key = new RecordKey(type, identity);
       ByteKey existing = rows.get(key);
       if (!expected.equals(Optional.ofNullable(existing))) return CompletableFuture.completedFuture(false);
+      boolean seal = identity.equals(initializationIdentity())
+          && SnapshotPinRecordCodec.decodeInitialization(replacement).sealedRegistryId().isPresent();
+      if (seal && failSealBeforeWrite != null) {
+        BackendFailure.Category category = failSealBeforeWrite;
+        failSealBeforeWrite = null;
+        return CompletableFuture.failedFuture(new BackendFailure(category));
+      }
       rows.put(key, replacement);
-      if (loseCasReplyAfterWrite.compareAndSet(true, false)) {
+      boolean lostSeal = seal && loseSealReplyAfterWrite.compareAndSet(true, false);
+      if (loseCasReplyAfterWrite.compareAndSet(true, false) || lostSeal) {
         return CompletableFuture.failedFuture(
             new BackendFailure(BackendFailure.Category.UNKNOWN));
       }
@@ -428,6 +657,10 @@ class SnapshotPinManagerTest {
     }
 
     private void loseNextCasReplyAfterWrite() { loseCasReplyAfterWrite.set(true); }
+    private void loseNextSealReplyAfterWrite() { loseSealReplyAfterWrite.set(true); }
+    private synchronized void failNextSealBeforeWrite(BackendFailure.Category category) {
+      failSealBeforeWrite = category;
+    }
 
     private void pauseNextCompareAndSet() {
       casEntered = new CompletableFuture<>();
@@ -452,20 +685,59 @@ class SnapshotPinManagerTest {
       return rows.containsKey(new RecordKey(type, identity));
     }
 
-    private synchronized void failNextCreate(SystemRecordType type, ByteKey identity) {
-      nextCreateFailure = new RecordKey(type, identity);
+    private synchronized void failNextShardCreate(int shard) {
+      nextFailedShard = shard;
     }
+
+    private synchronized void pauseNextShardCreates(int count) {
+      pausedShardCreates = count;
+      createEntered = new CompletableFuture<>();
+      releaseCreate = new CompletableFuture<>();
+    }
+
+    private synchronized boolean containsAnyShard(int shard) {
+      return rows.keySet().stream().anyMatch(key -> matchesShard(key, shard));
+    }
+
+    private synchronized long countShardRows(int shard) {
+      return rows.keySet().stream().filter(key -> matchesShard(key, shard)).count();
+    }
+
+    private synchronized ByteKey value(SystemRecordType type, ByteKey identity) {
+      return java.util.Objects.requireNonNull(rows.get(new RecordKey(type, identity)));
+    }
+
+    private static boolean matchesShard(RecordKey key, Integer shard) {
+      return shard != null && shardIndex(key) == shard;
+    }
+
+    private static int shardIndex(RecordKey key) {
+      if (key.type() != SystemRecordType.SNAPSHOT_PIN) return -1;
+      byte[] identity = key.identity().bytes();
+      if (identity.length != Integer.BYTES * 2 + 16
+          || java.nio.ByteBuffer.wrap(identity).getInt() != 2) return -1;
+      return java.nio.ByteBuffer.wrap(identity).getInt(identity.length - Integer.BYTES);
+    }
+
+    private CompletableFuture<Void> createEntered() { return createEntered; }
+    private void releaseCreate() { releaseCreate.complete(null); }
   }
 
   private record RecordKey(SystemRecordType type, ByteKey identity) {}
 
-  private static ByteKey shardIdentity(int shard) {
-    return ByteKey.copyOf(java.nio.ByteBuffer.allocate(Integer.BYTES * 2)
-        .putInt(1).putInt(shard).array());
+  private static ByteKey activeShardIdentity(MemoryRecords records, int shard) {
+    ByteKey encoded = records.value(SystemRecordType.SNAPSHOT_PIN, configurationIdentity());
+    ByteKey registryId = SnapshotPinRecordCodec.decodeConfiguration(encoded).registryId();
+    return ByteKey.copyOf(java.nio.ByteBuffer.allocate(Integer.BYTES * 2 + 16)
+        .putInt(2).put(registryId.bytes()).putInt(shard).array());
   }
 
   private static ByteKey configurationIdentity() {
     return ByteKey.copyOf(new byte[] {0x53, 0x50, 0x49, 0x4e, 0x01, 0x00});
+  }
+
+  private static ByteKey initializationIdentity() {
+    return ByteKey.copyOf(new byte[] {0x53, 0x50, 0x49, 0x4e, 0x01, 0x01});
   }
 
   private static final class MutableClock extends Clock {

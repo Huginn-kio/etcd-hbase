@@ -14,27 +14,36 @@ import java.util.Optional;
 /** Strict bounded encoding for the immutable registry configuration and mutable shard rows. */
 final class SnapshotPinRecordCodec {
   private static final int CONFIG_MAGIC = 0x53504331;
+  private static final int INITIALIZATION_MAGIC = 0x53504931;
   private static final int SHARD_MAGIC = 0x53505331;
+  private static final int CONFIG_FORMAT_VERSION = 2;
   private static final int FORMAT_VERSION = 1;
+  private static final int REGISTRY_ID_BYTES = 16;
   private static final int CHECKSUM_BYTES = 32;
   private static final int MAX_ROOT_ID_BYTES = 1024;
   private static final int MAX_RECORD_BYTES = 2 * 1024 * 1024;
 
   private SnapshotPinRecordCodec() {}
 
-  static ByteKey encodeConfiguration(SnapshotPinConfiguration configuration) {
+  record RegistryConfiguration(SnapshotPinConfiguration configuration, ByteKey registryId) {}
+
+  record Initialization(int attempts, Optional<ByteKey> sealedRegistryId) {}
+
+  static ByteKey encodeConfiguration(SnapshotPinConfiguration configuration, ByteKey registryId) {
+    requireRegistryId(registryId);
     return checksum(out -> {
       out.writeInt(CONFIG_MAGIC);
-      out.writeInt(FORMAT_VERSION);
+      out.writeInt(CONFIG_FORMAT_VERSION);
       out.writeInt(configuration.shardCount());
       out.writeInt(configuration.slotsPerShard());
       out.writeLong(configuration.leaseMillis());
+      writeFixed(out, registryId, REGISTRY_ID_BYTES);
     });
   }
 
-  static SnapshotPinConfiguration decodeConfiguration(ByteKey encoded) {
+  static RegistryConfiguration decodeConfiguration(ByteKey encoded) {
     return decode(encoded, input -> {
-      if (input.readInt() != CONFIG_MAGIC || input.readInt() != FORMAT_VERSION) {
+      if (input.readInt() != CONFIG_MAGIC || input.readInt() != CONFIG_FORMAT_VERSION) {
         throw new IllegalArgumentException("unsupported snapshot pin configuration format");
       }
       int shards = input.readInt();
@@ -43,7 +52,38 @@ final class SnapshotPinRecordCodec {
       if (leaseMillis <= 0 || leaseMillis > Long.MAX_VALUE / 1_000_000L) {
         throw new IllegalArgumentException("invalid snapshot pin lease duration");
       }
-      return new SnapshotPinConfiguration(shards, slots, Duration.ofMillis(leaseMillis));
+      ByteKey registryId = readFixed(input, REGISTRY_ID_BYTES);
+      requireRegistryId(registryId);
+      return new RegistryConfiguration(
+          new SnapshotPinConfiguration(shards, slots, Duration.ofMillis(leaseMillis)), registryId);
+    });
+  }
+
+  static ByteKey encodeInitialization(Initialization initialization) {
+    if (initialization.attempts() < 0) throw new IllegalArgumentException("negative initialization count");
+    initialization.sealedRegistryId().ifPresent(SnapshotPinRecordCodec::requireRegistryId);
+    return checksum(out -> {
+      out.writeInt(INITIALIZATION_MAGIC);
+      out.writeInt(FORMAT_VERSION);
+      out.writeInt(initialization.attempts());
+      out.writeBoolean(initialization.sealedRegistryId().isPresent());
+      writeFixed(out, initialization.sealedRegistryId().orElse(ByteKey.empty()), REGISTRY_ID_BYTES);
+    });
+  }
+
+  static Initialization decodeInitialization(ByteKey encoded) {
+    return decode(encoded, input -> {
+      if (input.readInt() != INITIALIZATION_MAGIC || input.readInt() != FORMAT_VERSION) {
+        throw new IllegalArgumentException("unsupported snapshot pin initialization format");
+      }
+      int attempts = input.readInt();
+      boolean sealed = input.readBoolean();
+      ByteKey registryId = readFixed(input, REGISTRY_ID_BYTES);
+      if (attempts < 0 || (!sealed && !allZero(registryId))) {
+        throw new IllegalArgumentException("invalid snapshot pin initialization state");
+      }
+      if (sealed) requireRegistryId(registryId);
+      return new Initialization(attempts, sealed ? Optional.of(registryId) : Optional.empty());
     });
   }
 
@@ -155,6 +195,12 @@ final class SnapshotPinRecordCodec {
   private static boolean allZero(ByteKey value) {
     for (byte part : value.bytes()) if (part != 0) return false;
     return true;
+  }
+
+  private static void requireRegistryId(ByteKey registryId) {
+    if (registryId.length() != REGISTRY_ID_BYTES || allZero(registryId)) {
+      throw new IllegalArgumentException("invalid snapshot pin registry identity");
+    }
   }
 
   private static void writeFixed(DataOutputStream out, ByteKey value, int length) throws IOException {
