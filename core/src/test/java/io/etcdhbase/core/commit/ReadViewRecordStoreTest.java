@@ -212,7 +212,7 @@ class ReadViewRecordStoreTest {
           fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
       var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
       var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
-      var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192, 8192);
+      var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 8192, 8192);
       try (var account = budgets.admit("public", scope, reservation);
           var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(15));
           var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account),
@@ -247,7 +247,7 @@ class ReadViewRecordStoreTest {
           fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
       var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
       var budgets = new BudgetManager(limits, Map.of("public", limits), limits);
-      var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192, 8192);
+      var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 8192, 8192);
       try (var account = budgets.admit("public", scope, reservation);
           var scheduler = new ScanScheduler(budgets, Duration.ofSeconds(15));
           var cursor = SortedMergeCursor.values(view, scheduler.bind(view, account),
