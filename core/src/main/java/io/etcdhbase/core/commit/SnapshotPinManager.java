@@ -189,17 +189,25 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
         .thenCompose(created -> {
           if (created == null) return failed(new IllegalStateException("pin store returned no create result"));
           if (created != SystemRecordStore.CreateResult.CONFLICT) return CompletableFuture.completedFuture(null);
-          return readShard(shard, scope).thenCompose(stored -> {
-            if (stored.shard().equals(empty)) return CompletableFuture.completedFuture(null);
-            return readConfiguration(scope).thenApply(configured -> {
-              if (!configured) {
-                throw new IllegalStateException(
-                    "unconfigured snapshot pin shard contains durable state");
-              }
-              return null;
-            });
-          });
+          return acceptExistingShard(shard, empty, scope);
         });
+  }
+
+  private CompletableFuture<Void> acceptExistingShard(int shard, SnapshotPinShard empty,
+      RequestScope scope) {
+    return readShard(shard, scope).thenCompose(stored -> {
+      if (stored.shard().equals(empty)) return CompletableFuture.completedFuture(null);
+      return requireConfiguredRegistry(scope);
+    });
+  }
+
+  private CompletableFuture<Void> requireConfiguredRegistry(RequestScope scope) {
+    return readConfiguration(scope).thenApply(configured -> {
+      if (!configured) {
+        throw new IllegalStateException("unconfigured snapshot pin shard contains durable state");
+      }
+      return null;
+    });
   }
 
   private CompletableFuture<Pin> registerAttempt(int shard, ByteKey pinId,

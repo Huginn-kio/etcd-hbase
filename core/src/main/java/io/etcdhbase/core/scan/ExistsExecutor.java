@@ -2,6 +2,7 @@ package io.etcdhbase.core.scan;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
@@ -187,9 +188,7 @@ public final class ExistsExecutor implements AutoCloseable {
     return failure instanceof BackendFailure backend ? backend : new BackendFailure(BackendFailure.Category.UNKNOWN, failure);
   }
   private static Throwable unwrapPinFailure(Throwable failure) {
-    while (failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null) {
-      failure = failure.getCause();
-    }
+    failure = CompletionFailures.unwrapCompletion(failure);
     if (failure instanceof BackendFailure || failure instanceof Error) return failure;
     return new BackendFailure(BackendFailure.Category.UNKNOWN, failure);
   }
