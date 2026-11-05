@@ -12,13 +12,19 @@ J29.1 通过现有 invocation、manifest、control 行 CAS、发布解析、deci
 - 候选基线：单 key 64 B、16 key × 1024 B、大事务；metadata-only 模拟续租不改变 KV revision。
 - 读负载：8 个候选，均匀分布到 4 个 salt bucket；先部分物化，再由新 owner 恢复剩余版本，同时按每页 1 个 key 读取。HBase 页耗尽需要终止探测，因此共 12 次页请求、8 次 scanner 重开；测试 interlock 使其中 8 页与恢复物化交错，只调度恢复物化，不暂停读请求；此确定性时序不代替自然竞争或目标集群延迟。
 - 混合队列：4 个单 key KV、2 个 8 key 大事务、2 个 metadata-only 模拟续租；单活执行，最多连续处理 3 个业务事务后运行一个待处理续租。
-- HISTORY 和 NATIVE 复用相同 workload digest、JDK、MiniCluster 与 bucket 配置；协议内部行的完整成本仍计入。
+- HISTORY 和 NATIVE 复用相同 workload digest、JDK、MiniCluster 与 bucket 配置；协议内部操作和下述选定负载字节纳入观测，完整内部行成本未被计量。
 
 ## 3. 指标口径
 
-`j29-commit-baseline` 区分 invocation bind、准备、publish-and-finalize、finalization 与总耗时。finalization 是 publish-and-finalize 的子区间，二者不能相加。control CAS 与 system-record 操作记录应用层调用、冲突/未知结果、逻辑请求/响应字节和调用耗时；`j29-read` 的物理行、返回 Cell 字节和 scan RPC 数来自存储页计数，同时报告读页重开次数、恢复物化调用数、恢复进行中完成的页数及恢复总时长。队列等待从单线程执行器提交到任务开始计时，服务时间单独记录。
+`j29-commit-baseline` 区分 invocation bind、准备、publish-and-finalize、finalization 与总耗时。finalization 是 publish-and-finalize 的子区间，二者不能相加。control CAS 与 system-record 操作记录应用层调用、冲突/未知结果、选定负载字节和调用耗时。`inputBytes` 在调用开始时计入，`outputBytes` 只计成功结果中的选定字段：
 
-以下数据未由当前 MiniCluster instrumentation 可靠提供，保持为缺口：点请求的 HBase RPC/retry 数、服务端 scan counters、WAL/HFile IO 和 compaction 成本、JVM/direct-memory 高水位、恢复 reserve 的真实账本峰值、多进程故障接管成本。应用逻辑字节不能当作网络字节或 HBase Cell 字节。
+- `system.*.read` 输入计 0，输出计返回 value 长度；`create` 输入计 value 长度、输出计 0；`cas` 输入计存在的 expected value 与 replacement 长度之和、输出计 0。它们不单独计入 system-record identity 或 type。
+- `control.read` 输入计 0、输出计返回的 comparison token 长度；`initialize` 输入计编码后的初始状态长度；`cas` 输入计旧 comparison token 与编码后的替换状态长度。后两者输出均计 0。
+- `materialize.preflight` 和 `materialize.apply` 分别计候选记录的逻辑 key 与可选 value 长度，输出计 0；相同候选可在两个操作中分别计数，不代表去重后的数据量。
+
+这些值不包含未单独计数的 identity、物理行键、family/qualifier、Cell 元数据及其他请求字段，也不能当作完整请求或内部行大小。`j29-read` 的物理行、返回 Cell 字节和 scan RPC 数来自存储页计数，是不同口径；同时报告读页重开次数、恢复物化调用数、恢复进行中完成的页数及恢复总时长。队列等待从单线程执行器提交到任务开始计时，服务时间单独记录。
+
+以下数据未由当前 MiniCluster instrumentation 可靠提供，保持为缺口：点请求的 HBase RPC/retry 数、服务端 scan counters、WAL/HFile IO 和 compaction 成本、JVM/direct-memory 高水位、恢复 reserve 的真实账本峰值、多进程故障接管成本。选定应用负载字节不能当作网络字节或 HBase Cell 字节。
 
 ## 4. 原始分支观测（历史）
 
@@ -37,7 +43,7 @@ J29.1 通过现有 invocation、manifest、control 行 CAS、发布解析、deci
 
 本次请求边界采样的 heap 峰值为 HISTORY 89,176,024 B、NATIVE 58,268,784 B；direct buffer 分别为 12,592,074 B 和 12,592,070 B；线程数为 24 和 25。两个布局的候选逻辑负载峰值均为 16,710 B；扫描器峰值均为 1，pin 释放后活跃数均为 0（容量 32）。这些是稀疏请求边界采样值，不是连续 JVM 高水位。
 
-所有记录的 control CAS 均无冲突、未知结果或失败。每种布局均完成 26 次 control CAS、46 次 materialize apply；系统记录中的候选、manifest、decision、snapshot pin 操作和逻辑字节数见同目录 `summary.json`。本次仅运行一次且 HISTORY 先于 NATIVE 执行，结果不用于宣称某种物理布局更快。
+所有记录的 control CAS 均无冲突、未知结果或失败。每种布局均完成 26 次 control CAS、46 次 materialize apply；系统记录中的候选、manifest、decision、snapshot pin 操作和上述选定负载字节数见同目录 `summary.json`。本次仅运行一次且 HISTORY 先于 NATIVE 执行，结果不用于宣称某种物理布局更快。
 
 ## 5. 最新基线集成验证
 

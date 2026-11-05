@@ -19,7 +19,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Supplier;
 
-/** Application-port accounting for the public J29 MiniCluster workload. */
+/**
+ * Application-port operation and selected payload accounting for the public J29 workload.
+ * Byte counters omit system-record identities and other uncounted request/row fields; see the
+ * public cost report for the per-operation boundaries.
+ */
 final class M2CostMetrics {
   record Value(long calls, long succeeded, long conflicts, long unknown, long failed,
       long inputBytes, long outputBytes, long elapsedNanos) {}

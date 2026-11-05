@@ -15,6 +15,7 @@ SPEC.loader.exec_module(j29_report)
 SUITE = "io.etcdhbase.hbase.storage.M2CostBenchmarkIT"
 CASE = "reportsCommitReadAndSimulatedRenewalCostsForBothLayouts"
 MARKERS = ("j29-commit-baseline", "j29-read", "j29-queue", "j29-layout", "j29-resource")
+WORKLOAD_DIGEST = "a" * 64
 SOURCES = (
     "hbase/pom.xml",
     "hbase/src/test/java/io/etcdhbase/hbase/storage/M2CostBenchmarkIT.java",
@@ -34,7 +35,7 @@ SOURCES = (
 def measurement_lines():
     lines = []
     for layout in ("HISTORY", "NATIVE"):
-        common = {"layout": layout, "seed": 20261104, "workloadSha256": "fixture-digest"}
+        common = {"layout": layout, "seed": 20261104, "workloadSha256": WORKLOAD_DIGEST}
         rows = {
             "j29-commit-baseline": {"samples": [{"kind": kind} for kind in
                 ("SHORT_KV", "LARGE_KV", "SIMULATED_RENEWAL")]},
@@ -145,6 +146,23 @@ class J29ReportTest(unittest.TestCase):
     def test_rejects_duplicate_layout_measurement(self):
         lines = measurement_lines()
         self.write_report(lines=lines + [lines[0]])
+        self.assert_rejected()
+
+    def test_rejects_cross_marker_workload_mismatch(self):
+        for changed_marker in MARKERS:
+            with self.subTest(marker=changed_marker):
+                lines = []
+                for line in measurement_lines():
+                    marker, payload = line.split(" ", 1)
+                    row = json.loads(payload)
+                    if marker == changed_marker:
+                        row["workloadSha256"] = "b" * 64
+                    lines.append(f"{marker} {json.dumps(row)}")
+                self.write_report(lines=lines)
+                self.assert_rejected()
+
+    def test_rejects_workload_mismatch_between_layouts(self):
+        self.write_report(lines=history_read_lines(workloadSha256="b" * 64))
         self.assert_rejected()
 
     def test_rejects_read_contract_boundary_violations(self):

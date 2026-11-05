@@ -149,6 +149,12 @@ def validate_measurements(observed: dict[str, list[dict]]) -> dict[str, dict[str
         raise ValueError("one or more J29 measurements are missing")
     layouts = {"HISTORY", "NATIVE"}
     profiles = {marker: require_layout_rows(observed[marker], layouts, marker) for marker in required}
+    workload_identities = {
+        (row["seed"], row["workloadSha256"])
+        for rows in profiles.values() for row in rows.values()
+    }
+    if len(workload_identities) != 1:
+        raise ValueError("J29 measurements use different workload identities")
     environment_profiles = {
         (row.get("hbaseVersion"), row.get("java"), row.get("bucketCount"))
         for row in profiles["j29-layout"].values()
@@ -181,9 +187,15 @@ def build_summary(root: Path, counts: dict[str, int], profiles: dict[str, dict[s
             }
             for layout in sorted(profiles["j29-layout"])
         },
+        "byte_accounting": (
+            "Selected application payload lengths only, not complete request or row sizes. "
+            "System-record identities and types, physical row keys, cell overhead and other "
+            "uncounted fields are not separately included; see docs/testing/j29-public-cost-report.md "
+            "for per-operation inputs and outputs."
+        ),
         "verified": [
             "full M2 invocation, manifest preparation, control publication, archive, materialization and finalization path",
-            "application-port operation counts, observed CAS conflicts/unknown results, and logical request/response bytes",
+            "application-port operation counts, observed CAS conflicts/unknown results, and selected payload bytes",
             "durable pin open and selected-candidate point read while RecoveryManager finalizes a partial publication",
             "four-bucket one-row page reopen sequence deterministically overlapped with recovery materialization",
             "pin registration, renewals, completion, occupancy, scanner concurrency, and sampled JVM heap/direct/thread gauges",
