@@ -137,4 +137,18 @@ class BudgetManagerTest {
       assertEquals(0, manager.snapshot().reservedBytes());
     }
   }
+
+  @Test
+  void manifestCandidatePayloadConsumesTheRequestReadByteBudget() throws Exception {
+    var manager = new BudgetManager(GLOBAL, Map.of("alpha", GROUP), REQUEST);
+    var readLimits = new BudgetManager.ReadLimits(100, 1024, 100, 8, 8);
+    var candidateAndReturnedCost = new StoragePage.Cost(0, 512, 1,
+        Map.of(StoragePage.Observation.MANIFEST_CANDIDATE_BYTES, 513L));
+    try (var scope = RequestScope.withoutDeadline();
+        var account = manager.admit("alpha", scope, MEMORY, readLimits)) {
+      account.chargeCandidateRead(513);
+      assertThrows(BackendFailure.class, () -> account.charge(candidateAndReturnedCost),
+          "candidate payload and returned cells share the bounded request read-byte budget");
+    }
+  }
 }

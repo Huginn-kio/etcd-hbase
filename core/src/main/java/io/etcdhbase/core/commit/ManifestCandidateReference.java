@@ -32,4 +32,9 @@ public record ManifestCandidateReference(
         candidate.contentDigest(), candidate.valueDigest(), candidate.record().metadata().valueLength(),
         candidate.record().metadata().state() == StorageMetadata.State.TOMBSTONE);
   }
+
+  /** Matches StoredRecord.retainedBytes using authenticated key/value lengths before value I/O. */
+  public long retainedBytes() {
+    return Math.addExact(256L, Math.addExact(logicalKey.length(), tombstone ? 0L : valueLength));
+  }
 }

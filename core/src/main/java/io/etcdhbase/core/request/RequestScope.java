@@ -27,10 +27,13 @@ public final class RequestScope implements AutoCloseable {
       Collections.newSetFromMap(new IdentityHashMap<>());
   private final AtomicInteger cleanupFailureCount = new AtomicInteger();
   private final CompletableFuture<Void> cleanupCompletion = new CompletableFuture<>();
+  private final CompletableFuture<Void> physicalProducersCompletion = new CompletableFuture<>();
   private boolean cancelled;
   private boolean closed;
   private boolean cleanupFinished;
   private int pendingCleanup;
+  private int physicalProducers;
+  private Throwable physicalProducerFailure;
 
   public static RequestScope withTimeout(Duration timeout) {
     Objects.requireNonNull(timeout, "timeout");
@@ -123,6 +126,24 @@ public final class RequestScope implements AutoCloseable {
   /** Read-only completion of all resources registered before or during the closing batch. */
   public CompletionStage<Void> cleanupCompletion() {
     return cleanupCompletion.minimalCompletionStage();
+  }
+
+  /**
+   * Tracks a backend producer separately from its cancellable request result. Register it before
+   * starting the producer; the stage must settle only after that producer has actually stopped.
+   */
+  public void trackPhysicalProducer(CompletionStage<?> producerCompletion) {
+    Objects.requireNonNull(producerCompletion, "producerCompletion");
+    synchronized (lock) {
+      if (closed) return;
+      physicalProducers = Math.addExact(physicalProducers, 1);
+    }
+    producerCompletion.whenComplete((ignored, failure) -> physicalProducerFinished(failure));
+  }
+
+  /** Completes after the scope is closed and every producer registered before closure has stopped. */
+  public CompletionStage<Void> physicalProducersCompletion() {
+    return physicalProducersCompletion.minimalCompletionStage();
   }
 
   public boolean cancel() {
@@ -240,6 +261,8 @@ public final class RequestScope implements AutoCloseable {
   private boolean finish(boolean cancellation, Executor executor) {
     Objects.requireNonNull(executor, "cleanupExecutor");
     List<AutoCloseable> resources;
+    Throwable stoppedFailure = null;
+    boolean producersStopped;
     synchronized (lock) {
       if (closed) return false;
       cancelled = cancellation;
@@ -248,7 +271,10 @@ public final class RequestScope implements AutoCloseable {
       cleanupOrder.clear();
       // The batch sentinel keeps completion pending until the cleanup task itself has run.
       pendingCleanup = resources.size() + 1;
+      producersStopped = physicalProducers == 0;
+      if (producersStopped) stoppedFailure = physicalProducerFailure;
     }
+    if (producersStopped) completePhysicalProducers(stoppedFailure);
     Runnable cleanup = () -> closeBatch(resources);
     try {
       executor.execute(cleanup);
@@ -258,6 +284,27 @@ public final class RequestScope implements AutoCloseable {
       throw rejected;
     }
     return true;
+  }
+
+  private void physicalProducerFinished(Throwable failure) {
+    Throwable stoppedFailure = null;
+    boolean producersStopped;
+    synchronized (lock) {
+      if (physicalProducers <= 0) throw new IllegalStateException("physical producer count underflow");
+      if (failure != null) {
+        if (physicalProducerFailure == null) physicalProducerFailure = failure;
+        else if (physicalProducerFailure != failure) physicalProducerFailure.addSuppressed(failure);
+      }
+      physicalProducers--;
+      producersStopped = closed && physicalProducers == 0;
+      if (producersStopped) stoppedFailure = physicalProducerFailure;
+    }
+    if (producersStopped) completePhysicalProducers(stoppedFailure);
+  }
+
+  private void completePhysicalProducers(Throwable failure) {
+    if (failure == null) physicalProducersCompletion.complete(null);
+    else physicalProducersCompletion.completeExceptionally(failure);
   }
 
   private void closeBatch(List<AutoCloseable> resources) {

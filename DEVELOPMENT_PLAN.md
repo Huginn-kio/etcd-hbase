@@ -697,7 +697,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J14/J20–J24。
   - 完成标准：默认一致读及历史 Range 在同一逻辑视图完成，处理已发布未收尾状态；两种候选均验证失败版本隔离、删除/重建、列间元数据一致性及历史 key 枚举。
   - 验证层次：L1 存储/内核。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=公开实现与两种布局的本地 MiniCluster 验证已交付；跨副本持久 pin/GC 竞争及真实目标验收待补，最终历史布局等待 J52.1；负责人=Codex；完成日期=2026-11-04；PR/commit=[PR #29](https://github.com/Reidddddd/etcd-hbase/pull/29)；验证报告=[J25 一致读视图报告](docs/reports/m2-j25-read-view.md)；评审人/结论=`Reidddddd`（`reidchan@apache.org`）/待评审。
 
 - [ ] **J26｜跨副本 SnapshotPinManager 与 GC 边界接口**
   - 依赖：J25。

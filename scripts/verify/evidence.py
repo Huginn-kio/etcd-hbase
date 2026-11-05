@@ -10,7 +10,8 @@ GO_PACKAGES = {"cmd/m0driver", "cmd/native-etcd", "internal/client", "internal/c
 GO_MODULE = "github.com/Reidddddd/etcd-hbase/testkit/go/"
 
 
-def java_reports(root, required, modules=JAVA_MODULES):
+def java_reports(root, required, modules=JAVA_MODULES, required_cases=None):
+    required_cases = required_cases or {}
     paths = [path for module in modules for kind in ("surefire-reports", "failsafe-reports")
              for path in sorted((root / module / "target" / kind).glob("TEST-*.xml"))]
     suites = {}
@@ -23,9 +24,13 @@ def java_reports(root, required, modules=JAVA_MODULES):
             raise ValueError("duplicate, empty, failed or skipped Java suite")
         if len(cases) != counts["tests"] or any(case.find(tag) is not None for case in cases for tag in ("failure", "error", "skipped")):
             raise ValueError("Java testcase evidence contradicts counters")
+        if not set(required_cases.get(name, ())).issubset({case.get("name") for case in cases}):
+            raise ValueError("required Java testcase evidence is missing")
         suites[name] = counts
     if not set(required).issubset(suites):
         raise ValueError("required Java suite evidence is missing")
+    if not set(required_cases).issubset(suites):
+        raise ValueError("required Java testcase suite evidence is missing")
     return paths, suites
 
 

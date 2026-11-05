@@ -12,7 +12,7 @@ import java.util.concurrent.CompletionStage;
 
 /** Single ledger for global/group/request admission, work and reserved memory lanes. */
 public final class BudgetManager {
-  public enum Memory { HEAD, PAGE, IO, OUTPUT }
+  public enum Memory { HEAD, PAGE, IO, OUTPUT, CANDIDATE }
 
   public record Limits(int requests, int queued, int operations, int scanners, int cleanup,
       long queuedBytes, long memoryBytes) {
@@ -22,17 +22,24 @@ public final class BudgetManager {
     }
   }
 
-  public record Reservation(long heads, long page, long io, long output) {
+  public record Reservation(long heads, long page, long io, long output, long candidates) {
+    /** Existing reservations fail closed for candidate buffers until callers reserve them. */
+    public Reservation(long heads, long page, long io, long output) {
+      this(heads, page, io, output, 0);
+    }
+
     public Reservation {
-      if (heads < 0 || page < 1 || io < 1 || output < 0) throw new IllegalArgumentException("invalid memory reservation");
+      if (heads < 0 || page < 1 || io < 1 || output < 0 || candidates < 0) {
+        throw new IllegalArgumentException("invalid memory reservation");
+      }
       try {
-        Math.addExact(Math.addExact(heads, page), Math.addExact(io, output));
+        Math.addExact(Math.addExact(Math.addExact(heads, page), Math.addExact(io, output)), candidates);
       } catch (ArithmeticException overflow) {
         throw new IllegalArgumentException("memory reservation overflow", overflow);
       }
     }
 
-    public long total() { return heads + page + io + output; }
+    public long total() { return heads + page + io + output + candidates; }
 
     long capacity(Memory kind) {
       return switch (kind) {
@@ -40,6 +47,7 @@ public final class BudgetManager {
         case PAGE -> page;
         case IO -> io;
         case OUTPUT -> output;
+        case CANDIDATE -> candidates;
       };
     }
   }
@@ -58,6 +66,7 @@ public final class BudgetManager {
       long cleanup, long queuedBytes, long reservedBytes, long allocatedBytes, long retiredScanners,
       long peakScanners, long peakAllocatedBytes) {}
 
+  /** Per-request read work; cellBytes includes returned cells and fetched manifest candidates. */
   public record ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages, long pointOperations) {
     public ReadLimits {
       if (physicalRows < 1 || cellBytes < 1 || scanRpcCalls < 1 || pages < 1 || pointOperations < 1) throw new IllegalArgumentException("invalid read limits");
@@ -148,7 +157,7 @@ public final class BudgetManager {
     private boolean closed;
     private boolean admissionReleased;
     private final ReadLimits readLimits;
-    private long physicalRows, cellBytes, scanRpcCalls, pages;
+    private long physicalRows, cellBytes, candidateBytes, reportedCandidateBytes, scanRpcCalls, pages;
     private long pointReads;
     private boolean readExhausted;
     private final CompletableFuture<Void> drained = new CompletableFuture<>();
@@ -165,6 +174,7 @@ public final class BudgetManager {
     String groupId() { return groupId; }
     private BudgetManager owner() { return BudgetManager.this; }
     RequestScope scope() { return scope; }
+    public boolean belongsTo(RequestScope expectedScope) { return scope == expectedScope; }
     public Reservation reservation() { return reservation; }
     public CompletionStage<Void> termination() { return drained.minimalCompletionStage(); }
     public long pointReads() { synchronized (BudgetManager.this) { return pointReads; } }
@@ -178,6 +188,20 @@ public final class BudgetManager {
         pointReads++;
       }
     }
+
+    /** Charges a candidate before its value is fetched so limits bound attempted bytes too. */
+    public void chargeCandidateRead(long bytes) throws BackendFailure {
+      if (bytes < 0) throw new IllegalArgumentException("negative candidate read bytes");
+      synchronized (BudgetManager.this) {
+        requireActive();
+        if (bytes > readLimits.cellBytes() - cellBytes) {
+          readExhausted = true;
+          throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+        }
+        cellBytes = Math.addExact(cellBytes, bytes);
+        candidateBytes = Math.addExact(candidateBytes, bytes);
+      }
+    }
     public boolean isActive() {
       synchronized (BudgetManager.this) { return !closed && !readExhausted && !scope.isClosed() && !scope.isDeadlineExceeded(); }
     }
@@ -185,6 +209,8 @@ public final class BudgetManager {
     void charge(StoragePage.Cost cost) throws BackendFailure {
       synchronized (BudgetManager.this) {
         requireActive();
+        long pageCandidateBytes = cost.observations().getOrDefault(
+            StoragePage.Observation.MANIFEST_CANDIDATE_BYTES, 0L);
         boolean exceeds = cost.physicalRows() > readLimits.physicalRows() - physicalRows
             || cost.returnedCellBytes() > readLimits.cellBytes() - cellBytes
             || cost.scanRpcCalls() > readLimits.scanRpcCalls() - scanRpcCalls || pages >= readLimits.pages();
@@ -192,8 +218,12 @@ public final class BudgetManager {
           readExhausted = true;
           throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
         }
+        if (pageCandidateBytes > candidateBytes - reportedCandidateBytes) {
+          throw new IllegalStateException("manifest page reports candidate bytes that were not fetched");
+        }
         physicalRows += cost.physicalRows();
-        cellBytes += cost.returnedCellBytes();
+        cellBytes = Math.addExact(cellBytes, cost.returnedCellBytes());
+        reportedCandidateBytes = Math.addExact(reportedCandidateBytes, pageCandidateBytes);
         scanRpcCalls += cost.scanRpcCalls();
         pages++;
       }

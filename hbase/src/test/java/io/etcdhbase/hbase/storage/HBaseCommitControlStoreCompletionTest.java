@@ -30,9 +30,11 @@ class HBaseCommitControlStoreCompletionTest {
     assertFalse(hbaseCas.isDone());
     assertFalse(dependent.isDone());
     assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+    assertFalse(scope.physicalProducersCompletion().toCompletableFuture().isDone());
 
     assertTrue(hbaseCas.complete(true));
     assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+    assertTrue(scope.physicalProducersCompletion().toCompletableFuture().isDone());
     BackendFailure stillUnknown = assertInstanceOf(BackendFailure.class,
         assertThrows(CompletionException.class, request::join).getCause());
     assertEquals(BackendFailure.Category.CANCELLED, stillUnknown.category());
