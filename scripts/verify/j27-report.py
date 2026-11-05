@@ -8,18 +8,29 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
+from evidence import java_reports
 
-def report_counts(path: Path, expected_tests: int, required_cases: set[str]) -> dict[str, int]:
-    if not path.is_file():
-        raise ValueError(f"missing test report: {path.name}")
-    suite = ET.parse(path).getroot()
-    counts = {key: int(suite.get(key, "0")) for key in ("tests", "failures", "errors", "skipped")}
-    cases = {case.get("name") for case in suite.iter("testcase")}
-    if counts != {"tests": expected_tests, "failures": 0, "errors": 0, "skipped": 0}:
-        raise ValueError(f"test report did not pass exactly: {path.name}")
-    if not required_cases.issubset(cases):
-        raise ValueError(f"required cases are missing: {path.name}")
-    return counts
+RECOVERY_TEST = "io.etcdhbase.core.commit.RecoveryManagerTest"
+FINALIZATION_TEST = "io.etcdhbase.core.commit.CommitFinalizationServiceTest"
+RECOVERY_IT = "io.etcdhbase.hbase.storage.M2RecoveryIT"
+REQUIRED_CASES = {
+    RECOVERY_TEST: {
+        "takesOverSelectedSlotAndRepeatedStartupDoesNotAllocateAnotherRevision",
+        "recoveryFinalizesSelectedWorkAfterCallerResultWindowCloses",
+        "recoveryResumesAfterTheDecisionArchiveWasPersisted",
+        "sealedButUnpublishedWorkStaysPrivateAfterOldOwnerIsFenced",
+        "doesNotPreemptAnotherLiveOwnerOrScanInvocations",
+        "rejectsProfileMismatchBeforeClaimingAnOwnerEpoch",
+        "missingSelectedInvocationFailsClosedAfterOwnerFence",
+    },
+    FINALIZATION_TEST: {
+        "archivesAndFinalizesSelectedMetadataOnlyCommitIdempotently",
+        "materializesNonEmptySealedPlanBeforeAdvancingFinalizedSequence",
+        "failedMaterializationDoesNotAdvanceFinalizedSequence",
+        "conflictingDecisionArchiveCannotAdvanceFinalizedSequence",
+    },
+    RECOVERY_IT: {"freshManagerArchivesAndFinalizesSelectedMetadataOnlyPublication"},
+}
 
 
 def module_counts(directory: Path) -> dict[str, int]:
@@ -39,32 +50,15 @@ def collect(root: Path, output: Path) -> None:
     core_dir = root / "core/target/surefire-reports"
     hbase_dir = root / "hbase/target/surefire-reports"
     failsafe = root / "hbase/target/failsafe-reports"
-    recovery = report_counts(
-        core_dir / "TEST-io.etcdhbase.core.commit.RecoveryManagerTest.xml",
-        7,
-        {
-            "takesOverSelectedSlotAndRepeatedStartupDoesNotAllocateAnotherRevision",
-            "recoveryFinalizesSelectedWorkAfterCallerResultWindowCloses",
-            "recoveryResumesAfterTheDecisionArchiveWasPersisted",
-            "sealedButUnpublishedWorkStaysPrivateAfterOldOwnerIsFenced",
-            "doesNotPreemptAnotherLiveOwnerOrScanInvocations",
-            "rejectsProfileMismatchBeforeClaimingAnOwnerEpoch",
-            "missingSelectedInvocationFailsClosedAfterOwnerFence",
-        },
-    )
-    finalization = report_counts(
-        core_dir / "TEST-io.etcdhbase.core.commit.CommitFinalizationServiceTest.xml",
-        2,
-        {
-            "archivesAndFinalizesSelectedMetadataOnlyCommitIdempotently",
-            "conflictingDecisionArchiveCannotAdvanceFinalizedSequence",
-        },
-    )
-    integration = report_counts(
-        failsafe / "TEST-io.etcdhbase.hbase.storage.M2RecoveryIT.xml",
-        1,
-        {"freshManagerArchivesAndFinalizesSelectedMetadataOnlyPublication"},
-    )
+    for directory, suite in ((core_dir, RECOVERY_TEST), (core_dir, FINALIZATION_TEST),
+                             (failsafe, RECOVERY_IT)):
+        if not (directory / f"TEST-{suite}.xml").is_file():
+            raise ValueError(f"required Java suite is in the wrong location: {suite}")
+    _, suites = java_reports(root, set(REQUIRED_CASES), modules=("core", "hbase"),
+                             required_cases=REQUIRED_CASES)
+    recovery = suites[RECOVERY_TEST]
+    finalization = suites[FINALIZATION_TEST]
+    integration = suites[RECOVERY_IT]
     stdout = "\n".join(
         element.text or ""
         for element in ET.parse(failsafe / "TEST-io.etcdhbase.hbase.storage.M2RecoveryIT.xml").getroot().iter("system-out")
@@ -81,6 +75,7 @@ def collect(root: Path, output: Path) -> None:
         "hbase/pom.xml",
         "hbase/src/test/java/io/etcdhbase/hbase/storage/M2RecoveryIT.java",
         "scripts/verify/j27-report.py",
+        "scripts/verify/test_j27_report.py",
         "scripts/verify/j27.sh",
     ]
     patch = subprocess.run(

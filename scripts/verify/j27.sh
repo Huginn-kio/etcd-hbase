@@ -7,6 +7,8 @@ cd "$ROOT"
 REPORT="$ROOT/.artifacts/m2/j27/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "$REPORT"
 
+python3 scripts/verify/test_j27_report.py
+
 scripts/dev/mvn21.sh -B -ntp -pl hbase -am clean verify -Pj27-hbase-local \
   > "$REPORT/maven.log" 2>&1 || {
     tail -n 100 "$REPORT/maven.log" >&2
