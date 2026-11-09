@@ -148,7 +148,9 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
 
   private void requireTypeSupported(SystemRecordType type) {
     Objects.requireNonNull(type, "type");
-    if ((type == SystemRecordType.RESULT || type == SystemRecordType.TABLE_GROUP_IDENTITY)
+    // RESULT marks the M3 system-record capability, including its private workset pages.
+    if ((type == SystemRecordType.RESULT || type == SystemRecordType.TABLE_GROUP_IDENTITY
+        || type == SystemRecordType.WORKSET)
         && !resultsSupported) {
       throw new IllegalStateException("system table does not declare M3 record capability");
     }

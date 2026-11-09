@@ -10,7 +10,7 @@ import java.util.List;
 import java.util.Objects;
 import mvccpb.Kv;
 
-/** Projects a verified flat transaction result with the actual serving member's outer header. */
+/** Projects a verified transaction tree with the actual serving member's outer header. */
 public final class TxnResponseMapper {
   private TxnResponseMapper() {}
 
@@ -23,26 +23,60 @@ public final class TxnResponseMapper {
         || txn.header().revision() != revision) {
       throw new IllegalArgumentException("transaction result or serving identity differs");
     }
+    boolean changes = containsSelectedPut(command, txn);
+    if (changes != changed) throw new IllegalArgumentException("transaction publication differs from its result");
+    long baseRevision = revision - (changes ? 1 : 0);
+    if (baseRevision <= 0) throw new IllegalArgumentException("invalid transaction base revision");
+    var response = Rpc.TxnResponse.newBuilder().setSucceeded(txn.succeeded())
+        .setHeader(ResponseHeaderFactory.create(clusterId, memberId, revision, 0));
+    appendChildren(command, txn, new RevisionCursor(baseRevision, revision), response);
+    return response.build();
+  }
+
+  private static boolean containsSelectedPut(TxnCommand command, ResultNode.Txn result) {
+    List<TxnCommand.Operation> selected = result.succeeded() ? command.success() : command.failure();
+    if (selected.size() != result.responses().size()) {
+      throw new IllegalArgumentException("transaction result does not match its selected branch");
+    }
+    boolean changed = false;
+    for (int index = 0; index < selected.size(); index++) {
+      TxnCommand.Operation operation = selected.get(index);
+      ResultNode child = result.responses().get(index);
+      if (operation instanceof TxnCommand.Put) changed = true;
+      else if (operation instanceof TxnCommand.Nested nested) {
+        if (!(child instanceof ResultNode.Txn branch)) {
+          throw new IllegalArgumentException("nested transaction response differs from its request");
+        }
+        changed |= containsSelectedPut(nested.command(), branch);
+      }
+    }
+    return changed;
+  }
+
+  private static void appendChildren(TxnCommand command, ResultNode.Txn txn,
+      RevisionCursor revisions, Rpc.TxnResponse.Builder response) {
     List<TxnCommand.Operation> selected = txn.succeeded() ? command.success() : command.failure();
     if (selected.size() != txn.responses().size()) {
       throw new IllegalArgumentException("transaction result does not match its selected branch");
     }
-    boolean changes = selected.stream().anyMatch(TxnCommand.Put.class::isInstance);
-    if (changes != changed) throw new IllegalArgumentException("transaction publication differs from its result");
-    long currentRevision = revision - (changes ? 1 : 0);
-    if (currentRevision <= 0) throw new IllegalArgumentException("invalid transaction base revision");
-    var response = Rpc.TxnResponse.newBuilder().setSucceeded(txn.succeeded())
-        .setHeader(ResponseHeaderFactory.create(clusterId, memberId, revision, 0));
     for (int index = 0; index < selected.size(); index++) {
-      TxnCommand.Operation operation = selected.get(index);
-      if (operation instanceof TxnCommand.Put) currentRevision = revision;
-      response.addResponses(project(operation, txn.responses().get(index), currentRevision));
+      response.addResponses(project(selected.get(index), txn.responses().get(index), revisions));
     }
-    return response.build();
   }
 
-  private static Rpc.ResponseOp project(TxnCommand.Operation operation, ResultNode result, long revision) {
-    if (!result.header().present() || result.header().revision() != revision) {
+  private static Rpc.ResponseOp project(TxnCommand.Operation operation, ResultNode result,
+      RevisionCursor revisions) {
+    if (operation instanceof TxnCommand.Nested nested && result instanceof ResultNode.Txn child) {
+      if (!child.header().present() || child.header().revision() != 0) {
+        throw new IllegalArgumentException("nested transaction header differs from the native response");
+      }
+      var response = Rpc.TxnResponse.newBuilder().setHeader(Rpc.ResponseHeader.getDefaultInstance())
+          .setSucceeded(child.succeeded());
+      appendChildren(nested.command(), child, revisions, response);
+      return Rpc.ResponseOp.newBuilder().setResponseTxn(response).build();
+    }
+    if (operation instanceof TxnCommand.Put) revisions.current = revisions.written;
+    if (!result.header().present() || result.header().revision() != revisions.current) {
       throw new IllegalArgumentException("transaction child response has an invalid revision");
     }
     Rpc.ResponseHeader header = Rpc.ResponseHeader.newBuilder().setRevision(result.header().revision()).build();
@@ -65,6 +99,15 @@ public final class TxnResponseMapper {
       return Rpc.ResponseOp.newBuilder().setResponsePut(response).build();
     }
     throw new IllegalArgumentException("transaction response operation differs from its request");
+  }
+
+  private static final class RevisionCursor {
+    private long current;
+    private final long written;
+    private RevisionCursor(long current, long written) {
+      this.current = current;
+      this.written = written;
+    }
   }
 
   private static Kv.KeyValue project(StoredRecord record) {

@@ -20,7 +20,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
-/** Persists a flat transaction's original result before sealing it or completing it unchanged. */
+/** Persists the original transaction result before sealing it or completing it unchanged. */
 public final class TxnCommitPreparation {
   public sealed interface Prepared permits Sealed, NoChanges {}
 
@@ -69,10 +69,11 @@ public final class TxnCommitPreparation {
     Objects.requireNonNull(invocation, "invocation");
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(account, "account");
-    boolean changed = !evaluation.candidates().isEmpty();
+    boolean changed = evaluation.candidateCount() > 0;
     if (invocation.state() != InvocationBinding.State.PREPARING || !account.belongsTo(scope)
         || !evaluation.belongsTo(invocation, scope)
-        || evaluation.candidates().size() != evaluation.events().size()
+        || evaluation.eventCount() < evaluation.candidateCount()
+        || !changed && evaluation.eventCount() != 0
         || !(evaluation.result().root() instanceof ResultNode.Txn txn)
         || !txn.header().present() || txn.header().revision() != invocation.baseRevision() + (changed ? 1 : 0)) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("transaction result and invocation differ"));
@@ -99,8 +100,8 @@ public final class TxnCommitPreparation {
           return invocations.completeWithoutChanges(invocation, reference, catalog,
               evaluation::finishRead, scope).thenApply(NoChanges::new);
         }
-        return manifests.prepareWithResult(invocation, evaluation.candidates().iterator(),
-            evaluation.events().iterator(), reference, catalog, evaluation::finishRead, scope)
+        return manifests.prepareWithResult(invocation, evaluation.candidates(),
+            evaluation.events(), reference, catalog, evaluation::finishRead, scope)
             .thenCompose(manifest -> invocations.transition(invocation,
                 invocation.seal(manifest.systemIdentity()), scope)
                 .thenApply(sealed -> new Sealed(sealed, manifest)));

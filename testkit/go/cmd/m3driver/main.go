@@ -114,8 +114,11 @@ func executeScenario(ctx context.Context, options options, suiteID string, outpu
 	defer cancel()
 	if options.nativeData != "" {
 		runNative := scenario.RunM3NativePut
-		if suiteID == "m3-txn-v1" {
+		switch suiteID {
+		case "m3-txn-v1":
 			runNative = scenario.RunM3NativeTxn
+		case "m3-nested-txn-v1":
+			runNative = scenario.RunM3NativeNestedTxn
 		}
 		if err := runNative(requestContext, options.nativeData, options.prefix, output); err != nil {
 			return err
@@ -127,8 +130,11 @@ func executeScenario(ctx context.Context, options options, suiteID string, outpu
 		}
 		defer func() { runErr = errors.Join(runErr, connection.Close()) }()
 		runScenario := scenario.RunM3Put
-		if suiteID == "m3-txn-v1" {
+		switch suiteID {
+		case "m3-txn-v1":
 			runScenario = scenario.RunM3Txn
+		case "m3-nested-txn-v1":
+			runScenario = scenario.RunM3NestedTxn
 		}
 		if err := runScenario(requestContext, connection, options.scope, options.prefix, output); err != nil {
 			return err

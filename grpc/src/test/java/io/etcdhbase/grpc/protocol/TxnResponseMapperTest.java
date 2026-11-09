@@ -48,6 +48,28 @@ class TxnResponseMapperTest {
   }
 
   @Test
+  void projectsNestedTxnHeaderAndOrderedChildrenWithoutInventingIdentity() {
+    var childCommand = new TxnCommand(List.of(), List.of(new TxnCommand.PointRange(KEY)), List.of());
+    var outerCommand = new TxnCommand(List.of(), List.of(
+        new TxnCommand.Put(new PutCommand(KEY, new byte[] {1}, 0, false, false, false)),
+        new TxnCommand.Nested(childCommand)), List.of());
+    var current = StoredRecord.live(KEY,
+        new StorageMetadata(3, 3, 1, 0, StorageMetadata.State.LIVE, 1), new byte[] {1});
+    var tree = new ResultTree(new ResultNode.Txn(0, header(3), true, List.of(
+        new ResultNode.Put(0, header(3), KEY, Optional.empty()),
+        new ResultNode.Txn(1, header(0), true,
+            List.of(new ResultNode.Range(0, header(3), List.of(current), 1, false))))));
+    var outer = TxnResponseMapper.toWire(outerCommand, tree, 3, true, 1, 2);
+    var child = outer.getResponses(1).getResponseTxn();
+    assertTrue(child.hasHeader());
+    assertEquals(0, child.getHeader().getRevision());
+    assertEquals(0, child.getHeader().getClusterId());
+    assertTrue(child.getSucceeded());
+    assertEquals(3, child.getResponses(0).getResponseRange().getHeader().getRevision());
+    assertArrayEquals(new byte[] {1}, child.getResponses(0).getResponseRange().getKvs(0).getValue().toByteArray());
+  }
+
+  @Test
   void noChangeElseKeepsItsOriginalRevisionAndEmptyResponse() {
     var result = new ResultTree(new ResultNode.Txn(0, header(2), false, List.of()));
     var response = TxnResponseMapper.toWire(command(true), result, 2, false, 1, 2);

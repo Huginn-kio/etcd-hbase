@@ -9,8 +9,10 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.ManifestCatalog;
+import io.etcdhbase.core.commit.ManifestRepository;
 import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.commit.TxnReadSession;
+import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.kv.CompareReadExecutor;
@@ -33,7 +35,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 
-/** Executes an owner-bound flat transaction against one fixed base and its private workset. */
+/** Executes an owner-bound transaction against one fixed base and its private workset. */
 public final class TxnMutationExecutor {
   private static final BudgetManager.Work FINALIZATION_CAPACITY =
       new BudgetManager.Work(0, 1, 0, 1, 0);
@@ -42,6 +44,8 @@ public final class TxnMutationExecutor {
   private final CommitControlStore control;
   private final ReadViewService views;
   private final ManifestCatalog manifests;
+  private final SystemRecordStore worksetRecords;
+  private final ManifestRepository worksetManifests;
   private final HBaseConnectionFactory connections;
   private final StorageTableBinding primary;
   private final Executor backendWorker;
@@ -54,23 +58,26 @@ public final class TxnMutationExecutor {
 
   public TxnMutationExecutor(String tableGroup, ByteKey profileFingerprint,
       CommitControlStore control, ReadViewService views, ManifestCatalog manifests,
+      SystemRecordStore worksetRecords, ManifestRepository worksetManifests,
       HBaseConnectionFactory connections, StorageTableBinding primary, Executor backendWorker,
       ScanScheduler scans, TxnCommitPreparation preparation, CommitPublisher publisher, TxnExecutionLimits limits) {
-    this(tableGroup, profileFingerprint, control, views, manifests, connections, primary,
+    this(tableGroup, profileFingerprint, control, views, manifests, worksetRecords, worksetManifests, connections, primary,
         backendWorker, scans, preparation, publisher, limits, Clock.systemUTC(), new RequestMetrics());
   }
 
   public TxnMutationExecutor(String tableGroup, ByteKey profileFingerprint,
       CommitControlStore control, ReadViewService views, ManifestCatalog manifests,
+      SystemRecordStore worksetRecords, ManifestRepository worksetManifests,
       HBaseConnectionFactory connections, StorageTableBinding primary, Executor backendWorker,
       ScanScheduler scans, TxnCommitPreparation preparation, CommitPublisher publisher,
       TxnExecutionLimits limits, RequestMetrics metrics) {
-    this(tableGroup, profileFingerprint, control, views, manifests, connections, primary,
+    this(tableGroup, profileFingerprint, control, views, manifests, worksetRecords, worksetManifests, connections, primary,
         backendWorker, scans, preparation, publisher, limits, Clock.systemUTC(), metrics);
   }
 
   TxnMutationExecutor(String tableGroup, ByteKey profileFingerprint,
       CommitControlStore control, ReadViewService views, ManifestCatalog manifests,
+      SystemRecordStore worksetRecords, ManifestRepository worksetManifests,
       HBaseConnectionFactory connections, StorageTableBinding primary, Executor backendWorker,
       ScanScheduler scans, TxnCommitPreparation preparation, CommitPublisher publisher,
       TxnExecutionLimits limits, Clock clock, RequestMetrics metrics) {
@@ -79,6 +86,8 @@ public final class TxnMutationExecutor {
     this.control = Objects.requireNonNull(control, "control");
     this.views = Objects.requireNonNull(views, "views");
     this.manifests = Objects.requireNonNull(manifests, "manifests");
+    this.worksetRecords = Objects.requireNonNull(worksetRecords, "worksetRecords");
+    this.worksetManifests = Objects.requireNonNull(worksetManifests, "worksetManifests");
     this.connections = Objects.requireNonNull(connections, "connections");
     this.primary = Objects.requireNonNull(primary, "primary");
     this.backendWorker = Objects.requireNonNull(backendWorker, "backendWorker");
@@ -141,7 +150,7 @@ public final class TxnMutationExecutor {
                     limits.pointBytes()));
             var evaluator = new TxnEvaluator(session, compares, account, scope,
                 new TxnEvaluator.Limits(limits.pointBytes(), limits.resultBytes(), limits.workingBytes()),
-                primary.codec()::bucket);
+                primary.codec()::bucket, worksetRecords, worksetManifests);
             return evaluator.evaluate(command, Optional.of(binding));
           }).thenCompose(evaluated -> preparation.prepare(evaluated, binding, scope, account))
           .exceptionallyCompose(failure -> {

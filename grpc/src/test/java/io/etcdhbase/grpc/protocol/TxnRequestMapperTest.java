@@ -13,6 +13,7 @@ import io.etcdhbase.core.kv.CompareEvaluator;
 import io.etcdhbase.core.kv.KvFailure;
 import io.etcdhbase.core.kv.TxnCommand;
 import java.util.Collections;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class TxnRequestMapperTest {
@@ -63,7 +64,8 @@ class TxnRequestMapperTest {
     var nested = Rpc.TxnRequest.newBuilder().addSuccess(put).addFailure(put).build();
     var nestedOp = Rpc.RequestOp.newBuilder().setRequestTxn(nested).build();
     var allowed = TxnRequestMapper.fromWire(Rpc.TxnRequest.newBuilder().addSuccess(nestedOp).build());
-    assertTrue(assertInstanceOf(TxnCommand.Unsupported.class, allowed.success().getFirst()).mayWrite());
+    var mappedNested = assertInstanceOf(TxnCommand.Nested.class, allowed.success().getFirst());
+    assertTrue(mappedNested.command().mayWrite());
     var duplicate = Rpc.TxnRequest.newBuilder().addSuccess(nestedOp).addSuccess(put).build();
     assertEquals(KvFailure.Reason.DUPLICATE_KEY,
         assertThrows(KvFailure.class, () -> TxnRequestMapper.fromWire(duplicate)).reason());
@@ -79,6 +81,40 @@ class TxnRequestMapperTest {
     Rpc.TxnRequest oversizedTree = deep;
     assertEquals(KvFailure.Reason.REQUEST_BUDGET_EXHAUSTED,
         assertThrows(KvFailure.class, () -> TxnRequestMapper.fromWire(oversizedTree)).reason());
+  }
+
+  @Test
+  void matchesNativeNestedPotentialWriteIntervalsEvenInUnselectedBranches() {
+    var childPuts = nested(List.of(put('a')), List.of(put('a')));
+    var exclusivePutDelete = nested(List.of(put('a')), List.of(delete('a', -1)));
+    assertAccepted(childPuts);
+    assertAccepted(exclusivePutDelete);
+    assertDuplicate(nested(List.of(put('a')), List.of()), nested(List.of(put('a')), List.of()));
+    var childPut = nested(List.of(put('a')), List.of());
+    assertDuplicate(delete('a', 'z'), childPut);
+    assertDuplicate(childPut, delete('a', 'z'));
+    assertDuplicate(nested(List.of(delete('a', 'z')), List.of()),
+        nested(List.of(put('m')), List.of()));
+    assertAccepted(delete('a', 'z'), put('z'));
+    assertAccepted(delete('a', 'z'), delete('m', 0xff));
+    assertAccepted(delete('z', 'a'), put('m'));
+    assertAccepted(delete('a', 0), put('z'));
+    assertDuplicate(delete(0, 0xff), put(0));
+    assertAccepted(delete(0, 0xff), put(0xff));
+  }
+
+  @Test
+  void depthBudgetIncludesLeafResponseBeforeAnyTransactionStarts() {
+    var leaf = Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder()
+        .setRequestRange(Rpc.RangeRequest.newBuilder().setKey(binary('a')))).build();
+    Rpc.TxnRequest safe = leaf;
+    for (int index = 0; index < 14; index++) {
+      safe = Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder().setRequestTxn(safe)).build();
+    }
+    TxnRequestMapper.fromWire(safe);
+    var tooDeep = Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder().setRequestTxn(safe)).build();
+    assertEquals(KvFailure.Reason.REQUEST_BUDGET_EXHAUSTED,
+        assertThrows(KvFailure.class, () -> TxnRequestMapper.fromWire(tooDeep)).reason());
   }
 
   @Test
@@ -108,6 +144,23 @@ class TxnRequestMapperTest {
 
   private static Rpc.RequestOp put(int key) {
     return Rpc.RequestOp.newBuilder().setRequestPut(Rpc.PutRequest.newBuilder().setKey(binary(key))).build();
+  }
+  private static Rpc.RequestOp delete(int start, int end) {
+    var request = Rpc.DeleteRangeRequest.newBuilder().setKey(binary(start));
+    if (end >= 0) request.setRangeEnd(binary(end));
+    return Rpc.RequestOp.newBuilder().setRequestDeleteRange(request).build();
+  }
+  private static Rpc.RequestOp nested(List<Rpc.RequestOp> success, List<Rpc.RequestOp> failure) {
+    return Rpc.RequestOp.newBuilder().setRequestTxn(Rpc.TxnRequest.newBuilder()
+        .addAllSuccess(success).addAllFailure(failure)).build();
+  }
+  private static void assertAccepted(Rpc.RequestOp... operations) {
+    TxnRequestMapper.fromWire(Rpc.TxnRequest.newBuilder().addAllFailure(List.of(operations)).build());
+  }
+  private static void assertDuplicate(Rpc.RequestOp... operations) {
+    var request = Rpc.TxnRequest.newBuilder().addAllFailure(List.of(operations)).build();
+    assertEquals(KvFailure.Reason.DUPLICATE_KEY,
+        assertThrows(KvFailure.class, () -> TxnRequestMapper.fromWire(request)).reason());
   }
   private static ByteString binary(int value) { return ByteString.copyFrom(new byte[] {(byte) value}); }
 }

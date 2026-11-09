@@ -91,7 +91,7 @@ public final class SystemTableBinding {
     }
   }
 
-  /** Result records require an explicit table capability; older M2 tables remain readable. */
+  /** M3 result, identity and workset records require this capability; older M2 tables remain readable. */
   public boolean supportsResults(TableDescriptor descriptor) {
     validate(descriptor);
     String categories = descriptor.getValue("etcdhbase.m0.record-categories");

@@ -24,6 +24,29 @@
   </build>
   <profiles>
     <profile>
+      <id>m3-j32-public</id>
+      <properties>
+        <j03.skipWire>false</j03.skipWire>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <failIfNoTests>true</failIfNoTests>
+              <includes combine.self="override">
+                <include>**/M3TxnCommitIT.java</include>
+                <include>**/M3NestedRpcIT.java</include>
+                <include>**/M3WorksetIT.java</include>
+              </includes>
+              <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
       <id>m3-j31-public</id>
       <properties>
         <j03.skipWire>false</j03.skipWire>

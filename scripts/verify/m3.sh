@@ -17,8 +17,8 @@ while (($#)); do
   esac
 done
 if [[ "$scope" != public || -z "$artifact_root" || ${#tasks[@]} != 1 ]] ||
-   [[ "${tasks[0]}" != J30 && "${tasks[0]}" != J31 ]]; then
-  echo 'only public J30 and J31 verification are registered; other tasks are not yet delivered' >&2
+   [[ "${tasks[0]}" != J30 && "${tasks[0]}" != J31 && "${tasks[0]}" != J32 ]]; then
+  echo 'only public J30, J31 and J32 verification are registered; other tasks are not yet delivered' >&2
   exit 2
 fi
 : "${ETCD_HBASE_JDK21_HOME:?Set ETCD_HBASE_JDK21_HOME to the pinned Temurin JDK 21 home.}"
@@ -65,10 +65,12 @@ if [[ "$M3_TASK" == J30 ]]; then
     exit 1
   }
   profiles='m3-hbase-local,m3-init-local,m3-public'
-else
+elif [[ "$M3_TASK" == J31 ]]; then
   # M3TxnRpcIT starts its own pinned native server and runs the identical Go suite
   # against both disposable HBase layouts in the same source-bound artifact directory.
   profiles='m3-j31-public'
+else
+  profiles='m3-j32-public'
 fi
 scripts/dev/mvn21.sh -B -ntp -pl server -am clean verify -P"$profiles" \
   > "$artifact_root/maven.log" 2>&1 || {
@@ -80,7 +82,7 @@ if [[ "$M3_TASK" == J30 ]]; then
     mkdir -p "$artifact_root/$module/target/failsafe-reports"
     cp "$module"/target/failsafe-reports/TEST-*.xml "$artifact_root/$module/target/failsafe-reports/"
   done
-else
+elif [[ "$M3_TASK" == J31 ]]; then
   for module in hbase server; do
     mkdir -p "$artifact_root/$module/target/failsafe-reports"
     cp "$module"/target/failsafe-reports/TEST-*.xml "$artifact_root/$module/target/failsafe-reports/"
@@ -88,6 +90,17 @@ else
   for module in core grpc server; do
     mkdir -p "$artifact_root/$module/target/surefire-reports"
     cp "$module"/target/surefire-reports/TEST-*.xml "$artifact_root/$module/target/surefire-reports/"
+  done
+else
+  # Preserve all reactor reports so a skipped or failed test cannot disappear from J32 evidence.
+  for module in protocol spi core hbase grpc admin server; do
+    for kind in surefire-reports failsafe-reports; do
+      for report in "$module"/target/"$kind"/TEST-*.xml; do
+        [[ -f "$report" ]] || continue
+        mkdir -p "$artifact_root/$module/target/$kind"
+        cp "$report" "$artifact_root/$module/target/$kind/"
+      done
+    done
   done
 fi
 python3 - "$artifact_root/run.json" <<'PY'

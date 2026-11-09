@@ -217,6 +217,8 @@ class M3ResultRepositoryIT {
         .join().isEmpty());
     assertThrows(IllegalStateException.class,
         () -> new HBaseResultRepository(legacyRecords).createPage(page, scope));
+    assertThrows(IllegalStateException.class,
+        () -> legacyRecords.read(SystemRecordType.WORKSET, ByteKey.copyOf(new byte[] {1}), scope));
   }
 
   private static PersistedResult persistAndVerifyResult(SystemRecordStore records,

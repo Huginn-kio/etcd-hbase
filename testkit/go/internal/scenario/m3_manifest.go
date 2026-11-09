@@ -30,6 +30,16 @@ var expectedM3PutSteps = []Step{
 
 var expectedM3TxnSteps = txnSteps()
 
+var expectedM3NestedTxnSteps = func() []Step {
+	steps := []Step{{CaseID: "C13", ID: "native-baseline"}}
+	for _, id := range []string{"branch-base", "historical-reads", "nested-else", "unselected-dynamic",
+		"mutually-exclusive", "sibling-duplicate", "parent-overlap", "dynamic-priority",
+		"future-revision", "negative-revision", "unselected-empty-key"} {
+		steps = append(steps, Step{CaseID: "C13", ID: "J32-" + id})
+	}
+	return steps
+}()
+
 func txnSteps() []Step {
 	steps := []Step{{CaseID: "C11", ID: "native-baseline"}}
 	for _, target := range []string{"version", "create", "mod", "value", "lease"} {
@@ -79,6 +89,8 @@ func LoadM3Suite(path string) (Suite, string, error) {
 		expected = expectedM3PutSteps
 	case "m3-txn-v1":
 		expected = expectedM3TxnSteps
+	case "m3-nested-txn-v1":
+		expected = expectedM3NestedTxnSteps
 	default:
 		return Suite{}, "", errors.New("M3 scenario identity is not registered")
 	}

@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 
@@ -416,6 +417,70 @@ class ManifestPreparationTest {
       resultRepository.page = null;
       assertThrows(CompletionException.class, () -> verifier.verify(sealed, root, scope).join());
     }
+  }
+
+  @Test
+  void asynchronouslyStreamsCandidatesAndEventsBeforeSealing() {
+    MemoryRepository repository = new MemoryRepository();
+    SingleResultRepository resultRepository = new SingleResultRepository();
+    InvocationBinding invocation = InvocationBinding.begin(InvocationId.create(),
+        ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]), TransactionId.create(), 1, 0, 1);
+    ResultIdentity identity = ResultIdentity.from(invocation);
+    ResultPage page = new ResultPage(identity, 0, new byte[] {1});
+    ResultDirectory directory = ResultDirectory.create(identity, List.of(ResultPageReference.from(page)));
+    resultRepository.page = page;
+    resultRepository.directory = directory;
+    var candidate = candidate(invocation.transactionId(), new byte[] {'a'}, new byte[] {1});
+    var event = event(invocation.transactionId(), 0, new byte[] {'a'}, new byte[] {1});
+    var candidateReady = new CompletableFuture<Optional<PreparedCandidate>>();
+    var eventReady = new CompletableFuture<Optional<PreparedEvent>>();
+    var candidateReads = new AtomicInteger();
+    var eventReads = new AtomicInteger();
+    AsyncCursor<PreparedCandidate> candidates = () -> candidateReads.getAndIncrement() == 0
+        ? candidateReady : CompletableFuture.completedFuture(Optional.empty());
+    AsyncCursor<PreparedEvent> events = () -> eventReads.getAndIncrement() == 0
+        ? eventReady : CompletableFuture.completedFuture(Optional.empty());
+    try (RequestScope scope = scope()) {
+      var preparation = new ManifestPreparation(repository, new ManifestPreparation.Limits(1, 1, 1, 4096));
+      var pending = preparation.prepareWithResult(invocation, candidates, events,
+          directory.reference(), new ResultCatalog(resultRepository),
+          () -> CompletableFuture.completedFuture(null), scope);
+      assertFalse(pending.isDone());
+      assertEquals(0, repository.writeCount);
+      assertEquals(0, eventReads.get());
+      candidateReady.complete(Optional.of(candidate));
+      assertFalse(pending.isDone());
+      assertEquals(1, eventReads.get());
+      assertEquals(0, repository.sealCalls);
+      eventReady.complete(Optional.of(event));
+      ManifestRoot root = pending.join();
+      assertEquals(1, root.candidateCount());
+      assertEquals(1, root.eventCount());
+      assertEquals(2, candidateReads.get());
+      assertEquals(2, eventReads.get());
+      assertEquals(1, repository.sealCalls);
+    }
+  }
+
+  @Test
+  void cancellationBeforeAnAsyncCursorReturnsCannotSealAManifest() {
+    MemoryRepository repository = new MemoryRepository();
+    InvocationBinding invocation = InvocationBinding.begin(InvocationId.create(),
+        ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]), TransactionId.create(), 1, 0, 1);
+    ResultIdentity identity = ResultIdentity.from(invocation);
+    ResultPage page = new ResultPage(identity, 0, new byte[] {1});
+    ResultDirectory directory = ResultDirectory.create(identity, List.of(ResultPageReference.from(page)));
+    var ready = new CompletableFuture<Optional<PreparedCandidate>>();
+    RequestScope scope = scope();
+    var preparation = new ManifestPreparation(repository, new ManifestPreparation.Limits(1, 1, 1, 4096));
+    var pending = preparation.prepareWithResult(invocation, () -> ready,
+        () -> CompletableFuture.completedFuture(Optional.empty()), directory.reference(),
+        new ResultCatalog(new SingleResultRepository()), () -> CompletableFuture.completedFuture(null), scope);
+    scope.close();
+    ready.complete(Optional.of(candidate(invocation.transactionId(), new byte[] {'a'}, new byte[] {1})));
+    assertThrows(CompletionException.class, pending::join);
+    assertEquals(0, repository.writeCount);
+    assertEquals(0, repository.sealCalls);
   }
 
   @Test

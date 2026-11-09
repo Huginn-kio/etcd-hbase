@@ -82,6 +82,12 @@ public final class PreparedEvent {
 
   /** Stable event identity is ordinal-addressed so repeated mutations of one key stay ordered. */
   public ByteKey systemIdentity() {
+    return systemIdentity(transactionId, ordinal);
+  }
+
+  public static ByteKey systemIdentity(TransactionId transactionId, long ordinal) {
+    Objects.requireNonNull(transactionId, "transactionId");
+    if (ordinal < 0) throw new IllegalArgumentException("event ordinal must not be negative");
     return ByteKey.copyOf(java.nio.ByteBuffer.allocate(16 + 1 + Long.BYTES)
         .put(transactionId.bytes()).put(ManifestRecordFormat.PREPARED_EVENT).putLong(ordinal).array());
   }

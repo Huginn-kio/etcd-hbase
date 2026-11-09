@@ -336,7 +336,7 @@ class ReadViewRecordStoreTest {
       var scheduler = resources.scheduler();
       var session = openTransaction(fixture, scope);
       var comparisons = transactionComparisons(session, scheduler, account, scope);
-      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 16384);
       var put = new PutCommand(key("alpha"), bytes("new"), 0, true, false, false);
       var command = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key("alpha")),
           CompareCondition.Target.VERSION, CompareCondition.Relation.EQUAL, 1)),
@@ -359,12 +359,337 @@ class ReadViewRecordStoreTest {
       assertEquals("new", new String(after.records().getFirst().value().orElseThrow()));
       assertEquals(List.of(2L, 3L, 3L), result.responses().stream()
           .map(node -> node.header().revision()).toList());
-      assertEquals(1, evaluated.candidates().size());
-      assertEquals(3, evaluated.candidates().getFirst().record().metadata().modificationRevision());
-      assertEquals(1, evaluated.events().size());
+      assertEquals(1, evaluated.candidateCount());
+      assertEquals(3, evaluated.candidates().next().join().orElseThrow().record().metadata().modificationRevision());
+      assertEquals(1, evaluated.eventCount());
       assertEquals("old", new String(fixture.physical.versions.get(key("alpha")).getFirst()
           .value().orElseThrow()), "planning cannot modify the backend");
       session.finish().join();
+    }
+  }
+
+  @Test
+  void nestedCompareUsesBaseWhileNestedReadSeesEarlierPut() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         BudgetManager.Account account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
+          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
+          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0, fixture.worksetRecords, fixture.repository);
+      var key = key("new-key");
+      var child = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key),
+          CompareCondition.Target.VERSION, CompareCondition.Relation.EQUAL, 0)),
+          List.of(new TxnCommand.PointRange(key)), List.of());
+      var command = new TxnCommand(List.of(), List.of(
+          new TxnCommand.Put(new PutCommand(key, bytes("new"), 0, false, false, false)),
+          new TxnCommand.Nested(child)), List.of());
+      var binding = InvocationBinding.begin(InvocationId.create(), digest(7), digest(9),
+          TransactionId.create(), 1, session.barrierSequence(), session.currentRevision());
+      var evaluated = evaluator.evaluate(command, Optional.of(binding)).join();
+      var outer = assertInstanceOf(ResultNode.Txn.class, evaluated.result().root());
+      var nested = assertInstanceOf(ResultNode.Txn.class, outer.responses().get(1));
+      assertTrue(nested.succeeded(), "nested Compare must use the original base view");
+      assertEquals(0, nested.header().revision(), "native nested Txn header is present with zero revision");
+      var read = assertInstanceOf(ResultNode.Range.class, nested.responses().getFirst());
+      assertEquals("new", new String(read.records().getFirst().value().orElseThrow()));
+      assertEquals(3, read.header().revision());
+      assertEquals(3, outer.header().revision());
+      session.finish().join();
+    }
+  }
+
+  @Test
+  void nestedSelectionDoesNotReadUnselectedBranchesAndPropagatesBackendFailure() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    var brokenCompare = CompareCondition.numeric(KeyRange.point(key("broken")),
+        CompareCondition.Target.VERSION, CompareCondition.Relation.EQUAL, 0);
+    var child = new TxnCommand(List.of(brokenCompare), List.of(), List.of());
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         BudgetManager.Account account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
+          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
+          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0, fixture.worksetRecords, fixture.repository);
+      fixture.physical.blockNextGet(key("broken"));
+      var outer = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key("missing")),
+          CompareCondition.Target.VERSION, CompareCondition.Relation.GREATER, 0)),
+          List.of(new TxnCommand.Nested(child)), List.of());
+      var result = evaluator.evaluate(outer, Optional.empty()).join();
+      assertFalse(assertInstanceOf(ResultNode.Txn.class, result.result().root()).succeeded());
+      assertFalse(fixture.physical.pendingGet.isDone(), "the unselected nested Compare must not run");
+      result.finishReadOnly().join();
+    }
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         BudgetManager.Account account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
+          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
+          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0, fixture.worksetRecords, fixture.repository);
+      fixture.physical.blockNextGet(key("broken"));
+      var outer = new TxnCommand(List.of(), List.of(
+          new TxnCommand.Put(new PutCommand(key("later"), bytes("value"), 0, false, false, false)),
+          new TxnCommand.Nested(child)), List.of());
+      var binding = InvocationBinding.begin(InvocationId.create(), digest(7), digest(9),
+          TransactionId.create(), 1, session.barrierSequence(), session.currentRevision());
+      var pending = evaluator.evaluate(outer, Optional.of(binding));
+      assertFalse(pending.isDone());
+      fixture.physical.pendingGet.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      var failure = assertInstanceOf(BackendFailure.class, completionFailure(pending::join));
+      assertEquals(BackendFailure.Category.UNAVAILABLE, failure.category());
+      assertFalse(fixture.physical.versions.containsKey(key("later")));
+    }
+  }
+
+  @Test
+  void selectedNestedHistoricalReadUsesSameBarrierWithoutOverlayingPriorPut() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    fixture.physical.add(live("alpha", 1, 1, 1, 0, "old"));
+    fixture.physical.add(live("alpha", 1, 2, 2, 0, "base"));
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         BudgetManager.Account account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
+          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
+          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0, fixture.worksetRecords, fixture.repository);
+      var key = key("alpha");
+      var child = new TxnCommand(List.of(), List.of(new TxnCommand.PointRange(key),
+          new TxnCommand.PointRange(key, 1), new TxnCommand.PointRange(key, 2)), List.of());
+      var command = new TxnCommand(List.of(), List.of(
+          new TxnCommand.Put(new PutCommand(key, bytes("new"), 0, false, false, false)),
+          new TxnCommand.Nested(child)), List.of());
+      var binding = InvocationBinding.begin(InvocationId.create(), digest(7), digest(9),
+          TransactionId.create(), 1, session.barrierSequence(), session.currentRevision());
+      var evaluated = evaluator.evaluate(command, Optional.of(binding)).join();
+      var nested = assertInstanceOf(ResultNode.Txn.class,
+          assertInstanceOf(ResultNode.Txn.class, evaluated.result().root()).responses().get(1));
+      var current = assertInstanceOf(ResultNode.Range.class, nested.responses().get(0));
+      var historical = assertInstanceOf(ResultNode.Range.class, nested.responses().get(1));
+      var explicitBase = assertInstanceOf(ResultNode.Range.class, nested.responses().get(2));
+      assertEquals("new", new String(current.records().getFirst().value().orElseThrow()));
+      assertEquals("old", new String(historical.records().getFirst().value().orElseThrow()));
+      assertEquals("base", new String(explicitBase.records().getFirst().value().orElseThrow()));
+      assertEquals(3, historical.header().revision(), "header follows the transaction, not the historical target");
+      assertEquals(2, fixture.pinRegistrations.get());
+      assertEquals(0, fixture.pinCompletions.get());
+      evaluated.finishRead().join();
+      assertEquals(2, fixture.pinCompletions.get());
+    }
+  }
+
+  @Test
+  void abandonedHistoricalPinFutureCannotCancelInstallationOrLeakItsProtection() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      fixture.pinRegistration = new CompletableFuture<>();
+      CompletableFuture<Void> abandoned = session.pinRevisions(List.of(1L));
+      assertFalse(abandoned.isDone());
+      assertTrue(abandoned.cancel(false));
+      assertThrows(IllegalStateException.class, () -> session.reader(1));
+      fixture.pinRegistration.complete(null);
+      session.reader(1);
+      assertEquals(2, fixture.pinRegistrations.get());
+      session.finish().join();
+      assertEquals(2, fixture.pinCompletions.get());
+      assertEquals(2, fixture.pinCloses.get());
+    }
+  }
+
+  @Test
+  void failedHistoricalPinClosesThePreviouslyAcquiredBasePin() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      fixture.pinRegistration = new CompletableFuture<>();
+      var pending = session.pinRevisions(List.of(1L));
+      fixture.pinRegistration.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      assertEquals(BackendFailure.Category.UNAVAILABLE,
+          assertInstanceOf(BackendFailure.class, completionFailure(pending::join)).category());
+      scope.cleanupCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+      assertEquals(1, fixture.pinCloses.get());
+      assertThrows(IllegalStateException.class, () -> session.reader(0));
+    }
+  }
+
+  @Test
+  void tooManySelectedHistoricalPinsAreResourceExhaustion() throws Exception {
+    Fixture fixture = new Fixture(130, List.of(
+        candidate("delta", 1, 131, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      List<Long> revisions = java.util.stream.LongStream.rangeClosed(1, 128).boxed().toList();
+      var failure = assertInstanceOf(BackendFailure.class,
+          completionFailure(() -> session.pinRevisions(revisions).join()));
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT, failure.category());
+      assertEquals(1, fixture.pinRegistrations.get());
+    }
+  }
+
+  @Test
+  void selectedHistoricalPinsKeepTheOriginalBarrierAfterAnotherCommit() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    fixture.physical.add(live("alpha", 1, 1, 1, 0, "old"));
+    fixture.physical.add(live("alpha", 1, 2, 2, 0, "base"));
+    fixture.physical.add(live("alpha", 1, 3, 3, 0, "later"));
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      CommitState previous = fixture.control.state;
+      fixture.control.state = CommitState.restore(previous.profileFingerprint(), previous.ownerInstance(),
+          previous.ownerEpoch(), previous.ownerLeaseDeadlineEpochMillis(), previous.stateVersion() + 1,
+          previous.publishedSequence() + 1, 3, previous.finalizedSequence() + 1, 3, Optional.empty(), 0);
+      session.pinRevisions(List.of(1L)).join();
+      var current = session.reader(0).get(key("alpha"), 2, ReadProjection.FULL).join().orElseThrow();
+      var historical = session.reader(1).get(key("alpha"), 1, ReadProjection.FULL).join().orElseThrow();
+      assertEquals("base", new String(current.value().orElseThrow()));
+      assertEquals("old", new String(historical.value().orElseThrow()));
+      assertEquals(2, session.currentRevision());
+      assertEquals(previous.publishedSequence(), session.barrierSequence());
+      session.finish().join();
+    }
+  }
+
+  @Test
+  void nestedPreflightFollowsNativeDynamicErrorOrderAndSkipsUnselectedTargets() throws Exception {
+    var future = new TxnCommand.PointRange(key("missing"), Long.MAX_VALUE);
+    var ignoredMissing = new TxnCommand.Put(new PutCommand(key("missing-ignore"),
+        new byte[0], 0, false, true, false));
+    var selected = new TxnCommand(List.of(), List.of(future,
+        new TxnCommand.Nested(new TxnCommand(List.of(), List.of(ignoredMissing), List.of()))), List.of());
+    assertTransactionFailure(selected, KvFailure.Reason.KEY_NOT_FOUND);
+    assertTransactionFailure(new TxnCommand(List.of(),
+        List.of(new TxnCommand.PointRange(key("a"), -2)), List.of()), KvFailure.Reason.COMPACTED);
+    assertTransactionFailure(new TxnCommand(List.of(), List.of(future), List.of()), KvFailure.Reason.FUTURE_REVISION);
+
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         BudgetManager.Account account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      var compares = new CompareReadExecutor(session, scheduler, account, scope,
+          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+      var evaluator = new TxnEvaluator(session, compares, account, scope,
+          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0, fixture.worksetRecords, fixture.repository);
+      var unselected = new TxnCommand(List.of(), List.of(new TxnCommand.PointRange(key("a"), -1)),
+          List.of(new TxnCommand.Nested(new TxnCommand(List.of(), List.of(future, ignoredMissing), List.of()))));
+      var binding = InvocationBinding.begin(InvocationId.create(), digest(7), digest(9),
+          TransactionId.create(), 1, session.barrierSequence(), session.currentRevision());
+      var result = evaluator.evaluate(unselected, Optional.of(binding)).join();
+      assertEquals(1, fixture.pinRegistrations.get(), "unselected historical targets must not be pinned");
+      assertEquals(1, assertInstanceOf(ResultNode.Txn.class, result.result().root()).responses().size());
+      result.finishRead().join();
+    }
+  }
+
+  @Test
+  void uncertainPreparedInvocationCannotRerunItsComparisons() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    var command = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key("compare")),
+        CompareCondition.Target.VERSION, CompareCondition.Relation.EQUAL, 0)),
+        List.of(new TxnCommand.Put(new PutCommand(key("write"), bytes("value"), 0, false, false, false))), List.of());
+    InvocationBinding binding;
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         BudgetManager.Account account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
+          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
+          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0, fixture.worksetRecords, fixture.repository);
+      binding = InvocationBinding.begin(InvocationId.create(), digest(7), digest(9),
+          TransactionId.create(), 1, session.barrierSequence(), session.currentRevision());
+      fixture.worksetRecords.failNextPage = true;
+      assertThrows(CompletionException.class, () -> evaluator.evaluate(command, Optional.of(binding)).join());
+    }
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         BudgetManager.Account account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
+          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
+          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0, fixture.worksetRecords, fixture.repository);
+      fixture.physical.blockNextGet(key("compare"));
+      var retry = evaluator.evaluate(command, Optional.of(binding));
+      assertTrue(retry.isDone(), "the durable start marker must reject replay before any comparison read");
+      assertThrows(CompletionException.class, retry::join);
+      assertFalse(fixture.physical.pendingGet.isDone());
+    }
+  }
+
+  private static void assertTransactionFailure(TxnCommand command, KvFailure.Reason expected) throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         BudgetManager.Account account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      var compares = new CompareReadExecutor(session, scheduler, account, scope,
+          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+      var evaluator = new TxnEvaluator(session, compares, account, scope,
+          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0, fixture.worksetRecords, fixture.repository);
+      var binding = InvocationBinding.begin(InvocationId.create(), digest(7), digest(9),
+          TransactionId.create(), 1, session.barrierSequence(), session.currentRevision());
+      Optional<InvocationBinding> invocation = command.mayWrite() ? Optional.of(binding) : Optional.empty();
+      var failure = assertInstanceOf(KvFailure.class, completionFailure(() -> evaluator.evaluate(command, invocation).join()));
+      assertEquals(expected, failure.reason());
+      assertEquals(1, fixture.pinRegistrations.get(), "invalid target must fail before acquiring another pin");
     }
   }
 
@@ -381,7 +706,7 @@ class ReadViewRecordStoreTest {
       var scheduler = resources.scheduler();
       var session = openTransaction(fixture, scope);
       var comparisons = transactionComparisons(session, scheduler, account, scope);
-      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key("missing")),
           CompareCondition.Target.VERSION, CompareCondition.Relation.GREATER, 0)),
           List.of(new TxnCommand.Put(new PutCommand(key("a"), new byte[0], 0, false, true, false)),
@@ -394,8 +719,8 @@ class ReadViewRecordStoreTest {
       assertFalse(result.succeeded());
       assertEquals(2, result.header().revision());
       assertTrue(result.responses().isEmpty());
-      assertTrue(evaluated.candidates().isEmpty());
-      assertTrue(evaluated.events().isEmpty());
+      assertEquals(0, evaluated.candidateCount());
+      assertEquals(0, evaluated.eventCount());
       session.finish().join();
     }
   }
@@ -413,7 +738,7 @@ class ReadViewRecordStoreTest {
       var scheduler = resources.scheduler();
       var session = openTransaction(fixture, scope);
       var comparisons = transactionComparisons(session, scheduler, account, scope);
-      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key("missing")),
           CompareCondition.Target.VERSION, CompareCondition.Relation.GREATER, 0)), List.of(),
           List.of(new TxnCommand.Put(new PutCommand(key("a"), bytes("else"), 0, false, false, false))));
@@ -423,7 +748,7 @@ class ReadViewRecordStoreTest {
       var result = assertInstanceOf(ResultNode.Txn.class, evaluated.result().root());
       assertFalse(result.succeeded());
       assertEquals(3, result.header().revision());
-      assertEquals(1, evaluated.candidates().size());
+      assertEquals(1, evaluated.candidateCount());
       session.finish().join();
     }
   }
@@ -441,14 +766,14 @@ class ReadViewRecordStoreTest {
       var scheduler = resources.scheduler();
       var session = openTransaction(fixture, scope);
       var comparisons = transactionComparisons(session, scheduler, account, scope);
-      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 16384);
       var evaluated = evaluator.evaluate(new TxnCommand(List.of(),
           List.of(new TxnCommand.PointRange(key("missing"))), List.of()), Optional.empty()).join();
       var result = assertInstanceOf(ResultNode.Txn.class, evaluated.result().root());
       assertTrue(result.succeeded());
       assertEquals(2, result.header().revision());
       assertEquals(0, assertInstanceOf(ResultNode.Range.class, result.responses().getFirst()).count());
-      assertTrue(evaluated.events().isEmpty());
+      assertEquals(0, evaluated.eventCount());
       var validated = evaluated.finishReadOnly().join();
       assertTrue(validated.belongsTo(scope));
       assertEquals(2, validated.revision());
@@ -467,7 +792,7 @@ class ReadViewRecordStoreTest {
          var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
       var session = openTransaction(fixture, scope);
       var comparisons = transactionComparisons(session, scheduler, account, scope);
-      var evaluator = transactionEvaluator(session, comparisons, account, scope, 256);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 256);
       var result = evaluator.evaluate(new TxnCommand(List.of(),
           List.of(new TxnCommand.PointRange(key("alpha"))), List.of()), Optional.empty());
       var failure = assertInstanceOf(BackendFailure.class, completionFailure(result::join));
@@ -491,7 +816,7 @@ class ReadViewRecordStoreTest {
       var scheduler = resources.scheduler();
       var session = openTransaction(fixture, scope);
       var comparisons = transactionComparisons(session, scheduler, account, scope);
-      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(), List.of(new TxnCommand.Put(
           new PutCommand(key("a"), bytes("x"), 0, false, false, false))), List.of());
       InvocationBinding foreign = InvocationBinding.begin(InvocationId.create(), digest(7), digest(8),
@@ -515,7 +840,7 @@ class ReadViewRecordStoreTest {
       var scheduler = resources.scheduler();
       var session = openTransaction(fixture, scope);
       var comparisons = transactionComparisons(session, scheduler, account, scope);
-      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(), List.of(new TxnCommand.Put(
           new PutCommand(key("a"), bytes("x"), 0, false, false, false))), List.of());
       InvocationBinding binding = InvocationBinding.begin(InvocationId.create(), digest(7), digest(9),
@@ -540,7 +865,7 @@ class ReadViewRecordStoreTest {
       var scheduler = resources.scheduler();
       var session = openTransaction(fixture, scope);
       var comparisons = transactionComparisons(session, scheduler, account, scope);
-      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(), List.of(new TxnCommand.Unsupported(false)), List.of());
       var failure = assertInstanceOf(KvFailure.class,
           completionFailure(() -> evaluator.evaluate(command, Optional.empty()).join()));
@@ -560,7 +885,7 @@ class ReadViewRecordStoreTest {
          var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
       var session = openTransaction(fixture, scope);
       var comparisons = transactionComparisons(session, scheduler, account, scope);
-      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 16384);
       fixture.physical.blockNextGet(key("blocked"));
       var result = evaluator.evaluate(new TxnCommand(List.of(),
           List.of(new TxnCommand.PointRange(key("blocked"))), List.of()), Optional.empty());
@@ -1161,11 +1486,12 @@ class ReadViewRecordStoreTest {
         new CompareReadExecutor.Limits(1, 4096, 64, 4096));
   }
 
-  private static TxnEvaluator transactionEvaluator(TxnReadSession session,
+  private static TxnEvaluator transactionEvaluator(Fixture fixture, TxnReadSession session,
       CompareReadExecutor comparisons, BudgetManager.Account account, RequestScope scope,
       long maxResultBytes) {
     return new TxnEvaluator(session, comparisons, account, scope,
-        new TxnEvaluator.Limits(4096, maxResultBytes, 65536), ignored -> 0);
+        new TxnEvaluator.Limits(4096, maxResultBytes, 65536), ignored -> 0,
+        fixture.worksetRecords, fixture.repository);
   }
 
   private static List<String> pageRecords(BucketCursor.Page page) {
@@ -1282,8 +1608,10 @@ class ReadViewRecordStoreTest {
     private final CompletableFuture<Void> pinCompletionStarted = new CompletableFuture<>();
     private volatile CompletableFuture<Void> pinRenewal = CompletableFuture.completedFuture(null);
     private volatile CompletableFuture<Void> pinCompletion = CompletableFuture.completedFuture(null);
+    private volatile CompletableFuture<Void> pinRegistration = CompletableFuture.completedFuture(null);
     private final ReadViewService views;
     private final MemoryRecordStore physical = new MemoryRecordStore();
+    private final MemorySystemRecords worksetRecords = new MemorySystemRecords();
 
     private Fixture(long baseRevision, List<PreparedCandidate> candidates) {
       selectedCandidates = candidates.stream().map(candidate -> new PreparedCandidate(transactionId,
@@ -1304,7 +1632,7 @@ class ReadViewRecordStoreTest {
           2, slot.sequence(), slot.revision(), baseSequence, baseRevision, Optional.of(slot), 0);
       control = new MemoryControl(state);
       ManifestCatalog catalog = new ManifestCatalog(repository);
-      ReadViewPinRegistry pinRegistry = (view, scope) -> {
+      ReadViewPinRegistry pinRegistry = (view, scope) -> pinRegistration.thenApply(ignored -> {
         pinRegistrations.incrementAndGet();
         AtomicBoolean closed = new AtomicBoolean();
         ReadViewPinRegistry.Pin pin = new ReadViewPinRegistry.Pin() {
@@ -1324,8 +1652,8 @@ class ReadViewRecordStoreTest {
             if (closed.compareAndSet(false, true)) pinCloses.incrementAndGet();
           }
         };
-        return CompletableFuture.completedFuture(pin);
-      };
+        return pin;
+      });
       views = new ReadViewService(control, catalog, pinRegistry, profile);
     }
 
@@ -1344,6 +1672,30 @@ class ReadViewRecordStoreTest {
   }
 
   private record BudgetFixture(BudgetManager manager, BudgetManager.Account account) {}
+
+  private static final class MemorySystemRecords implements SystemRecordStore {
+    private final Map<ByteKey, ByteKey> rows = new HashMap<>();
+    private boolean failNextPage;
+    @Override public CompletableFuture<Optional<ByteKey>> read(
+        SystemRecordType type, ByteKey identity, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.ofNullable(rows.get(identity)));
+    }
+    @Override public int bucket(SystemRecordType type, ByteKey identity) { return 0; }
+    @Override public CompletableFuture<CreateResult> createIfAbsent(
+        SystemRecordType type, ByteKey identity, ByteKey value, RequestScope scope) {
+      ByteKey old = rows.putIfAbsent(identity, value);
+      if (identity.length() == 29 && failNextPage) {
+        failNextPage = false;
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+      }
+      return CompletableFuture.completedFuture(old == null ? CreateResult.CREATED
+          : old.equals(value) ? CreateResult.ALREADY_PRESENT : CreateResult.CONFLICT);
+    }
+    @Override public CompletableFuture<Boolean> compareAndSet(SystemRecordType type, ByteKey identity,
+        Optional<ByteKey> expected, ByteKey replacement, RequestScope scope) {
+      return CompletableFuture.failedFuture(new UnsupportedOperationException());
+    }
+  }
 
   private static final class MemoryControl implements CommitControlStore {
     private volatile CommitState state;
@@ -1367,6 +1719,7 @@ class ReadViewRecordStoreTest {
     private final ManifestRoot root;
     private final ManifestPage page;
     private final Map<ByteKey, PreparedCandidate> candidates = new HashMap<>();
+    private final Map<ByteKey, PreparedEvent> events = new HashMap<>();
     private final AtomicInteger rootReads = new AtomicInteger();
     private final AtomicInteger candidateReads = new AtomicInteger();
     private int blockedRootReadNumber;
@@ -1390,7 +1743,12 @@ class ReadViewRecordStoreTest {
     @Override public CompletableFuture<SystemRecordStore.CreateResult> createDirectoryPage(
         ManifestDirectoryPage value, RequestScope scope) { return created(); }
     @Override public CompletableFuture<SystemRecordStore.CreateResult> createEvent(
-        PreparedEvent event, RequestScope scope) { return created(); }
+        PreparedEvent event, RequestScope scope) {
+      PreparedEvent old = events.putIfAbsent(event.systemIdentity(), event);
+      return CompletableFuture.completedFuture(old == null ? SystemRecordStore.CreateResult.CREATED
+          : old.digest().equals(event.digest()) ? SystemRecordStore.CreateResult.ALREADY_PRESENT
+              : SystemRecordStore.CreateResult.CONFLICT);
+    }
     @Override public CompletableFuture<SystemRecordStore.CreateResult> createEventPage(
         EventPage value, RequestScope scope) { return created(); }
     @Override public CompletableFuture<SystemRecordStore.CreateResult> createEventDirectoryPage(
@@ -1434,7 +1792,7 @@ class ReadViewRecordStoreTest {
     @Override public CompletableFuture<Optional<ManifestDirectoryPage>> readDirectoryPage(
         ByteKey identity, RequestScope scope) { return CompletableFuture.completedFuture(Optional.empty()); }
     @Override public CompletableFuture<Optional<PreparedEvent>> readEvent(
-        ByteKey identity, RequestScope scope) { return CompletableFuture.completedFuture(Optional.empty()); }
+        ByteKey identity, RequestScope scope) { return CompletableFuture.completedFuture(Optional.ofNullable(events.get(identity))); }
     @Override public CompletableFuture<Optional<EventPage>> readEventPage(
         ByteKey identity, RequestScope scope) { return CompletableFuture.completedFuture(Optional.empty()); }
     @Override public CompletableFuture<Optional<EventDirectoryPage>> readEventDirectoryPage(

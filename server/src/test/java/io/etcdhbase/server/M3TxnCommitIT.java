@@ -25,6 +25,8 @@ import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.ResultPreparation;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
+import io.etcdhbase.core.commit.SystemRecordStore;
+import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.commit.TxnReadSession;
 import io.etcdhbase.core.error.BackendFailure;
@@ -62,6 +64,7 @@ import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.StreamObserver;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -79,6 +82,35 @@ import org.junit.jupiter.api.Test;
 class M3TxnCommitIT {
   private static final Duration TIMEOUT = Duration.ofMinutes(3);
   private static final ByteKey AUTHORIZATION = digest(9);
+
+  @Test
+  void nestedWorksetExceedsMemoryAndDoesNotReplayAnUncertainPageOnBothLayouts() throws Exception {
+    for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
+      try (M3TestEnvironment environment = M3TestEnvironment.start(layout, 1);
+           Engine engine = new Engine(environment)) {
+        byte[] value = new byte[1024];
+        var operations = new ArrayList<TxnCommand.Operation>();
+        for (int index = 0; index < 80; index++) {
+          operations.add(new TxnCommand.Put(new PutCommand(key(String.format("bulk-%03d", index)),
+              value, 0, false, false, false)));
+        }
+        operations.add(new TxnCommand.Nested(new TxnCommand(List.of(), List.of(
+            new TxnCommand.PointRange(key("bulk-000")), new TxnCommand.PointRange(key("bulk-079"))), List.of())));
+        var command = new TxnCommand(List.of(), operations, List.of());
+        Receipt result = engine.run(command, 40, 64 * 1024);
+        assertTrue(result.changed());
+        assertEquals(2, result.revision());
+        engine.assertResolvedResponse(result, command, true);
+        assertTrue((long) value.length * 80 > 64 * 1024);
+        Receipt later = engine.run(new TxnCommand(List.of(), List.of(put("later", "value")), List.of()), 42);
+        assertEquals(3, later.revision());
+        engine.assertResolvedResponse(result, command, true);
+        engine.assertUncertainWorksetCannotReplay();
+        assertEquals(4, engine.currentRevision());
+        assertEquals(3, engine.currentSequence());
+      }
+    }
+  }
 
   @Test
   void publishesMultipleKeysOnceAndReplaysAnEarlierNoChangeResultOnBothLayouts() throws Exception {
@@ -180,7 +212,8 @@ class M3TxnCommitIT {
           stores.invocations(), handoff, stores.finalizer());
       mutations = new TxnMutationExecutor(environment.system().tableGroupId(),
           environment.system().profileFingerprint(), stores.control(), stores.views(), stores.manifests(),
-          environment.factory(), environment.primary(), worker, scans, preparation, publisher,
+          stores.records(), stores.manifestRepository(), environment.factory(), environment.primary(), worker,
+          scans, preparation, publisher,
           new TxnExecutionLimits(4096, 1L << 20, 8L << 20, 4096, 64));
       processor = new TxnOwnerProcessor(environment.system().tableGroupId(), owner, budgets,
           reservation(), mutations, stores.outcomes(), 1_572_864);
@@ -190,6 +223,10 @@ class M3TxnCommitIT {
     }
 
     private Receipt run(TxnCommand command, int requestNumber) throws Exception {
+      return run(command, requestNumber, 8L << 20);
+    }
+
+    private Receipt run(TxnCommand command, int requestNumber, long workingBytes) throws Exception {
       RequestScope scope = RequestScope.withTimeout(TIMEOUT);
       try {
         BudgetManager.Account account = account(scope);
@@ -205,7 +242,8 @@ class M3TxnCommitIT {
         var comparisons = new CompareReadExecutor(session, scans, account, scope,
             new CompareReadExecutor.Limits(1, 4096, 64, 4096));
         var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-            new TxnEvaluator.Limits(4096, 1L << 20, 8L << 20), environment.primary().codec()::bucket);
+            new TxnEvaluator.Limits(4096, 1L << 20, workingBytes), environment.primary().codec()::bucket,
+            stores.records(), stores.manifestRepository());
         var evaluated = evaluator.evaluate(command, Optional.of(binding)).join();
         var ready = preparation.prepare(evaluated, binding, scope, account).join();
         if (ready instanceof TxnCommitPreparation.Sealed sealed) {
@@ -219,6 +257,91 @@ class M3TxnCommitIT {
       } finally {
         closeScope(scope);
       }
+    }
+
+    private void assertUncertainWorksetCannotReplay() throws Exception {
+      var deliveredPage = new AtomicBoolean();
+      SystemRecordStore underlying = stores.records();
+      SystemRecordStore uncertain = new SystemRecordStore() {
+        @Override public CompletableFuture<Optional<ByteKey>> read(
+            SystemRecordType type, ByteKey id, RequestScope scope) { return underlying.read(type, id, scope); }
+        @Override public int bucket(SystemRecordType type, ByteKey id) { return underlying.bucket(type, id); }
+        @Override public CompletableFuture<CreateResult> createIfAbsent(
+            SystemRecordType type, ByteKey id, ByteKey value, RequestScope scope) {
+          return underlying.createIfAbsent(type, id, value, scope).thenCompose(result -> {
+            if (type == SystemRecordType.WORKSET && id.length() == 29 && deliveredPage.compareAndSet(false, true)) {
+              return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+            }
+            return CompletableFuture.completedFuture(result);
+          });
+        }
+        @Override public CompletableFuture<Boolean> compareAndSet(SystemRecordType type, ByteKey id,
+            Optional<ByteKey> expected, ByteKey replacement, RequestScope scope) {
+          return underlying.compareAndSet(type, id, expected, replacement, scope);
+        }
+      };
+      var command = new TxnCommand(List.of(), List.of(put("uncertain", "private")), List.of());
+      InvocationBinding binding;
+      RequestScope first = RequestScope.withTimeout(TIMEOUT);
+      try {
+        var account = account(first);
+        var control = stores.control().read(first).join().orElseThrow().state();
+        binding = invocations.bindOrJoin(InvocationBinding.begin(InvocationId.create(), digest(41),
+            AUTHORIZATION, TransactionId.create(), owner.epoch(), control.publishedSequence(),
+            control.publishedRevision()), first).join();
+        var evaluator = evaluator(first, account, uncertain);
+        assertThrows(CompletionException.class, () -> evaluator.evaluate(command, Optional.of(binding)).join());
+        assertTrue(deliveredPage.get(), "HBase accepted the page before its reply was lost");
+      } finally {
+        closeScope(first);
+      }
+      RequestScope retry = RequestScope.withTimeout(TIMEOUT);
+      try {
+        var evaluator = evaluator(retry, account(retry), underlying);
+        var failure = assertThrows(CompletionException.class,
+            () -> evaluator.evaluate(command, Optional.of(binding)).join());
+        assertEquals(BackendFailure.Category.UNKNOWN, assertInstanceOf(BackendFailure.class, failure.getCause()).category());
+        assertTrue(environment.openPrimary(retry).get(key("uncertain"), binding.baseRevision(),
+            ReadProjection.FULL).join().isEmpty());
+      } finally {
+        closeScope(retry);
+      }
+      RequestScope recovery = RequestScope.withTimeout(TIMEOUT);
+      try {
+        long afterExpiry = System.currentTimeMillis() + Duration.ofHours(2).toMillis();
+        var nextOwner = new CommitOwnerService(stores.control()).claim("m3-workset-recovery", afterExpiry,
+            afterExpiry + Duration.ofHours(1).toMillis(), recovery).join().orElseThrow();
+        var outcome = stores.outcomes().resolve(binding, recovery).join();
+        assertEquals(CommitOutcomeResolver.State.NOT_SELECTED, outcome.state());
+        var fenced = invocations.transition(binding, binding.notSelected(outcome.notSelectedProof().orElseThrow()),
+            recovery).join();
+        assertEquals(InvocationBinding.State.NOT_SELECTED, fenced.state());
+        var account = account(recovery);
+        var control = stores.control().read(recovery).join().orElseThrow().state();
+        var replacement = invocations.bindOrJoin(InvocationBinding.begin(InvocationId.create(), digest(43),
+            AUTHORIZATION, TransactionId.create(), nextOwner.epoch(), control.publishedSequence(),
+            control.publishedRevision()), recovery).join();
+        var evaluated = evaluator(recovery, account, underlying).evaluate(command, Optional.of(replacement)).join();
+        var prepared = assertInstanceOf(TxnCommitPreparation.Sealed.class,
+            preparation.prepare(evaluated, replacement, recovery, account).join());
+        var published = publisher.publish(prepared.invocation(), nextOwner, prepared.manifest(), recovery).join();
+        assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED, published.state());
+        assertEquals(4, published.decision().orElseThrow().revision());
+      } finally {
+        closeScope(recovery);
+      }
+    }
+
+    private TxnEvaluator evaluator(RequestScope scope, BudgetManager.Account account,
+        SystemRecordStore worksetRecords) throws Exception {
+      var physical = environment.openPrimary(scope);
+      var session = TxnReadSession.open(stores.views(), List.of(), AUTHORIZATION, physical,
+          stores.manifests(), environment.primary().codec()::bucket, 1, scope).join();
+      var compares = new CompareReadExecutor(session, scans, account, scope,
+          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+      return new TxnEvaluator(session, compares, account, scope,
+          new TxnEvaluator.Limits(4096, 1L << 20, 64 * 1024), environment.primary().codec()::bucket,
+          worksetRecords, stores.manifestRepository());
     }
 
     private ResultNode.Txn replayNoChanges(Receipt receipt) throws Exception {
