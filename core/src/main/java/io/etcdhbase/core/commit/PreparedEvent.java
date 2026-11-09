@@ -43,7 +43,9 @@ public final class PreparedEvent {
         || current.metadata().state() != (kind == Kind.PUT
             ? StorageMetadata.State.LIVE : StorageMetadata.State.TOMBSTONE)
         || previous.filter(value -> !value.key().equals(current.key())
-            || value.metadata().modificationRevision() > baseRevision).isPresent()) {
+            || value.metadata().modificationRevision() > baseRevision
+                && (ordinal == 0 || value.metadata().modificationRevision()
+                    != current.metadata().modificationRevision())).isPresent()) {
       throw new IllegalArgumentException("event does not match its commit identity or operation kind");
     }
     requireDecodableProjection(current);

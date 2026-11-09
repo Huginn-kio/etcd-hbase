@@ -40,6 +40,25 @@ var expectedM3NestedTxnSteps = func() []Step {
 	return steps
 }()
 
+var expectedM3DeleteSteps = []Step{
+	{CaseID: "C09", ID: "native-baseline"},
+	{CaseID: "C09", ID: "J33-point"},
+	{CaseID: "C09", ID: "J33-empty"},
+	{CaseID: "C09", ID: "J33-recreate"},
+	{CaseID: "C09", ID: "J33-recreate-read"},
+	{CaseID: "C10", ID: "J33-seed-range"},
+	{CaseID: "C10", ID: "J33-prefix"},
+	{CaseID: "C13", ID: "J33-seed-overlap"},
+	{CaseID: "C13", ID: "J33-overlap"},
+	{CaseID: "C13", ID: "J33-seed-zero"},
+	{CaseID: "C13", ID: "J33-zero-delete-put"},
+	{CaseID: "C13", ID: "J33-zero-put-delete"},
+	{CaseID: "C10", ID: "J33-seed-client"},
+	{CaseID: "C10", ID: "J33-client-prefix"},
+	{CaseID: "C09", ID: "J33-no-prev"},
+	{CaseID: "C09", ID: "J33-empty-key"},
+}
+
 func txnSteps() []Step {
 	steps := []Step{{CaseID: "C11", ID: "native-baseline"}}
 	for _, target := range []string{"version", "create", "mod", "value", "lease"} {
@@ -91,6 +110,8 @@ func LoadM3Suite(path string) (Suite, string, error) {
 		expected = expectedM3TxnSteps
 	case "m3-nested-txn-v1":
 		expected = expectedM3NestedTxnSteps
+	case "m3-delete-v1":
+		expected = expectedM3DeleteSteps
 	default:
 		return Suite{}, "", errors.New("M3 scenario identity is not registered")
 	}

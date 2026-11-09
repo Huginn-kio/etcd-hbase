@@ -60,7 +60,7 @@ public final class MutationOwnerLane {
       return CompletableFuture.completedFuture(new OwnerForwarding.Unknown(BackendFailure.Category.PERMISSION));
     }
     final boolean transaction;
-    try { transaction = MutationOperationEnvelope.isTransaction(request.operationBytes()); }
+    try { transaction = MutationOperationEnvelope.kind(request.operationBytes()) != MutationOperationEnvelope.Kind.PUT; }
     catch (IllegalArgumentException malformed) {
       return CompletableFuture.completedFuture(new OwnerForwarding.Unknown(BackendFailure.Category.UNKNOWN));
     }

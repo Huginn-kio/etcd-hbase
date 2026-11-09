@@ -3,6 +3,7 @@ package io.etcdhbase.core.kv;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -38,6 +39,178 @@ import java.util.concurrent.CompletionException;
 import org.junit.jupiter.api.Test;
 
 class TxnWorkingSetTest {
+  @Test
+  void deletesOnlyLiveRecordsAndKeepsRepeatedDeletesEmpty() throws Exception {
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      var previous = new java.util.ArrayList<StoredRecord>();
+      var records = List.of(live("a", "one"), live("b", "two"), live("c", "three"));
+      assertEquals(3, working.delete(KeyRange.all(), AsyncCursor.fromIterator(records.iterator()), previous::add).join());
+      assertEquals(records, previous);
+      var tombstones = new java.util.ArrayList<StoredRecord>();
+      for (StoredRecord record : records) {
+        tombstones.add(working.current(record.key(), Optional.of(record)).join().orElseThrow());
+      }
+      assertEquals(0, working.delete(KeyRange.all(), AsyncCursor.fromIterator(tombstones.iterator()),
+          record -> { throw new AssertionError("a tombstone cannot be deleted twice"); }).join());
+      assertEquals(3, working.candidateCount());
+      assertEquals(3, working.eventCount());
+      working.freeze();
+      var events = working.events();
+      for (int ordinal = 0; ordinal < 3; ordinal++) {
+        var event = events.next().join().orElseThrow();
+        assertEquals(PreparedEvent.Kind.DELETE, event.kind());
+        assertEquals(ordinal, event.ordinal());
+        assertEquals(records.get(ordinal), event.previous().orElseThrow());
+      }
+      assertTrue(events.next().join().isEmpty());
+    }
+  }
+
+  @Test
+  void manyPriorTombstonesDoNotCreateEventsOrARecursiveFutureChain() throws Exception {
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      var tombstones = java.util.stream.IntStream.range(0, 10_000).mapToObj(index ->
+          StoredRecord.metadataOnly(key(String.format("key-%05d", index)),
+              new StorageMetadata(1, 5, 1, 0, StorageMetadata.State.TOMBSTONE, 0))).iterator();
+      assertEquals(0, working.delete(KeyRange.all(), AsyncCursor.fromIterator(tombstones),
+          ignored -> { throw new AssertionError("a tombstone cannot be deleted twice"); }).join());
+      assertEquals(0, working.eventCount());
+      assertEquals(0, working.candidateCount());
+    }
+  }
+
+  @Test
+  void deleteAndPutOfTheSameKeyPreserveOrderedEventsAndFinalCandidate() throws Exception {
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      StoredRecord old = live("a", "old");
+      assertEquals(1, working.delete(KeyRange.point(key("a")),
+          AsyncCursor.fromIterator(List.of(old).iterator()), ignored -> {}).join());
+      var put = working.put(command("a", "new", true), Optional.of(old)).join();
+      assertTrue(put.previous().isEmpty());
+      var current = working.current(key("a"), Optional.of(old)).join().orElseThrow();
+      assertEquals(6, current.metadata().createRevision());
+      assertEquals(1, current.metadata().version());
+      working.freeze();
+      assertEquals(1, working.candidateCount());
+      var events = working.events();
+      assertEquals(PreparedEvent.Kind.DELETE, events.next().join().orElseThrow().kind());
+      assertEquals(PreparedEvent.Kind.PUT, events.next().join().orElseThrow().kind());
+      assertTrue(events.next().join().isEmpty());
+    }
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      StoredRecord old = live("a", "old");
+      working.put(command("a", "new", true), Optional.of(old)).join();
+      StoredRecord current = working.current(key("a"), Optional.of(old)).join().orElseThrow();
+      assertEquals(1, working.delete(KeyRange.point(key("a")),
+          AsyncCursor.fromIterator(List.of(current).iterator()), ignored -> {}).join());
+      working.freeze();
+      assertEquals(1, working.candidateCount());
+      var events = working.events();
+      assertEquals(PreparedEvent.Kind.PUT, events.next().join().orElseThrow().kind());
+      var deleted = events.next().join().orElseThrow();
+      assertEquals(PreparedEvent.Kind.DELETE, deleted.kind());
+      assertEquals(6, deleted.previous().orElseThrow().metadata().modificationRevision());
+      assertArrayEquals(bytes("new"), deleted.previous().orElseThrow().value().orElseThrow());
+      assertTrue(events.next().join().isEmpty());
+    }
+  }
+
+  @Test
+  void incompleteDeleteKeepsItsCheckpointPrivateAndFencesTheAttempt() throws Exception {
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      fixture.records.failNextCreate = true;
+      assertThrows(CompletionException.class, () -> working.delete(KeyRange.all(),
+          AsyncCursor.fromIterator(List.of(live("a", "one"), live("b", "two")).iterator()),
+          ignored -> {}).join());
+      assertEquals(0, working.candidateCount());
+      assertEquals(0, working.eventCount());
+      assertThrows(CompletionException.class, () -> working.current(key("a"), Optional.empty()).join());
+      assertThrows(IllegalStateException.class, working::freeze);
+    }
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      fixture.manifests.failEventOrdinal = 1;
+      assertThrows(CompletionException.class, () -> working.delete(KeyRange.all(),
+          AsyncCursor.fromIterator(List.of(live("a", "one"), live("b", "two")).iterator()),
+          ignored -> {}).join());
+      assertEquals(1, fixture.manifests.events.size(), "the first event was persisted before the second failed");
+      assertEquals(0, working.candidateCount());
+      assertEquals(0, working.eventCount());
+      assertThrows(IllegalStateException.class, working::freeze);
+    }
+  }
+
+  @Test
+  void cancellingAnInFlightDeleteNeverMakesItsPartialOperationVisible() throws Exception {
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      fixture.manifests.blockedEvent = new CompletableFuture<>();
+      var pending = working.delete(KeyRange.all(),
+          AsyncCursor.fromIterator(List.of(live("a", "one"), live("b", "two")).iterator()), ignored -> {});
+      assertFalse(pending.isDone());
+      fixture.scope.cancel();
+      fixture.manifests.blockedEvent.complete(null);
+      assertThrows(CompletionException.class, pending::join);
+      assertEquals(0, working.candidateCount());
+      assertEquals(0, working.eventCount());
+    }
+  }
+
+  @Test
+  void leaseBearingKeyRejectsTheEntirePartiallyPreparedDelete() throws Exception {
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      StoredRecord leased = StoredRecord.live(key("b"),
+          new StorageMetadata(1, 5, 2, 7, StorageMetadata.State.LIVE, 3), bytes("two"));
+      var failure = assertThrows(CompletionException.class, () -> working.delete(KeyRange.all(),
+          AsyncCursor.fromIterator(List.of(live("a", "one"), leased).iterator()), ignored -> {}).join());
+      assertEquals(KvFailure.Reason.LEASE_UNAVAILABLE,
+          assertInstanceOf(KvFailure.class, failure.getCause()).reason());
+      assertEquals(1, fixture.manifests.events.size());
+      assertEquals(0, working.candidateCount());
+      assertEquals(0, working.eventCount());
+      assertThrows(IllegalStateException.class, working::freeze);
+    }
+  }
+
+  @Test
+  void failureAtEachDeleteEventLeavesTheOperationUncheckpointed() throws Exception {
+    for (int failingOrdinal = 0; failingOrdinal < 3; failingOrdinal++) {
+      try (var fixture = new Fixture()) {
+        var working = fixture.working();
+        fixture.manifests.failEventOrdinal = failingOrdinal;
+        assertThrows(CompletionException.class, () -> working.delete(KeyRange.all(),
+            AsyncCursor.fromIterator(List.of(live("a", "one"), live("b", "two"), live("c", "three")).iterator()),
+            ignored -> {}).join());
+        assertEquals(failingOrdinal, fixture.manifests.events.size());
+        assertEquals(0, working.candidateCount());
+        assertEquals(0, working.eventCount());
+        assertThrows(IllegalStateException.class, working::freeze);
+      }
+    }
+  }
+
+  @Test
+  void deleteRejectsOutOfRangeAndUnorderedInputsBeforePublishingAnOperation() throws Exception {
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      assertThrows(CompletionException.class, () -> working.delete(KeyRange.between(key("a"), key("c")),
+          AsyncCursor.fromIterator(List.of(live("b", "one"), live("a", "two")).iterator()), ignored -> {}).join());
+      assertEquals(0, working.eventCount());
+    }
+    try (var fixture = new Fixture()) {
+      var working = fixture.working();
+      assertThrows(CompletionException.class, () -> working.delete(KeyRange.point(key("a")),
+          AsyncCursor.fromIterator(List.of(live("b", "two")).iterator()), ignored -> {}).join());
+      assertEquals(0, working.eventCount());
+    }
+  }
+
   @Test
   void orderedWritesShareOneRevisionAndOnlyTheWorkingViewSeesThem() throws Exception {
     try (var fixture = new Fixture()) {
@@ -232,10 +405,14 @@ class TxnWorkingSetTest {
   private static final class MemoryManifests implements ManifestRepository {
     private final Map<ByteKey, PreparedEvent> events = new HashMap<>();
     private CompletableFuture<Void> blockedEvent;
+    private long failEventOrdinal = -1;
     @Override public int candidateBucket(PreparedCandidate candidate) {
       return candidate.record().key().equals(key("a")) ? 1 : 0;
     }
     @Override public CompletableFuture<SystemRecordStore.CreateResult> createEvent(PreparedEvent event, RequestScope scope) {
+      if (event.ordinal() == failEventOrdinal) {
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+      }
       var ready = blockedEvent == null ? CompletableFuture.<Void>completedFuture(null) : blockedEvent;
       return ready.thenApply(ignored -> {
         PreparedEvent old = events.putIfAbsent(event.systemIdentity(), event);

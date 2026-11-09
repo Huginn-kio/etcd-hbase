@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.kv.PutCommand;
 import io.etcdhbase.core.kv.ResultNode;
 import io.etcdhbase.core.kv.ResultTree;
@@ -19,6 +20,45 @@ import org.junit.jupiter.api.Test;
 
 class TxnResponseMapperTest {
   private static final ByteKey KEY = ByteKey.copyOf(new byte[] {0, (byte) 0xff});
+
+  @Test
+  void projectsChangedAndEmptyDeletesAtTheirActualOperationRevision() {
+    ByteKey a = ByteKey.copyOf(new byte[] {'a'});
+    ByteKey b = ByteKey.copyOf(new byte[] {'b'});
+    ByteKey z = ByteKey.copyOf(new byte[] {'z'});
+    StoredRecord first = StoredRecord.live(a,
+        new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, 1), new byte[] {1});
+    StoredRecord second = StoredRecord.live(b,
+        new StorageMetadata(1, 2, 1, 0, StorageMetadata.State.LIVE, 1), new byte[] {2});
+    var command = new TxnCommand(List.of(), List.of(new TxnCommand.PointRange(a),
+        new TxnCommand.Delete(KeyRange.between(a, z), true),
+        new TxnCommand.Delete(KeyRange.between(a, z), true)), List.of());
+    var tree = new ResultTree(new ResultNode.Txn(0, header(3), true, List.of(
+        new ResultNode.Range(0, header(2), List.of(first), 1, false),
+        new ResultNode.Delete(1, header(3), 2, List.of(first, second)),
+        new ResultNode.Delete(2, header(3), 0, List.of()))));
+    var response = TxnResponseMapper.toWire(command, tree, 3, true, 1, 2);
+    assertEquals(2, response.getResponses(0).getResponseRange().getHeader().getRevision());
+    var deleted = response.getResponses(1).getResponseDeleteRange();
+    assertEquals(3, deleted.getHeader().getRevision());
+    assertEquals(2, deleted.getDeleted());
+    assertArrayEquals(a.bytes(), deleted.getPrevKvs(0).getKey().toByteArray());
+    assertArrayEquals(b.bytes(), deleted.getPrevKvs(1).getKey().toByteArray());
+    assertEquals(0, response.getResponses(2).getResponseDeleteRange().getDeleted());
+
+    var unordered = new ResultTree(new ResultNode.Txn(0, header(3), true, List.of(
+        new ResultNode.Range(0, header(2), List.of(first), 1, false),
+        new ResultNode.Delete(1, header(3), 2, List.of(second, first)),
+        new ResultNode.Delete(2, header(3), 0, List.of()))));
+    assertThrows(IllegalArgumentException.class,
+        () -> TxnResponseMapper.toWire(command, unordered, 3, true, 1, 2));
+
+    var emptyCommand = new TxnCommand(List.of(), List.of(new TxnCommand.Delete(KeyRange.point(a), false)), List.of());
+    var emptyTree = new ResultTree(new ResultNode.Txn(0, header(2), true,
+        List.of(new ResultNode.Delete(0, header(2), 0, List.of()))));
+    assertEquals(2, TxnResponseMapper.toWire(emptyCommand, emptyTree, 2, false, 1, 2)
+        .getResponses(0).getResponseDeleteRange().getHeader().getRevision());
+  }
 
   @Test
   void projectsOuterIdentityAndPerOperationRevisionsWithoutInventingChildIdentities() {

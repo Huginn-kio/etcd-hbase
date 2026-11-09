@@ -14,6 +14,7 @@ import io.etcdhbase.core.kv.TxnCommand;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.RequestScopeInterceptor;
+import io.etcdhbase.grpc.protocol.DeleteProtocolLimit;
 import io.etcdhbase.grpc.protocol.ErrorProjection;
 import io.etcdhbase.grpc.protocol.TxnProtocolLimit;
 import io.etcdhbase.grpc.protocol.TxnRequestMapper;
@@ -32,7 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
-/** Routes flat Txn requests through a fixed read view or the authorized mutation owner. */
+/** Routes Txn and DeleteRange requests through a fixed view or the authorized mutation owner. */
 public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserver<Rpc.TxnResponse>> {
   private final String tableGroup;
   private final AuthorizedBackendIdentity identity;
@@ -77,6 +78,31 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
 
   @Override
   public void accept(Rpc.TxnRequest request, StreamObserver<Rpc.TxnResponse> observer) {
+    accept(request, null, observer);
+  }
+
+  /** A standalone delete uses the same transaction evaluation and durable result path. */
+  public void deleteRange(Rpc.DeleteRangeRequest request, StreamObserver<Rpc.DeleteRangeResponse> observer) {
+    Objects.requireNonNull(request, "request");
+    Objects.requireNonNull(observer, "observer");
+    var transaction = Rpc.TxnRequest.newBuilder()
+        .addSuccess(Rpc.RequestOp.newBuilder().setRequestDeleteRange(request)).build();
+    accept(transaction, request, new StreamObserver<>() {
+      @Override public void onNext(Rpc.TxnResponse response) {
+        if (!response.hasHeader() || response.getResponsesCount() != 1
+            || !response.getResponses(0).hasResponseDeleteRange()) {
+          throw new IllegalStateException("standalone delete result differs from its request");
+        }
+        observer.onNext(response.getResponses(0).getResponseDeleteRange().toBuilder()
+            .setHeader(response.getHeader()).build());
+      }
+      @Override public void onError(Throwable failure) { observer.onError(failure); }
+      @Override public void onCompleted() { observer.onCompleted(); }
+    });
+  }
+
+  private void accept(Rpc.TxnRequest request, Rpc.DeleteRangeRequest delete,
+      StreamObserver<Rpc.TxnResponse> observer) {
     Objects.requireNonNull(request, "request");
     Objects.requireNonNull(observer, "observer");
     RequestScope scope = RequestScopeInterceptor.currentScope();
@@ -91,7 +117,7 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
           .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
       PutCommitPreparation.retainUntilDrain(scope, input);
       worker.execute(() -> {
-        if (dispatchState.compareAndSet(0, 1)) begin(request, observer, scope, account, terminal, gatewayDrained);
+        if (dispatchState.compareAndSet(0, 1)) begin(request, delete, observer, scope, account, terminal, gatewayDrained);
       });
     } catch (BackendFailure | RuntimeException failure) {
       if (dispatchState.compareAndSet(0, 2)) {
@@ -107,23 +133,27 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
     }
   }
 
-  private void begin(Rpc.TxnRequest request, StreamObserver<Rpc.TxnResponse> observer,
+  private void begin(Rpc.TxnRequest request, Rpc.DeleteRangeRequest delete, StreamObserver<Rpc.TxnResponse> observer,
       RequestScope scope, BudgetManager.Account account, AtomicBoolean terminal,
       CompletableFuture<Void> gatewayDrained) {
     try {
       TxnCommand command = TxnRequestMapper.fromWire(request);
       InvocationId invocation = InvocationId.create();
-      if (TxnRequestMapper.requiresNativeRaftLimit(request)) {
+      if (delete != null) {
+        DeleteProtocolLimit.requireWithin(delete, invocation.value().getMostSignificantBits(), maximumEtcdRequestBytes);
+      } else if (TxnRequestMapper.requiresNativeRaftLimit(request)) {
         TxnProtocolLimit.requireWithin(request, invocation.value().getMostSignificantBits(), maximumEtcdRequestBytes);
       }
       if (!command.mayWrite()) {
         reads.execute(command, authorizationDigest, identity, scope, account).whenComplete((result, failure) ->
             dispatchResponse(observer, scope, terminal, gatewayDrained, result, failure,
-                value -> TxnResponseEmitter.sendReadOnly(command, value, clusterId, memberId, scope, account, countOutput(observer)),
+                value -> TxnResponseEmitter.sendReadOnly(command, value, clusterId, memberId, scope, account,
+                    countOutput(observer, delete == null)),
                 ignored -> { }));
         return;
       }
-      ByteKey operation = MutationOperationEnvelope.transaction(request.toByteArray());
+      ByteKey operation = delete == null ? MutationOperationEnvelope.transaction(request.toByteArray())
+          : MutationOperationEnvelope.deleteRange(delete.toByteArray());
       ByteKey digest = MutationForwardRequest.digest(tableGroup, operation);
       control.read(scope).thenCompose(observed -> {
         var state = observed.orElseThrow(() ->
@@ -140,7 +170,7 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
       }).thenCompose(reply -> resolveReply(reply, invocation, digest, scope, account))
           .whenComplete((resolved, failure) -> dispatchResponse(observer, scope, terminal, gatewayDrained,
               resolved, failure, value -> TxnResponseEmitter.sendResolved(command, value,
-                  ResultMessages::decodeTree, clusterId, memberId, scope, account, countOutput(observer)),
+                  ResultMessages::decodeTree, clusterId, memberId, scope, account, countOutput(observer, delete == null)),
               value -> { if (value != null) value.close(); }));
     } catch (RuntimeException failure) {
       gatewayDrained.complete(null);
@@ -248,11 +278,11 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
     }
   }
 
-  private StreamObserver<Rpc.TxnResponse> countOutput(StreamObserver<Rpc.TxnResponse> observer) {
+  private StreamObserver<Rpc.TxnResponse> countOutput(StreamObserver<Rpc.TxnResponse> observer, boolean txnRpc) {
     return new StreamObserver<>() {
       @Override public void onNext(Rpc.TxnResponse response) {
         observer.onNext(response);
-        metrics.recordTxnOutputBytes(response.getSerializedSize());
+        if (txnRpc) metrics.recordTxnOutputBytes(response.getSerializedSize());
       }
       @Override public void onError(Throwable failure) { observer.onError(failure); }
       @Override public void onCompleted() { observer.onCompleted(); }

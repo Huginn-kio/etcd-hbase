@@ -13,6 +13,8 @@ import etcdserverpb.KVGrpc;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.commit.CommitOutcomeResolver;
+import io.etcdhbase.core.commit.CommitDecision;
+import io.etcdhbase.core.commit.CommitFinalizationService;
 import io.etcdhbase.core.commit.CommitOwnerService;
 import io.etcdhbase.core.commit.CommitPlanVerifier;
 import io.etcdhbase.core.commit.CommitPublisher;
@@ -20,9 +22,11 @@ import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.ManifestPreparation;
+import io.etcdhbase.core.commit.MaterializationStore;
 import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
+import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.ResultPreparation;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
 import io.etcdhbase.core.commit.SystemRecordStore;
@@ -38,8 +42,10 @@ import io.etcdhbase.core.kv.TxnCommand;
 import io.etcdhbase.core.kv.TxnEvaluator;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.scan.DirectRecordReader;
 import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.core.storage.ReadProjection;
+import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.grpc.protocol.TxnResponseEmitter;
 import io.etcdhbase.grpc.service.KvService;
 import io.etcdhbase.hbase.codec.ResultMessages;
@@ -75,6 +81,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -108,6 +115,60 @@ class M3TxnCommitIT {
         engine.assertUncertainWorksetCannotReplay();
         assertEquals(4, engine.currentRevision());
         assertEquals(3, engine.currentSequence());
+      }
+    }
+  }
+
+  @Test
+  void largeDeleteIsAtomicBudgetedAndReplayableOnBothLayouts() throws Exception {
+    for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
+      try (M3TestEnvironment environment = M3TestEnvironment.start(layout, 1);
+           Engine engine = new Engine(environment)) {
+        byte[] value = new byte[1024];
+        var writes = new ArrayList<TxnCommand.Operation>();
+        for (int index = 0; index < 80; index++) {
+          writes.add(new TxnCommand.Put(new PutCommand(key(String.format("delete-%03d", index)),
+              value, 0, false, false, false)));
+        }
+        Receipt seed = engine.run(new TxnCommand(List.of(), writes, List.of()), 50, 64 * 1024);
+        assertEquals(2, seed.revision());
+        var range = KeyRange.between(key("delete-"), key("delete."));
+        var delete = new TxnCommand(List.of(), List.of(new TxnCommand.Delete(range, true)), List.of());
+        engine.assertDeleteOutputBudgetRejectsBeforePublication(delete);
+        assertEquals(2, engine.currentRevision());
+        assertEquals(1, engine.currentSequence());
+        Receipt removed = engine.run(delete, 52, 64 * 1024);
+        assertTrue(removed.changed());
+        assertEquals(3, removed.revision());
+        engine.assertDeleteResult(removed, 80, 80);
+        engine.assertHistoricalAndDeletedRecord("delete-000", 2, 3, value);
+        Receipt empty = engine.run(delete, 53, 64 * 1024);
+        assertFalse(empty.changed());
+        assertEquals(3, empty.revision());
+        engine.assertDeleteResult(empty, 0, 0);
+        assertEquals(2, engine.currentSequence());
+        Receipt recreated = engine.run(new TxnCommand(List.of(), List.of(put("delete-000", "new")), List.of()), 54);
+        assertEquals(4, recreated.revision());
+        engine.assertDeleteResult(removed, 80, 80);
+        engine.assertValue("delete-000", 4, "new");
+        Receipt reseeded = engine.run(new TxnCommand(List.of(), writes, List.of()), 55, 64 * 1024);
+        assertEquals(5, reseeded.revision());
+        var withoutPrevious = new TxnCommand(List.of(), List.of(new TxnCommand.Delete(range, false)), List.of());
+        Receipt removedWithoutPrevious = engine.run(withoutPrevious, 56, 64 * 1024);
+        assertEquals(6, removedWithoutPrevious.revision());
+        engine.assertDeleteResult(removedWithoutPrevious, 80, 0);
+      }
+    }
+  }
+
+  @Test
+  void partialDeleteMaterializationRecoversWithoutPartialReadsOnBothLayouts() throws Exception {
+    for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
+      try (M3TestEnvironment environment = M3TestEnvironment.start(layout, 1);
+           Engine engine = new Engine(environment)) {
+        Receipt seed = engine.run(new TxnCommand(List.of(), List.of(put("a", "one"), put("b", "two")), List.of()), 60);
+        assertEquals(2, seed.revision());
+        engine.assertPartialDeleteMaterializationRecovers();
       }
     }
   }
@@ -256,6 +317,146 @@ class M3TxnCommitIT {
         return new Receipt(id, requestDigest, binding.baseRevision(), false);
       } finally {
         closeScope(scope);
+      }
+    }
+
+    private void assertDeleteOutputBudgetRejectsBeforePublication(TxnCommand command) throws Exception {
+      RequestScope scope = RequestScope.withTimeout(TIMEOUT);
+      try {
+        BudgetManager.Account account = account(scope);
+        var control = stores.control().read(scope).join().orElseThrow().state();
+        var binding = invocations.bindOrJoin(InvocationBinding.begin(InvocationId.create(), digest(51),
+            AUTHORIZATION, TransactionId.create(), owner.epoch(), control.publishedSequence(),
+            control.publishedRevision()), scope).join();
+        var physical = environment.openPrimary(scope);
+        var session = TxnReadSession.open(stores.views(), List.of(), AUTHORIZATION, physical,
+            stores.manifests(), environment.primary().codec()::bucket, 1, scope).join();
+        var comparisons = new CompareReadExecutor(session, scans, account, scope,
+            new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+        var evaluator = new TxnEvaluator(session, comparisons, account, scope,
+            new TxnEvaluator.Limits(4096, 256, 64 * 1024), environment.primary().codec()::bucket,
+            stores.records(), stores.manifestRepository());
+        var failure = assertThrows(CompletionException.class,
+            () -> evaluator.evaluate(command, Optional.of(binding)).join());
+        assertEquals(BackendFailure.Category.RESOURCE_LIMIT,
+            assertInstanceOf(BackendFailure.class, failure.getCause()).category());
+      } finally {
+        closeScope(scope);
+      }
+    }
+
+    private void assertPartialDeleteMaterializationRecovers() throws Exception {
+      InvocationBinding selected;
+      RequestScope scope = RequestScope.withTimeout(TIMEOUT);
+      try {
+        BudgetManager.Account account = account(scope);
+        var control = stores.control().read(scope).join().orElseThrow().state();
+        var binding = invocations.bindOrJoin(InvocationBinding.begin(InvocationId.create(), digest(61),
+            AUTHORIZATION, TransactionId.create(), owner.epoch(), control.publishedSequence(),
+            control.publishedRevision()), scope).join();
+        var command = new TxnCommand(List.of(), List.of(
+            new TxnCommand.Delete(KeyRange.between(key("a"), key("c")), true)), List.of());
+        var evaluated = evaluator(scope, account, stores.records()).evaluate(command, Optional.of(binding)).join();
+        var sealed = assertInstanceOf(TxnCommitPreparation.Sealed.class,
+            preparation.prepare(evaluated, binding, scope, account).join());
+        selected = sealed.invocation();
+        var applied = new AtomicInteger();
+        MaterializationStore interrupted = new MaterializationStore() {
+          @Override public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope requestScope) {
+            return stores.materialization().preflight(candidate, requestScope);
+          }
+          @Override public CompletableFuture<ApplyResult> applySelected(
+              CommitDecision decision, PreparedCandidate candidate, RequestScope requestScope) {
+            if (applied.incrementAndGet() == 2) {
+              return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+            }
+            return stores.materialization().applySelected(decision, candidate, requestScope);
+          }
+        };
+        var finalizer = new CommitFinalizationService(stores.control(), stores.outcomes(), stores.decisions(),
+            stores.manifests(), interrupted, stores.results());
+        var interruptedPublisher = new CommitPublisher(stores.control(), stores.outcomes(),
+            new CommitPlanVerifier(stores.manifests(), stores.materialization(), stores.results()),
+            stores.invocations(), handoff, finalizer);
+        assertThrows(CompletionException.class,
+            () -> interruptedPublisher.publish(sealed.invocation(), owner, sealed.manifest(), scope).join());
+        assertEquals(2, applied.get());
+        var pending = stores.outcomes().resolve(sealed.invocation(), scope).join();
+        assertEquals(CommitOutcomeResolver.State.SELECTED_PENDING, pending.state());
+        assertEquals(3, currentRevision());
+        assertEquals(1, control().finalizedSequence());
+        var physical = environment.openPrimary(scope);
+        assertEquals(StorageMetadata.State.TOMBSTONE,
+            physical.get(key("a"), 3, ReadProjection.METADATA).join().orElseThrow().metadata().state());
+        assertEquals(StorageMetadata.State.LIVE,
+            physical.get(key("b"), 3, ReadProjection.METADATA).join().orElseThrow().metadata().state());
+      } finally {
+        closeScope(scope);
+      }
+      RequestScope readScope = RequestScope.withTimeout(TIMEOUT);
+      try {
+        var account = account(readScope);
+        var physical = environment.openPrimary(readScope);
+        var read = TxnReadSession.open(stores.views(), List.of(), AUTHORIZATION, physical,
+            stores.manifests(), environment.primary().codec()::bucket, 1, readScope).join();
+        for (String name : List.of("a", "b")) {
+          try (var point = new DirectRecordReader(read.reader(0), account, 4096)
+              .readForPreparation(key(name), 3, ReadProjection.METADATA).join()) {
+            assertEquals(StorageMetadata.State.TOMBSTONE, point.record().orElseThrow().metadata().state());
+          }
+        }
+        read.finish().join();
+        var pending = stores.outcomes().resolve(selected, readScope).join();
+        assertEquals(CommitOutcomeResolver.State.SELECTED_PENDING, pending.state());
+        assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED,
+            stores.finalizer().finish(selected, pending, readScope).join().state());
+        for (String name : List.of("a", "b")) {
+          assertEquals(StorageMetadata.State.TOMBSTONE,
+              physical.get(key(name), 3, ReadProjection.METADATA).join().orElseThrow().metadata().state());
+        }
+        assertEquals(2, control().finalizedSequence());
+        try (var result = stores.invocationResults().resolveTransaction(selected.invocationId(),
+            selected.requestDigest(), AUTHORIZATION, readScope, account).join()) {
+          var root = assertInstanceOf(ResultNode.Txn.class, ResultMessages.decodeTree(result.payload().buffer()).root());
+          var deleted = assertInstanceOf(ResultNode.Delete.class, root.responses().getFirst());
+          assertEquals(2, deleted.deleted());
+          assertEquals(2, deleted.previous().size());
+        }
+      } finally {
+        closeScope(readScope);
+      }
+    }
+
+    private void assertDeleteResult(Receipt receipt, long deleted, int previousCount) throws Exception {
+      RequestScope scope = RequestScope.withTimeout(TIMEOUT);
+      try {
+        var result = stores.invocationResults().resolveTransaction(receipt.id(), receipt.requestDigest(),
+            AUTHORIZATION, scope, account(scope)).join();
+        try (result) {
+          var tree = ResultMessages.decodeTree(result.payload().buffer());
+          var root = assertInstanceOf(ResultNode.Txn.class, tree.root());
+          var response = assertInstanceOf(ResultNode.Delete.class, root.responses().getFirst());
+          assertEquals(deleted, response.deleted());
+          assertEquals(previousCount, response.previous().size());
+          for (int index = 0; index < previousCount; index++) {
+            assertEquals(key(String.format("delete-%03d", index)), response.previous().get(index).key());
+            assertEquals(1024, response.previous().get(index).value().orElseThrow().length);
+          }
+        }
+      } finally {
+        closeScope(scope);
+      }
+    }
+
+    private void assertHistoricalAndDeletedRecord(String name, long historical, long deletedRevision,
+        byte[] expected) throws Exception {
+      try (RequestScope scope = RequestScope.withTimeout(TIMEOUT)) {
+        var store = environment.openPrimary(scope);
+        var before = store.get(key(name), historical, ReadProjection.FULL).join().orElseThrow();
+        assertArrayEquals(expected, before.value().orElseThrow());
+        var after = store.get(key(name), deletedRevision, ReadProjection.FULL).join().orElseThrow();
+        assertEquals(StorageMetadata.State.TOMBSTONE, after.metadata().state());
+        assertEquals(deletedRevision, after.metadata().modificationRevision());
       }
     }
 

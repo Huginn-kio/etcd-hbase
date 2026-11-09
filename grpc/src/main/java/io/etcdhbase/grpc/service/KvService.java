@@ -10,17 +10,20 @@ import java.util.function.BiConsumer;
 public final class KvService extends KVGrpc.KVImplBase {
   private final BiConsumer<Rpc.PutRequest, StreamObserver<Rpc.PutResponse>> putHandler;
   private final BiConsumer<Rpc.TxnRequest, StreamObserver<Rpc.TxnResponse>> txnHandler;
+  private final BiConsumer<Rpc.DeleteRangeRequest, StreamObserver<Rpc.DeleteRangeResponse>> deleteHandler;
 
   /** Keeps the protocol-only skeleton explicitly unimplemented. */
   public KvService() {
     this.putHandler = null;
     this.txnHandler = null;
+    this.deleteHandler = null;
   }
 
   /** Installs a fully assembled Put handler; other KV methods remain unimplemented. */
   public KvService(BiConsumer<Rpc.PutRequest, StreamObserver<Rpc.PutResponse>> putHandler) {
     this.putHandler = Objects.requireNonNull(putHandler, "putHandler");
     this.txnHandler = null;
+    this.deleteHandler = null;
   }
 
   /** Installs both fully assembled handlers. */
@@ -28,6 +31,16 @@ public final class KvService extends KVGrpc.KVImplBase {
       BiConsumer<Rpc.TxnRequest, StreamObserver<Rpc.TxnResponse>> txnHandler) {
     this.putHandler = Objects.requireNonNull(putHandler, "putHandler");
     this.txnHandler = Objects.requireNonNull(txnHandler, "txnHandler");
+    this.deleteHandler = null;
+  }
+
+  /** Installs Put, Txn and DeleteRange handlers backed by the same table-group runtime. */
+  public KvService(BiConsumer<Rpc.PutRequest, StreamObserver<Rpc.PutResponse>> putHandler,
+      BiConsumer<Rpc.TxnRequest, StreamObserver<Rpc.TxnResponse>> txnHandler,
+      BiConsumer<Rpc.DeleteRangeRequest, StreamObserver<Rpc.DeleteRangeResponse>> deleteHandler) {
+    this.putHandler = Objects.requireNonNull(putHandler, "putHandler");
+    this.txnHandler = Objects.requireNonNull(txnHandler, "txnHandler");
+    this.deleteHandler = Objects.requireNonNull(deleteHandler, "deleteHandler");
   }
 
   @Override
@@ -44,7 +57,8 @@ public final class KvService extends KVGrpc.KVImplBase {
   @Override
   public void deleteRange(
       Rpc.DeleteRangeRequest request, StreamObserver<Rpc.DeleteRangeResponse> responseObserver) {
-    UnimplementedStreams.failUnary(responseObserver, "KV.DeleteRange");
+    if (deleteHandler == null) UnimplementedStreams.failUnary(responseObserver, "KV.DeleteRange");
+    else deleteHandler.accept(request, responseObserver);
   }
 
   @Override

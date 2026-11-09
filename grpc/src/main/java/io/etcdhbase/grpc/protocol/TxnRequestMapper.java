@@ -79,7 +79,9 @@ public final class TxnRequestMapper {
                 operation.getRequestRange().getRevision())
             : new TxnCommand.Unsupported(false);
         case REQUEST_PUT -> new TxnCommand.Put(PutRequestMapper.fromWire(operation.getRequestPut()));
-        case REQUEST_DELETE_RANGE -> new TxnCommand.Unsupported(true);
+        case REQUEST_DELETE_RANGE -> new TxnCommand.Delete(
+            range(operation.getRequestDeleteRange().getKey(), operation.getRequestDeleteRange().getRangeEnd()),
+            operation.getRequestDeleteRange().getPrevKv());
         case REQUEST_TXN -> new TxnCommand.Nested(command(operation.getRequestTxn()));
         case REQUEST_NOT_SET -> throw new KvFailure(KvFailure.Reason.KEY_NOT_FOUND);
       });

@@ -17,8 +17,8 @@ while (($#)); do
   esac
 done
 if [[ "$scope" != public || -z "$artifact_root" || ${#tasks[@]} != 1 ]] ||
-   [[ "${tasks[0]}" != J30 && "${tasks[0]}" != J31 && "${tasks[0]}" != J32 ]]; then
-  echo 'only public J30, J31 and J32 verification are registered; other tasks are not yet delivered' >&2
+   [[ "${tasks[0]}" != J30 && "${tasks[0]}" != J31 && "${tasks[0]}" != J32 && "${tasks[0]}" != J33 ]]; then
+  echo 'only public J30 through J33 verification are registered; other tasks are not yet delivered' >&2
   exit 2
 fi
 : "${ETCD_HBASE_JDK21_HOME:?Set ETCD_HBASE_JDK21_HOME to the pinned Temurin JDK 21 home.}"
@@ -69,8 +69,10 @@ elif [[ "$M3_TASK" == J31 ]]; then
   # M3TxnRpcIT starts its own pinned native server and runs the identical Go suite
   # against both disposable HBase layouts in the same source-bound artifact directory.
   profiles='m3-j31-public'
-else
+elif [[ "$M3_TASK" == J32 ]]; then
   profiles='m3-j32-public'
+else
+  profiles='m3-j33-public'
 fi
 scripts/dev/mvn21.sh -B -ntp -pl server -am clean verify -P"$profiles" \
   > "$artifact_root/maven.log" 2>&1 || {

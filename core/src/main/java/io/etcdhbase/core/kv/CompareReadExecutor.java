@@ -11,6 +11,7 @@ import io.etcdhbase.core.scan.SortedMergeCursor;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanSource;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -52,6 +53,12 @@ public final class CompareReadExecutor {
   boolean belongsTo(TxnReadSession expectedSession, BudgetManager.Account expectedAccount,
       RequestScope expectedScope) {
     return session == expectedSession && account == expectedAccount && scope == expectedScope;
+  }
+
+  Limits limits() { return limits; }
+
+  ScanSource scanSource() {
+    return scheduler.bind(session.reader(0), account);
   }
 
   /** The caller must complete the session's final protection check before using this result. */

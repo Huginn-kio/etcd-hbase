@@ -35,7 +35,7 @@ class TxnRequestMapperTest {
   }
 
   @Test
-  void preservesPotentialWritesInUnsupportedUnselectedBranches() {
+  void preservesPotentialWritesInUnselectedBranches() {
     var complexRange = Rpc.RequestOp.newBuilder().setRequestRange(Rpc.RangeRequest.newBuilder()
         .setKey(binary('a')).setRangeEnd(binary('z'))).build();
     var delete = Rpc.RequestOp.newBuilder().setRequestDeleteRange(
@@ -43,12 +43,29 @@ class TxnRequestMapperTest {
     var mapped = TxnRequestMapper.fromWire(Rpc.TxnRequest.newBuilder()
         .addSuccess(complexRange).addFailure(delete).build());
     assertFalse(assertInstanceOf(TxnCommand.Unsupported.class, mapped.success().getFirst()).mayWrite());
-    assertTrue(assertInstanceOf(TxnCommand.Unsupported.class, mapped.failure().getFirst()).mayWrite());
+    assertInstanceOf(TxnCommand.Delete.class, mapped.failure().getFirst());
     assertTrue(mapped.mayWrite());
     assertTrue(TxnRequestMapper.requiresNativeRaftLimit(Rpc.TxnRequest.newBuilder()
         .addSuccess(complexRange).addFailure(delete).build()));
     assertFalse(TxnRequestMapper.requiresNativeRaftLimit(Rpc.TxnRequest.newBuilder()
         .addSuccess(complexRange).build()));
+  }
+
+  @Test
+  void mapsDeletePointFullSpaceAndEmptyRangesWithoutLosingPreviousValueFlag() {
+    var point = Rpc.RequestOp.newBuilder().setRequestDeleteRange(
+        Rpc.DeleteRangeRequest.newBuilder().setKey(binary(0xff)).setPrevKv(true)).build();
+    var all = delete(0, 0);
+    var empty = delete('z', 'a');
+    var command = TxnRequestMapper.fromWire(Rpc.TxnRequest.newBuilder()
+        .addSuccess(point).addSuccess(all).addSuccess(empty).build());
+    var exact = assertInstanceOf(TxnCommand.Delete.class, command.success().get(0));
+    assertTrue(exact.previousRequested());
+    assertTrue(exact.range().contains(ByteKey.copyOf(new byte[] {(byte) 0xff})));
+    assertFalse(exact.range().contains(ByteKey.copyOf(new byte[] {(byte) 0xff, 0})));
+    var full = assertInstanceOf(TxnCommand.Delete.class, command.success().get(1));
+    assertTrue(full.range().contains(ByteKey.copyOf(new byte[] {(byte) 0xff, 0})));
+    assertTrue(assertInstanceOf(TxnCommand.Delete.class, command.success().get(2)).range().isEmpty());
   }
 
   @Test

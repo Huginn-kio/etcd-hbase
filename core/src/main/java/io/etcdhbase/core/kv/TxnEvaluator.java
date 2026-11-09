@@ -278,6 +278,10 @@ public final class TxnEvaluator {
         return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.UNSUPPORTED_OPERATION));
       }
       if (operation instanceof TxnCommand.PointRange range) return executeRange(plan, index, responses, state, range);
+      if (operation instanceof TxnCommand.Delete delete) {
+        return appendDelete(state, responses, index, delete).thenComposeAsync(ignored ->
+            execute(plan, index + 1, responses, state), CONTINUATION_EXECUTOR);
+      }
       return executePut(plan, index, responses, state, (TxnCommand.Put) operation);
     } catch (BackendFailure | RuntimeException failure) {
       return CompletableFuture.failedFuture(failure);
@@ -360,6 +364,34 @@ public final class TxnEvaluator {
       responses.add(new ResultNode.Put(ordinal, new ResultNode.Header(true, result.revision()),
           result.key(), result.previous()));
     });
+  }
+
+  private CompletableFuture<Void> appendDelete(State state, List<ResultNode> responses, int ordinal,
+      TxnCommand.Delete command) throws BackendFailure {
+    if (state.working == null) throw new IllegalStateException("delete was not routed through an invocation");
+    state.reserve(128);
+    var previous = new ArrayList<StoredRecord>();
+    var view = new DeleteViewCursor(session, state.working, command.range(), bucket, compares,
+        account, scope, limits.pointBytes());
+    CompletableFuture<Void> operation;
+    try {
+      operation = state.working.delete(command.range(), view, record -> {
+        if (command.previousRequested()) {
+          if (previous.size() >= ResultNode.MAX_RECORDS_PER_NODE) {
+            throw new java.util.concurrent.CompletionException(resourceLimit());
+          }
+          try { state.reserve(resultRecordBytes(record)); }
+          catch (BackendFailure failure) { throw new java.util.concurrent.CompletionException(failure); }
+          previous.add(record);
+        }
+      }).thenAccept(deleted -> responses.add(new ResultNode.Delete(ordinal,
+          new ResultNode.Header(true, state.currentRevision()), deleted, previous)));
+    } catch (RuntimeException | Error failure) {
+      try { view.close(); }
+      catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+      throw failure;
+    }
+    return operation.whenComplete((ignored, failure) -> view.close());
   }
 
   private Evaluation finish(State state, BranchPlan plan, List<ResultNode> responses) {

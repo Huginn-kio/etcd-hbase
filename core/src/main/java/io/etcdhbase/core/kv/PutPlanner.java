@@ -19,6 +19,16 @@ public final class PutPlanner {
   }
 
   public Plan plan(PutCommand command, InvocationBinding invocation, Optional<StoredRecord> baseRecord) {
+    return plan(command, invocation, baseRecord, false);
+  }
+
+  /** The caller must obtain an in-transaction record from its verified completed workset. */
+  Plan planWorking(PutCommand command, InvocationBinding invocation, Optional<StoredRecord> current) {
+    return plan(command, invocation, current, true);
+  }
+
+  private Plan plan(PutCommand command, InvocationBinding invocation, Optional<StoredRecord> baseRecord,
+      boolean workingView) {
     Objects.requireNonNull(command, "command");
     Objects.requireNonNull(invocation, "invocation");
     Objects.requireNonNull(baseRecord, "baseRecord");
@@ -29,6 +39,7 @@ public final class PutPlanner {
       StoredRecord record = baseRecord.orElseThrow();
       if (!record.key().equals(command.key())
           || record.metadata().modificationRevision() > invocation.baseRevision()
+              && (!workingView || record.metadata().modificationRevision() - invocation.baseRevision() != 1)
           || record.metadata().state() == StorageMetadata.State.LIVE && !record.hasValue()) {
         throw new IllegalArgumentException("Put base record does not match its fixed read view");
       }

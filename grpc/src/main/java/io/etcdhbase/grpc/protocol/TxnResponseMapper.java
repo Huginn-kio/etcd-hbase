@@ -2,6 +2,7 @@ package io.etcdhbase.grpc.protocol;
 
 import com.google.protobuf.ByteString;
 import etcdserverpb.Rpc;
+import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.kv.ResultNode;
 import io.etcdhbase.core.kv.ResultTree;
 import io.etcdhbase.core.kv.TxnCommand;
@@ -23,7 +24,7 @@ public final class TxnResponseMapper {
         || txn.header().revision() != revision) {
       throw new IllegalArgumentException("transaction result or serving identity differs");
     }
-    boolean changes = containsSelectedPut(command, txn);
+    boolean changes = containsSelectedMutation(command, txn);
     if (changes != changed) throw new IllegalArgumentException("transaction publication differs from its result");
     long baseRevision = revision - (changes ? 1 : 0);
     if (baseRevision <= 0) throw new IllegalArgumentException("invalid transaction base revision");
@@ -33,7 +34,7 @@ public final class TxnResponseMapper {
     return response.build();
   }
 
-  private static boolean containsSelectedPut(TxnCommand command, ResultNode.Txn result) {
+  private static boolean containsSelectedMutation(TxnCommand command, ResultNode.Txn result) {
     List<TxnCommand.Operation> selected = result.succeeded() ? command.success() : command.failure();
     if (selected.size() != result.responses().size()) {
       throw new IllegalArgumentException("transaction result does not match its selected branch");
@@ -43,11 +44,17 @@ public final class TxnResponseMapper {
       TxnCommand.Operation operation = selected.get(index);
       ResultNode child = result.responses().get(index);
       if (operation instanceof TxnCommand.Put) changed = true;
+      else if (operation instanceof TxnCommand.Delete) {
+        if (!(child instanceof ResultNode.Delete deleted)) {
+          throw new IllegalArgumentException("delete response differs from its request");
+        }
+        changed |= deleted.deleted() > 0;
+      }
       else if (operation instanceof TxnCommand.Nested nested) {
         if (!(child instanceof ResultNode.Txn branch)) {
           throw new IllegalArgumentException("nested transaction response differs from its request");
         }
-        changed |= containsSelectedPut(nested.command(), branch);
+        changed |= containsSelectedMutation(nested.command(), branch);
       }
     }
     return changed;
@@ -75,7 +82,10 @@ public final class TxnResponseMapper {
       appendChildren(nested.command(), child, revisions, response);
       return Rpc.ResponseOp.newBuilder().setResponseTxn(response).build();
     }
-    if (operation instanceof TxnCommand.Put) revisions.current = revisions.written;
+    if (operation instanceof TxnCommand.Put
+        || operation instanceof TxnCommand.Delete && result instanceof ResultNode.Delete deleted && deleted.deleted() > 0) {
+      revisions.current = revisions.written;
+    }
     if (!result.header().present() || result.header().revision() != revisions.current) {
       throw new IllegalArgumentException("transaction child response has an invalid revision");
     }
@@ -97,6 +107,22 @@ public final class TxnResponseMapper {
       var response = Rpc.PutResponse.newBuilder().setHeader(header);
       written.previous().ifPresent(previous -> response.setPrevKv(project(previous)));
       return Rpc.ResponseOp.newBuilder().setResponsePut(response).build();
+    }
+    if (operation instanceof TxnCommand.Delete delete && result instanceof ResultNode.Delete deleted) {
+      if ((!delete.previousRequested() && !deleted.previous().isEmpty())
+          || (delete.previousRequested() && deleted.previous().size() != deleted.deleted())) {
+        throw new IllegalArgumentException("delete previous values differ from its request");
+      }
+      ByteKey previous = null;
+      for (StoredRecord record : deleted.previous()) {
+        if (!delete.range().contains(record.key()) || previous != null && previous.compareTo(record.key()) >= 0) {
+          throw new IllegalArgumentException("delete previous values are unordered or outside the range");
+        }
+        previous = record.key();
+      }
+      var response = Rpc.DeleteRangeResponse.newBuilder().setHeader(header).setDeleted(deleted.deleted());
+      deleted.previous().forEach(record -> response.addPrevKvs(project(record)));
+      return Rpc.ResponseOp.newBuilder().setResponseDeleteRange(response).build();
     }
     throw new IllegalArgumentException("transaction response operation differs from its request");
   }

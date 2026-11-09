@@ -9,6 +9,7 @@ import etcdserverpb.KVGrpc;
 import etcdserverpb.Rpc;
 import io.etcdhbase.admin.M3TableGroupInitializer;
 import io.etcdhbase.admin.M3TableGroupPlan;
+import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
@@ -27,6 +28,7 @@ import io.grpc.StatusRuntimeException;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -93,6 +95,13 @@ class M3TxnRpcIT {
   private static void runTargetLayout(TemporaryHBaseClusterProcess cluster, String file,
       ScenarioRun run) throws Exception {
     var plan = M3TableGroupRuntimeIT.plan(file, cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
+    if (run.task().equals("j33")) {
+      byte[] first = (run.prefix() + "group/a").getBytes(StandardCharsets.UTF_8);
+      byte[] last = java.util.Arrays.copyOf((run.prefix() + "group/").getBytes(StandardCharsets.UTF_8), first.length);
+      last[last.length - 1] = (byte) 0xff;
+      assertTrue(plan.primary().codec().bucket(ByteKey.copyOf(first))
+          != plan.primary().codec().bucket(ByteKey.copyOf(last)), "prefix delete fixture must cross buckets");
+    }
     String layout = file.startsWith("history") ? "HISTORY" : "NATIVE";
     String suffix = layout.toLowerCase(Locale.ROOT);
     var auth = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
@@ -110,7 +119,8 @@ class M3TxnRpcIT {
       assertEquals(0, budgets.snapshot().allocatedBytes());
     }
     run(run.root(), run.artifacts().resolve(run.task() + "-compare-" + suffix + ".log"), List.of(
-        run.root().resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare", "--m3-txn",
+        run.root().resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare",
+        run.task().equals("j33") ? "--m3-delete" : "--m3-txn",
         "--left", run.nativeTrace().toString(), "--right",
         run.artifacts().resolve(run.task() + "-target-" + suffix + "-trace.jsonl").toString()));
   }
@@ -144,6 +154,7 @@ class M3TxnRpcIT {
           "--trace", run.artifacts().resolve(run.task() + "-target-" + suffix + "-trace.jsonl").toString(),
           "--metadata", run.artifacts().resolve(run.task() + "-target-" + suffix + "-metadata.json").toString());
       if (run.task().equals("j31")) assertPhysicalRowLimits(server, provider, identity, plan);
+      if (run.task().equals("j33")) assertFullKeyspaceDeleteOnDisposableFixture(server.boundListener().port());
     }
   }
 
@@ -175,8 +186,31 @@ class M3TxnRpcIT {
     }
   }
 
-  private static void runDriver(Path root, Path log, String scenario, String... args) throws Exception {
+  private static void assertFullKeyspaceDeleteOnDisposableFixture(int port) throws Exception {
+    var channel = NettyChannelBuilder.forAddress("127.0.0.1", port).usePlaintext().build();
+    try {
+      var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS);
+      ByteString first = ByteString.copyFromUtf8("j33-full-space-a");
+      ByteString second = ByteString.copyFromUtf8("j33-full-space-b");
+      for (ByteString key : List.of(first, second)) {
+        stub.put(Rpc.PutRequest.newBuilder().setKey(key).setValue(ByteString.copyFromUtf8("value")).build());
+      }
+      ByteString zero = ByteString.copyFrom(new byte[] {0});
+      var request = Rpc.DeleteRangeRequest.newBuilder().setKey(zero).setRangeEnd(zero).setPrevKv(true).build();
+      var deleted = stub.deleteRange(request);
+      assertTrue(deleted.getDeleted() >= 2);
+      assertTrue(deleted.getPrevKvsList().stream().anyMatch(kv -> kv.getKey().equals(first)));
+      assertTrue(deleted.getPrevKvsList().stream().anyMatch(kv -> kv.getKey().equals(second)));
+      var empty = stub.deleteRange(request);
+      assertEquals(0, empty.getDeleted());
+      assertEquals(deleted.getHeader().getRevision(), empty.getHeader().getRevision());
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
 
+  private static void runDriver(Path root, Path log, String scenario, String... args) throws Exception {
     var command = new ArrayList<String>();
     command.add(root.resolve("scripts/dev/go-program.sh").toString());
     command.add("m3driver");

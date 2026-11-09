@@ -10,7 +10,9 @@ import (
 func projectM3Term(left, right map[string]any, leftScope string, bothSucceeded bool, policy tracePolicy) error {
 	method := left["method"]
 	if right["method"] != method ||
-		(method != "etcdserverpb.KV/Put" && !(policy == m3TxnPolicy && method == "etcdserverpb.KV/Txn")) {
+		(method != "etcdserverpb.KV/Put" &&
+			!((policy == m3TxnPolicy || policy == m3DeletePolicy) && method == "etcdserverpb.KV/Txn") &&
+			!(policy == m3DeletePolicy && method == "etcdserverpb.KV/DeleteRange")) {
 		return errors.New("method is not registered for the M3 policy")
 	}
 	if !bothSucceeded {

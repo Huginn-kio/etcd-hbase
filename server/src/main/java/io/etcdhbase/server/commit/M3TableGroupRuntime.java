@@ -158,7 +158,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         (peer, request, scope) -> peer.equals(owner.token().instance())
             ? CompletableFuture.completedFuture(new MutationForwardReceiver.VerifiedAuthorization(identity, authorization))
             : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION)),
-        (request, binding, principal, scope) -> MutationOperationEnvelope.isTransaction(request.operationBytes())
+        (request, binding, principal, scope) -> MutationOperationEnvelope.kind(request.operationBytes()) != MutationOperationEnvelope.Kind.PUT
             ? business.txnProcessor().process(request, binding, principal, scope)
             : business.putProcessor().process(request, binding, principal, scope));
     var lane = new MutationOwnerLane(plan.source().tableGroupId(), pending.queue, receiver, business.metrics());
@@ -180,7 +180,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     var txnGateway = new TxnGateway(plan.source().tableGroupId(), identity, authorization,
         stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
         stores.control(), relay, stores.invocationResults(), business.txnReads(), budgets, REQUEST_MEMORY, pending.worker, business.metrics());
-    return new KvService(gateway, txnGateway);
+    return new KvService(gateway, txnGateway, txnGateway::deleteRange);
   }
 
   public KvService kvService() { return kvService; }

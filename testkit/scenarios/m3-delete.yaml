@@ -1,0 +1,20 @@
+schema_version: 1
+id: m3-delete-v1
+protocol: etcd-v3.5.23
+steps:
+  - {case_id: C09, id: native-baseline}
+  - {case_id: C09, id: J33-point}
+  - {case_id: C09, id: J33-empty}
+  - {case_id: C09, id: J33-recreate}
+  - {case_id: C09, id: J33-recreate-read}
+  - {case_id: C10, id: J33-seed-range}
+  - {case_id: C10, id: J33-prefix}
+  - {case_id: C13, id: J33-seed-overlap}
+  - {case_id: C13, id: J33-overlap}
+  - {case_id: C13, id: J33-seed-zero}
+  - {case_id: C13, id: J33-zero-delete-put}
+  - {case_id: C13, id: J33-zero-put-delete}
+  - {case_id: C10, id: J33-seed-client}
+  - {case_id: C10, id: J33-client-prefix}
+  - {case_id: C09, id: J33-no-prev}
+  - {case_id: C09, id: J33-empty-key}
