@@ -8,6 +8,8 @@ final class ManifestRecordFormat {
   static final byte PREPARED_EVENT = 4;
   static final byte EVENT_PAGE = 5;
   static final byte EVENT_DIRECTORY_PAGE = 6;
+  static final byte RESULT_PAGE = 7;
+  static final byte RESULT_DIRECTORY = 8;
 
   private ManifestRecordFormat() {}
 }

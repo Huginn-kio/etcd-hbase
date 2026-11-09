@@ -12,6 +12,22 @@ import org.junit.jupiter.api.Test;
 
 class RequestMetricsTest {
   @Test
+  void recordsOnlyObservedPutStagesAndAcceptedOutputBytes() {
+    var metrics = new RequestMetrics();
+    metrics.recordPutStage(RequestMetrics.PutStage.QUEUE, 7);
+    metrics.recordPutStage(RequestMetrics.PutStage.QUEUE, 13);
+    metrics.recordPutOutputBytes(19);
+    var queue = metrics.putStages().get(RequestMetrics.PutStage.QUEUE);
+    assertEquals(2, queue.count());
+    assertEquals(20, queue.totalNanos());
+    assertEquals(19, metrics.putOutputBytes());
+    assertEquals(0, metrics.putStages().get(RequestMetrics.PutStage.RESULT_RESOLUTION).count());
+    assertThrows(IllegalArgumentException.class,
+        () -> metrics.recordPutStage(RequestMetrics.PutStage.PREPARE, -1));
+    assertThrows(IllegalArgumentException.class, () -> metrics.recordPutOutputBytes(-1));
+  }
+
+  @Test
   void countsOnlyBoundedMethodAndOutcomeDimensions() {
     RequestMetrics metrics = new RequestMetrics();
     RequestScope scope = RequestScope.withoutDeadline();

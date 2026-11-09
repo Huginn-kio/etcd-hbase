@@ -203,6 +203,31 @@ class MutationForwardReceiverTest {
     assertEquals(1, processors.get());
   }
 
+  @Test
+  void parentCleanupWaitsForForwardedPhysicalProducerAfterReply() {
+    var repository = new InMemoryInvocationRepository();
+    var physicalWrite = new CompletableFuture<Void>();
+    var outerScope = RequestScope.withoutDeadline();
+    try {
+      var fixture = receiver(currentState(), repository,
+          (peer, request, scope) -> CompletableFuture.completedFuture(verifiedAuthorization()),
+          (request, binding, identity, scope) -> {
+            scope.trackPhysicalProducer(physicalWrite);
+            return CompletableFuture.completedFuture(new OwnerForwarding.Completed(new byte[] {1}));
+          });
+      assertInstanceOf(OwnerForwarding.Completed.class,
+          fixture.receiver().receive("authenticated-peer", request(), outerScope).join());
+      outerScope.close();
+      assertFalse(outerScope.cleanupCompletion().toCompletableFuture().isDone(),
+          "parent cleanup must not finish while forwarded physical work is still running");
+      physicalWrite.complete(null);
+      outerScope.cleanupCompletion().toCompletableFuture().join();
+    } finally {
+      physicalWrite.complete(null);
+      outerScope.close();
+    }
+  }
+
   private static void assertStaleBindingRejected(InvocationBinding.State state) {
     var repository = new InMemoryInvocationRepository();
     var stale = InvocationBinding.begin(INVOCATION, request().requestDigest(), AUTH_DIGEST,

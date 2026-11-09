@@ -17,6 +17,7 @@ public final class CommitFinalizationService implements CommitFinalizer {
   private final CommitDecisionRepository decisions;
   private final ManifestCatalog manifests;
   private final MaterializationStore materialization;
+  private final ResultCatalog results;
 
   public CommitFinalizationService(
       CommitControlStore control,
@@ -24,11 +25,23 @@ public final class CommitFinalizationService implements CommitFinalizer {
       CommitDecisionRepository decisions,
       ManifestCatalog manifests,
       MaterializationStore materialization) {
+    this(control, outcomes, decisions, manifests, materialization, null);
+  }
+
+  /** An equipped finalizer also recovers M2 roots written before result records existed. */
+  public CommitFinalizationService(
+      CommitControlStore control,
+      CommitOutcomeResolver outcomes,
+      CommitDecisionRepository decisions,
+      ManifestCatalog manifests,
+      MaterializationStore materialization,
+      ResultCatalog results) {
     this.control = Objects.requireNonNull(control, "control");
     this.outcomes = Objects.requireNonNull(outcomes, "outcomes");
     this.decisions = Objects.requireNonNull(decisions, "decisions");
     this.manifests = Objects.requireNonNull(manifests, "manifests");
     this.materialization = Objects.requireNonNull(materialization, "materialization");
+    this.results = results;
   }
 
   @Override
@@ -102,7 +115,7 @@ public final class CommitFinalizationService implements CommitFinalizer {
 
   private CompletableFuture<ManifestRoot> readAndValidateManifest(
       InvocationBinding invocation, CommitDecision decision, RequestScope scope) {
-    return manifests.readRoot(decision.manifestRoot(), scope).thenApply(stored -> {
+    return manifests.readRoot(decision.manifestRoot(), scope).thenCompose(stored -> {
       ManifestRoot root = stored.orElseThrow(
           () -> new IllegalStateException("selected sealed manifest root is missing"));
       if (!root.transactionId().equals(decision.transactionId())
@@ -114,7 +127,13 @@ public final class CommitFinalizationService implements CommitFinalizer {
           || !root.digest().equals(decision.manifestDigest())) {
         throw new IllegalStateException("selected decision differs from its sealed manifest root");
       }
-      return root;
+      if (root.resultReference().isEmpty()) return CompletableFuture.completedFuture(root);
+      ResultReference result = root.resultReference().orElseThrow();
+      if (results == null || !result.identity().matches(invocation)) {
+        return CompletableFuture.failedFuture(new IllegalStateException(
+            "finalizer cannot verify this invocation result"));
+      }
+      return results.verify(result, scope).thenApply(ignored -> root);
     });
   }
 

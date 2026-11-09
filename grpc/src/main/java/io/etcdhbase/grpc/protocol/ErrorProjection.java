@@ -1,6 +1,7 @@
 package io.etcdhbase.grpc.protocol;
 
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.kv.KvFailure;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import java.util.Collections;
@@ -25,6 +26,9 @@ public final class ErrorProjection {
     Throwable cause = unwrap(Objects.requireNonNull(failure, "failure"));
     if (cause instanceof BackendFailure backendFailure) {
       return projectBackendFailure(backendFailure);
+    }
+    if (cause instanceof KvFailure kvFailure) {
+      return projectKvFailure(kvFailure);
     }
     if (cause instanceof CancellationException || cause instanceof InterruptedException) {
       return status(
@@ -58,6 +62,26 @@ public final class ErrorProjection {
       case CANCELLED -> status(Status.CANCELLED, failure.safeMessage());
       case RESOURCE_LIMIT -> status(Status.RESOURCE_EXHAUSTED, failure.safeMessage());
       case UNKNOWN -> status(Status.INTERNAL, failure.safeMessage());
+    };
+  }
+
+  private static StatusRuntimeException projectKvFailure(KvFailure failure) {
+    return switch (failure.reason()) {
+      case EMPTY_KEY -> status(Status.INVALID_ARGUMENT, "etcdserver: key is not provided");
+      case KEY_NOT_FOUND -> status(Status.INVALID_ARGUMENT, "etcdserver: key not found");
+      case VALUE_PROVIDED -> status(Status.INVALID_ARGUMENT, "etcdserver: value is provided");
+      case LEASE_PROVIDED -> status(Status.INVALID_ARGUMENT, "etcdserver: lease is provided");
+      case TOO_MANY_OPS ->
+          status(Status.INVALID_ARGUMENT, "etcdserver: too many operations in txn request");
+      case DUPLICATE_KEY ->
+          status(Status.INVALID_ARGUMENT, "etcdserver: duplicate key given in txn request");
+      case COMPACTED ->
+          status(Status.OUT_OF_RANGE, "etcdserver: mvcc: required revision has been compacted");
+      case FUTURE_REVISION ->
+          status(Status.OUT_OF_RANGE, "etcdserver: mvcc: required revision is a future revision");
+      case REQUEST_TOO_LARGE -> status(Status.INVALID_ARGUMENT, "etcdserver: request is too large");
+      case LEASE_UNAVAILABLE ->
+          status(Status.UNIMPLEMENTED, "etcd-hbase: lease binding is not available");
     };
   }
 

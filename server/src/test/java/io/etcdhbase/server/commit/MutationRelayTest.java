@@ -13,6 +13,7 @@ import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.kv.KvFailure;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -122,6 +123,16 @@ class MutationRelayTest {
     var unknown = assertInstanceOf(MutationRelay.ResultUnknown.class,
         relay.forward(request(), RequestScope.withoutDeadline()).join());
     assertEquals(BackendFailure.Category.UNAVAILABLE, unknown.category());
+  }
+
+  @Test
+  void semanticRejectionPreservesTheKnownEtcdReason() {
+    var relay = relay(ignored -> CompletableFuture.completedFuture(ROUTE),
+        (selected, forwarded, scope) -> CompletableFuture.completedFuture(
+            new OwnerForwarding.SemanticRejected(KvFailure.Reason.KEY_NOT_FOUND)));
+    var result = assertInstanceOf(MutationRelay.SemanticRejection.class,
+        relay.forward(request(), RequestScope.withoutDeadline()).join());
+    assertEquals(KvFailure.Reason.KEY_NOT_FOUND, result.reason());
   }
 
   @Test

@@ -51,6 +51,7 @@ public final class SystemTableBinding {
   public TableName table() { return table; }
   public byte[] family() { return family.clone(); }
   public String tableGroupId() { return tableGroupId; }
+  public SaltProfile saltProfile() { return saltProfile; }
   public SystemRecordKeyCodec keyCodec() { return keyCodec; }
   public ByteKey profileFingerprint() { return profileFingerprint; }
 
@@ -88,6 +89,13 @@ public final class SystemTableBinding {
       throw new IllegalArgumentException(
           "system records require a non-expiring single-version column family");
     }
+  }
+
+  /** Result records require an explicit table capability; older M2 tables remain readable. */
+  public boolean supportsResults(TableDescriptor descriptor) {
+    validate(descriptor);
+    String categories = descriptor.getValue("etcdhbase.m0.record-categories");
+    return Arrays.asList(categories.split(",", -1)).contains("RESULT");
   }
 
   private static boolean containsRequiredCategories(String categories) {

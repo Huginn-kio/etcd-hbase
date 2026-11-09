@@ -8,10 +8,20 @@ import java.util.concurrent.CompletableFuture;
 public final class CommitPlanVerifier {
   private final ManifestCatalog catalog;
   private final MaterializationStore materialization;
+  private final ResultCatalog results;
 
   public CommitPlanVerifier(ManifestCatalog catalog, MaterializationStore materialization) {
     this.catalog = Objects.requireNonNull(catalog, "catalog");
     this.materialization = Objects.requireNonNull(materialization, "materialization");
+    this.results = null;
+  }
+
+  /** Creates a verifier for business requests, which must have a complete durable result. */
+  public CommitPlanVerifier(ManifestCatalog catalog, MaterializationStore materialization,
+      ResultCatalog results) {
+    this.catalog = Objects.requireNonNull(catalog, "catalog");
+    this.materialization = Objects.requireNonNull(materialization, "materialization");
+    this.results = Objects.requireNonNull(results, "results");
   }
 
   public CompletableFuture<ManifestRoot> verify(
@@ -34,10 +44,25 @@ public final class CommitPlanVerifier {
         return CompletableFuture.failedFuture(new IllegalStateException(
             "durable manifest root differs from the proposed root"));
       }
-      return catalog.forEachCandidate(root, scope,
+      if (root.resultReference().isPresent() != (results != null)) {
+        return CompletableFuture.failedFuture(new IllegalStateException(
+            "manifest result capability does not match the publisher"));
+      }
+      CompletableFuture<?> verified;
+      if (root.resultReference().isPresent()) {
+        ResultReference result = root.resultReference().orElseThrow();
+        if (!result.identity().matches(invocation)) {
+          return CompletableFuture.failedFuture(new IllegalStateException(
+              "manifest result belongs to another invocation"));
+        }
+        verified = results.verify(result, scope);
+      } else {
+        verified = CompletableFuture.completedFuture(null);
+      }
+      return verified.thenCompose(ignored -> catalog.forEachCandidate(root, scope,
               candidate -> materialization.preflight(candidate, scope))
           .thenCompose(candidates -> catalog.forEachEvent(root, scope,
-              event -> CompletableFuture.completedFuture(null)))
+              event -> CompletableFuture.completedFuture(null))))
           .thenApply(ignored -> root);
     });
   }

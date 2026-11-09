@@ -13,6 +13,16 @@ import (
 // protocol normalizations approved for M0: elapsed time, stable entity ID
 // correspondence, and one scenario-relative revision offset.
 func CompareTraces(left, right io.Reader) error {
+	return compareTraces(left, right, false)
+}
+
+// CompareM3PutTraces also applies the explicitly disclosed non-Raft header term projection.
+// It is restricted to the J30 Put suite; other M3 methods need their own registered policy.
+func CompareM3PutTraces(left, right io.Reader) error {
+	return compareTraces(left, right, true)
+}
+
+func compareTraces(left, right io.Reader, m3Put bool) error {
 	leftRecords, err := trace.ReadJSONL(left)
 	if err != nil {
 		return fmt.Errorf("read left trace: %w", err)
@@ -21,7 +31,7 @@ func CompareTraces(left, right io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("read right trace: %w", err)
 	}
-	return Compare(leftRecords, rightRecords)
+	return compare(leftRecords, rightRecords, m3Put)
 }
 
 // NormalizeTrace writes the permitted comparison representation for one
@@ -49,9 +59,18 @@ func NormalizeTrace(input io.Reader, output io.Writer) error {
 
 // Compare rejects missing, reordered, or semantically different records.
 func Compare(left, right []trace.Record) error {
+	return compare(left, right, false)
+}
+
+func compare(left, right []trace.Record, m3Put bool) error {
 	leftScope, rightScope, err := comparisonScopes(left, right)
 	if err != nil {
 		return err
+	}
+	if m3Put && (leftScope == rightScope ||
+		(leftScope != "native-etcd" && rightScope != "native-etcd") ||
+		(leftScope != "target-hbase" && rightScope != "target-hbase")) {
+		return errors.New("M3 Put comparison requires native and target traces")
 	}
 	leftNormalized, err := normalize(left)
 	if err != nil {
@@ -67,9 +86,14 @@ func Compare(left, right []trace.Record) error {
 	for index := range leftNormalized {
 		// Evidence provenance is checked above; it is not a wire field.
 		rightNormalized[index]["evidence_scope"] = leftNormalized[index]["evidence_scope"]
-		policy := strictCount
 		bothSucceeded := left[index].Error == nil && right[index].Error == nil &&
 			left[index].StreamTerminal == nil && right[index].StreamTerminal == nil
+		if m3Put {
+			if err := projectM3PutTerm(leftNormalized[index], rightNormalized[index], leftScope, bothSucceeded); err != nil {
+				return fmt.Errorf("trace record %d has invalid M3 Put header: %w", index+1, err)
+			}
+		}
+		policy := strictCount
 		if leftScope != rightScope && bothSucceeded {
 			policy = countPolicyForRequest(leftNormalized[index])
 		}

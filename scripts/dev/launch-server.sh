@@ -19,7 +19,9 @@ JDK_HOME="$(cd "$JDK_HOME" && pwd -P)"
 export JAVA_HOME="$JDK_HOME"
 export PATH="$JAVA_HOME/bin:$PATH"
 
-if [[ "$ENTRY" == j03 && $# -ne 6 ]] || [[ "$ENTRY" == runtime && ( $# -ne 2 || "${1:-}" != --config ) ]]; then
+if [[ "$ENTRY" == j03 && $# -ne 6 ]] \
+  || [[ "$ENTRY" == runtime && ( "${1:-}" != --config \
+      || ( $# -ne 2 && ( $# -ne 4 || "${3:-}" != --m3-config ) ) ) ]]; then
   echo "invalid server arguments" >&2
   exit 2
 fi

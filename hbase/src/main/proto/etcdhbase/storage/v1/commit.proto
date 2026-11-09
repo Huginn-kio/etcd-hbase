@@ -55,6 +55,106 @@ message InvocationBinding {
   optional bytes result_reference = 11;
 }
 
+// Durable response records bind output to one request, authorization scope and attempt.
+// These are internal storage records, not the public etcd protobuf messages.
+message ResultIdentity {
+  optional bytes invocation_id = 1;
+  optional bytes transaction_id = 2;
+  optional bytes request_digest = 3;
+  optional bytes authorization_scope_digest = 4;
+  optional int64 owner_epoch = 5;
+  optional int64 base_sequence = 6;
+  optional int64 base_revision = 7;
+}
+
+message ResultPage {
+  optional uint32 format_version = 1;
+  optional ResultIdentity identity = 2;
+  optional uint32 page_index = 3;
+  optional bytes payload = 4;
+  optional bytes digest = 5;
+  optional uint32 item_count = 6;
+}
+
+message ResultPageReference {
+  optional uint32 page_index = 1;
+  optional uint32 payload_bytes = 2;
+  optional bytes digest = 3;
+  optional uint32 item_count = 4;
+}
+
+message ResultDirectory {
+  optional uint32 format_version = 1;
+  optional ResultIdentity identity = 2;
+  repeated ResultPageReference pages = 3;
+  optional bytes digest = 4;
+  optional uint32 item_count = 5;
+}
+
+message ResultReference {
+  optional ResultIdentity identity = 1;
+  optional bytes digest = 2;
+  optional uint32 page_count = 3;
+  optional uint64 total_bytes = 4;
+  optional uint32 item_count = 5;
+}
+
+message ResultKeyValue {
+  optional bytes key = 1;
+  optional int64 create_revision = 2;
+  optional int64 modification_revision = 3;
+  optional int64 version = 4;
+  optional int64 lease_id = 5;
+  optional bytes value = 6;
+  optional uint32 value_length = 7;
+}
+
+// ResultNode describes a logical response position, not an etcd wire response.
+message ResultHeader {
+  optional bool present = 1;
+  optional int64 revision = 2;
+}
+
+message PutResultNode {
+  optional bytes key = 1;
+  optional ResultKeyValue previous = 2;
+}
+
+message DeleteResultNode {
+  optional int64 deleted = 1;
+  repeated ResultKeyValue previous = 2;
+}
+
+message RangeResultNode {
+  repeated ResultKeyValue records = 1;
+  optional int64 count = 2;
+  optional bool more = 3;
+}
+
+message TxnResultNode {
+  optional bool succeeded = 1;
+  repeated ResultNode responses = 2;
+}
+
+message ResultNode {
+  optional uint32 ordinal = 1;
+  optional ResultHeader header = 2;
+  oneof kind {
+    PutResultNode put = 3;
+    DeleteResultNode delete = 4;
+    RangeResultNode range = 5;
+    TxnResultNode txn = 6;
+  }
+}
+
+message ResultTree {
+  optional uint32 format_version = 1;
+  optional ResultNode root = 2;
+  optional uint32 node_count = 3;
+  optional uint32 record_count = 4;
+  optional uint64 retained_bytes = 5;
+}
+
 message PreparedCandidate {
   optional uint32 format_version = 1;
   optional bytes transaction_id = 2;
@@ -139,6 +239,7 @@ message ManifestRoot {
   optional uint64 event_directory_total_bytes = 26;
   optional uint32 directory_first_bucket = 27;
   optional uint32 directory_last_bucket = 28;
+  optional ResultReference result = 29;
 }
 
 enum PreparedEventKind {

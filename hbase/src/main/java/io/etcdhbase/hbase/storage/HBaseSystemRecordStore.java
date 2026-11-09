@@ -10,6 +10,7 @@ import io.etcdhbase.hbase.connection.HBaseRequestContext;
 import io.etcdhbase.hbase.error.HBaseFailures;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -31,14 +32,18 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
 
   private final AsyncConnection connection;
   private final SystemTableBinding binding;
+  private final boolean resultsSupported;
 
-  private HBaseSystemRecordStore(AsyncConnection connection, SystemTableBinding binding) {
+  private HBaseSystemRecordStore(AsyncConnection connection, SystemTableBinding binding,
+      boolean resultsSupported) {
     this.connection = connection;
     this.binding = binding;
+    this.resultsSupported = resultsSupported;
   }
 
   @Override
   public int bucket(SystemRecordType type, ByteKey identity) {
+    requireTypeSupported(type);
     return binding.keyCodec().bucket(type, identity);
   }
 
@@ -52,8 +57,8 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
         HBaseRequestCompletion.startRequest(scope,
             () -> connection.getAdmin().getDescriptor(binding.table()))
             .thenApply(descriptor -> {
-              binding.validate(descriptor);
-              return new HBaseSystemRecordStore(connection, binding);
+              boolean supportsResults = binding.supportsResults(descriptor);
+              return new HBaseSystemRecordStore(connection, binding, supportsResults);
             })).exceptionallyCompose(failure -> CompletableFuture.failedFuture(
                 HBaseFailures.classify(failure)));
   }
@@ -61,6 +66,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
   @Override
   public CompletableFuture<Optional<ByteKey>> read(
       SystemRecordType type, ByteKey identity, RequestScope scope) {
+    requireTypeSupported(type);
     byte[] row = binding.row(type, identity);
     return execute(scope, table -> table.get(
         new Get(row).setConsistency(Consistency.STRONG).addFamily(binding.family())))
@@ -70,6 +76,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
   @Override
   public CompletableFuture<CreateResult> createIfAbsent(
       SystemRecordType type, ByteKey identity, ByteKey value, RequestScope scope) {
+    requireTypeSupported(type);
     byte[] row = binding.row(type, identity);
     byte[] bytes = checkedValue(value);
     Put put = put(row, bytes);
@@ -91,6 +98,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
       Optional<ByteKey> expected,
       ByteKey replacement,
       RequestScope scope) {
+    requireTypeSupported(type);
     byte[] row = binding.row(type, identity);
     byte[] bytes = checkedValue(replacement);
     var builder = CheckAndMutate.newBuilder(row);
@@ -136,6 +144,14 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
   private static byte[] checkedValue(ByteKey value) {
     validateValueLength(value.length());
     return value.bytes();
+  }
+
+  private void requireTypeSupported(SystemRecordType type) {
+    Objects.requireNonNull(type, "type");
+    if ((type == SystemRecordType.RESULT || type == SystemRecordType.TABLE_GROUP_IDENTITY)
+        && !resultsSupported) {
+      throw new IllegalStateException("system table does not declare M3 record capability");
+    }
   }
 
   private static void validateValueLength(int length) {

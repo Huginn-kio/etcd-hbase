@@ -1,6 +1,7 @@
 package io.etcdhbase.grpc.service;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 import etcdserverpb.Rpc;
 import io.grpc.Status;
@@ -10,6 +11,25 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class SkeletonServiceTest {
+  @Test
+  void defaultPutRemainsUnimplementedAndAnAssembledHandlerReceivesTheOriginalRequest() {
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    StreamObserver<Rpc.PutResponse> observer = new StreamObserver<>() {
+      @Override public void onNext(Rpc.PutResponse value) { throw new AssertionError("unexpected success"); }
+      @Override public void onError(Throwable value) { failure.set(value); }
+      @Override public void onCompleted() { throw new AssertionError("unexpected completion"); }
+    };
+    var request = Rpc.PutRequest.newBuilder().setKey(com.google.protobuf.ByteString.copyFromUtf8("k")).build();
+    new KvService().put(request, observer);
+    assertEquals(Status.Code.UNIMPLEMENTED, Status.fromThrowable(failure.get()).getCode());
+    AtomicReference<Rpc.PutRequest> forwarded = new AtomicReference<>();
+    AtomicReference<StreamObserver<Rpc.PutResponse>> destination = new AtomicReference<>();
+    new KvService((value, response) -> { forwarded.set(value); destination.set(response); })
+        .put(request, observer);
+    assertSame(request, forwarded.get());
+    assertSame(observer, destination.get());
+  }
+
   @Test
   void emptyHalfClosedStreamFailsOnceWithoutReturningAResponse() {
     AtomicInteger terminalCount = new AtomicInteger();

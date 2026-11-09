@@ -9,6 +9,9 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -19,7 +22,10 @@ import java.util.function.Function;
 
 /** Bounded service-owned lane for attempts that may have reached the publication CAS. */
 public final class BoundedPublicationHandoff implements PublicationHandoff, AutoCloseable {
+  private static final Executor TIMEOUT_CLEANUP =
+      task -> Thread.ofVirtual().name("commit-publish-timeout").start(task);
   private final ThreadPoolExecutor workers;
+  private final ScheduledThreadPoolExecutor deadlines;
   private final Semaphore capacity;
   private final Duration serviceDeadline;
   private final AtomicBoolean closing = new AtomicBoolean();
@@ -48,6 +54,10 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
     capacity = new Semaphore(slots);
     workers = new ThreadPoolExecutor(workerCount, workerCount, 0, TimeUnit.NANOSECONDS,
         new ArrayBlockingQueue<>(queueCapacity), threads, new ThreadPoolExecutor.AbortPolicy());
+    deadlines = new ScheduledThreadPoolExecutor(1,
+        Thread.ofPlatform().daemon().name("commit-publish-deadline-", 0).factory());
+    deadlines.setRemoveOnCancelPolicy(true);
+    deadlines.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
   }
 
   @Override
@@ -64,14 +74,23 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
         new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
     active.incrementAndGet();
     var task = new HandoffTask<T>(requestScope, serviceWork);
-    requestScope.registerCleanup(task);
-    if (!task.accept()) {
-      task.releaseCapacity();
+    try {
+      task.registration = requestScope.registerScopedCleanup(task, task.physicalDrain);
+      if (!task.accept()) {
+        task.releaseCapacity();
+        return task.waitingResult.copy();
+      }
+    } catch (RuntimeException failure) {
+      task.rejectAdmission(failure);
       return task.waitingResult.copy();
+    } catch (Error fatal) {
+      task.rejectAdmission(fatal);
+      throw fatal;
     }
     try {
+      task.armDeadline();
       workers.execute(task::run);
-    } catch (java.util.concurrent.RejectedExecutionException rejected) {
+    } catch (RuntimeException rejected) {
       task.reject(rejected);
     } catch (Error fatal) {
       // Thread creation may fail after execute has queued this task. Reject it before returning
@@ -87,6 +106,17 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
     return drained.copy();
   }
 
+  /** Waits for the owned worker and deadline threads after accepted work has drained. */
+  public boolean awaitTermination(Duration timeout) throws InterruptedException {
+    Objects.requireNonNull(timeout, "timeout");
+    if (timeout.isNegative()) throw new IllegalArgumentException("negative termination timeout");
+    long nanos = durationNanos(timeout);
+    long start = System.nanoTime();
+    if (!workers.awaitTermination(nanos, TimeUnit.NANOSECONDS)) return false;
+    long elapsed = Math.max(0, System.nanoTime() - start);
+    return deadlines.awaitTermination(Math.max(0, nanos - elapsed), TimeUnit.NANOSECONDS);
+  }
+
   @Override
   public void close() {
     if (closing.compareAndSet(false, true)) workers.shutdown();
@@ -100,7 +130,18 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
   }
 
   private void completeIfDrained() {
-    if (closing.get() && active.get() == 0) drained.complete(null);
+    if (closing.get() && active.get() == 0) {
+      deadlines.shutdown();
+      drained.complete(null);
+    }
+  }
+
+  private static long durationNanos(Duration duration) {
+    try {
+      return duration.toNanos();
+    } catch (ArithmeticException overflow) {
+      return Long.MAX_VALUE;
+    }
   }
 
   private final class HandoffTask<T> implements AutoCloseable {
@@ -110,8 +151,16 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
     private final RequestScope requestScope;
     private final Function<RequestScope, CompletableFuture<T>> serviceWork;
     private final CompletableFuture<T> waitingResult = new CompletableFuture<>();
+    private final CompletableFuture<Void> physicalDrain = new CompletableFuture<>();
+    private RequestScope.ScopedCleanup registration;
+    private volatile ScheduledFuture<?> deadline;
+    private RequestScope runningScope;
     private State state = State.WAITING;
     private boolean capacityReleased;
+    private boolean timedOut;
+    private boolean timeoutRunning;
+    private boolean releaseAfterTimeout;
+    private Throwable deferredCleanupFailure;
 
     private HandoffTask(RequestScope requestScope,
         Function<RequestScope, CompletableFuture<T>> serviceWork) {
@@ -128,6 +177,8 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
             return;
           }
           state = State.TRANSFERRED;
+          // Parent cleanup and its memory owners must include the independent service producer.
+          requestScope.trackPhysicalProducer(physicalDrain);
         }
       });
       if (!requestOpen) {
@@ -147,36 +198,112 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
       return accepted;
     }
 
+    private void armDeadline() {
+      deadline = deadlines.schedule(this::timeout, durationNanos(serviceDeadline), TimeUnit.NANOSECONDS);
+    }
+
     private void run() {
-      synchronized (lock) {
-        if (state != State.TRANSFERRED) return;
-        state = State.RUNNING;
-      }
-      RequestScope serviceScope = null;
-      CompletableFuture<T> serviceResult;
+      RequestScope serviceScope;
       try {
         serviceScope = RequestScope.withTimeout(serviceDeadline);
+      } catch (RuntimeException failure) {
+        reject(failure);
+        return;
+      } catch (Error fatal) {
+        rejectFatal(fatal);
+        throw fatal;
+      }
+      boolean expired;
+      synchronized (lock) {
+        if (state != State.TRANSFERRED) {
+          serviceScope.close();
+          return;
+        }
+        expired = timedOut;
+        if (expired) state = State.FINISHED;
+        else {
+          state = State.RUNNING;
+          runningScope = serviceScope;
+        }
+      }
+      if (expired) {
+        serviceScope.close();
+        releaseCapacity();
+        return;
+      }
+      CompletableFuture<T> serviceResult;
+      try {
         serviceResult = Objects.requireNonNull(serviceWork.apply(serviceScope), "serviceWork result");
       } catch (RuntimeException failure) {
         serviceResult = CompletableFuture.failedFuture(failure);
       } catch (Error fatal) {
         // This task already owns capacity and may have registered service resources. Preserve
         // the fatal result, drain that scope, and release capacity only after physical cleanup.
+        cancelDeadline();
         failFatal(fatal, serviceScope);
         throw fatal;
       }
-      RequestScope ownedServiceScope = serviceScope;
-      serviceResult.whenComplete(
-          (value, failure) -> finishServiceWork(ownedServiceScope, value, failure));
+      serviceResult.whenComplete((value, failure) -> {
+        cancelDeadline();
+        finishServiceWork(serviceScope, value, failure);
+      });
     }
 
     private void finishServiceWork(RequestScope serviceScope, T value, Throwable failure) {
       if (!markFinished()) return;
       Throwable serviceFailure = failure == null
           ? null : CompletionFailures.unwrapCompletion(failure);
+      if ((timedOut || serviceScope != null && serviceScope.isDeadlineExceeded())
+          && !(serviceFailure instanceof Error)) {
+        serviceFailure = new BackendFailure(BackendFailure.Category.TIMEOUT, serviceFailure);
+      }
       Error cleanupFatal = closeServiceScope(serviceScope);
       releaseCapacityAfterCleanup(serviceScope);
       publishServiceResult(value, serviceFailure, cleanupFatal);
+    }
+
+    private void timeout() {
+      RequestScope serviceScope;
+      synchronized (lock) {
+        if (state != State.TRANSFERRED && state != State.RUNNING) return;
+        timedOut = true;
+        timeoutRunning = true;
+        serviceScope = runningScope;
+      }
+      try {
+        TIMEOUT_CLEANUP.execute(() -> expire(serviceScope));
+      } catch (RuntimeException | Error failure) {
+        // If a thread cannot be started, retain ownership and perform the cleanup here.
+        try { expire(serviceScope); }
+        catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+        throw failure;
+      }
+    }
+
+    private void expire(RequestScope serviceScope) {
+      try {
+        if (serviceScope != null) serviceScope.cancelAsync(TIMEOUT_CLEANUP);
+      } finally {
+        try {
+          // After transfer, timeout is an unknown outcome, never proof that the write failed.
+          waitingResult.completeExceptionally(new BackendFailure(BackendFailure.Category.TIMEOUT));
+        } finally {
+          Throwable cleanupFailure;
+          boolean release;
+          synchronized (lock) {
+            timeoutRunning = false;
+            release = releaseAfterTimeout;
+            cleanupFailure = deferredCleanupFailure;
+            deferredCleanupFailure = null;
+          }
+          if (release) releaseCapacity(cleanupFailure);
+        }
+      }
+    }
+
+    private void cancelDeadline() {
+      ScheduledFuture<?> scheduled = deadline;
+      if (scheduled != null) scheduled.cancel(false);
     }
 
     private boolean markFinished() {
@@ -232,6 +359,14 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
       releaseCapacity();
     }
 
+    private void rejectAdmission(Throwable failure) {
+      synchronized (lock) {
+        if (state == State.WAITING || state == State.TRANSFERRED) state = State.REJECTED;
+      }
+      waitingResult.completeExceptionally(failure);
+      releaseCapacity();
+    }
+
     private void rejectFatal(Error failure) {
       if (!markRejected()) return;
       waitingResult.completeExceptionally(failure);
@@ -250,16 +385,38 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
       if (serviceScope == null) {
         releaseCapacity();
       } else {
-        serviceScope.cleanupCompletion().whenComplete((ignored, cleanupFailure) -> releaseCapacity());
+        CompletableFuture.allOf(serviceScope.cleanupCompletion().toCompletableFuture(),
+            serviceScope.physicalProducersCompletion().toCompletableFuture())
+            .whenComplete((ignored, cleanupFailure) -> releaseCapacity(cleanupFailure));
       }
     }
 
     private void releaseCapacity() {
+      releaseCapacity(null);
+    }
+
+    private void releaseCapacity(Throwable cleanupFailure) {
       synchronized (lock) {
         if (capacityReleased) return;
+        if (timeoutRunning) {
+          releaseAfterTimeout = true;
+          if (deferredCleanupFailure == null) deferredCleanupFailure = cleanupFailure;
+          else if (cleanupFailure != null && deferredCleanupFailure != cleanupFailure) {
+            deferredCleanupFailure.addSuppressed(cleanupFailure);
+          }
+          return;
+        }
         capacityReleased = true;
       }
+      cancelDeadline();
       BoundedPublicationHandoff.this.release();
+      if (cleanupFailure == null) physicalDrain.complete(null);
+      else physicalDrain.completeExceptionally(CompletionFailures.unwrapCompletion(cleanupFailure));
+      try {
+        if (registration != null) registration.close();
+      } catch (Exception failure) {
+        throw new IllegalStateException("publication request registration did not close", failure);
+      }
     }
 
     private void suppressDistinct(Throwable primary, Throwable secondary) {

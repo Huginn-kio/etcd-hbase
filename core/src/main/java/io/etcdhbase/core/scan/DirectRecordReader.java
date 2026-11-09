@@ -28,6 +28,21 @@ public final class DirectRecordReader implements RecordReader {
 
   @Override
   public CompletableFuture<PointResult> read(ByteKey key, long upper, ReadProjection projection) {
+    return read(key, upper, projection, true);
+  }
+
+  /**
+   * Retains an intermediate point result without ending its shared read view. The caller must
+   * finish the store's read successfully after preparing all dependent data and before sealing
+   * or exposing that data. The returned point result still owns its output allocation.
+   */
+  public CompletableFuture<PointResult> readForPreparation(
+      ByteKey key, long upper, ReadProjection projection) {
+    return read(key, upper, projection, false);
+  }
+
+  private CompletableFuture<PointResult> read(ByteKey key, long upper, ReadProjection projection,
+      boolean finishRead) {
     Objects.requireNonNull(key, "key");
     Objects.requireNonNull(projection, "projection");
     if (upper <= 0) return CompletableFuture.failedFuture(new IllegalArgumentException("revision must be positive"));
@@ -45,7 +60,7 @@ public final class DirectRecordReader implements RecordReader {
       if (actual != delivered) actual.close();
     }));
     CompletableFuture<Optional<StoredRecord>> operation;
-    try { operation = PointRead.get(store, key, upper, projection, account); }
+    try { operation = PointRead.get(store, key, upper, projection, account, finishRead); }
     catch (Error fatal) {
       throw settleFailureAfterCleanup(owner, fatal, output);
     }

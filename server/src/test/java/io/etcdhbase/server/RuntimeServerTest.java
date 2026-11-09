@@ -1,12 +1,14 @@
 package io.etcdhbase.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.etcdhbase.server.config.RuntimeConfiguration;
+import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfigurationLoader;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -30,6 +32,7 @@ class RuntimeServerTest {
             .put("id", "second")
             .put("bind_host", "LOCALHOST."));
     var server = RuntimeServer.start(load(tree));
+    assertFalse(server.dataReady());
     var bound = server.boundListeners();
     assertEquals(2, bound.size());
     server.close();
@@ -77,6 +80,9 @@ class RuntimeServerTest {
         "env://UNRESOLVED_TEST_REFERENCE",
         configuration.hbaseProfiles().getFirst().credentialReference());
     assertThrows(IllegalArgumentException.class, () -> RuntimeServer.start(configuration));
+    var activation = new M3RuntimeConfiguration("1", 6000, 1000, 30000, 30000,
+        512L << 20, 1_048_576, 2, 16, 60000);
+    assertThrows(IllegalArgumentException.class, () -> RuntimeServer.startM3(configuration, activation));
     profile.put("credential_reference", "cleartext-password");
     assertThrows(IllegalArgumentException.class, () -> load(tree));
   }

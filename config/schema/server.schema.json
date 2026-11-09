@@ -549,7 +549,8 @@
         "INVOCATION",
         "CANDIDATE",
         "MANIFEST",
-        "SNAPSHOT_PIN"
+        "SNAPSHOT_PIN",
+        "RESULT"
       ]
     },
     "TablePermission": {

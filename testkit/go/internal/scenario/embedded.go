@@ -42,7 +42,7 @@ func Run(ctx context.Context, suite Suite, dataDir string, output io.Writer) (Me
 	if err != nil {
 		return Metadata{}, err
 	}
-	runner := &runner{client: server.client, writer: output, ordinals: make(map[string]uint64)}
+	runner := &runner{client: server.client, writer: output, ordinals: make(map[string]uint64), evidenceScope: "native-etcd"}
 	if err := runner.run(ctx); err != nil {
 		return metadata, err
 	}

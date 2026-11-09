@@ -113,6 +113,190 @@ class BoundedPublicationHandoffTest {
     cleanupCompletion.complete(null);
     handoff.drained().get(5, TimeUnit.SECONDS);
     assertTrue(handoff.drained().isDone());
+    assertTrue(handoff.awaitTermination(Duration.ofSeconds(5)));
+  }
+
+  @Test
+  void transferredPhysicalProducerKeepsParentAndHandoffCapacityUntilItStops() throws Exception {
+    var handoff = handoff();
+    var requestScope = RequestScope.withoutDeadline();
+    var physicalWrite = new CompletableFuture<Void>();
+    try {
+      CompletableFuture<String> result = handoff.transfer(invocation(), requestScope, serviceScope -> {
+        serviceScope.trackPhysicalProducer(physicalWrite);
+        return CompletableFuture.completedFuture(PUBLISHED_OBSERVATION);
+      });
+      assertEquals(PUBLISHED_OBSERVATION, result.get(5, TimeUnit.SECONDS));
+      handoff.close();
+      requestScope.close();
+      assertFalse(handoff.drained().isDone(), "handoff must retain capacity for the producer");
+      assertFalse(requestScope.cleanupCompletion().toCompletableFuture().isDone(),
+          "request cleanup must wait for the transferred producer");
+      assertFalse(requestScope.physicalProducersCompletion().toCompletableFuture().isDone(),
+          "the transferred producer must remain owned by the parent request");
+
+      physicalWrite.complete(null);
+      handoff.drained().get(5, TimeUnit.SECONDS);
+      requestScope.physicalProducersCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+    } finally {
+      physicalWrite.complete(null);
+      requestScope.close();
+      handoff.close();
+    }
+  }
+
+  @Test
+  void serviceDeadlineCancelsWorkButRetainsCapacityUntilItsPhysicalProducerStops() throws Exception {
+    var handoff = new BoundedPublicationHandoff(1, 1, Duration.ofMillis(500));
+    var requestScope = RequestScope.withoutDeadline();
+    var physicalWrite = new CompletableFuture<Void>();
+    var started = new CountDownLatch(1);
+    var serviceScopeReference = new AtomicReference<RequestScope>();
+    try {
+      CompletableFuture<String> result = handoff.transfer(invocation(), requestScope, serviceScope -> {
+        serviceScopeReference.set(serviceScope);
+        serviceScope.trackPhysicalProducer(physicalWrite);
+        started.countDown();
+        return serviceScope.track(new CompletableFuture<>());
+      });
+      assertTrue(started.await(5, TimeUnit.SECONDS));
+      var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> result.get(5, TimeUnit.SECONDS));
+      assertEquals(BackendFailure.Category.TIMEOUT,
+          ((BackendFailure) failure.getCause()).category());
+      assertTrue(serviceScopeReference.get().isCancelled());
+      handoff.close();
+      requestScope.close();
+      assertFalse(handoff.drained().isDone());
+      physicalWrite.complete(null);
+      handoff.drained().get(5, TimeUnit.SECONDS);
+    } finally {
+      physicalWrite.complete(null);
+      requestScope.close();
+      handoff.close();
+    }
+  }
+
+  @Test
+  void blockedCleanupDoesNotPreventAnotherTransferFromTimingOut() throws Exception {
+    var handoff = new BoundedPublicationHandoff(2, 1, Duration.ofMillis(500));
+    var firstScope = RequestScope.withoutDeadline();
+    var secondScope = RequestScope.withoutDeadline();
+    var firstStarted = new CountDownLatch(1);
+    var secondStarted = new CountDownLatch(1);
+    var cleanupStarted = new CountDownLatch(1);
+    var allowCleanup = new CountDownLatch(1);
+    try {
+      handoff.transfer(invocation(), firstScope, serviceScope -> {
+        serviceScope.registerCleanup(() -> {
+          cleanupStarted.countDown();
+          if (!allowCleanup.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("cleanup stalled");
+        });
+        firstStarted.countDown();
+        return serviceScope.track(new CompletableFuture<String>());
+      });
+      assertTrue(firstStarted.await(5, TimeUnit.SECONDS));
+      var second = handoff.transfer(invocation(), secondScope, serviceScope -> {
+        secondStarted.countDown();
+        return serviceScope.track(new CompletableFuture<String>());
+      });
+      assertTrue(secondStarted.await(5, TimeUnit.SECONDS));
+      assertTrue(cleanupStarted.await(5, TimeUnit.SECONDS));
+      var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> second.get(2, TimeUnit.SECONDS));
+      assertEquals(BackendFailure.Category.TIMEOUT, ((BackendFailure) failure.getCause()).category());
+      handoff.close();
+      assertFalse(handoff.drained().isDone());
+    } finally {
+      allowCleanup.countDown();
+      firstScope.close();
+      secondScope.close();
+      handoff.close();
+      handoff.drained().get(10, TimeUnit.SECONDS);
+    }
+  }
+
+  @Test
+  void blockedTimeoutObserverDoesNotRetireCapacityEarlyOrBlockOtherDeadlines() throws Exception {
+    var handoff = new BoundedPublicationHandoff(2, 1, Duration.ofMillis(500));
+    var firstScope = RequestScope.withoutDeadline();
+    var secondScope = RequestScope.withoutDeadline();
+    var firstStarted = new CountDownLatch(1);
+    var observerStarted = new CountDownLatch(1);
+    var allowObserver = new CountDownLatch(1);
+    try {
+      var first = handoff.transfer(invocation(), firstScope, serviceScope -> {
+        firstStarted.countDown();
+        return serviceScope.track(new CompletableFuture<String>());
+      });
+      first.whenComplete((value, failure) -> {
+        observerStarted.countDown();
+        try {
+          if (!allowObserver.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("observer stalled");
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("observer interrupted", interrupted);
+        }
+      });
+      assertTrue(firstStarted.await(5, TimeUnit.SECONDS));
+      var second = handoff.transfer(invocation(), secondScope,
+          serviceScope -> serviceScope.track(new CompletableFuture<String>()));
+      assertTrue(observerStarted.await(5, TimeUnit.SECONDS));
+      var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> second.get(2, TimeUnit.SECONDS));
+      assertEquals(BackendFailure.Category.TIMEOUT, ((BackendFailure) failure.getCause()).category());
+      handoff.close();
+      assertFalse(handoff.drained().isDone(), "the timeout callback still owns its capacity");
+    } finally {
+      allowObserver.countDown();
+      firstScope.close();
+      secondScope.close();
+      handoff.close();
+      handoff.drained().get(10, TimeUnit.SECONDS);
+    }
+  }
+
+  @Test
+  void queuedTransferExpiresWithoutRunningAfterABlockedWorkerResumes() throws Exception {
+    var handoff = new BoundedPublicationHandoff(1, 1, Duration.ofMillis(500));
+    var firstScope = RequestScope.withoutDeadline();
+    var secondScope = RequestScope.withoutDeadline();
+    var started = new CountDownLatch(1);
+    var release = new CountDownLatch(1);
+    var secondStarts = new AtomicInteger();
+    try {
+      var first = handoff.transfer(invocation(), firstScope, serviceScope -> {
+        started.countDown();
+        try {
+          if (!release.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("worker stalled");
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("worker interrupted", interrupted);
+        }
+        return CompletableFuture.completedFuture(PUBLISHED_OBSERVATION);
+      });
+      assertTrue(started.await(5, TimeUnit.SECONDS));
+      var second = handoff.transfer(invocation(), secondScope, serviceScope -> {
+        secondStarts.incrementAndGet();
+        return CompletableFuture.completedFuture(PUBLISHED_OBSERVATION);
+      });
+      var firstFailure = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> first.get(5, TimeUnit.SECONDS));
+      var secondFailure = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> second.get(5, TimeUnit.SECONDS));
+      assertEquals(BackendFailure.Category.TIMEOUT, ((BackendFailure) firstFailure.getCause()).category());
+      assertEquals(BackendFailure.Category.TIMEOUT, ((BackendFailure) secondFailure.getCause()).category());
+      handoff.close();
+      assertFalse(handoff.drained().isDone());
+      release.countDown();
+      handoff.drained().get(5, TimeUnit.SECONDS);
+      assertEquals(0, secondStarts.get());
+    } finally {
+      release.countDown();
+      firstScope.close();
+      secondScope.close();
+      handoff.close();
+    }
   }
 
   @Test

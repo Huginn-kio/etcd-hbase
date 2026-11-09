@@ -67,6 +67,33 @@ public final class HBaseMaterializationStore implements MaterializationStore {
       StorageTableBinding primary,
       Optional<StorageTableBinding> current,
       RequestScope scope) {
+    return open(factory, identity, Optional.empty(), primary, current, scope);
+  }
+
+  /** Opens only data tables provisioned as part of the supplied system-table group. */
+  public static CompletableFuture<HBaseMaterializationStore> openForTableGroup(
+      HBaseConnectionFactory factory,
+      AuthorizedBackendIdentity identity,
+      SystemTableBinding system,
+      StorageTableBinding primary,
+      Optional<StorageTableBinding> current,
+      RequestScope scope) {
+    Objects.requireNonNull(identity, "identity");
+    Objects.requireNonNull(system, "system");
+    if (!identity.scope().tableGroupId().equals(system.tableGroupId())
+        || !identity.allowedTableGroupIds().contains(system.tableGroupId())) {
+      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION));
+    }
+    return open(factory, identity, Optional.of(system), primary, current, scope);
+  }
+
+  private static CompletableFuture<HBaseMaterializationStore> open(
+      HBaseConnectionFactory factory,
+      AuthorizedBackendIdentity identity,
+      Optional<SystemTableBinding> system,
+      StorageTableBinding primary,
+      Optional<StorageTableBinding> current,
+      RequestScope scope) {
     Objects.requireNonNull(primary, "primary");
     Objects.requireNonNull(current, "current");
     boolean history = primary.layout() == StorageTableBinding.Layout.HISTORY;
@@ -89,17 +116,68 @@ public final class HBaseMaterializationStore implements MaterializationStore {
           ? context.execute(() -> connection.getAdmin().getDescriptor(current.orElseThrow().table()))
               .thenApply(Optional::of)
           : CompletableFuture.completedFuture(Optional.empty());
-      return primaryDescriptor.thenCombine(currentDescriptor, (primaryTable, currentTable) -> {
-        primary.validate(primaryTable);
-        currentTable.ifPresent(descriptor -> current.orElseThrow().validate(descriptor));
+      CompletableFuture<Optional<TableDescriptor>> systemDescriptor = system.isPresent()
+          ? context.execute(() -> connection.getAdmin().getDescriptor(system.orElseThrow().table()))
+              .thenApply(Optional::of)
+          : CompletableFuture.completedFuture(Optional.empty());
+      return primaryDescriptor.thenCombine(currentDescriptor, Descriptors::new)
+          .thenCombine(systemDescriptor, (tables, systemTable) -> {
+        primary.validate(tables.primary());
+        tables.current().ifPresent(descriptor -> current.orElseThrow().validate(descriptor));
+        systemTable.ifPresent(descriptor -> validateTableGroupDescriptors(
+            system.orElseThrow(), descriptor, primary, tables.primary(), tables.current()));
         int versions = nativeLayout
-            ? primaryTable.getColumnFamily(primary.family()).getMaxVersions() : 1;
+            ? tables.primary().getColumnFamily(primary.family()).getMaxVersions() : 1;
         if (nativeLayout && (versions < 2 || versions > MAX_NATIVE_VERSIONS)) {
           throw new IllegalArgumentException("native version limit is outside the bounded M2 range");
         }
         return new HBaseMaterializationStore(connection, primary, current, versions);
       });
     }).exceptionallyCompose(failure -> CompletableFuture.failedFuture(HBaseFailures.classify(failure)));
+  }
+
+  private record Descriptors(TableDescriptor primary, Optional<TableDescriptor> current) {}
+
+  /** Rejects mixed or unowned tables before a group can be made ready for writes. */
+  static void validateTableGroupDescriptors(SystemTableBinding system, TableDescriptor systemTable,
+      StorageTableBinding primary, TableDescriptor primaryTable, Optional<TableDescriptor> currentTable) {
+    system.validate(systemTable);
+    String expectedLayout = switch (primary.layout()) {
+      case HISTORY -> "SEPARATE_HISTORY_TABLE";
+      case NATIVE -> "NATIVE_CELL_VERSIONS";
+      case CURRENT -> throw new IllegalArgumentException("current table cannot be the primary history");
+    };
+    String cluster = systemTable.getValue("etcdhbase.m0.backend-cluster-id");
+    String plan = systemTable.getValue("etcdhbase.m0.plan-fingerprint");
+    String schema = systemTable.getValue("etcdhbase.m0.schema-version");
+    String salt = systemTable.getValue("etcdhbase.m0.salt-profile-id");
+    if (cluster == null || cluster.isBlank() || plan == null || !plan.matches("[0-9a-f]{64}")
+        || !"1".equals(schema) || salt == null || salt.isBlank()
+        || !expectedLayout.equals(systemTable.getValue("etcdhbase.m0.history-layout"))
+        || (primary.layout() == StorageTableBinding.Layout.HISTORY) != currentTable.isPresent()) {
+      throw new IllegalArgumentException("system table lacks matching group provisioning metadata");
+    }
+    validateDataOwner(system, primaryTable, cluster, plan, schema, salt, expectedLayout);
+    currentTable.ifPresent(table -> validateDataOwner(
+        system, table, cluster, plan, schema, salt, expectedLayout));
+    if (system.table().equals(primaryTable.getTableName())
+        || currentTable.filter(table -> table.getTableName().equals(system.table())
+            || table.getTableName().equals(primaryTable.getTableName())).isPresent()) {
+      throw new IllegalArgumentException("table group physical tables must be distinct");
+    }
+  }
+
+  private static void validateDataOwner(SystemTableBinding system, TableDescriptor table,
+      String cluster, String plan, String schema, String salt, String expectedLayout) {
+    if (!system.table().getNamespaceAsString().equals(table.getTableName().getNamespaceAsString())
+        || !system.tableGroupId().equals(table.getValue("etcdhbase.m0.table-group-id"))
+        || !cluster.equals(table.getValue("etcdhbase.m0.backend-cluster-id"))
+        || !plan.equals(table.getValue("etcdhbase.m0.plan-fingerprint"))
+        || !schema.equals(table.getValue("etcdhbase.m0.schema-version"))
+        || !salt.equals(table.getValue("etcdhbase.m0.salt-profile-id"))
+        || !expectedLayout.equals(table.getValue("etcdhbase.m0.history-layout"))) {
+      throw new IllegalArgumentException("data table does not belong to the configured table group");
+    }
   }
 
   @Override

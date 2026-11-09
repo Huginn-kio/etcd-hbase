@@ -13,6 +13,15 @@ public interface RecordStore extends ScanSource {
   CompletableFuture<List<BatchWriteResult>> putBatch(List<StoredRecord> records);
   ScanOperation startScan(ScanRequest request);
 
+  /**
+   * True when one point read opens a scanner that must consume scanner capacity. Such stores must
+   * attach {@link ScanCleanupFailure} to a failed read when scanner cleanup is unconfirmed;
+   * otherwise the caller treats cleanup as completed and releases the capacity.
+   */
+  default boolean pointReadUsesScanner() {
+    return false;
+  }
+
   /** Fences a pinned unary result after all data bytes have been materialized; ordinary stores need no action. */
   default CompletableFuture<Void> finishRead() {
     return CompletableFuture.completedFuture(null);

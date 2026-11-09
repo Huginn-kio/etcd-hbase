@@ -44,10 +44,12 @@ class ReadViewRecordStoreTest {
   @Test
   void currentReadOverlaysOnlyTheSelectedPendingTransactionBeforeRangeMerge() throws Exception {
     Fixture fixture = currentReadFixture();
+    fixture.physical.pointUsesScanner = true;
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
         BudgetManager.Account account = fixture.account(scope, 1L << 20)) {
       PinnedReadView pinned = fixture.views.open(OptionalLong.empty(), digest(9), scope).join();
       ReadViewRecordStore view = fixture.readStore(pinned, scope);
+      assertTrue(view.pointReadUsesScanner());
       assertSelectedPointReads(view, account);
       assertCurrentScanPage(view, pinned, account);
       assertRangeMergeAndExists(fixture, view, scope);
@@ -887,6 +889,7 @@ class ReadViewRecordStoreTest {
     private final Map<ByteKey, List<StoredRecord>> versions = new HashMap<>();
     private final AtomicInteger getCalls = new AtomicInteger();
     private final AtomicInteger scanCalls = new AtomicInteger();
+    private boolean pointUsesScanner;
     private ByteKey blockedKey;
     private CompletableFuture<Optional<StoredRecord>> pendingGet;
     private void blockNextGet(ByteKey key) {
@@ -898,6 +901,7 @@ class ReadViewRecordStoreTest {
       versions.get(record.key()).sort(Comparator.comparingLong(
           (StoredRecord value) -> value.metadata().modificationRevision()).reversed());
     }
+    @Override public boolean pointReadUsesScanner() { return pointUsesScanner; }
     @Override public CompletableFuture<Optional<StoredRecord>> get(
         ByteKey key, long upper, ReadProjection projection) {
       getCalls.incrementAndGet();

@@ -95,12 +95,15 @@ public final class MutationForwardReceiver {
     Objects.requireNonNull(scope, "scope");
     long requestBudget = Math.min(request.remainingTimeoutNanos(), MAX_LOCAL_TIMEOUT_NANOS);
     RequestScope effectiveScope = scope.childWithTimeoutNanos(requestBudget);
+    CompletableFuture<Void> effectiveDrain = CompletableFuture.allOf(
+        effectiveScope.cleanupCompletion().toCompletableFuture(),
+        effectiveScope.physicalProducersCompletion().toCompletableFuture());
     RequestScope.ScopedCleanup parentRegistration = scope.registerScopedCleanup(
         () -> {
           if (scope.isCancelled()) effectiveScope.cancel();
           else effectiveScope.close();
         },
-        effectiveScope.cleanupCompletion());
+        effectiveDrain);
     try {
       return receiveWithinScope(authenticatedPeerIdentity, request, effectiveScope)
           .whenComplete((reply, failure) -> closeScopeRegistration(parentRegistration));

@@ -21,11 +21,14 @@ import io.etcdhbase.hbase.storage.proto.CommitProtos;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import org.apache.hadoop.hbase.HConstants;
 
 /** Strict bounded codecs for private candidate and sealed manifest records. */
 public final class ManifestMessages {
   public static final int FORMAT_VERSION = 2;
+  public static final int ROOT_RESULT_FORMAT_VERSION = 3;
   public static final int MAX_ROOT_BYTES = 16 * 1024;
+  public static final int MAX_RESULT_ROOT_BYTES = 128 * 1024;
   public static final int MAX_DIRECTORY_BYTES = ManifestDirectoryPage.MAX_PAGE_BYTES;
   public static final int MAX_EVENT_DIRECTORY_BYTES = 64 * 1024;
 
@@ -154,8 +157,14 @@ public final class ManifestMessages {
   }
 
   public static byte[] encode(ManifestRoot root) {
+    root.candidateDirectory().ifPresent(child -> {
+      requireRootKeyLength(child.firstKey().length());
+      requireRootKeyLength(child.lastKey().length());
+      requireRootKeyLength(child.identity().length());
+    });
+    root.eventDirectory().ifPresent(child -> requireRootKeyLength(child.identity().length()));
     var builder = CommitProtos.ManifestRoot.newBuilder()
-        .setFormatVersion(FORMAT_VERSION)
+        .setFormatVersion(root.resultReference().isPresent() ? ROOT_RESULT_FORMAT_VERSION : FORMAT_VERSION)
         .setTransactionId(ByteString.copyFrom(root.transactionId().bytes()))
         .setOwnerEpoch(root.ownerEpoch())
         .setBaseSequence(root.baseSequence())
@@ -185,21 +194,28 @@ public final class ManifestMessages {
         .setEventDirectoryPageCount(child.leafPageCount())
         .setEventDirectoryLevel(child.level())
         .setEventDirectoryTotalBytes(child.totalBytes()));
+    root.resultReference().ifPresent(reference -> builder.setResult(ResultMessages.encode(reference)));
     byte[] encoded = builder.build().toByteArray();
-    requireLength(encoded.length, MAX_ROOT_BYTES);
+    requireLength(encoded.length, root.resultReference().isPresent()
+        ? MAX_RESULT_ROOT_BYTES : MAX_ROOT_BYTES);
     return encoded;
   }
 
   public static ManifestRoot decodeRoot(byte[] encoded) {
-    requireLength(encoded.length, MAX_ROOT_BYTES);
+    requireLength(encoded.length, MAX_RESULT_ROOT_BYTES);
     try {
       var message = CommitProtos.ManifestRoot.parseFrom(encoded);
       if (!message.getUnknownFields().asMap().isEmpty()
-          || !message.hasFormatVersion() || message.getFormatVersion() != FORMAT_VERSION
+          || !message.hasFormatVersion()
+          || message.getFormatVersion() != FORMAT_VERSION
+              && message.getFormatVersion() != ROOT_RESULT_FORMAT_VERSION
           || !message.hasTransactionId() || !message.hasOwnerEpoch() || !message.hasBaseSequence()
           || !message.hasBaseRevision() || !message.hasCandidateCount()
           || !message.hasTotalValueBytes() || !message.hasRootDigest()
           || !message.hasEventCount() || !message.hasTotalEventBytes()) throw invalid();
+      if ((message.getFormatVersion() == ROOT_RESULT_FORMAT_VERSION) != message.hasResult()) throw invalid();
+      requireLength(encoded.length, message.getFormatVersion() == ROOT_RESULT_FORMAT_VERSION
+          ? MAX_RESULT_ROOT_BYTES : MAX_ROOT_BYTES);
       byte[] txn = message.getTransactionId().toByteArray();
       if (txn.length != 16) throw invalid();
       boolean hasDirectory = message.hasDirectoryIdentity();
@@ -217,6 +233,9 @@ public final class ManifestMessages {
       if (anyDirectoryField != allDirectoryFields) throw invalid();
       Optional<ManifestChildReference> directory = Optional.empty();
       if (hasDirectory) {
+        requireRootKeyLength(message.getDirectoryIdentity().size());
+        requireRootKeyLength(message.getDirectoryFirstKey().size());
+        requireRootKeyLength(message.getDirectoryLastKey().size());
         directory = Optional.of(new ManifestChildReference(
             ByteKey.copyOf(message.getDirectoryIdentity().toByteArray()),
             ByteKey.copyOf(message.getDirectoryDigest().toByteArray()),
@@ -238,12 +257,20 @@ public final class ManifestMessages {
       if (anyEventField != allEventFields) throw invalid();
       Optional<EventReference> eventDirectory = Optional.empty();
       if (hasEventDirectory) {
+        requireRootKeyLength(message.getEventDirectoryIdentity().size());
         eventDirectory = Optional.of(new EventReference(
             ByteKey.copyOf(message.getEventDirectoryIdentity().toByteArray()),
             ByteKey.copyOf(message.getEventDirectoryDigest().toByteArray()),
             message.getEventDirectoryFirstOrdinal(), message.getEventDirectoryLastOrdinal(),
             message.getEventDirectoryItemCount(), message.getEventDirectoryTotalBytes(),
             message.getEventDirectoryPageCount(), message.getEventDirectoryLevel()));
+      }
+      if (message.hasResult()) {
+        return ManifestRoot.restoreWithResult(TransactionId.fromBytes(txn), message.getOwnerEpoch(),
+            message.getBaseSequence(), message.getBaseRevision(), message.getCandidateCount(),
+            message.getTotalValueBytes(), directory, message.getEventCount(),
+            message.getTotalEventBytes(), eventDirectory, ResultMessages.decode(message.getResult()),
+            ByteKey.copyOf(message.getRootDigest().toByteArray()));
       }
       return ManifestRoot.restore(TransactionId.fromBytes(txn), message.getOwnerEpoch(),
           message.getBaseSequence(), message.getBaseRevision(), message.getCandidateCount(),
@@ -494,6 +521,10 @@ public final class ManifestMessages {
 
   private static void requireLength(int length, int max) {
     if (length <= 0 || length > max) throw invalid();
+  }
+
+  private static void requireRootKeyLength(int length) {
+    if (length <= 0 || length > HConstants.MAX_ROW_LENGTH) throw invalid();
   }
 
   private static IllegalArgumentException invalid() {

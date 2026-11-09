@@ -9,6 +9,7 @@ import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.ScanOperation;
+import io.etcdhbase.core.storage.ScanCleanupFailure;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
@@ -19,6 +20,7 @@ import io.etcdhbase.hbase.error.HBaseFailures;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -81,6 +83,11 @@ public final class HBaseRecordStore implements RecordStore {
     });
   }
 
+  @Override
+  public boolean pointReadUsesScanner() {
+    return binding.layout() == StorageTableBinding.Layout.HISTORY;
+  }
+
   private CompletableFuture<Optional<StoredRecord>> getHistory(ByteKey key, long upper, ReadProjection projection) {
     return execute(() -> {
       byte[] startRow = binding.codec().encode(key, upper);
@@ -90,9 +97,30 @@ public final class HBaseRecordStore implements RecordStore {
           .setLimit(1).setCaching(1).setMaxResultSize(StorageMessages.MAX_VALUE_BYTES + 8192L)
           .addColumn(binding.family(), METADATA);
       if (projection == ReadProjection.FULL) scan.addColumn(binding.family(), VALUE);
-      return table().scanAll(scan).thenCompose(rows ->
+      return scanHistoryOnce(scan).thenCompose(rows ->
           decodeAsync(rows.isEmpty() ? Result.EMPTY_RESULT : rows.getFirst(), projection));
     });
+  }
+
+  private CompletableFuture<List<Result>> scanHistoryOnce(Scan scan) {
+    // A failed HBase scanner may close asynchronously. Avoid opening a retry scanner while its
+    // predecessor is unconfirmed; the caller retires the original capacity on failure.
+    AsyncTable<?> table = table(true);
+    try {
+      return Objects.requireNonNull(table.scanAll(scan), "history scan future")
+          .exceptionallyCompose(HBaseRecordStore::unconfirmedScannerClose);
+    } catch (RuntimeException failure) {
+      return unconfirmedScannerClose(failure);
+    } catch (Error fatal) {
+      fatal.addSuppressed(new ScanCleanupFailure(null));
+      throw fatal;
+    }
+  }
+
+  private static <T> CompletableFuture<T> unconfirmedScannerClose(Throwable failure) {
+    BackendFailure classified = HBaseFailures.classify(failure);
+    classified.addSuppressed(new ScanCleanupFailure(null));
+    return CompletableFuture.failedFuture(classified);
   }
 
   private CompletableFuture<Optional<StoredRecord>> decodeAsync(Result row, ReadProjection projection) {
@@ -203,9 +231,16 @@ public final class HBaseRecordStore implements RecordStore {
   }
 
   AsyncTable<?> table() {
+    return table(false);
+  }
+
+  private AsyncTable<?> table(boolean oneAttempt) {
     long remaining = Math.max(1, Math.min(TimeUnit.SECONDS.toNanos(30), scope.remainingDeadlineNanos()));
-    return connection.getTableBuilder(binding.table()).setOperationTimeout(remaining, TimeUnit.NANOSECONDS)
-        .setScanTimeout(remaining, TimeUnit.NANOSECONDS).setRpcTimeout(remaining, TimeUnit.NANOSECONDS).build();
+    var builder = connection.getTableBuilder(binding.table())
+        .setOperationTimeout(remaining, TimeUnit.NANOSECONDS)
+        .setScanTimeout(remaining, TimeUnit.NANOSECONDS).setRpcTimeout(remaining, TimeUnit.NANOSECONDS);
+    if (oneAttempt) builder.setMaxAttempts(1);
+    return builder.build();
   }
 
   StoredRecord decode(Result row, ReadProjection projection) {

@@ -131,7 +131,10 @@ public final class InvocationService {
     return repository.compareAndSet(expected, replacement, scope)
         .handle((updated, failure) -> new CasResult(updated, failure))
         .thenCompose(result -> {
-          if (result.failure() == null && result.updated()) {
+          if (result.failure() != null && !isUnknown(CompletionFailures.unwrapCompletion(result.failure()))) {
+            return CompletableFuture.failedFuture(CompletionFailures.unwrapCompletion(result.failure()));
+          }
+          if (result.failure() == null && Boolean.TRUE.equals(result.updated())) {
             return CompletableFuture.completedFuture(replacement);
           }
           return repository.read(expected.invocationId(), scope).thenCompose(observed -> {
@@ -149,6 +152,9 @@ public final class InvocationService {
             if (result.failure() != null) {
               return CompletableFuture.failedFuture(
                   CompletionFailures.unwrapCompletion(result.failure()));
+            }
+            if (result.updated() == null) {
+              return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
             }
             return transition(current, replacement, scope, attempt + 1);
           });

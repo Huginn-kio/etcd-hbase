@@ -57,6 +57,10 @@ final class M1TestEnvironment implements AutoCloseable {
 
   AuthorizedBackendIdentity identity() { return identity; }
 
+  org.apache.hadoop.conf.Configuration clientConfiguration() {
+    return cluster.clientConfiguration();
+  }
+
   /** Returns the provider-owned connection for fixture callers that borrow it. */
   AsyncConnection connection() { return connection; }
 

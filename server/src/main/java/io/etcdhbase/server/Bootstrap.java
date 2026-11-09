@@ -55,26 +55,42 @@ public final class Bootstrap implements AutoCloseable {
         binding.bindHost(),
         binding.port(),
         binding.tableGroupId(),
-        new RuntimeConfiguration.ResourceBudgets(65536, 64, 5000, 1048576, 2097152, 16, 0));
+        new RuntimeConfiguration.ResourceBudgets(65536, 64, 5000, 1048576, 2097152, 16, 0),
+        new KvService(), new RequestMetrics());
   }
 
   static Bootstrap startConfigured(
       RuntimeConfiguration.Listener binding, RuntimeConfiguration.ResourceBudgets resources)
       throws IOException {
+    return startConfigured(binding, resources, new KvService());
+  }
+
+  /** Binds a previously assembled KV service; its backend lifecycle remains with the caller. */
+  static Bootstrap startConfigured(
+      RuntimeConfiguration.Listener binding, RuntimeConfiguration.ResourceBudgets resources,
+      KvService kv) throws IOException {
+    return startConfigured(binding, resources, kv, new RequestMetrics());
+  }
+
+  static Bootstrap startConfigured(
+      RuntimeConfiguration.Listener binding, RuntimeConfiguration.ResourceBudgets resources,
+      KvService kv, RequestMetrics metrics) throws IOException {
     String host = ListenerAddress.parse(binding.bindHost()).connectionName();
     if (host.equals("localhost")) host = "127.0.0.1";
-    return start(host, binding.port(), binding.tableGroupId(), resources);
+    return start(host, binding.port(), binding.tableGroupId(), resources, kv, metrics);
   }
 
   private static Bootstrap start(
-      String host, int port, String tableGroup, RuntimeConfiguration.ResourceBudgets resources)
+      String host, int port, String tableGroup, RuntimeConfiguration.ResourceBudgets resources,
+      KvService kv, RequestMetrics metrics)
       throws IOException {
+    Objects.requireNonNull(kv, "kv");
+    Objects.requireNonNull(metrics, "metrics");
     var deadlines =
         new java.util.concurrent.ScheduledThreadPoolExecutor(
             1, Thread.ofPlatform().daemon().name("grpc-request-deadline-", 0).factory());
     deadlines.setRemoveOnCancelPolicy(true);
     deadlines.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
-    RequestMetrics metrics = new RequestMetrics();
     var requests =
         new RequestScopeInterceptor(
             deadlines,
@@ -86,7 +102,7 @@ public final class Bootstrap implements AutoCloseable {
         NettyServerBuilder.forAddress(new InetSocketAddress(host, port))
             .maxInboundMessageSize(resources.maxRpcBytes())
             .intercept(requests)
-            .addService(new KvService())
+            .addService(kv)
             .addService(new WatchService())
             .addService(new LeaseService())
             .addService(new AuthService())
