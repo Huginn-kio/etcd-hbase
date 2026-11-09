@@ -194,9 +194,9 @@ Put/Delete/Txn 的语义结果包含分支选择、嵌套响应顺序、PrevKV�
 
 ### 8.1 执行次序
 
-独立 Range 的 `revision<=0` 选择当前视图，正数选择相应历史；Txn 子请求仍保留第 5.4 节的预检查差别。默认读取得强一致控制屏障，注册/复核 pin，按请求目标选择逻辑版本；M2 选定候选叠加完成后，依次处理存活状态、revision 过滤、排序、全局 Limit/More 和输出投影。`serializable=true` 首版仍可走同一更强路径，不降低默认请求的一致性。
+独立 Range 的 `revision<=0` 选择当前视图，正数选择相应历史；Txn 子请求仍保留第 5.4 节的预检查差别。默认读取得强一致控制屏障，注册/复核 pin，按请求目标选择逻辑版本；普通 Range 在 M2 选定候选叠加完成后，依次处理存活状态、revision 过滤、排序、全局 Limit/More 和输出投影。CountOnly 按第 8.3 节单独判断所选视图中的存活集合，不将 revision 过滤应用于 Count。`serializable=true` 首版仍可走同一更强路径，不降低默认请求的一致性。
 
-min/max create/mod revision 的非零边界为 inclusive，过滤的是本次视图选中的记录，不从更早版本中寻找“能满足过滤的值”。KeysOnly 只清空响应 value，保留真实元数据；Compare VALUE、PrevKV 和事件所需完整值不能因 KeysOnly 被省略。
+普通 Range 的 min/max create/mod revision 非零边界为 inclusive，过滤的是本次视图选中的记录，不从更早版本中寻找“能满足过滤的值”。KeysOnly 只清空响应 value，保留真实元数据；Compare VALUE、PrevKV 和事件所需完整值不能因 KeysOnly 被省略。
 
 目标 revision 的压缩/未来边界在建视图时检查；历史数据必须仍可完整枚举，包括后来删除的 key。缺列、错版、缺候选或 pin 撤销都不是空结果。正式 Compact RPC 归 J52，M3 只验收已存在控制边界的读取解释及专用 fixture，不伪造 Compact 成功。
 
@@ -216,7 +216,7 @@ min/max create/mod revision 的非零边界为 inclusive，过滤的是本次视
 
 ### 8.3 Limit、More、Count 与客户端翻页
 
-Limit 为全局限制，L+1 的第额外一项必须是同一视图下已通过过滤的可见记录。墓碑、版本和被过滤记录不占 L；More=false 需要全部相关桶的耗尽证据，短页、空桶和达到物理预算均不能代替。每桶页大小独立于用户 Limit，不做默认 N×L 预读；极大 int64 limit 在计算 L+1 前检查溢出和输出可行性。
+普通 Range 的 Limit 为全局限制，L+1 的第额外一项必须是同一视图下已通过过滤的可见记录。墓碑、版本和被过滤记录不占 L；More=false 需要全部相关桶的耗尽证据，短页、空桶和达到物理预算均不能代替。每桶页大小独立于用户 Limit，不做默认 N×L 预读；极大 int64 limit 在计算 L+1 前检查溢出和输出可行性。
 
 **表 6　沿用已批准的轻量 Count 边界**
 
@@ -229,7 +229,7 @@ Limit 为全局限制，L+1 的第额外一项必须是同一视图下已通过�
 | 范围 CountOnly + Limit=1 | Count=真实存在性 0/1，Kvs 为空，More=false；允许真实提前命中 |
 | 其他范围 CountOnly | 明确 `UNIMPLEMENTED`，不暗中执行全范围计数 |
 
-CountOnly 的存在性仍受目标 revision、墓碑、过滤与授权约束，不能直接看到物理行就返回 1。CountOnly 与 KeysOnly 组合保持 Kvs 为空。与原生差分只豁免表中的 Count/对应存在性 More 约定，不能豁免排序、遗漏、版本或错误。
+精确 CountOnly 和范围 CountOnly+Limit=1 依据相应当前或历史视图判断存活，事务内当前视图仍包括此前已执行的工作集；目标 revision、墓碑与授权约束不变，不能直接看到物理行就返回 1。固定原生的 Count 路径返回空 Kvs 和计数，四项 min/max create/mod revision 过滤只处理 Kvs，不改变 Count；因此这些过滤条件不能将存活 key 的 CountOnly 存在性变为 0。[MVCC Count][mvcc]、[Range 组装][apply] 例如视图中 `a` 存活且 modRevision=2，min_mod_revision=3 时，精确 CountOnly 与覆盖 `a` 的范围 CountOnly+Limit=1 均返回 Count=1。CountOnly 与 KeysOnly 组合保持 Kvs 为空。与原生差分仅按表中的 Count 口径作有限允许；CountOnly 的 More 仍为 false，不能豁免排序、遗漏、版本或错误。
 
 内部页重开持有同一 ReadView。多次独立 Range 不自动共享快照；需要跨 RPC 固定快照时客户端显式携带 revision。对降序响应，后续 RPC 通过缩小独占上界续读；不擅自新增公开 token。没有 Limit 的 unary 结果超预算时整次失败，不返回一部分且称已完成。
 
@@ -286,7 +286,7 @@ RPC/event-loop 线程不阻塞等 HBase、归并或大计划。取消停止新�
 | J31，L1/L2，C11/C12 | 五目标×四比较结果，缺失/空范围/含空洞范围；Then/Else 写、纯读、无效 Compare 后端失败；一次 revision 与无修改终态重放 |
 | J32，L1/L2，C13 | 嵌套 Compare 基准、顺序读写、静态未选分支、重复 Put、Put/Delete 重叠、重叠删除、互斥与跨节点潜在写；子响应树/Headers/错误优先级 |
 | J33，L1/L2，C09/C10 | 跨桶删除、真实 deleted/PrevKvs、重复删除、大计划预算、每页准备失败/取消；发布前无公共修改，发布后完整恢复 |
-| J34，L1/L2，C02/C04–C06 | Prefix/FromKey/全空间，历史删除重建，四项过滤 inclusive/零/负边界，KeysOnly/CountOnly组合、显式多个历史目标、pin 最终验证 |
+| J34，L1/L2，C02/C04–C06 | Prefix/FromKey/全空间，历史删除重建，四项过滤 inclusive/零/负边界；四项过滤分别与精确 CountOnly、范围 CountOnly+Limit=1 组合，覆盖存活 key 不满足过滤仍计数及真正不存在；KeysOnly/CountOnly 组合、显式多个历史目标、pin 最终验证 |
 | J35，L1/L2，C03 | KEY 双向顺序、空桶/慢桶、墓碑/过滤后的 L+1、单 scanner 配额、HISTORY 版本组/反向候选、页重开无重漏；四种非 KEY 目标真实拒绝 |
 | J36，L1/L2，C23 与 J51.3 | 跨副本写后读、相同 revision 的 metadata sequence、失效间隙、Compact、负缓存覆盖、身份轮换/越权、等待者取消与真实 producer 清理；启用前后对照 |
 | J28.2，L2 | Put/CAS/Else/Delete/Range/nested 混合并发、跨桶读，发布成功丢响应、重复内部转发、取消、切换 owner 与进程重启；完整调用历史可线性化 |
