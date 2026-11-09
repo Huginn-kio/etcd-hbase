@@ -39,6 +39,7 @@ enum InvocationAttemptState {
   INVOCATION_SELECTED = 3;
   INVOCATION_NOT_SELECTED = 4;
   INVOCATION_WINDOW_CLOSED = 5;
+  INVOCATION_NO_CHANGES = 6;
 }
 
 message InvocationBinding {

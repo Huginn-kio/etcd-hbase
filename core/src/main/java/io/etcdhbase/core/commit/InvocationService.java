@@ -5,6 +5,7 @@ import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /** Resolves concurrent first binds and persists progress without rebinding an invocation ID. */
 public final class InvocationService {
@@ -23,6 +24,9 @@ public final class InvocationService {
       InvocationBinding proposed, RequestScope scope) {
     Objects.requireNonNull(proposed, "proposed");
     Objects.requireNonNull(scope, "scope");
+    if (proposed.state() != InvocationBinding.State.PREPARING) {
+      throw new IllegalArgumentException("first invocation binding must start in PREPARING");
+    }
     return bindOrJoin(proposed, scope, 0, null);
   }
 
@@ -120,7 +124,49 @@ public final class InvocationService {
   public CompletableFuture<InvocationBinding> transition(
       InvocationBinding expected, InvocationBinding replacement, RequestScope scope) {
     validateTransition(expected, replacement);
+    if (replacement.state() == InvocationBinding.State.NO_CHANGES) {
+      throw new IllegalArgumentException("no-change completion requires durable result verification");
+    }
     return transition(expected, replacement, scope, 0);
+  }
+
+  /**
+   * Verifies an immutable result and the read protection before competing with seal on the same
+   * durable invocation CAS. The caller retains page/IO capacity until all producers drain.
+   */
+  public CompletableFuture<InvocationBinding> completeWithoutChanges(
+      InvocationBinding expected, ResultReference reference, ResultCatalog results,
+      Supplier<CompletableFuture<Void>> finishRead, RequestScope scope) {
+    Objects.requireNonNull(expected, "expected");
+    Objects.requireNonNull(reference, "reference");
+    Objects.requireNonNull(results, "results");
+    Objects.requireNonNull(finishRead, "finishRead");
+    Objects.requireNonNull(scope, "scope");
+    if (expected.state() != InvocationBinding.State.PREPARING
+        || !reference.identity().matches(expected)) {
+      throw new IllegalArgumentException("result does not belong to the preparing invocation");
+    }
+    if (scope.isClosed() || scope.isDeadlineExceeded()) {
+      return CompletableFuture.failedFuture(inactive(scope));
+    }
+    InvocationBinding completed = expected.completeWithoutChanges(reference.token());
+    validateTransition(expected, completed);
+    return results.verify(reference, scope).thenCompose(ignored -> {
+      if (scope.isClosed() || scope.isDeadlineExceeded()) {
+        return CompletableFuture.<Void>failedFuture(inactive(scope));
+      }
+      return Objects.requireNonNull(finishRead.get(), "read protection result");
+    }).thenCompose(ignored -> {
+      if (scope.isClosed() || scope.isDeadlineExceeded()) {
+        return CompletableFuture.failedFuture(inactive(scope));
+      }
+      return transition(expected, completed, scope, 0);
+    });
+  }
+
+  private static BackendFailure inactive(RequestScope scope) {
+    return new BackendFailure(scope.isDeadlineExceeded()
+        ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
   }
 
   private CompletableFuture<InvocationBinding> transition(
@@ -172,10 +218,11 @@ public final class InvocationService {
   private static boolean legalProgress(InvocationBinding before, InvocationBinding after) {
     return switch (before.state()) {
       case PREPARING -> after.state() == InvocationBinding.State.SEALED
-          || after.state() == InvocationBinding.State.NOT_SELECTED;
+          || after.state() == InvocationBinding.State.NOT_SELECTED
+          || after.state() == InvocationBinding.State.NO_CHANGES;
       case SEALED -> after.state() == InvocationBinding.State.SELECTED
           || after.state() == InvocationBinding.State.NOT_SELECTED;
-      case SELECTED, NOT_SELECTED -> after.state() == InvocationBinding.State.WINDOW_CLOSED;
+      case SELECTED, NOT_SELECTED, NO_CHANGES -> after.state() == InvocationBinding.State.WINDOW_CLOSED;
       case WINDOW_CLOSED -> false;
     };
   }

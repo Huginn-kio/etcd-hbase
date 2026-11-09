@@ -27,6 +27,7 @@ import io.etcdhbase.core.commit.SnapshotGcBoundary;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
 import io.etcdhbase.core.commit.SnapshotPinManager;
 import io.etcdhbase.core.commit.SystemRecordStore;
+import io.etcdhbase.core.commit.TxnReadSession;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
@@ -42,6 +43,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
+import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.UUID;
@@ -75,6 +77,50 @@ class M2SnapshotPinIT {
       assertInstanceOf(IllegalStateException.class,
           failure(() -> fixture.second().register(oldView, scope).join()));
       System.out.println("j26-snapshot-pin sharedRows=true floorsDurable=true expiryRequiresRevocation=true");
+    }
+  }
+
+  @Test
+  void transactionRetainsCurrentAndHistoricalPinsUntilFinalValidation() throws Exception {
+    try (M1TestEnvironment environment = M1TestEnvironment.start(1);
+        RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(180))) {
+      PinFixture fixture = prepareFixture(environment, scope);
+      StorageTableBinding data = new StorageTableBinding(
+          TableName.valueOf("m3_pin_query_" + UUID.randomUUID().toString().replace("-", "")),
+          FAMILY, StorageTableBinding.Layout.HISTORY, SALT);
+      environment.create(data, SALT.splitKeys().toArray(byte[][]::new));
+      var physical = environment.store(data, scope);
+      ByteKey key = ByteKey.copyOf(bytes("transaction-history"));
+      byte[] old = bytes("old");
+      byte[] current = bytes("current");
+      M1TestEnvironment.await(physical.put(StoredRecord.live(key,
+          new StorageMetadata(1, 7, 1, 0, StorageMetadata.State.LIVE, old.length), old)));
+      M1TestEnvironment.await(physical.put(StoredRecord.live(key,
+          new StorageMetadata(1, 8, 2, 0, StorageMetadata.State.LIVE, current.length), current)));
+      CommitState state = CommitState.initial(fixture.binding().profileFingerprint(), 8);
+      ManifestCatalog catalog = new ManifestCatalog(new EmptyManifestRepository());
+      ReadViewService views = new ReadViewService(new StaticControl(state), catalog,
+          fixture.first(), fixture.binding().profileFingerprint());
+      var session = TxnReadSession.open(views, List.of(7L), AUTHORIZATION, physical, catalog,
+          data.codec()::bucket, SALT.profile().bucketCount(), scope).join();
+      assertEquals(2, fixture.second().readBoundary(scope).join().protections().size());
+      var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+      var budgets = new BudgetManager(limits, java.util.Map.of("public", limits), limits);
+      var reservation = new BudgetManager.Reservation(8192, 4096, 8192, 8192, 8192);
+      try (BudgetManager.Account account = budgets.admit("public", scope, reservation)) {
+        try (PointResult result = new DirectRecordReader(session.reader(7), account, 8192)
+            .readForPreparation(key, 7, ReadProjection.FULL).get(30, TimeUnit.SECONDS)) {
+          assertArrayEquals(old, result.record().orElseThrow().value().orElseThrow());
+        }
+        try (PointResult result = new DirectRecordReader(session.reader(0), account, 8192)
+            .readForPreparation(key, 8, ReadProjection.FULL).get(30, TimeUnit.SECONDS)) {
+          assertArrayEquals(current, result.record().orElseThrow().value().orElseThrow());
+        }
+        session.reader(0).finishRead().join();
+        assertEquals(2, fixture.second().readBoundary(scope).join().protections().size());
+        session.finish().get(30, TimeUnit.SECONDS);
+        assertTrue(fixture.second().readBoundary(scope).join().protections().isEmpty());
+      }
     }
   }
 

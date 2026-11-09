@@ -586,7 +586,7 @@ class KernelHistoryModelTest {
         throw new IllegalStateException("fixture invocation identity is not unique");
       }
       CommitPublisher publisher = new CommitPublisher(control, outcomes,
-          new CommitPlanVerifier(catalog, materialization), handoff, finalizer);
+          new CommitPlanVerifier(catalog, materialization), invocations, handoff, finalizer);
       CommitOwnerService.OwnerToken owner = new CommitOwnerService.OwnerToken(
           base.ownerInstance().orElseThrow(), base.ownerEpoch());
       return new PublicationAttempt(transaction, publisher.publish(binding, owner, root, requestScope));

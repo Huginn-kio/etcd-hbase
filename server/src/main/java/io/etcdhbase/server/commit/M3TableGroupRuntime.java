@@ -7,12 +7,14 @@ import io.etcdhbase.core.commit.CommitPlanVerifier;
 import io.etcdhbase.core.commit.CommitPublisher;
 import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.ManifestPreparation;
+import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.RecoveryManager;
 import io.etcdhbase.core.commit.ResultPreparation;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.grpc.service.KvService;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
@@ -36,7 +38,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Owns the local Put lane for one validated table group; the caller owns its HBase factory. */
+/** Owns the local KV runtime for one validated table group; the caller owns its HBase factory. */
 public final class M3TableGroupRuntime implements AutoCloseable {
   private static final BudgetManager.Reservation REQUEST_MEMORY =
       new BudgetManager.Reservation(64L << 10, 64L << 10, 2L << 20, 16L << 20, 64L << 20);
@@ -45,15 +47,15 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static final Executor CLEANUP = task -> Thread.ofVirtual().name("m3-runtime-cleanup").start(task);
 
   private final Pending resources;
-  private final KvService putService;
+  private final KvService kvService;
   private final long clusterId;
   private final long memberId;
   private final RequestMetrics metrics;
 
-  private M3TableGroupRuntime(Pending resources, KvService putService, long clusterId, long memberId,
+  private M3TableGroupRuntime(Pending resources, KvService kvService, long clusterId, long memberId,
       RequestMetrics metrics) {
     this.resources = resources;
-    this.putService = putService;
+    this.kvService = kvService;
     this.clusterId = clusterId;
     this.memberId = memberId;
     this.metrics = metrics;
@@ -66,13 +68,15 @@ public final class M3TableGroupRuntime implements AutoCloseable {
    */
   public static M3TableGroupRuntime open(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
       RuntimeConfiguration.ResourceBudgets limits, HBaseConnectionFactory connections,
-      AuthorizedBackendIdentity identity, BudgetManager budgets, RequestScope startup) throws Exception {
+      AuthorizedBackendIdentity identity, BudgetManager budgets, ScanScheduler scans,
+      RequestScope startup) throws Exception {
     Objects.requireNonNull(plan, "plan");
     Objects.requireNonNull(activation, "activation");
     Objects.requireNonNull(limits, "limits");
     Objects.requireNonNull(connections, "connections");
     Objects.requireNonNull(identity, "identity");
     Objects.requireNonNull(budgets, "budgets");
+    Objects.requireNonNull(scans, "scans");
     Objects.requireNonNull(startup, "startup");
     if (limits.maxConcurrentRequests() < 1 || limits.maxConcurrentRequests() > 100_000
         || limits.requestDeadlineMs() < 1 || limits.requestDeadlineMs() > 600_000
@@ -103,17 +107,31 @@ public final class M3TableGroupRuntime implements AutoCloseable {
               new ManifestPreparation.Limits(1, 4L << 20, 1, 8L << 20)), invocations);
       var publisher = new CommitPublisher(stores.control(), stores.outcomes(),
           new CommitPlanVerifier(stores.manifests(), stores.materialization(), stores.results()),
-          pending.handoff, stores.finalizer());
+          stores.invocations(), pending.handoff, stores.finalizer());
       var metrics = new RequestMetrics();
       var executor = new PutMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
           stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
           preparation, publisher, 5L << 20, 8L << 20, metrics);
-      var processor = new PutOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
+      var putProcessor = new PutOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
           REQUEST_MEMORY, executor, stores.outcomes());
+      var txnLimits = new TxnExecutionLimits(5L << 20, 8L << 20, 32L << 20, 4096, 4096);
+      var txnPreparation = new TxnCommitPreparation(new ResultPreparation(stores.resultRepository()),
+          stores.results(), new ManifestPreparation(stores.manifestRepository(),
+              new ManifestPreparation.Limits(128, 4L << 20, 128, 8L << 20)), invocations, 8L << 20);
+      var txnExecutor = new TxnMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
+          stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
+          scans, txnPreparation, publisher, txnLimits, metrics);
+      var txnProcessor = new TxnOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
+          REQUEST_MEMORY, txnExecutor, stores.outcomes(), activation.maxEtcdRequestBytes());
+      var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),
+          connections, plan.primary(), pending.worker, scans, txnLimits, metrics);
       var receiver = new MutationForwardReceiver(stores.control(), invocations,
           (peer, request, scope) -> peer.equals(owner.token().instance())
               ? CompletableFuture.completedFuture(new MutationForwardReceiver.VerifiedAuthorization(identity, authorization))
-              : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION)), processor);
+              : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION)),
+          (request, binding, principal, scope) -> MutationOperationEnvelope.isTransaction(request.operationBytes())
+              ? txnProcessor.process(request, binding, principal, scope)
+              : putProcessor.process(request, binding, principal, scope));
       var lane = new MutationOwnerLane(plan.source().tableGroupId(), pending.queue, receiver, metrics);
       var route = new OwnerForwarding.Route(owner.token().instance(), owner.token().epoch(),
           owner.token().instance(), owner.token().instance());
@@ -130,11 +148,14 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       var gateway = new PutGateway(plan.source().tableGroupId(), identity, authorization,
           stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
           stores.control(), relay, stores.invocationResults(), budgets, REQUEST_MEMORY, pending.worker, metrics);
+      var txnGateway = new TxnGateway(plan.source().tableGroupId(), identity, authorization,
+          stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
+          stores.control(), relay, stores.invocationResults(), txnReads, budgets, REQUEST_MEMORY, pending.worker, metrics);
       startup.closeAsync(CLEANUP);
       await(CompletableFuture.allOf(startup.cleanupCompletion().toCompletableFuture(),
           startup.physicalProducersCompletion().toCompletableFuture()), startup);
       if (!owner.isReady()) throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
-      return new M3TableGroupRuntime(pending, new KvService(gateway),
+      return new M3TableGroupRuntime(pending, new KvService(gateway, txnGateway),
           stores.clusterId(), activation.memberIdBits(), metrics);
     } catch (Exception failure) {
       throw new StartupException(failure, abort(startup, pending, failure));
@@ -144,7 +165,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     }
   }
 
-  public KvService putService() { return putService; }
+  public KvService kvService() { return kvService; }
   public long clusterId() { return clusterId; }
   public long memberId() { return memberId; }
   public RequestMetrics metrics() { return metrics; }

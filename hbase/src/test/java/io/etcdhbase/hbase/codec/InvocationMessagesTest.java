@@ -33,9 +33,12 @@ class InvocationMessagesTest {
     InvocationBinding notSelected = InvocationBinding.restore(INVOCATION, REQUEST_DIGEST,
         AUTHORIZATION_DIGEST, TRANSACTION, 1, 0, 1, InvocationBinding.State.NOT_SELECTED,
         Optional.empty(), Optional.empty());
+    InvocationBinding noChanges = InvocationBinding.restore(INVOCATION, REQUEST_DIGEST,
+        AUTHORIZATION_DIGEST, TRANSACTION, 1, 0, 1, InvocationBinding.State.NO_CHANGES,
+        Optional.empty(), Optional.of(digest(4)));
 
     for (InvocationBinding binding : List.of(
-        preparing, sealed, selected, notSelected, windowClosed)) {
+        preparing, sealed, selected, notSelected, windowClosed, noChanges, noChanges.closeQueryWindow())) {
       assertSameBinding(binding, InvocationMessages.decode(InvocationMessages.encode(binding)));
     }
   }
@@ -84,6 +87,16 @@ class InvocationMessagesTest {
         .build().toByteArray();
     assertThrows(IllegalArgumentException.class,
         () -> InvocationMessages.decode(unspecifiedState));
+
+    byte[] unknownState = valid.toBuilder().setStateValue(999).build().toByteArray();
+    assertThrows(IllegalArgumentException.class, () -> InvocationMessages.decode(unknownState));
+
+    assertThrows(IllegalArgumentException.class, () -> InvocationBinding.restore(INVOCATION,
+        REQUEST_DIGEST, AUTHORIZATION_DIGEST, TRANSACTION, 1, 0, 1,
+        InvocationBinding.State.NO_CHANGES, Optional.empty(), Optional.empty()));
+    assertThrows(IllegalArgumentException.class, () -> InvocationBinding.restore(INVOCATION,
+        REQUEST_DIGEST, AUTHORIZATION_DIGEST, TRANSACTION, 1, 0, 1,
+        InvocationBinding.State.NO_CHANGES, Optional.of(digest(3)), Optional.of(digest(4))));
 
     assertThrows(IllegalArgumentException.class,
         () -> InvocationMessages.decode(new byte[16 * 1024 + 1]));

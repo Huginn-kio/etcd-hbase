@@ -754,7 +754,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J30。
   - 完成标准：CAS 真败不写；Else 写分支正常增长一次 revision。
   - 验证层次：L1 内核 + L2 协议/Go client。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=公开实现与验证进行中；负责人=Codex；完成日期=—；PR/commit=本任务 PR；验证入口=`scripts/verify/m3.sh --scope public --task J31 --artifact-root <新报告目录>`；评审人/结论=待评审。范围为 Compare、平面事务点读与 Put、无修改调用结果和单表组本地 owner；嵌套事务、删除和完整 Range 选项仍由 J32–J35 交付，目标身份/TLS 与跨进程 owner 转发仍待后续验证。
 
 - [ ] **J32｜duplicate/nested Txn 校验与混合操作**
   - 依赖：J31。

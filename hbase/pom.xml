@@ -127,6 +127,25 @@
   </build>
   <profiles>
     <profile>
+      <id>m3-j31-public</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <failIfNoTests>true</failIfNoTests>
+              <includes combine.self="override">
+                <include>**/M2SnapshotPinIT.java</include>
+                <include>**/M3ResultRepositoryIT.java</include>
+              </includes>
+              <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
       <id>m3-hbase-local</id>
       <build>
         <plugins>

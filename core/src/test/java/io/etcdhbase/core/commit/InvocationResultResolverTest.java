@@ -2,6 +2,7 @@ package io.etcdhbase.core.commit;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.etcdhbase.core.bytes.ByteKey;
@@ -54,8 +55,66 @@ class InvocationResultResolverTest {
     }
   }
 
+  @Test
+  void replaysTheSameNoChangeResultWithoutReadingACommitDecision() throws Exception {
+    try (Fixture fixture = new Fixture()) {
+      fixture.completeWithoutChanges();
+      try (var first = fixture.resolveNoChanges(); var replay = fixture.resolveNoChanges()) {
+        assertEquals(1, first.revision());
+        assertArrayEquals(new byte[] {1, 2, 3}, bytes(first.payload()));
+        assertArrayEquals(new byte[] {1, 2, 3}, bytes(replay.payload()));
+      }
+      assertEquals(0, fixture.controlReads);
+      assertEquals(0, fixture.invocations.casCalls);
+      assertEquals(0, fixture.budgets.snapshot().allocatedBytes());
+      byte[] wrongAuth = new byte[32];
+      wrongAuth[0] = 1;
+      assertThrows(CompletionException.class, () -> fixture.resolver.resolveNoChanges(fixture.id,
+          fixture.digest, ByteKey.copyOf(wrongAuth), fixture.scope, fixture.account).join());
+    }
+  }
+
+  @Test
+  void noChangeReplayRejectsMissingPagesAndAWindowClosedDuringLoad() throws Exception {
+    try (Fixture fixture = new Fixture()) {
+      fixture.completeWithoutChanges();
+      fixture.results.missingPage = true;
+      assertThrows(CompletionException.class, fixture::resolveNoChanges);
+      assertEquals(0, fixture.budgets.snapshot().allocatedBytes());
+      fixture.results.missingPage = false;
+      fixture.results.afterRead = () -> fixture.invocations.binding =
+          fixture.invocations.binding.closeQueryWindow();
+      assertThrows(CompletionException.class, fixture::resolveNoChanges);
+      assertEquals(InvocationBinding.State.WINDOW_CLOSED, fixture.invocations.binding.state());
+      assertEquals(0, fixture.budgets.snapshot().allocatedBytes());
+      assertThrows(CompletionException.class, fixture::resolveNoChanges);
+      assertEquals(0, fixture.controlReads);
+    }
+  }
+
+  @Test
+  void transactionResolutionDistinguishesNoChangeFromMetadataOnlyPublication() throws Exception {
+    try (Fixture fixture = new Fixture()) {
+      assertThrows(CompletionException.class, () -> fixture.resolver.resolveTransaction(
+          fixture.id, fixture.digest, fixture.digest, fixture.scope, fixture.account).join());
+      assertEquals(0, fixture.budgets.snapshot().allocatedBytes());
+      fixture.completeWithoutChanges();
+      try (var result = fixture.resolver.resolveTransaction(fixture.id, fixture.digest,
+          fixture.digest, fixture.scope, fixture.account).join()) {
+        assertEquals(1, result.revision());
+        assertFalse(result.changed());
+        assertArrayEquals(new byte[] {1, 2, 3}, bytes(result.payload()));
+      }
+      assertEquals(0, fixture.budgets.snapshot().allocatedBytes());
+    }
+  }
+
   private static byte[] bytes(InvocationResultResolver.ResolvedResult value) {
-    var buffer = value.payload().buffer();
+    return bytes(value.payload());
+  }
+
+  private static byte[] bytes(ResultCatalog.RetainedResult value) {
+    var buffer = value.buffer();
     byte[] bytes = new byte[buffer.remaining()];
     buffer.get(bytes);
     return bytes;
@@ -71,6 +130,7 @@ class InvocationResultResolverTest {
     private final ResultMemory results;
     private final ResultReference reference;
     private final InvocationResultResolver resolver;
+    private int controlReads;
 
     private Fixture() throws Exception {
       var limits = new BudgetManager.Limits(2, 0, 2, 1, 1, 0, 2_000_000);
@@ -91,6 +151,7 @@ class InvocationResultResolverTest {
           .publish(slot).finalizePublication(identity.transactionId());
       CommitControlStore control = new CommitControlStore() {
         @Override public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope ignored) {
+          controlReads++;
           return CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(finalized, new byte[] {1})));
         }
         @Override public CompletableFuture<Boolean> initializeIfAbsent(CommitState state, RequestScope ignored) {
@@ -113,6 +174,18 @@ class InvocationResultResolverTest {
 
     private InvocationResultResolver.ResolvedResult resolve() {
       return resolver.resolve(id, digest, digest, scope, account).join();
+    }
+
+    private void completeWithoutChanges() {
+      var prior = invocations.binding;
+      var preparing = InvocationBinding.begin(prior.invocationId(), prior.requestDigest(),
+          prior.authorizationScopeDigest(), prior.transactionId(), prior.preparedOwnerEpoch(),
+          prior.baseSequence(), prior.baseRevision());
+      invocations.binding = preparing.completeWithoutChanges(reference.token());
+    }
+
+    private InvocationResultResolver.ResolvedNoChanges resolveNoChanges() {
+      return resolver.resolveNoChanges(id, digest, digest, scope, account).join();
     }
 
     @Override public void close() { scope.close(); }
@@ -146,6 +219,7 @@ class InvocationResultResolverTest {
     private final ResultDirectory directory;
     private final ResultPage page;
     private boolean missingPage;
+    private Runnable afterRead;
     private ResultMemory(ResultDirectory directory, ResultPage page) { this.directory = directory; this.page = page; }
     @Override public CompletableFuture<SystemRecordStore.CreateResult> createPage(ResultPage value, RequestScope scope) {
       throw new UnsupportedOperationException();
@@ -154,6 +228,7 @@ class InvocationResultResolverTest {
         ResultDirectory value, RequestScope scope) { throw new UnsupportedOperationException(); }
     @Override public CompletableFuture<Optional<ResultPage>> readPage(
         ResultIdentity identity, int index, RequestScope scope) {
+      if (afterRead != null) afterRead.run();
       return CompletableFuture.completedFuture(missingPage ? Optional.empty() : Optional.of(page));
     }
     @Override public CompletableFuture<Optional<ResultDirectory>> readDirectory(ResultIdentity identity, RequestScope scope) {

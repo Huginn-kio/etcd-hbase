@@ -16,8 +16,9 @@ while (($#)); do
     *) echo 'unknown M3 verification option' >&2; exit 2 ;;
   esac
 done
-if [[ "$scope" != public || -z "$artifact_root" || ${#tasks[@]} != 1 || "${tasks[0]}" != J30 ]]; then
-  echo 'only public J30 verification is registered; other tasks are not yet delivered' >&2
+if [[ "$scope" != public || -z "$artifact_root" || ${#tasks[@]} != 1 ]] ||
+   [[ "${tasks[0]}" != J30 && "${tasks[0]}" != J31 ]]; then
+  echo 'only public J30 and J31 verification are registered; other tasks are not yet delivered' >&2
   exit 2
 fi
 : "${ETCD_HBASE_JDK21_HOME:?Set ETCD_HBASE_JDK21_HOME to the pinned Temurin JDK 21 home.}"
@@ -44,7 +45,7 @@ PY
 )"
 run_id="$(basename "$artifact_root")"
 prefix="etcd-hbase-m3-test/$run_id/"
-export M3_ARTIFACT_ROOT="$artifact_root" M3_RUN_ID="$run_id" M3_SOURCE_COMMIT="$source_commit"
+export M3_ARTIFACT_ROOT="$artifact_root" M3_RUN_ID="$run_id" M3_SOURCE_COMMIT="$source_commit" M3_TASK="${tasks[0]}"
 
 python3 scripts/verify/test_m3_report.py
 python3 scripts/verify/m3-report.py --validate-registry
@@ -55,22 +56,40 @@ scripts/dev/go-m0.sh test -count=1 -json ./... > "$artifact_root/go-test.jsonl" 
   tail -n 100 "$artifact_root/go-test.stderr" >&2
   exit 1
 }
-scripts/dev/go-program.sh m3driver --scenario testkit/scenarios/m3-put.yaml \
-  --native-data-dir "$artifact_root/native-data" --scope native-etcd --prefix "$prefix" \
-  --trace "$artifact_root/native-trace.jsonl" --metadata "$artifact_root/native-metadata.json" \
-  > "$artifact_root/native.log" 2>&1 || {
-  tail -n 100 "$artifact_root/native.log" >&2
-  exit 1
-}
-scripts/dev/mvn21.sh -B -ntp -pl server -am clean verify -Pm3-hbase-local,m3-init-local,m3-public \
+if [[ "$M3_TASK" == J30 ]]; then
+  scripts/dev/go-program.sh m3driver --scenario testkit/scenarios/m3-put.yaml \
+    --native-data-dir "$artifact_root/native-data" --scope native-etcd --prefix "$prefix" \
+    --trace "$artifact_root/native-trace.jsonl" --metadata "$artifact_root/native-metadata.json" \
+    > "$artifact_root/native.log" 2>&1 || {
+    tail -n 100 "$artifact_root/native.log" >&2
+    exit 1
+  }
+  profiles='m3-hbase-local,m3-init-local,m3-public'
+else
+  # M3TxnRpcIT starts its own pinned native server and runs the identical Go suite
+  # against both disposable HBase layouts in the same source-bound artifact directory.
+  profiles='m3-j31-public'
+fi
+scripts/dev/mvn21.sh -B -ntp -pl server -am clean verify -P"$profiles" \
   > "$artifact_root/maven.log" 2>&1 || {
   tail -n 120 "$artifact_root/maven.log" >&2
   exit 1
 }
-for module in hbase admin server; do
-  mkdir -p "$artifact_root/$module/target/failsafe-reports"
-  cp "$module"/target/failsafe-reports/TEST-*.xml "$artifact_root/$module/target/failsafe-reports/"
-done
+if [[ "$M3_TASK" == J30 ]]; then
+  for module in hbase admin server; do
+    mkdir -p "$artifact_root/$module/target/failsafe-reports"
+    cp "$module"/target/failsafe-reports/TEST-*.xml "$artifact_root/$module/target/failsafe-reports/"
+  done
+else
+  for module in hbase server; do
+    mkdir -p "$artifact_root/$module/target/failsafe-reports"
+    cp "$module"/target/failsafe-reports/TEST-*.xml "$artifact_root/$module/target/failsafe-reports/"
+  done
+  for module in core grpc server; do
+    mkdir -p "$artifact_root/$module/target/surefire-reports"
+    cp "$module"/target/surefire-reports/TEST-*.xml "$artifact_root/$module/target/surefire-reports/"
+  done
+fi
 python3 - "$artifact_root/run.json" <<'PY'
 import json
 import os
@@ -78,7 +97,7 @@ import sys
 
 record = {'schema': 'etcd-hbase-m3-run/v1', 'scope': 'public-local-minicluster',
           'run_id': os.environ['M3_RUN_ID'], 'source_commit': os.environ['M3_SOURCE_COMMIT'],
-          'tasks': ['J30'], 'commands_passed': True}
+          'tasks': [os.environ['M3_TASK']], 'commands_passed': True}
 with open(sys.argv[1], 'x', encoding='utf-8') as stream:
     json.dump(record, stream)
     stream.write('\n')

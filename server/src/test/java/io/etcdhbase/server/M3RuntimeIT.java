@@ -84,6 +84,11 @@ class M3RuntimeIT {
       assertEquals(clusterId, first.getHeader().getClusterId());
       assertEquals(Long.MIN_VALUE, first.getHeader().getMemberId());
       assertEquals(2, first.getHeader().getRevision());
+      var read = txnRead(server);
+      assertTrue(read.getSucceeded());
+      assertEquals(2, read.getHeader().getRevision());
+      assertEquals(ByteString.copyFromUtf8("before"),
+          read.getResponses(0).getResponseRange().getKvs(0).getValue());
     } finally {
       server.close();
     }
@@ -96,6 +101,8 @@ class M3RuntimeIT {
       assertTrue(metrics.putStages().get(stage).count() > 0, "missing observed stage " + stage);
     }
     assertTrue(metrics.putOutputBytes() > 0);
+    assertTrue(metrics.txnStages().get(RequestMetrics.TxnStage.COMPARE_AND_PREPARE).count() > 0);
+    assertTrue(metrics.txnOutputBytes() > 0);
   }
 
   private static void verifyEmbeddedRestart(M3TableGroupPlan plan,
@@ -147,6 +154,24 @@ class M3RuntimeIT {
 
   private static Rpc.PutResponse put(RuntimeServer server, String value) throws Exception {
     return put(server.boundListeners().getFirst().port(), value);
+  }
+
+  private static Rpc.TxnResponse txnRead(RuntimeServer server) throws Exception {
+    var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListeners().getFirst().port())
+        .usePlaintext().build();
+    try {
+      var key = ByteString.copyFromUtf8("configured-runtime-key");
+      var compare = Rpc.Compare.newBuilder().setKey(ByteString.copyFromUtf8("configured-runtime-"))
+          .setRangeEnd(ByteString.copyFromUtf8("configured-runtime."))
+          .setTarget(Rpc.Compare.CompareTarget.VERSION).setResult(Rpc.Compare.CompareResult.GREATER)
+          .setVersion(0).build();
+      return KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS).txn(
+          Rpc.TxnRequest.newBuilder().addCompare(compare).addSuccess(Rpc.RequestOp.newBuilder()
+              .setRequestRange(Rpc.RangeRequest.newBuilder().setKey(key))).build());
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
   }
 
   private static Rpc.PutResponse put(int port, String value) throws Exception {

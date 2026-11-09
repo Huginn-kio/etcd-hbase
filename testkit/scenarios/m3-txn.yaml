@@ -1,0 +1,64 @@
+schema_version: 1
+id: m3-txn-v1
+protocol: etcd-v3.5.23
+steps:
+  - case_id: C11
+    id: native-baseline
+  - case_id: C11
+    id: J31-compare-version-equal
+  - case_id: C11
+    id: J31-compare-version-not-equal
+  - case_id: C11
+    id: J31-compare-version-greater
+  - case_id: C11
+    id: J31-compare-version-less
+  - case_id: C11
+    id: J31-compare-create-equal
+  - case_id: C11
+    id: J31-compare-create-not-equal
+  - case_id: C11
+    id: J31-compare-create-greater
+  - case_id: C11
+    id: J31-compare-create-less
+  - case_id: C11
+    id: J31-compare-mod-equal
+  - case_id: C11
+    id: J31-compare-mod-not-equal
+  - case_id: C11
+    id: J31-compare-mod-greater
+  - case_id: C11
+    id: J31-compare-mod-less
+  - case_id: C11
+    id: J31-compare-value-equal
+  - case_id: C11
+    id: J31-compare-value-not-equal
+  - case_id: C11
+    id: J31-compare-value-greater
+  - case_id: C11
+    id: J31-compare-value-less
+  - case_id: C11
+    id: J31-compare-lease-equal
+  - case_id: C11
+    id: J31-compare-lease-not-equal
+  - case_id: C11
+    id: J31-compare-lease-greater
+  - case_id: C11
+    id: J31-compare-lease-less
+  - case_id: C12
+    id: J31-compare-missing-version
+  - case_id: C12
+    id: J31-compare-missing-value
+  - case_id: C12
+    id: J31-compare-range
+  - case_id: C12
+    id: J31-then-write
+  - case_id: C12
+    id: J31-else-write
+  - case_id: C12
+    id: J31-no-change
+  - case_id: C12
+    id: J31-client-read
+  - case_id: C12
+    id: J31-empty-compare
+  - case_id: C12
+    id: J31-duplicate-put

@@ -77,7 +77,7 @@ public final class M3CrashWriterMain {
         throw new IllegalStateException("unexpected owner epoch in crash fixture");
       }
       var publisher = new CommitPublisher(control, outcomes,
-          new CommitPlanVerifier(manifests, materialization, results), handoff,
+          new CommitPlanVerifier(manifests, materialization, results), invocations, handoff,
           (selectedBinding, publication, serviceScope) -> {
             if (publication.state() != CommitOutcomeResolver.State.SELECTED_PENDING) {
               return CompletableFuture.failedFuture(new IllegalStateException("expected selected publication"));

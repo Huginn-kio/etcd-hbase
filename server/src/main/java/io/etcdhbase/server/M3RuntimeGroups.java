@@ -8,6 +8,8 @@ import io.etcdhbase.admin.TableGroupPlanFactory;
 import io.etcdhbase.admin.config.DevelopmentHBaseConfiguration;
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.grpc.service.KvService;
 import io.etcdhbase.hbase.identity.HBaseAuthenticators;
 import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
@@ -24,6 +26,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
@@ -35,14 +38,19 @@ import org.apache.hadoop.security.UserGroupInformation;
 final class M3RuntimeGroups implements AutoCloseable {
   private static final Executor CLEANUP = task -> Thread.ofVirtual().name("m3-group-cleanup").start(task);
   private final Map<String, ManagedGroup> groups;
+  private final ScanScheduler scans;
   private final AtomicBoolean closing = new AtomicBoolean();
   private final CompletableFuture<Void> drained = new CompletableFuture<>();
 
-  private M3RuntimeGroups(Map<String, ManagedGroup> groups) { this.groups = Map.copyOf(groups); }
+  private M3RuntimeGroups(Map<String, ManagedGroup> groups, ScanScheduler scans) {
+    this.groups = Map.copyOf(groups);
+    this.scans = scans;
+  }
 
   static M3RuntimeGroups open(RuntimeConfiguration configuration, M3RuntimeConfiguration activation)
       throws IOException {
     var budgets = M3RuntimeBudgets.create(configuration, activation);
+    var scans = new ScanScheduler(budgets, Duration.ofMillis(configuration.resources().requestDeadlineMs()));
     Map<String, ManagedGroup> opened = new LinkedHashMap<>();
     try {
       for (String group : configuration.listeners().stream()
@@ -53,7 +61,7 @@ final class M3RuntimeGroups implements AutoCloseable {
             || !source.identityProviderId().equals(DEVELOPMENT_NO_AUTH_PROVIDER_ID)) {
           throw new IllegalArgumentException("configured target identity activation is not available");
         }
-        ManagedGroup managed = openGroup(plan, configuration, activation, budgets);
+        ManagedGroup managed = openGroup(plan, configuration, activation, budgets, scans);
         try {
           opened.put(group, managed);
         } catch (RuntimeException | Error failure) {
@@ -64,9 +72,9 @@ final class M3RuntimeGroups implements AutoCloseable {
           throw failure;
         }
       }
-      return new M3RuntimeGroups(opened);
+      return new M3RuntimeGroups(opened, scans);
     } catch (Exception | Error failure) {
-      var rollback = new M3RuntimeGroups(opened);
+      var rollback = new M3RuntimeGroups(opened, scans);
       try { rollback.close(); }
       catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
       awaitCleanup(rollback.drained, activation.shutdownTimeoutMs(), failure);
@@ -78,7 +86,7 @@ final class M3RuntimeGroups implements AutoCloseable {
   }
 
   private static ManagedGroup openGroup(M3TableGroupPlan plan, RuntimeConfiguration configuration,
-      M3RuntimeConfiguration activation, io.etcdhbase.core.scan.BudgetManager budgets) throws Exception {
+      M3RuntimeConfiguration activation, BudgetManager budgets, ScanScheduler scans) throws Exception {
     var source = plan.source();
     var provider = createProvider(source, activation);
     boolean providerCloseDeferred = false;
@@ -86,7 +94,7 @@ final class M3RuntimeGroups implements AutoCloseable {
       M3TableGroupRuntime runtime;
       try (var startup = RequestScope.withTimeout(Duration.ofMillis(activation.startupTimeoutMs()))) {
         AuthorizedBackendIdentity identity = authenticate(provider, source, activation);
-        runtime = startRuntime(plan, configuration, activation, budgets, provider, identity, startup);
+        runtime = startRuntime(plan, configuration, activation, budgets, scans, provider, identity, startup);
       } catch (M3TableGroupRuntime.StartupException failure) {
         providerCloseDeferred = true;
         awaitCleanup(closeAfter(failure.cleanup(), provider), activation.shutdownTimeoutMs(), failure);
@@ -131,10 +139,10 @@ final class M3RuntimeGroups implements AutoCloseable {
 
   private static M3TableGroupRuntime startRuntime(M3TableGroupPlan plan,
       RuntimeConfiguration configuration, M3RuntimeConfiguration activation,
-      io.etcdhbase.core.scan.BudgetManager budgets, HBaseBackendIdentityProvider provider,
+      BudgetManager budgets, ScanScheduler scans, HBaseBackendIdentityProvider provider,
       AuthorizedBackendIdentity identity, RequestScope startup) throws Exception {
     return M3TableGroupRuntime.open(plan, activation, configuration.resources(),
-        provider, identity, budgets, startup);
+        provider, identity, budgets, scans, startup);
   }
 
   private static boolean awaitFatalStartupCleanup(Error fatal, HBaseBackendIdentityProvider provider,
@@ -163,7 +171,7 @@ final class M3RuntimeGroups implements AutoCloseable {
   KvService service(String group) {
     ManagedGroup managed = groups.get(group);
     if (managed == null || closing.get()) throw new IllegalArgumentException("table group is not active");
-    return managed.runtime().putService();
+    return managed.runtime().kvService();
   }
 
   RequestMetrics metrics(String group) {
@@ -178,7 +186,10 @@ final class M3RuntimeGroups implements AutoCloseable {
 
   CompletableFuture<Void> drained() { return drained.copy(); }
 
-  @Override public void close() {
+  @Override public void close() { closeAfterRequests(CompletableFuture.completedFuture(null)); }
+
+  void closeAfterRequests(CompletionStage<Void> requestsDrained) {
+    Objects.requireNonNull(requestsDrained, "requestsDrained");
     if (!closing.compareAndSet(false, true)) return;
     List<CompletableFuture<Void>> cleanup = new ArrayList<>();
     for (ManagedGroup group : groups.values()) {
@@ -187,12 +198,25 @@ final class M3RuntimeGroups implements AutoCloseable {
       } catch (RuntimeException | Error failure) {
         cleanup.add(CompletableFuture.failedFuture(failure));
       }
-      cleanup.add(closeAfter(group.runtime().drained(), group.provider()));
+    }
+    try { scans.close(); }
+    catch (RuntimeException | Error failure) { cleanup.add(CompletableFuture.failedFuture(failure)); }
+    var scansDrained = scans.termination().toCompletableFuture();
+    cleanup.add(scansDrained);
+    for (ManagedGroup group : groups.values()) {
+      cleanup.add(closeWhenDrained(group.runtime().drained(), scansDrained, requestsDrained,
+          group.provider()::close));
     }
     CompletableFuture.allOf(cleanup.toArray(CompletableFuture[]::new)).whenComplete((ignored, failure) -> {
       if (failure == null) drained.complete(null);
       else drained.completeExceptionally(failure);
     });
+  }
+
+  static CompletableFuture<Void> closeWhenDrained(CompletionStage<Void> runtime,
+      CompletionStage<Void> scans, CompletionStage<Void> requests, Runnable close) {
+    return CompletableFuture.allOf(runtime.toCompletableFuture(), scans.toCompletableFuture(),
+        requests.toCompletableFuture()).thenRunAsync(close, CLEANUP);
   }
 
   private static CompletableFuture<Void> closeAfter(CompletionStage<Void> completion,

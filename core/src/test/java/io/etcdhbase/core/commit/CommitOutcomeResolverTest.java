@@ -57,6 +57,19 @@ class CommitOutcomeResolverTest {
         .resolve(mismatchedBase, RequestScope.withoutDeadline()).join());
   }
 
+  @Test
+  void noChangeTerminalIsNotACommitPublicationOutcome() {
+    var preparing = InvocationBinding.begin(ATTEMPT_INVOCATION, DIGEST, DIGEST,
+        ATTEMPT_TRANSACTION, 1, 0, 1);
+    var noChanges = preparing.completeWithoutChanges(ByteKey.copyOf(new byte[] {7}));
+    var outcomeResolver = resolver(ownedState(), Optional.empty());
+    var scope = RequestScope.withoutDeadline();
+    assertThrows(CompletionException.class, () -> outcomeResolver.resolve(noChanges, scope).join());
+    assertThrows(CompletionException.class,
+        () -> outcomeResolver.resolveForFinalization(noChanges, scope).join());
+    scope.close();
+  }
+
   private static CommitOutcomeResolver resolver(
       CommitState state, Optional<CommitDecision> selectedDecision) {
     return new CommitOutcomeResolver(new FixedControlStore(state),

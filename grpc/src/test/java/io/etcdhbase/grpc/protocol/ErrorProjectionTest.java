@@ -39,6 +39,10 @@ class ErrorProjectionTest {
         Status.Code.INVALID_ARGUMENT, "etcdserver: request is too large");
     assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.LEASE_UNAVAILABLE)),
         Status.Code.UNIMPLEMENTED, "etcd-hbase: lease binding is not available");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.UNSUPPORTED_OPERATION)),
+        Status.Code.UNIMPLEMENTED, "etcd-hbase: transaction operation is not available");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.REQUEST_BUDGET_EXHAUSTED)),
+        Status.Code.RESOURCE_EXHAUSTED, "backend resource limit was reached");
   }
 
   @Test

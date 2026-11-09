@@ -13,6 +13,7 @@ public final class CommitPublisher {
   private final CommitControlStore control;
   private final CommitOutcomeResolver outcomes;
   private final CommitPlanVerifier planVerifier;
+  private final InvocationRepository invocations;
   private final PublicationHandoff handoff;
   private final CommitFinalizer finalizer;
 
@@ -20,11 +21,13 @@ public final class CommitPublisher {
       CommitControlStore control,
       CommitOutcomeResolver outcomes,
       CommitPlanVerifier planVerifier,
+      InvocationRepository invocations,
       PublicationHandoff handoff,
       CommitFinalizer finalizer) {
     this.control = Objects.requireNonNull(control, "control");
     this.outcomes = Objects.requireNonNull(outcomes, "outcomes");
     this.planVerifier = Objects.requireNonNull(planVerifier, "planVerifier");
+    this.invocations = Objects.requireNonNull(invocations, "invocations");
     this.handoff = Objects.requireNonNull(handoff, "handoff");
     this.finalizer = Objects.requireNonNull(finalizer, "finalizer");
   }
@@ -47,9 +50,19 @@ public final class CommitPublisher {
           new IllegalArgumentException("owner token does not match the sealed invocation"));
     }
     return planVerifier.verify(invocation, manifest, requestScope).thenCompose(verified ->
-        handoff.transfer(invocation, requestScope, serviceScope ->
-            attempt(invocation, owner, verified, serviceScope, 0)
-                .thenCompose(publication -> finalizer.finish(invocation, publication, serviceScope))))
+        invocations.read(invocation.invocationId(), requestScope).thenCompose(found -> {
+          InvocationBinding durable = found.orElseThrow(() ->
+              new IllegalStateException("sealed invocation was not persisted"));
+          if (!durable.sameAttempt(invocation) || durable.state() != InvocationBinding.State.SEALED
+              || !durable.manifestRoot().equals(invocation.manifestRoot())
+              || !durable.resultReference().equals(invocation.resultReference())) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("durable invocation does not own the sealed plan"));
+          }
+          return handoff.transfer(durable, requestScope, serviceScope ->
+              attempt(durable, owner, verified, serviceScope, 0)
+                  .thenCompose(publication -> finalizer.finish(durable, publication, serviceScope)));
+        }))
         .exceptionallyCompose(CommitPublisher::failed);
   }
 

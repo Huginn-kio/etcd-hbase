@@ -156,7 +156,7 @@ class M2CostBenchmarkIT {
           catalog, materialization));
       this.publisher = new CommitPublisher(control, outcomes,
           new io.etcdhbase.core.commit.CommitPlanVerifier(catalog, materialization),
-          serviceHandoff(), finalizer);
+          invocations, serviceHandoff(), finalizer);
     }
 
     static Profile open(M1TestEnvironment environment, StorageTableBinding.Layout layout)

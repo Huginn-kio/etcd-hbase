@@ -34,6 +34,35 @@ class CommitPublisherTest {
   }
 
   @Test
+  void staleSealedObjectCannotPublishAfterNoChangeWinsDurably() {
+    Fixture fixture = new Fixture(true, ScriptedControlStore::write);
+    var sealed = fixture.invocation;
+    var preparing = InvocationBinding.begin(sealed.invocationId(), sealed.requestDigest(),
+        sealed.authorizationScopeDigest(), sealed.transactionId(), sealed.preparedOwnerEpoch(),
+        sealed.baseSequence(), sealed.baseRevision());
+    fixture.durable.set(preparing.completeWithoutChanges(ByteKey.copyOf(new byte[] {7})));
+
+    assertThrows(CompletionException.class, () -> fixture.publish().join());
+    assertEquals(0, fixture.handoff.calls.get());
+    assertEquals(0, fixture.control.casCalls.get());
+  }
+
+  @Test
+  void unpersistedOrDifferentSealedObjectCannotAcquireSendRight() {
+    Fixture fixture = new Fixture(true, ScriptedControlStore::write);
+    var sealed = fixture.invocation;
+    var preparing = InvocationBinding.begin(sealed.invocationId(), sealed.requestDigest(),
+        sealed.authorizationScopeDigest(), sealed.transactionId(), sealed.preparedOwnerEpoch(),
+        sealed.baseSequence(), sealed.baseRevision());
+    fixture.durable.set(preparing);
+    assertThrows(CompletionException.class, () -> fixture.publish().join());
+    fixture.durable.set(preparing.seal(ByteKey.copyOf(new byte[] {8})));
+    assertThrows(CompletionException.class, () -> fixture.publish().join());
+    assertEquals(0, fixture.handoff.calls.get());
+    assertEquals(0, fixture.control.casCalls.get());
+  }
+
+  @Test
   void layoutPreflightFailureDoesNotPublish() {
     Fixture fixture = new Fixture(true, ScriptedControlStore::write, true);
 
@@ -137,6 +166,7 @@ class CommitPublisherTest {
     private final PreparedCandidate candidate;
     private final ManifestPage page;
     private final ScriptedControlStore control;
+    private final AtomicReference<InvocationBinding> durable = new AtomicReference<>();
     private final DirectHandoff handoff = new DirectHandoff();
     private final CommitPublisher publisher;
 
@@ -164,6 +194,7 @@ class CommitPublisherTest {
       }
       invocation = InvocationBinding.begin(new InvocationId(UUID.randomUUID()), DIGEST, DIGEST,
           transactionId, 1, 0, 1).seal(manifest.systemIdentity());
+      durable.set(invocation);
       control = new ScriptedControlStore(CommitState.initial(FINGERPRINT, 1)
           .claimOwner(OWNER, 0, 10_000), compareAndSet);
       var outcomes = new CommitOutcomeResolver(control, new EmptyDecisionRepository());
@@ -185,7 +216,18 @@ class CommitPublisherTest {
           storedRootPresent ? Optional.of(manifest) : Optional.empty(), candidate, page)), materialization);
       CommitFinalizer finalizer = (invocation, publication, scope) ->
           CompletableFuture.completedFuture(publication);
-      publisher = new CommitPublisher(control, outcomes, verifier, handoff, finalizer);
+      InvocationRepository repository = new InvocationRepository() {
+        @Override public CompletableFuture<Optional<InvocationBinding>> read(InvocationId id, RequestScope scope) {
+          return CompletableFuture.completedFuture(Optional.ofNullable(durable.get()));
+        }
+        @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+            InvocationBinding binding, RequestScope scope) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<Boolean> compareAndSet(
+            InvocationBinding expected, InvocationBinding replacement, RequestScope scope) {
+          throw new UnsupportedOperationException();
+        }
+      };
+      publisher = new CommitPublisher(control, outcomes, verifier, repository, handoff, finalizer);
     }
 
     private CompletableFuture<CommitOutcomeResolver.Resolution> publish() {

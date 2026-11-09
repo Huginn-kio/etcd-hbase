@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Protocol skeleton with bounded request contexts; business handlers remain UNIMPLEMENTED. */
@@ -123,6 +124,8 @@ public final class Bootstrap implements AutoCloseable {
   public int activeRequests() {
     return requests.activeRequests();
   }
+
+  CompletionStage<Void> requestsDrained() { return requests.drained(); }
 
   public RequestMetrics metrics() {
     return metrics;

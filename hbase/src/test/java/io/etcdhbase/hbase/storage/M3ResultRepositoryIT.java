@@ -16,6 +16,7 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.InvocationResultResolver;
+import io.etcdhbase.core.commit.InvocationRepository;
 import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.ManifestCatalog;
 import io.etcdhbase.core.commit.ManifestPreparation;
@@ -31,6 +32,7 @@ import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.commit.TableGroupIdentityService;
 import io.etcdhbase.core.commit.TransactionId;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.kv.PutResult;
@@ -43,6 +45,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
@@ -56,6 +59,79 @@ class M3ResultRepositoryIT {
   private static final String GROUP = "m3-result";
   private static final String PROFILE = "m3-result-salt";
   private static final HashSaltStrategy SALT = new HashSaltStrategy();
+
+  @Test
+  void noChangeResultSurvivesLostCasAcknowledgementAndRejectsLateSeal() throws Exception {
+    TableName table = TableName.valueOf("j31_nochange_" + UUID.randomUUID().toString().replace("-", ""));
+    var binding = new SystemTableBinding(table, FAMILY, GROUP, PROFILE, SALT);
+    try (var environment = M1TestEnvironment.start(1);
+         var scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
+      environment.create(table, tableDescriptor(table, GROUP, true), SALT.splitKeys().toArray(byte[][]::new));
+      var records = HBaseSystemRecordStore.open(environment.factory(), environment.identity(), binding, scope).join();
+      var control = HBaseCommitControlStore.open(environment.factory(), environment.identity(), binding, scope).join();
+      assertTrue(control.initializeIfAbsent(CommitState.initial(binding.profileFingerprint(), 1), scope).join());
+      var initial = control.read(scope).join().orElseThrow();
+      assertTrue(control.compareAndSet(initial, initial.state().claimOwner("j31-fixture-owner", 0, Long.MAX_VALUE),
+          scope).join());
+      var rawInvocations = new HBaseInvocationRepository(records);
+      var loseAcknowledgement = new AtomicBoolean(true);
+      InvocationRepository acknowledgementLost = new InvocationRepository() {
+        @Override public CompletableFuture<Optional<InvocationBinding>> read(InvocationId id, RequestScope request) {
+          return rawInvocations.read(id, request);
+        }
+        @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+            InvocationBinding value, RequestScope request) {
+          return rawInvocations.createIfAbsent(value, request);
+        }
+        @Override public CompletableFuture<Boolean> compareAndSet(
+            InvocationBinding expected, InvocationBinding replacement, RequestScope request) {
+          return rawInvocations.compareAndSet(expected, replacement, request).thenCompose(updated -> {
+            if (updated && replacement.state() == InvocationBinding.State.NO_CHANGES
+                && loseAcknowledgement.compareAndSet(true, false)) {
+              return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+            }
+            return CompletableFuture.completedFuture(updated);
+          });
+        }
+      };
+      var invocations = new InvocationService(acknowledgementLost);
+      var preparing = InvocationBinding.begin(InvocationId.create(), ByteKey.copyOf(new byte[32]),
+          ByteKey.copyOf(new byte[32]), TransactionId.create(), 1, 0, 1);
+      preparing = invocations.bindOrJoin(preparing, scope).join();
+      var resultRepository = new HBaseResultRepository(records);
+      var identity = ResultIdentity.from(preparing);
+      var page = new ResultPage(identity, 0, new byte[] {1, 2, 3});
+      var reference = new ResultPreparation(resultRepository).prepare(identity, List.of(page), scope).join();
+      var results = new ResultCatalog(new HBaseResultRepository(records));
+      var completed = invocations.completeWithoutChanges(preparing, reference, results,
+          () -> CompletableFuture.completedFuture(null), scope).join();
+      assertEquals(InvocationBinding.State.NO_CHANGES, completed.state());
+      assertEquals(InvocationBinding.State.NO_CHANGES,
+          rawInvocations.read(preparing.invocationId(), scope).join().orElseThrow().state());
+      var latePreparing = preparing;
+      assertThrows(CompletionException.class, () -> invocations.transition(latePreparing,
+          latePreparing.seal(ByteKey.copyOf(new byte[] {7})), scope).join());
+
+      var decisions = new HBaseCommitDecisionRepository(records);
+      var resolver = new InvocationResultResolver(new HBaseInvocationRepository(records),
+          new CommitOutcomeResolver(control, decisions), new ManifestCatalog(new HBaseManifestRepository(records)),
+          results);
+      var limits = new BudgetManager.Limits(2, 0, 2, 1, 1, 0, 2_000_000);
+      var budgets = new BudgetManager(limits, Map.of("group", limits), limits);
+      try (var account = budgets.admit("group", scope, new BudgetManager.Reservation(0, 1, 1_000_000, 100));
+           var recovered = resolver.resolveNoChanges(preparing.invocationId(), preparing.requestDigest(),
+               preparing.authorizationScopeDigest(), scope, account).join()) {
+        byte[] bytes = new byte[recovered.payload().buffer().remaining()];
+        recovered.payload().buffer().get(bytes);
+        assertTrue(java.util.Arrays.equals(new byte[] {1, 2, 3}, bytes));
+        assertEquals(1, recovered.revision());
+      }
+      assertEquals(0, control.read(scope).join().orElseThrow().state().publishedSequence());
+      var closed = invocations.transition(completed, completed.closeQueryWindow(), scope).join();
+      assertEquals(InvocationBinding.State.WINDOW_CLOSED, closed.state());
+      assertEquals(InvocationBinding.State.WINDOW_CLOSED, invocations.bindOrJoin(preparing, scope).join().state());
+    }
+  }
 
   @Test
   void persistsVerifiesAndRejectsDamagedResultOnDisposableHBase() throws Exception {
@@ -222,7 +298,8 @@ class M3ResultRepositoryIT {
         return work.apply(requestScope);
       }
     };
-    var published = new CommitPublisher(control, outcomes, persisted.verifier(), handoff, finalizer)
+    var published = new CommitPublisher(control, outcomes, persisted.verifier(),
+        new HBaseInvocationRepository(records), handoff, finalizer)
         .publish(persisted.sealed(), new CommitOwnerService.OwnerToken("fixture-owner", 1),
             persisted.root(), scope).join();
     assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED, published.state());

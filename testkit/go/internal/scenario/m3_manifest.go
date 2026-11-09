@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 
@@ -27,9 +28,38 @@ var expectedM3PutSteps = []Step{
 	{CaseID: "C07", ID: "J30-request-too-large"},
 }
 
+var expectedM3TxnSteps = txnSteps()
+
+func txnSteps() []Step {
+	steps := []Step{{CaseID: "C11", ID: "native-baseline"}}
+	for _, target := range []string{"version", "create", "mod", "value", "lease"} {
+		for _, relation := range []string{"equal", "not-equal", "greater", "less"} {
+			steps = append(steps, Step{CaseID: "C11", ID: fmt.Sprintf("J31-compare-%s-%s", target, relation)})
+		}
+	}
+	for _, id := range []string{"J31-compare-missing-version", "J31-compare-missing-value",
+		"J31-compare-range", "J31-then-write", "J31-else-write", "J31-no-change",
+		"J31-client-read", "J31-empty-compare", "J31-duplicate-put"} {
+		steps = append(steps, Step{CaseID: "C12", ID: id})
+	}
+	return steps
+}
+
 // LoadM3PutSuite rejects partial, modified, or version-mismatched coverage declarations.
 // The returned digest describes the exact manifest bytes used by this run.
 func LoadM3PutSuite(path string) (Suite, string, error) {
+	suite, digest, err := LoadM3Suite(path)
+	if err != nil {
+		return Suite{}, "", err
+	}
+	if suite.ID != "m3-put-v1" {
+		return Suite{}, "", errors.New("M3 scenario is not the Put suite")
+	}
+	return suite, digest, nil
+}
+
+// LoadM3Suite accepts only explicitly registered, complete coverage manifests.
+func LoadM3Suite(path string) (Suite, string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return Suite{}, "", errors.New("M3 scenario manifest cannot be opened")
@@ -43,12 +73,20 @@ func LoadM3PutSuite(path string) (Suite, string, error) {
 	if err := yaml.UnmarshalStrict(data, &suite); err != nil {
 		return Suite{}, "", errors.New("M3 scenario manifest is invalid")
 	}
-	if suite.SchemaVersion != 1 || suite.ID != "m3-put-v1" || suite.Protocol != protocolVersion ||
-		len(suite.Steps) != len(expectedM3PutSteps) {
+	var expected []Step
+	switch suite.ID {
+	case "m3-put-v1":
+		expected = expectedM3PutSteps
+	case "m3-txn-v1":
+		expected = expectedM3TxnSteps
+	default:
+		return Suite{}, "", errors.New("M3 scenario identity is not registered")
+	}
+	if suite.SchemaVersion != 1 || suite.Protocol != protocolVersion || len(suite.Steps) != len(expected) {
 		return Suite{}, "", errors.New("M3 scenario identity or coverage is not pinned")
 	}
-	for index, expected := range expectedM3PutSteps {
-		if suite.Steps[index] != expected {
+	for index, step := range expected {
+		if suite.Steps[index] != step {
 			return Suite{}, "", errors.New("M3 scenario coverage differs from its pinned steps")
 		}
 	}

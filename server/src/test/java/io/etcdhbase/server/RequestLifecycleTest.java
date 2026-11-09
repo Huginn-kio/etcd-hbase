@@ -30,6 +30,33 @@ import org.junit.jupiter.api.Test;
 
 class RequestLifecycleTest {
   @Test
+  void drainCompletionWaitsForAdmittedRequestCleanupAfterShutdownStarts() throws Exception {
+    var entered = new CountDownLatch(1);
+    var release = new CountDownLatch(1);
+    try (var fixture = new Fixture(Duration.ofSeconds(5), RequestCompletionRecorder.NOOP)) {
+      fixture.extraCleanup = () -> { entered.countDown(); release.await(); };
+      var call = fixture.call();
+      assertTrue(fixture.started.await(2, TimeUnit.SECONDS));
+      call.cancel("cancelled", null);
+      assertTrue(entered.await(2, TimeUnit.SECONDS));
+      try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+        try {
+          var closing = executor.submit(fixture.interceptor::close);
+          assertFalse(fixture.interceptor.drained().toCompletableFuture().isDone());
+          release.countDown();
+          closing.get(3, TimeUnit.SECONDS);
+          fixture.interceptor.drained().toCompletableFuture().get(2, TimeUnit.SECONDS);
+          assertEquals(0, fixture.interceptor.activeRequests());
+        } finally {
+          release.countDown();
+        }
+      }
+    } finally {
+      release.countDown();
+    }
+  }
+
+  @Test
   void holdsAdmissionUntilConcurrentCleanupReallyCompletesAndRecordsItsFailure() throws Exception {
     var entered = new CountDownLatch(1);
     var release = new CountDownLatch(1);

@@ -6,7 +6,7 @@ import java.util.Optional;
 
 /** Durable one-to-one binding between an internal invocation and one preparation attempt. */
 public final class InvocationBinding {
-  public enum State { PREPARING, SEALED, SELECTED, NOT_SELECTED, WINDOW_CLOSED }
+  public enum State { PREPARING, SEALED, SELECTED, NOT_SELECTED, WINDOW_CLOSED, NO_CHANGES }
 
   public static final int MAX_RESULT_REFERENCE_BYTES = 4096;
 
@@ -59,6 +59,11 @@ public final class InvocationBinding {
       case SELECTED -> {
         if (manifestRoot.isEmpty() || resultReference.isEmpty()) {
           throw new IllegalArgumentException("selected invocation requires manifest and result references");
+        }
+      }
+      case NO_CHANGES -> {
+        if (manifestRoot.isPresent() || resultReference.isEmpty()) {
+          throw new IllegalArgumentException("no-change invocation requires only a result reference");
         }
       }
       case WINDOW_CLOSED -> {
@@ -117,6 +122,12 @@ public final class InvocationBinding {
     return copy(State.SELECTED, manifestRoot, Optional.of(Objects.requireNonNull(result, "result")));
   }
 
+  /** Used only after the result and read protection have been verified by InvocationService. */
+  InvocationBinding completeWithoutChanges(ByteKey result) {
+    if (state != State.PREPARING) throw new IllegalStateException("invocation is not preparing");
+    return copy(State.NO_CHANGES, Optional.empty(), Optional.of(Objects.requireNonNull(result, "result")));
+  }
+
   /** Only the outcome resolver can create the proof required to make this transition. */
   public InvocationBinding notSelected(NotSelectedProof proof) {
     Objects.requireNonNull(proof, "proof");
@@ -128,7 +139,7 @@ public final class InvocationBinding {
   }
 
   public InvocationBinding closeQueryWindow() {
-    if (state != State.SELECTED && state != State.NOT_SELECTED) {
+    if (state != State.SELECTED && state != State.NOT_SELECTED && state != State.NO_CHANGES) {
       throw new IllegalStateException("only a resolved invocation can close its query window");
     }
     return copy(State.WINDOW_CLOSED, manifestRoot, Optional.empty());
