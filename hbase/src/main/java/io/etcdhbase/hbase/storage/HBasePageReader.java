@@ -6,6 +6,8 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanDirection;
+import io.etcdhbase.core.storage.PhysicalScanProgress;
 import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.ScanCleanupFailure;
 import io.etcdhbase.core.storage.StoragePage;
@@ -124,6 +126,12 @@ final class HBasePageReader {
       KeyRange physical = binding.codec().physicalRange(request.bucket(), request.range());
       if (physical.isEmpty() || request.after().isEmpty()) return physical;
       KeyRange afterGroup = binding.codec().physicalRange(request.bucket(), KeyRange.point(request.after().get()));
+      if (request.direction() == ScanDirection.DESCENDING) {
+        ByteKey resume = afterGroup.lowerInclusive().orElseThrow();
+        Optional<ByteKey> upper = physical.upperExclusive();
+        return KeyRange.interval(physical.lowerInclusive(),
+            Optional.of(upper.isEmpty() || resume.compareTo(upper.orElseThrow()) < 0 ? resume : upper.orElseThrow()));
+      }
       ByteKey resume = afterGroup.upperExclusive().orElseThrow();
       ByteKey lower = physical.lowerInclusive().orElseThrow();
       return KeyRange.interval(Optional.of(resume.compareTo(lower) > 0 ? resume : lower), physical.upperExclusive());
@@ -133,8 +141,26 @@ final class HBasePageReader {
       var scan = new Scan().setCaching(1).setMaxResultSize(request.maximumBytes())
           .setAllowPartialResults(false).setScanMetricsEnabled(true)
           .setLimit(request.maximumPhysicalRows() + 1).addColumn(binding.family(), HBaseRecordStore.METADATA);
-      physical.lowerInclusive().ifPresent(lower -> scan.withStartRow(lower.bytes(), true));
-      physical.upperExclusive().ifPresent(upper -> scan.withStopRow(upper.bytes(), false));
+      if (request.direction() == ScanDirection.DESCENDING) {
+        scan.setReversed(true);
+        physical.upperExclusive().ifPresent(upper -> scan.withStartRow(upper.bytes(), false));
+        physical.lowerInclusive().ifPresent(lower -> scan.withStopRow(lower.bytes(), true));
+      } else {
+        physical.lowerInclusive().ifPresent(lower -> scan.withStartRow(lower.bytes(), true));
+        physical.upperExclusive().ifPresent(upper -> scan.withStopRow(upper.bytes(), false));
+      }
+      if (request.physicalProgress().isPresent()) {
+        var progress = request.physicalProgress().orElseThrow();
+        ByteKey row = progress.lastPhysicalRow();
+        var decoded = binding.codec().decode(row.bytes());
+        if (request.direction() != ScanDirection.DESCENDING || binding.layout() != StorageTableBinding.Layout.HISTORY
+            || !physical.contains(row) || binding.codec().bucket(decoded.key()) != request.bucket()
+            || !progress.physicalSourceId().equals(Optional.of(store.scanSourceId()))
+            || decoded.revision().isEmpty() || decoded.revision().getAsLong() <= request.revisionUpperBound()) {
+          throw new IllegalArgumentException("invalid history physical progress");
+        }
+        scan.withStartRow(row.bytes(), false);
+      }
       if (binding.layout() != StorageTableBinding.Layout.HISTORY) scan.setTimeRange(0, request.revisionUpperBound());
       if (request.projection() == ReadProjection.FULL) scan.addColumn(binding.family(), HBaseRecordStore.VALUE);
       return scan;
@@ -165,9 +191,23 @@ final class HBasePageReader {
           candidate = null;
         }
         group = decoded.key();
-        if (request.after().isPresent() && group.compareTo(request.after().get()) <= 0) continue;
-        if (decoded.revision().isPresent() && decoded.revision().getAsLong() > request.revisionUpperBound()) continue;
-        candidate = store.decode(row, request.projection());
+        if (request.after().isPresent() && request.direction().compare(group, request.after().get()) <= 0) continue;
+        if (decoded.revision().isPresent() && decoded.revision().getAsLong() > request.revisionUpperBound()) {
+          if (request.direction() == ScanDirection.DESCENDING && physicalRows == request.maximumPhysicalRows()) {
+            if (!records.isEmpty()) return page(records, false, opened, physicalRows, cellBytes);
+            if (row.getRow().length > request.maximumBytes()) throw resourceLimit();
+            var progress = PhysicalScanProgress.after(request, ByteKey.copyOf(row.getRow()), store.scanSourceId());
+            return page(records, false, opened, physicalRows, cellBytes, Optional.of(progress));
+          }
+          continue;
+        }
+        if (candidate == null || request.direction() == ScanDirection.ASCENDING) {
+          candidate = store.decode(row, request.projection());
+        }
+        if (request.direction() == ScanDirection.DESCENDING && physicalRows == request.maximumPhysicalRows()) {
+          if (!append(records, candidate, retained)) return page(records, false, opened, physicalRows, cellBytes);
+          return page(records, false, opened, physicalRows, cellBytes);
+        }
       }
       checkActive();
       if (candidate != null && !append(records, candidate, retained)) {
@@ -184,6 +224,11 @@ final class HBasePageReader {
     }
 
     private StoragePage page(List<StoredRecord> records, boolean exhausted, ResultScanner opened, long rows, long bytes) {
+      return page(records, exhausted, opened, rows, bytes, Optional.empty());
+    }
+
+    private StoragePage page(List<StoredRecord> records, boolean exhausted, ResultScanner opened, long rows, long bytes,
+        Optional<PhysicalScanProgress> progress) {
       var metrics = opened.getScanMetrics();
       var observed = Map.of(StoragePage.Observation.SERVER_ROWS_SCANNED, metrics.countOfRowsScanned.get(),
           StoragePage.Observation.BLOCK_BYTES_SCANNED, metrics.countOfBlockBytesScanned.get(),
@@ -191,7 +236,7 @@ final class HBasePageReader {
           StoragePage.Observation.BLOCK_CACHE_BYTES, metrics.bytesReadFromBlockCache.get(),
           StoragePage.Observation.MEMSTORE_BYTES, metrics.bytesReadFromMemstore.get(),
           StoragePage.Observation.SCANNER_RETRIES, metrics.countOfRPCRetries.get());
-      return new StoragePage(records, exhausted, new StoragePage.Cost(rows, bytes, metrics.countOfRPCcalls.get(), observed));
+      return new StoragePage(records, exhausted, new StoragePage.Cost(rows, bytes, metrics.countOfRPCcalls.get(), observed), progress);
     }
 
     private void checkActive() throws TimeoutException {

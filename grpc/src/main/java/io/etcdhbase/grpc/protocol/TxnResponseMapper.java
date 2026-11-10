@@ -9,6 +9,7 @@ import io.etcdhbase.core.kv.ResultNode;
 import io.etcdhbase.core.kv.ResultTree;
 import io.etcdhbase.core.kv.TxnCommand;
 import io.etcdhbase.core.storage.StoredRecord;
+import io.etcdhbase.core.storage.ScanDirection;
 import java.util.List;
 import java.util.Objects;
 import mvccpb.Kv;
@@ -138,7 +139,7 @@ public final class TxnResponseMapper {
 
   private static Rpc.RangeResponse projectRange(RangeCommand command, ResultNode.Range range,
       Rpc.ResponseHeader header) {
-    if (command.sort().target() != 0 || command.sort().order() < 0 || command.sort().order() > 1) {
+    if (command.sort().target() != 0 || command.sort().order() < 0 || command.sort().order() > 2) {
       throw new IllegalArgumentException("range result uses an unsupported sort");
     }
     validateRangeCount(command, range);
@@ -180,8 +181,9 @@ public final class TxnResponseMapper {
 
   private static void validateRangeRecords(RangeCommand command, ResultNode.Range range) {
     ByteKey previous = null;
+    var direction = command.sort().order() == 2 ? ScanDirection.DESCENDING : ScanDirection.ASCENDING;
     for (StoredRecord record : range.records()) {
-      if (!isOrderedAndInRange(command, record, previous)
+      if (!isOrderedAndInRange(command, record, previous, direction)
           || !matchesRangeProjection(command, record)
           || isNewerThanRequestedRevision(command, record)) {
         throw new IllegalArgumentException("range record differs from its request");
@@ -190,8 +192,9 @@ public final class TxnResponseMapper {
     }
   }
 
-  private static boolean isOrderedAndInRange(RangeCommand command, StoredRecord record, ByteKey previous) {
-    return command.range().contains(record.key()) && (previous == null || previous.compareTo(record.key()) < 0);
+  private static boolean isOrderedAndInRange(RangeCommand command, StoredRecord record, ByteKey previous,
+      ScanDirection direction) {
+    return command.range().contains(record.key()) && (previous == null || direction.compare(previous, record.key()) < 0);
   }
 
   private static boolean matchesRangeProjection(RangeCommand command, StoredRecord record) {

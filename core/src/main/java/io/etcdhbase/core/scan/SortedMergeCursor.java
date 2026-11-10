@@ -11,6 +11,7 @@ import io.etcdhbase.core.storage.ScanSource;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
+import io.etcdhbase.core.storage.ScanDirection;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -73,6 +74,9 @@ public final class SortedMergeCursor implements AutoCloseable {
   private SortedMergeCursor(ScanSource source, ScanRequest template, int bucketCount,
       BudgetManager.Account account, RequestScope scope, RecordStore valueStore,
       RecordStore completionStore) {
+    if (template.direction() != ScanDirection.ASCENDING) {
+      throw new UnsupportedOperationException("descending merge is not implemented");
+    }
     if (bucketCount < 1 || bucketCount > 4096
         || account.reservation().heads() / bucketCount < template.maximumBytes()) {
       throw new IllegalArgumentException("all bucket heads require reserved memory before scanning");
@@ -90,7 +94,7 @@ public final class SortedMergeCursor implements AutoCloseable {
     List<BucketCursor> opened = new ArrayList<>();
     for (int bucket = 0; bucket < bucketCount; bucket++) {
       opened.add(new BucketCursor(source, new ScanRequest(bucket, template.range(), template.after(),
-          template.revisionUpperBound(), ReadProjection.METADATA, 1, template.maximumBytes(), template.maximumPhysicalRows()), scope));
+          template.revisionUpperBound(), ReadProjection.METADATA, 1, template.maximumBytes(), template.maximumPhysicalRows()), scope, account));
     }
     buckets = List.copyOf(opened);
     registration = scope.registerScopedCleanup(this);

@@ -59,6 +59,15 @@ var expectedM3DeleteSteps = []Step{
 	{CaseID: "C09", ID: "J33-empty-key"},
 }
 
+var expectedM3SortSteps = func() []Step {
+	steps := []Step{{CaseID: "C03", ID: "native-baseline"}}
+	for _, id := range []string{"seed", "update", "none", "asc", "desc", "desc-first", "desc-next",
+		"desc-filter", "desc-history", "desc-point", "desc-keys", "desc-count", "client-asc", "txn-desc"} {
+		steps = append(steps, Step{CaseID: "C03", ID: "J35-" + id})
+	}
+	return steps
+}()
+
 var expectedM3RangeSteps = func() []Step {
 	steps := []Step{{CaseID: "C02", ID: "native-baseline"}}
 	for _, id := range []string{"seed", "update", "current", "historical", "negative-revision", "prefix-page", "keys-only",
@@ -145,6 +154,8 @@ func LoadM3Suite(path string) (Suite, string, error) {
 		expected = expectedM3DeleteSteps
 	case "m3-range-v1":
 		expected = expectedM3RangeSteps
+	case "m3-sort-v1":
+		expected = expectedM3SortSteps
 	default:
 		return Suite{}, "", errors.New("M3 scenario identity is not registered")
 	}

@@ -23,6 +23,7 @@ import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.core.scan.SortedMergeCursor;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.identity.HBaseAuthenticators;
@@ -109,6 +110,141 @@ class M1StorageIT {
         } finally {
           if (cluster != null) cluster.close();
         }
+      }
+    }
+  }
+
+  @Test
+  void reversedHistoryChecksAllFutureVersionsBeforeReportingAbsence() throws Exception {
+    var binding = table(StorageTableBinding.Layout.HISTORY);
+    ByteKey key = ByteKey.copyOf(new byte[] {0, (byte) 0xff});
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("m1", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60));
+         var account = budget.admit("m1", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(10))) {
+      var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+      await(store.put(live(key, 2, new byte[] {2})));
+      await(store.put(live(key, 3, new byte[] {3})));
+      var reader = new HBasePageReader(store, binding, scope, worker);
+      var request = new ScanRequest(binding.codec().bucket(key), KeyRange.all(), Optional.empty(), 1,
+          ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
+      try (var cursor = new BucketCursor(scheduler.bind(reader::start, account), request, scope, account);
+           var page = cursor.fetch().get(60, TimeUnit.SECONDS)) {
+        assertTrue(page.next().isEmpty());
+        assertTrue(page.exhausted());
+        assertEquals(2, page.cost().physicalRows());
+      }
+    }
+    assertEquals(0, budget.snapshot().allocatedBytes());
+  }
+
+  @Test
+  void physicalContinuationCannotBeReusedWithAnotherStore() throws Exception {
+    var binding = table(StorageTableBinding.Layout.HISTORY);
+    ByteKey key = ByteKey.copyOf(new byte[] {0, (byte) 0xff});
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60))) {
+      var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+      var other = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+      await(store.put(live(key, 1, new byte[] {1})));
+      await(store.put(live(key, 2, new byte[] {2})));
+      var request = new ScanRequest(binding.codec().bucket(key), KeyRange.all(), Optional.empty(), 1,
+          ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
+      var progress = await(new HBasePageReader(store, binding, scope, worker).read(request))
+          .physicalProgress().orElseThrow();
+      var resumed = request.resumePhysical(progress);
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> await(new HBasePageReader(other, binding, scope, worker).read(resumed)));
+      assertEquals(key, await(new HBasePageReader(store, binding, scope, worker).read(resumed))
+          .records().getFirst().key());
+    }
+  }
+
+  @Test
+  void reversedHistoryCursorAccountsForEveryPhysicalContinuation() throws Exception {
+    var binding = table(StorageTableBinding.Layout.HISTORY);
+    ByteKey key = ByteKey.copyOf(new byte[] {0, (byte) 0xff});
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("m1", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60));
+         var account = budget.admit("m1", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(10))) {
+      var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+      for (int revision = 1; revision <= 5; revision++) {
+        await(store.put(live(key, revision, new byte[] {(byte) revision})));
+      }
+      var reader = new HBasePageReader(store, binding, scope, worker);
+      var request = new ScanRequest(binding.codec().bucket(key), KeyRange.all(), Optional.empty(), 1,
+          ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
+      try (var cursor = new BucketCursor(scheduler.bind(reader::start, account), request, scope, account);
+           var page = cursor.fetch().get(60, TimeUnit.SECONDS)) {
+        assertEquals(key, page.next().orElseThrow().key());
+        assertEquals(5, page.cost().physicalRows());
+      }
+    }
+    assertEquals(0, budget.snapshot().scanners());
+    assertEquals(0, budget.snapshot().allocatedBytes());
+  }
+
+  @Test
+  void reversedHistoryMakesProgressAcrossAKeyWithManyFutureVersions() throws Exception {
+    var binding = table(StorageTableBinding.Layout.HISTORY);
+    ByteKey key = ByteKey.copyOf(new byte[] {0, (byte) 0xff});
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60))) {
+      var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+      for (int revision = 1; revision <= 5; revision++) {
+        await(store.put(live(key, revision, new byte[] {(byte) revision})));
+      }
+      var reader = new HBasePageReader(store, binding, scope, worker);
+      var request = new ScanRequest(binding.codec().bucket(key), KeyRange.all(), Optional.empty(), 1,
+          ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
+      io.etcdhbase.core.storage.StoragePage page;
+      int physicalPages = 0;
+      do {
+        page = await(reader.read(request));
+        assertTrue(page.cost().physicalRows() <= 1);
+        physicalPages++;
+        if (page.physicalProgress().isPresent()) request = request.resumePhysical(page.physicalProgress().orElseThrow());
+      } while (page.physicalProgress().isPresent() && physicalPages < 10);
+      assertTrue(physicalPages > 1, "the fixture must cross physical pages");
+      assertEquals(List.of(key), page.records().stream().map(StoredRecord::key).toList());
+      assertEquals(1, page.records().getFirst().metadata().modificationRevision());
+    }
+  }
+
+  @Test
+  void reversedPhysicalPagesSelectVisibleVersionsOnBothLayouts() throws Exception {
+    ByteKey a = ByteKey.copyOf(new byte[] {1});
+    ByteKey b = null;
+    int bucket = SALT.salt(a.bytes())[1] & 0xff;
+    for (int value = 2; value < 256; value++) {
+      ByteKey candidate = ByteKey.copyOf(new byte[] {(byte) value});
+      if ((SALT.salt(candidate.bytes())[1] & 0xff) == bucket) { b = candidate; break; }
+    }
+    if (b == null) throw new AssertionError("fixture did not find two keys in one bucket");
+    for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
+      var binding = table(layout);
+      try (var scope = RequestScope.withTimeout(Duration.ofSeconds(60))) {
+        var store = await(HBaseRecordStore.open(provider, identity, binding, scope, worker));
+        await(store.put(live(a, 1, new byte[] {1})));
+        await(store.put(live(a, 3, new byte[] {3})));
+        await(store.put(live(b, 1, new byte[] {1})));
+        await(store.put(StoredRecord.metadataOnly(b,
+            new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.TOMBSTONE, 0))));
+        await(store.put(live(b, 4, new byte[] {4})));
+        var reader = new HBasePageReader(store, binding, scope, worker);
+        var request = new ScanRequest(bucket, KeyRange.all(), Optional.empty(), 2,
+            ReadProjection.METADATA, 1, 4096, 128, ScanDirection.DESCENDING);
+        var first = await(reader.read(request));
+        assertEquals(List.of(b), first.records().stream().map(StoredRecord::key).toList());
+        assertEquals(StorageMetadata.State.TOMBSTONE, first.records().getFirst().metadata().state());
+        assertFalse(first.exhausted());
+        var second = await(reader.read(request.resumeAfter(Optional.of(b))));
+        assertEquals(List.of(a), second.records().stream().map(StoredRecord::key).toList());
+        assertEquals(1, second.records().getFirst().metadata().modificationRevision());
+        assertTrue(second.exhausted());
       }
     }
   }

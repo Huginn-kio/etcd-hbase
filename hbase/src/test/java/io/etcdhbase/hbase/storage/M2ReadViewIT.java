@@ -29,8 +29,11 @@ import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.scan.BucketCursor;
+import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
@@ -39,6 +42,7 @@ import io.etcdhbase.spi.salt.SaltProfile;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Comparator;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -75,6 +79,7 @@ class M2ReadViewIT {
         assertCurrentPointReads(fixture, account);
         assertCurrentRange(fixture, account);
       }
+      assertDescendingSelectedView(fixture);
       assertHistoricalReads(fixture);
       System.out.printf("j25-readview layout=%s selectedPending=true historical=true"
           + " deleteVisible=true unselectedIsolated=true%n", layout);
@@ -125,6 +130,40 @@ class M2ReadViewIT {
     await(physical.put(live(keys.deleted(), 1, 1, 1, "old-before-delete")));
     await(physical.put(live(keys.recreated(), 1, 1, 1, "before-delete")));
     await(physical.put(tombstone(keys.recreated(), 1, 2)));
+    for (int revision = 4; revision <= 8; revision++) {
+      await(physical.put(live(keys.updated(), 1, revision, revision, "future")));
+    }
+  }
+
+  private static void assertDescendingSelectedView(ReadFixture fixture) throws Exception {
+    var limits = new BudgetManager.Limits(4, 16, 2, 1, 1, 1_000_000, 16L << 20);
+    var manager = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(128 * 1024, 128 * 1024, 1L << 20, 1L << 20, 1L << 20);
+    try (var account = manager.admit("public", fixture.scope(), reservation);
+         var view = fixture.open(OptionalLong.empty());
+         var scheduler = new ScanScheduler(manager, Duration.ofSeconds(10))) {
+      var request = new ScanRequest(0, KeyRange.all(), Optional.empty(), 3,
+          ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
+      var actual = new ArrayList<StoredRecord>();
+      try (var cursor = new BucketCursor(scheduler.bind(view, account), request, fixture.scope(), account)) {
+        boolean exhausted = false;
+        while (!exhausted) {
+          try (var page = cursor.fetch().join()) {
+            page.next().ifPresent(actual::add);
+            exhausted = page.exhausted();
+          }
+        }
+      }
+      var keys = fixture.keys();
+      assertEquals(List.of(keys.updated(), keys.deleted(), keys.inserted(), keys.recreated()).stream()
+              .sorted(Comparator.reverseOrder()).toList(), actual.stream().map(StoredRecord::key).toList());
+      assertEquals(StorageMetadata.State.TOMBSTONE, actual.stream().filter(r -> r.key().equals(keys.deleted()))
+          .findFirst().orElseThrow().metadata().state());
+      assertEquals(3, actual.stream().filter(r -> r.key().equals(keys.updated())).findFirst().orElseThrow()
+          .metadata().modificationRevision());
+    }
+    assertEquals(0, manager.snapshot().allocatedBytes());
+    assertEquals(0, manager.snapshot().scanners());
   }
 
   private static List<PreparedCandidate> selectedCandidates(TransactionId transactionId,

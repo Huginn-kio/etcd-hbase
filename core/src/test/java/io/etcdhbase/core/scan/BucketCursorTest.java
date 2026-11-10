@@ -14,6 +14,8 @@ import io.etcdhbase.core.storage.BatchWriteResult;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanDirection;
+import io.etcdhbase.core.storage.PhysicalScanProgress;
 import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoragePage;
@@ -21,6 +23,7 @@ import io.etcdhbase.core.storage.StoredRecord;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -31,6 +34,114 @@ class BucketCursorTest {
   private final ControlledStore store = new ControlledStore();
   private final ScanRequest template = new ScanRequest(0, KeyRange.all(), Optional.empty(),
       Long.MAX_VALUE, ReadProjection.METADATA, 2, 4096, 16);
+
+  @Test
+  void physicalProgressResumesWithoutExposingAnEmptyLogicalPageAndRejectsRepetition() throws Exception {
+    var descending = new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
+        ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (var scope = RequestScope.withoutDeadline();
+         var account = budget.admit("public", scope, reservation);
+         var cursor = new BucketCursor(store, descending, scope, account)) {
+      var pending = cursor.fetch();
+      var progress = PhysicalScanProgress.after(store.requests.getLast(), key(5));
+      store.complete(new StoragePage(List.of(), false, new StoragePage.Cost(1, 20, 1), Optional.of(progress)));
+      assertFalse(pending.isDone());
+      assertEquals(Optional.of(progress), store.requests.getLast().physicalProgress());
+      var repeated = PhysicalScanProgress.after(store.requests.getLast(), key(5));
+      store.complete(new StoragePage(List.of(), false, new StoragePage.Cost(1, 20, 1), Optional.of(repeated)));
+      assertThrows(CompletionException.class, pending::join);
+      assertEquals(BucketCursor.State.FAILED, cursor.state());
+    }
+    assertEquals(0, budget.snapshot().allocatedBytes());
+  }
+
+  @Test
+  void cancelledPhysicalContinuationKeepsItsMemoryUntilTheProducerFinishes() throws Exception {
+    var descending = new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
+        ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (var scope = RequestScope.withoutDeadline(); var account = budget.admit("public", scope, reservation)) {
+      var cursor = new BucketCursor(store, descending, scope, account);
+      var pending = cursor.fetch();
+      var progress = PhysicalScanProgress.after(store.requests.getLast(), key(5));
+      store.complete(new StoragePage(List.of(), false, new StoragePage.Cost(1, 20, 1), Optional.of(progress)));
+      assertTrue(budget.snapshot().allocatedBytes() > 0);
+      cursor.close();
+      assertThrows(CompletionException.class, pending::join);
+      assertTrue(budget.snapshot().allocatedBytes() > 0);
+      store.complete(page(true));
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void logicalContinuationRemainsChargedUntilTheCancelledProducerFinishes() throws Exception {
+    var descending = new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
+        ReadProjection.METADATA, 2, 4096, 16, ScanDirection.DESCENDING);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (var scope = RequestScope.withoutDeadline(); var account = budget.admit("public", scope, reservation)) {
+      var cursor = new BucketCursor(store, descending, scope, account);
+      var first = cursor.fetch();
+      store.complete(page(false, record(2), record(1)));
+      try (var page = first.join()) { page.next().orElseThrow(); }
+      assertTrue(budget.snapshot().allocatedBytes() > 0);
+      var pending = cursor.fetch();
+      cursor.close();
+      assertThrows(CompletionException.class, pending::join);
+      assertTrue(budget.snapshot().allocatedBytes() > 0);
+      store.complete(page(true, record(1)));
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void logicalContinuationFailsClosedWhenItsHeadBudgetIsExhausted() throws Exception {
+    var descending = new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
+        ReadProjection.METADATA, 2, 4096, 16, ScanDirection.DESCENDING);
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(1, 8192, 8192, 65536, 131072);
+    try (var scope = RequestScope.withoutDeadline();
+         var account = budget.admit("public", scope, reservation);
+         var cursor = new BucketCursor(store, descending, scope, account)) {
+      var first = cursor.fetch();
+      store.complete(page(false, record(2), record(1)));
+      var page = first.join();
+      page.next().orElseThrow();
+      var failure = assertThrows(CompletionException.class, page::close);
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT, ((BackendFailure) failure.getCause()).category());
+      assertEquals(BucketCursor.State.FAILED, cursor.state());
+      assertTrue(store.operations.getLast().cancelled);
+      assertThrows(CompletionException.class, () -> cursor.fetch().join());
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  private static ByteKey key(int value) { return ByteKey.copyOf(new byte[] {(byte) value}); }
+
+  @Test
+  void descendingPagesResumeAfterTheLastConsumedLogicalKey() {
+    var descending = new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
+        ReadProjection.METADATA, 2, 4096, 16, ScanDirection.DESCENDING);
+    try (var scope = RequestScope.withoutDeadline(); var cursor = new BucketCursor(store, descending, scope)) {
+      var pending = cursor.fetch();
+      store.complete(page(false, record(2), record(1)));
+      try (var page = pending.join()) { assertEquals(record(2).key(), page.next().orElseThrow().key()); }
+      var next = cursor.fetch();
+      assertEquals(ScanDirection.DESCENDING, store.requests.getLast().direction());
+      assertEquals(Optional.of(record(2).key()), store.requests.getLast().after());
+      store.complete(page(true, record(1)));
+      try (var page = next.join()) { assertEquals(record(1).key(), page.next().orElseThrow().key()); }
+      assertEquals(BucketCursor.State.EXHAUSTED, cursor.state());
+    }
+  }
 
   @Test
   void pausesAndResumesFromOnlyTheLastConsumedKey() {

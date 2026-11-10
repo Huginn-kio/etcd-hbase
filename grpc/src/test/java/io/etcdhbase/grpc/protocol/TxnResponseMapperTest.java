@@ -89,6 +89,27 @@ class TxnResponseMapperTest {
   }
 
   @Test
+  void projectsDescendingRangeAndRejectsIncorrectOrdering() {
+    ByteKey a = ByteKey.copyOf(new byte[] {'a'});
+    ByteKey b = ByteKey.copyOf(new byte[] {'b'});
+    var metadata = new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, 1);
+    var first = StoredRecord.live(a, metadata, new byte[] {1});
+    var second = StoredRecord.live(b, metadata, new byte[] {2});
+    var range = new RangeCommand(KeyRange.all(), RangeCommand.Context.TRANSACTION, 0, 2,
+        new RangeCommand.Sort(2, 0), new RangeCommand.RevisionFilter(0, 0, 0, 0), false, false, false);
+    var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(range)), List.of());
+    var descending = new ResultTree(new ResultNode.Txn(0, header(2), true,
+        List.of(new ResultNode.Range(0, header(2), List.of(second, first), 2, true))));
+    var result = TxnResponseMapper.toWire(command, descending, 2, false, 1, 2)
+        .getResponses(0).getResponseRange();
+    assertArrayEquals(b.bytes(), result.getKvs(0).getKey().toByteArray());
+    assertTrue(result.getMore());
+    var ascending = new ResultTree(new ResultNode.Txn(0, header(2), true,
+        List.of(new ResultNode.Range(0, header(2), List.of(first, second), 2, true))));
+    assertThrows(IllegalArgumentException.class, () -> TxnResponseMapper.toWire(command, ascending, 2, false, 1, 2));
+  }
+
+  @Test
   void projectsRangeKeysOnlyAndCountOnlyWithoutInventingValues() {
     ByteKey a = ByteKey.copyOf(new byte[] {'a'});
     ByteKey z = ByteKey.copyOf(new byte[] {'z'});

@@ -29,6 +29,8 @@ import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanDirection;
+import io.etcdhbase.core.storage.PhysicalScanProgress;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
@@ -1827,6 +1829,132 @@ class ReadViewRecordStoreTest {
   }
 
   @Test
+  void descendingGlobalLimitUsesTheNextFilteredLiveKeyAcrossBuckets() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("x", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    fixture.physical.add(live("a", 1, 2, 2, 0, "a"));
+    fixture.physical.add(tombstone("b", 1, 2));
+    fixture.physical.add(live("c", 1, 1, 1, 0, "c"));
+    fixture.physical.add(live("d", 1, 2, 2, 0, "d"));
+    fixture.physical.add(live("e", 1, 2, 2, 0, "e"));
+    java.util.function.ToIntFunction<ByteKey> bucket = value -> value.equals(key("b")) || value.equals(key("d")) ? 1 : 0;
+    fixture.physical.bucketOf = bucket;
+    var limits = new BudgetManager.Limits(4, 32, 2, 1, 1, 1_000_000, 16_000_000);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(32768, 8192, 8192, 65536, 131072);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         BudgetManager.Account account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), bucket, 2, scope).join();
+      var compares = new CompareReadExecutor(session, scheduler, account, scope,
+          new CompareReadExecutor.Limits(2, 4096, 64, 4096));
+      var evaluator = new TxnEvaluator(session, compares, account, scope,
+          new TxnEvaluator.Limits(4096, 16384, 65536), bucket);
+      var range = new RangeCommand(KeyRange.all(), RangeCommand.Context.TRANSACTION, 0, 2,
+          new RangeCommand.Sort(2, 0), new RangeCommand.RevisionFilter(2, 0, 0, 0), false, false, false);
+      var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(range)), List.of());
+      var read = evaluator.evaluate(command, Optional.empty()).join().finishReadOnly().join();
+      var result = assertInstanceOf(ResultNode.Range.class,
+          assertInstanceOf(ResultNode.Txn.class, read.result().root()).responses().getFirst());
+      assertEquals(List.of("e", "d"), result.records().stream().map(record -> text(record.key())).toList());
+      assertEquals(2, result.count());
+      assertTrue(result.more());
+    }
+    assertEquals(0, budget.snapshot().allocatedBytes());
+  }
+
+  @Test
+  void descendingSelectedViewResumesPhysicalProgressAtItsStableRevision() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("d", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
+    fixture.physical.add(live("c", 1, 1, 1, 0, "base"));
+    fixture.physical.progressOnce.set(true);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10))) {
+      var budgets = budget(scope, 16384);
+      var view = fixture.readStore(fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+      var request = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
+          ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
+      try (var account = budgets.account();
+           var scheduler = new ScanScheduler(budgets.manager(), Duration.ofSeconds(5));
+           var cursor = new BucketCursor(scheduler.bind(view, account), request, scope, account);
+           var page = cursor.fetch().join()) {
+        assertEquals("d", text(page.next().orElseThrow().key()));
+        assertTrue(page.cost().physicalRows() >= 2);
+        assertEquals(1, fixture.physical.lastProgressRevision);
+        assertEquals(1, fixture.repository.candidateReads.get(),
+            "physical-only continuation must not reread the selected candidate");
+      } finally {
+        view.close();
+      }
+      assertEquals(0, budgets.manager().snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void descendingReadViewMergesSelectedCandidatesAndRejectsAnotherViewCheckpoint() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("b", 1, 2, 2, StorageMetadata.State.TOMBSTONE, new byte[0]),
+        candidate("d", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
+    fixture.physical.add(live("a", 1, 1, 1, 0, "a"));
+    fixture.physical.add(live("b", 1, 1, 1, 0, "old"));
+    fixture.physical.add(live("c", 1, 1, 1, 0, "c"));
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         var account = fixture.account(scope, 16384)) {
+      var firstView = fixture.readStore(fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+      var otherView = fixture.readStore(fixture.views.open(OptionalLong.empty(), digest(9), scope).join(), scope);
+      var request = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
+          ReadProjection.METADATA, 1, 4096, 16, ScanDirection.DESCENDING);
+      try {
+        for (String expected : List.of("d", "c", "b", "a")) {
+          var operation = firstView.startScan(request, account);
+          var page = operation.completion().toCompletableFuture().join();
+          operation.close();
+          assertEquals(expected, text(page.records().getFirst().key()));
+          if (expected.equals("b")) {
+            assertEquals(StorageMetadata.State.TOMBSTONE, page.records().getFirst().metadata().state());
+          }
+          request = request.resumeAfter(Optional.of(page.records().getFirst().key()));
+        }
+        var foreign = otherView.startScan(request, account);
+        assertThrows(CompletionException.class, () -> foreign.completion().toCompletableFuture().join());
+        foreign.close();
+        try (var otherAccount = fixture.account(scope, 16384)) {
+          var wrongAccount = firstView.startScan(request, otherAccount);
+          assertThrows(CompletionException.class, () -> wrongAccount.completion().toCompletableFuture().join());
+          wrongAccount.close();
+        }
+      } finally {
+        firstView.close();
+        otherView.close();
+      }
+    }
+  }
+
+  @Test
+  void descendingManifestTraversalResumesWithoutSkippingCandidates() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("a", 1, 2, 2, StorageMetadata.State.LIVE, bytes("a")),
+        candidate("b", 1, 2, 2, StorageMetadata.State.TOMBSTONE, new byte[0]),
+        candidate("c", 2, 2, 1, StorageMetadata.State.LIVE, bytes("c"))));
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         var account = fixture.account(scope, 16384)) {
+      var catalog = new ManifestCatalog(fixture.repository);
+      try (var first = catalog.candidatesInRange(fixture.root, 0, KeyRange.all(), Optional.empty(), 2,
+          16384, scope, () -> false, account, ScanDirection.DESCENDING).join()) {
+        assertEquals(List.of("c", "b"), first.candidates().stream().map(c -> text(c.record().key())).toList());
+        assertFalse(first.exhausted());
+      }
+      try (var second = catalog.candidatesInRange(fixture.root, 0, KeyRange.all(), Optional.of(key("b")), 2,
+          16384, scope, () -> false, account, ScanDirection.DESCENDING).join()) {
+        assertEquals(List.of("a"), second.candidates().stream().map(c -> text(c.record().key())).toList());
+        assertTrue(second.exhausted());
+      }
+    }
+  }
+
+  @Test
   void requestReadLimitStopsBeforeFetchingCandidateBeyondRemainingBytes() throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("a", 2, 2, 1, StorageMetadata.State.LIVE, new byte[4 * 1024 * 1024]),
@@ -2369,6 +2497,8 @@ class ReadViewRecordStoreTest {
     private final AtomicInteger getCalls = new AtomicInteger();
     private final List<ReadProjection> getProjections = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final AtomicInteger scanCalls = new AtomicInteger();
+    private final AtomicBoolean progressOnce = new AtomicBoolean();
+    private volatile long lastProgressRevision;
     private final List<Integer> scanBuckets = new java.util.concurrent.CopyOnWriteArrayList<>();
     private java.util.function.ToIntFunction<ByteKey> bucketOf = ignored -> 0;
     private boolean pointUsesScanner;
@@ -2397,11 +2527,20 @@ class ReadViewRecordStoreTest {
     @Override public ScanOperation startScan(ScanRequest request) {
       scanCalls.incrementAndGet();
       scanBuckets.add(request.bucket());
+      if (request.physicalProgress().isPresent()) lastProgressRevision = request.revisionUpperBound();
+      if (progressOnce.compareAndSet(true, false)) {
+        var progress = PhysicalScanProgress.after(request, key("physical-row"));
+        var page = new StoragePage(List.of(), false, new StoragePage.Cost(1, 1, 1), Optional.of(progress));
+        return new ScanOperation() {
+          @Override public CompletionStage<StoragePage> completion() { return CompletableFuture.completedFuture(page); }
+          @Override public void close() { }
+        };
+      }
       Map<ByteKey, StoredRecord> latest = new HashMap<>();
       for (List<StoredRecord> history : versions.values()) {
         for (StoredRecord record : history) {
           if (bucketOf.applyAsInt(record.key()) == request.bucket() && request.range().contains(record.key())
-              && request.after().map(after -> record.key().compareTo(after) > 0).orElse(true)
+              && request.after().map(after -> request.direction().compare(record.key(), after) > 0).orElse(true)
               && record.metadata().modificationRevision() <= request.revisionUpperBound()) {
             latest.merge(record.key(), record,
                 (left, right) -> left.metadata().modificationRevision()
@@ -2410,7 +2549,7 @@ class ReadViewRecordStoreTest {
         }
       }
       List<StoredRecord> matching = latest.values().stream()
-          .sorted(Comparator.comparing(StoredRecord::key)).toList();
+          .sorted((left, right) -> request.direction().compare(left.key(), right.key())).toList();
       List<StoredRecord> projected = new ArrayList<>();
       long bytes = 0;
       boolean exhausted = true;

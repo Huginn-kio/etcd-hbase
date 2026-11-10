@@ -42,6 +42,9 @@ import org.apache.hadoop.hbase.client.Scan;
 
 /** Request-bound physical adapter. The issuing factory retains the shared connection. */
 public final class HBaseRecordStore implements RecordStore {
+  private final java.util.UUID scanSourceId = java.util.UUID.randomUUID();
+
+  java.util.UUID scanSourceId() { return scanSourceId; }
   static final byte[] METADATA = {'m'};
   static final byte[] VALUE = {'v'};
   private final AsyncConnection connection;

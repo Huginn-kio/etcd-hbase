@@ -7,7 +7,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StoredRecord;
-import java.util.Comparator;
+import io.etcdhbase.core.storage.ScanDirection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -24,7 +24,8 @@ final class OrderedViewCursor implements AsyncCursor<StoredRecord>, AutoCloseabl
   private final List<AsyncCursor<StoredRecord>> sources;
   private final BudgetManager.Account account;
   private final RequestScope scope;
-  private final PriorityQueue<Head> heads = new PriorityQueue<>(Comparator.comparing(head -> head.record().key()));
+  private final ScanDirection direction;
+  private final PriorityQueue<Head> heads;
   private int initialized;
   private Head delivered;
   private ByteKey previous;
@@ -34,9 +35,16 @@ final class OrderedViewCursor implements AsyncCursor<StoredRecord>, AutoCloseabl
   private boolean failed;
 
   OrderedViewCursor(List<AsyncCursor<StoredRecord>> sources, BudgetManager.Account account, RequestScope scope) {
+    this(sources, account, scope, ScanDirection.ASCENDING);
+  }
+
+  OrderedViewCursor(List<AsyncCursor<StoredRecord>> sources, BudgetManager.Account account, RequestScope scope,
+      ScanDirection direction) {
     this.sources = List.copyOf(Objects.requireNonNull(sources, "sources"));
     this.account = Objects.requireNonNull(account, "account");
     this.scope = Objects.requireNonNull(scope, "scope");
+    this.direction = Objects.requireNonNull(direction, "direction");
+    this.heads = new PriorityQueue<>((left, right) -> direction.compare(left.record().key(), right.record().key()));
     if (this.sources.isEmpty() || this.sources.size() > 4096 || !account.belongsTo(scope)) {
       throw new IllegalArgumentException("invalid ordered view sources or request budget");
     }
@@ -133,7 +141,7 @@ final class OrderedViewCursor implements AsyncCursor<StoredRecord>, AutoCloseabl
       ended = true;
       return Optional.empty();
     }
-    if (previous != null && previous.compareTo(head.record().key()) >= 0) {
+    if (previous != null && direction.compare(previous, head.record().key()) >= 0) {
       head.lease().close();
       throw new IllegalStateException("bucket views contain duplicate or unordered keys");
     }

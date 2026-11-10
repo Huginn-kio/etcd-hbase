@@ -9,6 +9,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.storage.ScanDirection;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -44,6 +45,17 @@ class PagedWorksetIndexTest {
         found.add(text(next.orElseThrow().key()));
       }
       assertEquals(List.of("key-0101", "key-0105", "key-0109", "key-0113", "key-0117"), found);
+      var reverse = index.scan(1, KeyRange.between(key("key-0100"), key("key-0120")), ScanDirection.DESCENDING);
+      var descending = new ArrayList<String>();
+      for (var next = reverse.next().join(); next.isPresent(); next = reverse.next().join()) {
+        descending.add(text(next.orElseThrow().key()));
+      }
+      assertEquals(List.of("key-0117", "key-0113", "key-0109", "key-0105", "key-0101"), descending);
+      int beforeNarrowSeek = records.readCalls;
+      var absent = index.scan(1, KeyRange.between(key("z"), key("zz")), ScanDirection.DESCENDING);
+      assertTrue(absent.next().join().isEmpty());
+      assertTrue(records.readCalls - beforeNarrowSeek <= 16,
+          "a range beyond the indexed keys should prune directory pages; reads=" + (records.readCalls - beforeNarrowSeek));
       var all = index.scanAll();
       int count = 0;
       PagedWorksetIndex.EventRef previous = null;
@@ -182,11 +194,13 @@ class PagedWorksetIndexTest {
   private static final class MemoryRecords implements SystemRecordStore {
     private final Map<ByteKey, ByteKey> rows = new HashMap<>();
     private int maximumRecordBytes;
+    private int readCalls;
     private CompletableFuture<Optional<ByteKey>> blockedRead;
     private ByteKey blockedIdentity;
 
     @Override public CompletableFuture<Optional<ByteKey>> read(
         SystemRecordType type, ByteKey identity, RequestScope scope) {
+      readCalls++;
       if (blockedRead != null) {
         blockedIdentity = identity;
         return blockedRead;

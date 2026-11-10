@@ -3,12 +3,22 @@ package io.etcdhbase.core.storage;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /** Physical rows are client-returned Result rows; observations are sampled counters, not total IO. */
-public record StoragePage(List<StoredRecord> records, boolean exhausted, Cost cost) {
+public record StoragePage(List<StoredRecord> records, boolean exhausted, Cost cost,
+    Optional<PhysicalScanProgress> physicalProgress) {
+  public StoragePage(List<StoredRecord> records, boolean exhausted, Cost cost) {
+    this(records, exhausted, cost, Optional.empty());
+  }
+
   public StoragePage {
     records = List.copyOf(records);
     if (cost == null) throw new NullPointerException("cost");
+    physicalProgress = java.util.Objects.requireNonNull(physicalProgress, "physicalProgress");
+    if (physicalProgress.isPresent() && (exhausted || !records.isEmpty())) {
+      throw new IllegalArgumentException("physical progress must not contain logical results");
+    }
   }
 
   public enum Observation {

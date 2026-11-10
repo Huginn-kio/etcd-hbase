@@ -14,6 +14,7 @@ import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.util.List;
@@ -297,10 +298,16 @@ public final class TxnWorkingSet {
    * Tombstones are retained so the consumer can apply its own visibility and counting rules.
    */
   public AsyncCursor<StoredRecord> merge(int selectedBucket, KeyRange range, AsyncCursor<StoredRecord> base) {
+    return merge(selectedBucket, range, base, ScanDirection.ASCENDING);
+  }
+
+  public AsyncCursor<StoredRecord> merge(int selectedBucket, KeyRange range, AsyncCursor<StoredRecord> base,
+      ScanDirection direction) {
     requireReady();
     Objects.requireNonNull(range, "range");
     Objects.requireNonNull(base, "base");
-    return new MergeCursor(selectedBucket, range, base, index.scan(selectedBucket, range));
+    Objects.requireNonNull(direction, "direction");
+    return new MergeCursor(selectedBucket, range, base, index.scan(selectedBucket, range, direction), direction);
   }
 
   /** Final candidates are streamed in bucket/key order, with each referenced event verified. */
@@ -448,6 +455,7 @@ public final class TxnWorkingSet {
     private final KeyRange range;
     private final AsyncCursor<StoredRecord> base;
     private final AsyncCursor<PagedWorksetIndex.EventRef> overlay;
+    private final ScanDirection direction;
     private final AtomicBoolean reading = new AtomicBoolean();
     private StoredRecord baseHead;
     private StoredRecord overlayHead;
@@ -456,11 +464,12 @@ public final class TxnWorkingSet {
     private boolean overlayEnded;
 
     private MergeCursor(int selectedBucket, KeyRange range, AsyncCursor<StoredRecord> base,
-        AsyncCursor<PagedWorksetIndex.EventRef> overlay) {
+        AsyncCursor<PagedWorksetIndex.EventRef> overlay, ScanDirection direction) {
       this.selectedBucket = selectedBucket;
       this.range = range;
       this.base = base;
       this.overlay = overlay;
+      this.direction = direction;
     }
 
     @Override public CompletableFuture<Optional<StoredRecord>> next() {
@@ -486,7 +495,7 @@ public final class TxnWorkingSet {
       if (baseHead == null && overlayHead == null) return Optional.empty();
       if (baseHead == null) return consumeOverlay(false);
       if (overlayHead == null) return consumeBase();
-      int order = baseHead.key().compareTo(overlayHead.key());
+      int order = direction.compare(baseHead.key(), overlayHead.key());
       return order < 0 ? consumeBase() : consumeOverlay(order == 0);
     }
 
@@ -514,7 +523,7 @@ public final class TxnWorkingSet {
         }
         StoredRecord record = value.orElseThrow();
         if (!range.contains(record.key()) || checkedBucket(record.key()) != selectedBucket
-            || previousBase != null && previousBase.compareTo(record.key()) >= 0
+            || previousBase != null && direction.compare(previousBase, record.key()) >= 0
             || record.metadata().modificationRevision() > invocation.baseRevision()) {
           throw new IllegalStateException("base cursor is outside the fixed, ordered bucket view");
         }

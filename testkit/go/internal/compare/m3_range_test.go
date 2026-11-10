@@ -156,6 +156,18 @@ func TestM3RangeComparisonAppliesOnlyExistingPageCountAllowance(t *testing.T) {
 	}
 }
 
+func TestM3RangeComparisonRejectsDescendingReordering(t *testing.T) {
+	request := &etcdserverpb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z"),
+		Limit: 2, SortOrder: etcdserverpb.RangeRequest_DESCEND}
+	a := &mvccpb.KeyValue{Key: []byte("a"), Value: []byte{1}, CreateRevision: 2, ModRevision: 2, Version: 1}
+	b := &mvccpb.KeyValue{Key: []byte("b"), Value: []byte{2}, CreateRevision: 2, ModRevision: 2, Version: 1}
+	native := m3RangeTrace(t, "native-etcd", 3, request, 3, true, b, a)
+	target := m3RangeTrace(t, "target-hbase", 0, request, 2, true, a, b)
+	if err := CompareM3RangeTraces(bytes.NewReader(encodeTrace(t, native)), bytes.NewReader(encodeTrace(t, target))); err == nil {
+		t.Fatal("Count allowance hid a descending key-order mismatch")
+	}
+}
+
 func m3RangeTrace(t *testing.T, scope string, term uint64, request *etcdserverpb.RangeRequest,
 	count int64, more bool, values ...*mvccpb.KeyValue) []trace.Record {
 	t.Helper()

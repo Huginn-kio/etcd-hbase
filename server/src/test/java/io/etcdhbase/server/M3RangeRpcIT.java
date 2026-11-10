@@ -95,6 +95,7 @@ class M3RangeRpcIT {
       try {
         var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(90, TimeUnit.SECONDS);
         verifyRange(stub, runtime, plan.primary().codec()::bucket);
+        verifyDescending(stub);
         try (var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
           var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope)
               .get(30, TimeUnit.SECONDS);
@@ -194,6 +195,30 @@ class M3RangeRpcIT {
     var empty = stub.range(Rpc.RangeRequest.newBuilder().setKey(prefix).setRangeEnd(prefix).build());
     assertEquals(0, empty.getCount());
     assertEquals(0, empty.getKvsCount());
+  }
+
+  private static void verifyDescending(KVGrpc.KVBlockingStub stub) {
+    var prefix = ByteString.copyFromUtf8("j34/");
+    var end = ByteString.copyFromUtf8("j340");
+    var a = ByteString.copyFromUtf8("j34/a");
+    var c = ByteString.copyFromUtf8("j34/c");
+    var last = ByteString.copyFrom(new byte[] {'j', '3', '4', '/', (byte) 0xff});
+    var firstRequest = Rpc.RangeRequest.newBuilder().setKey(prefix).setRangeEnd(end).setRevision(5)
+        .setSortOrderValue(2).setLimit(2).build();
+    var first = stub.range(firstRequest);
+    assertEquals(List.of(last, c), first.getKvsList().stream().map(kv -> kv.getKey()).toList());
+    assertEquals(2, first.getCount());
+    assertTrue(first.getMore());
+    var second = stub.range(firstRequest.toBuilder().setRangeEnd(c).build());
+    assertEquals(List.of(a), second.getKvsList().stream().map(kv -> kv.getKey()).toList());
+    assertFalse(second.getMore());
+    var filtered = stub.range(firstRequest.toBuilder().setMinModRevision(4).setLimit(1).build());
+    assertEquals(List.of(c), filtered.getKvsList().stream().map(kv -> kv.getKey()).toList());
+    assertTrue(filtered.getMore());
+    for (int target = 1; target <= 4; target++) {
+      var unsupported = firstRequest.toBuilder().setSortTargetValue(target).build();
+      assertEquals(Status.Code.UNIMPLEMENTED, status(() -> stub.range(unsupported)));
+    }
   }
 
   private static void verifyCompactedRange(KVGrpc.KVBlockingStub stub, HBaseCommitControlStore control,

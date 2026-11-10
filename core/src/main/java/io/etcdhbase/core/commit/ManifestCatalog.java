@@ -7,6 +7,7 @@ import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
+import io.etcdhbase.core.storage.ScanDirection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -49,7 +50,7 @@ public final class ManifestCatalog {
       this.leases = List.copyOf(leases);
     }
 
-    private static CandidateSlice empty() {
+    static CandidateSlice empty() {
       return new CandidateSlice(List.of(), true, 0, 0, 0, List.of());
     }
 
@@ -141,11 +142,20 @@ public final class ManifestCatalog {
       KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
       long maximumCandidateBytes, RequestScope scope, BooleanSupplier cancelled,
       BudgetManager.Account account) {
+    return candidatesInRange(root, bucket, range, afterExclusive, maximumCandidates, maximumCandidateBytes,
+        scope, cancelled, account, ScanDirection.ASCENDING);
+  }
+
+  public CompletableFuture<CandidateSlice> candidatesInRange(ManifestRoot root, int bucket,
+      KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
+      long maximumCandidateBytes, RequestScope scope, BooleanSupplier cancelled,
+      BudgetManager.Account account, ScanDirection direction) {
     Objects.requireNonNull(root, "root");
     Objects.requireNonNull(range, "range");
     Objects.requireNonNull(afterExclusive, "afterExclusive");
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(cancelled, "cancelled");
+    Objects.requireNonNull(direction, "direction");
     if (account != null && !account.belongsTo(scope)) {
       return CompletableFuture.failedFuture(
           new IllegalArgumentException("candidate budget belongs to another request scope"));
@@ -160,7 +170,7 @@ public final class ManifestCatalog {
     var callerCancelled = new AtomicBoolean();
     var cursor = new CandidateRangeCursor(root, bucket, range, afterExclusive,
         maximumCandidates, maximumCandidateBytes, scope,
-        () -> cancelled.getAsBoolean() || callerCancelled.get(), account);
+        () -> cancelled.getAsBoolean() || callerCancelled.get(), account, direction);
     var result = new CompletableFuture<CandidateSlice>();
     CompletableFuture<Void> traversal;
     try {
@@ -218,6 +228,7 @@ public final class ManifestCatalog {
     private final RequestScope scope;
     private final BooleanSupplier cancelled;
     private final BudgetManager.Account account;
+    private final ScanDirection direction;
     private final List<PreparedCandidate> candidates = new java.util.ArrayList<>();
     private final List<BudgetManager.Lease> leases = new java.util.ArrayList<>();
     private int directoryPages;
@@ -228,7 +239,8 @@ public final class ManifestCatalog {
 
     private CandidateRangeCursor(ManifestRoot root, int bucket, KeyRange range,
         Optional<ByteKey> after, int maximumCandidates, long maximumCandidateBytes,
-        RequestScope scope, BooleanSupplier cancelled, BudgetManager.Account account) {
+        RequestScope scope, BooleanSupplier cancelled, BudgetManager.Account account,
+        ScanDirection direction) {
       this.root = root;
       this.bucket = bucket;
       this.range = range;
@@ -238,6 +250,7 @@ public final class ManifestCatalog {
       this.scope = scope;
       this.cancelled = cancelled;
       this.account = account;
+      this.direction = direction;
     }
 
     private CompletableFuture<Void> visit(ManifestChildReference reference) {
@@ -259,13 +272,13 @@ public final class ManifestCatalog {
         if (!page.transactionId().equals(root.transactionId()) || !page.reference().equals(reference)) {
           return invalid("manifest directory page differs from its authenticated range reference");
         }
-        return visitChildren(page.children(), 0);
+        return visitChildren(page.children(), firstIndex(page.children().size()));
       });
     }
 
     private CompletableFuture<Void> visitChildren(List<ManifestChildReference> children, int index) {
-      if (index == children.size() || stopped()) return CompletableFuture.completedFuture(null);
-      return visit(children.get(index)).thenCompose(ignored -> visitChildren(children, index + 1));
+      if (index < 0 || index >= children.size() || stopped()) return CompletableFuture.completedFuture(null);
+      return visit(children.get(index)).thenCompose(ignored -> visitChildren(children, nextIndex(index)));
     }
 
     private CompletableFuture<Void> visitLeaf(ManifestChildReference reference) {
@@ -278,13 +291,13 @@ public final class ManifestCatalog {
             || page.bucket() != bucket) {
           return invalid("manifest leaf page differs from its authenticated bucket range");
         }
-        return visitCandidates(page.candidates(), 0);
+        return visitCandidates(page.candidates(), firstIndex(page.candidates().size()));
       });
     }
 
     private CompletableFuture<Void> visitCandidates(
         List<ManifestCandidateReference> references, int index) {
-      if (index == references.size() || stopped()) return CompletableFuture.completedFuture(null);
+      if (index < 0 || index >= references.size() || stopped()) return CompletableFuture.completedFuture(null);
       if (cancelled.getAsBoolean() || scope.isClosed() || scope.isDeadlineExceeded()) {
         return CompletableFuture.failedFuture(stopFailure());
       }
@@ -299,10 +312,10 @@ public final class ManifestCatalog {
         return invalid("manifest leaf contains a candidate from another bucket");
       }
       ByteKey key = reference.logicalKey();
-      if (!range.contains(key) || after.filter(previous -> key.compareTo(previous) <= 0).isPresent()) {
-        return visitCandidates(references, index + 1);
+      if (!range.contains(key) || after.filter(previous -> direction.compare(key, previous) <= 0).isPresent()) {
+        return visitCandidates(references, nextIndex(index));
       }
-      if (lastKey != null && lastKey.compareTo(key) >= 0) {
+      if (lastKey != null && direction.compare(lastKey, key) >= 0) {
         return invalid("manifest range candidates are duplicated or unordered");
       }
       return readCandidate(references, index, reference, key);
@@ -382,7 +395,7 @@ public final class ManifestCatalog {
           exhausted = false;
           return CompletableFuture.completedFuture(null);
         }
-        return visitCandidates(references, index + 1);
+        return visitCandidates(references, nextIndex(index));
       } catch (RuntimeException | Error failure) {
         // Keep fatal failures observable through the traversal future, but settle this read's
         // ownership first; failedCandidate defers release if a physical producer is still active.
@@ -434,7 +447,8 @@ public final class ManifestCatalog {
     private boolean mayIntersect(ManifestChildReference reference) {
       if (bucket < reference.firstBucket() || bucket > reference.lastBucket()) return false;
       if (reference.firstBucket() != reference.lastBucket()) return true;
-      if (after.filter(previous -> reference.lastKey().compareTo(previous) <= 0).isPresent()) {
+      if (after.filter(previous -> direction == ScanDirection.ASCENDING
+          ? reference.lastKey().compareTo(previous) <= 0 : reference.firstKey().compareTo(previous) >= 0).isPresent()) {
         return false;
       }
       if (range.kind() == KeyRange.Kind.POINT) {
@@ -447,6 +461,14 @@ public final class ManifestCatalog {
 
     private boolean stopped() {
       return !exhausted;
+    }
+
+    private int firstIndex(int size) {
+      return direction == ScanDirection.ASCENDING ? 0 : size - 1;
+    }
+
+    private int nextIndex(int index) {
+      return direction == ScanDirection.ASCENDING ? index + 1 : index - 1;
     }
 
     private CandidateSlice slice() {

@@ -120,7 +120,7 @@ class M3TxnRpcIT {
     }
     String comparison = switch (run.task()) {
       case "j33" -> "--m3-delete";
-      case "j34" -> "--m3-range";
+      case "j34", "j35" -> "--m3-range";
       default -> "--m3-txn";
     };
     run(run.root(), run.artifacts().resolve(run.task() + "-compare-" + suffix + ".log"), List.of(

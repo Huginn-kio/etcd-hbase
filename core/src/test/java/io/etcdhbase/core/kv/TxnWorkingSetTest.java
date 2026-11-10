@@ -27,6 +27,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -275,6 +276,14 @@ class TxnWorkingSetTest {
         actual.add(new String(value.orElseThrow().value().orElseThrow(), StandardCharsets.UTF_8));
       }
       assertEquals(List.of("new-b", "new-c", "old-d"), actual);
+      var reversed = working.merge(0, KeyRange.between(key("b"), key("e")),
+          AsyncCursor.fromIterator(List.of(live("d", "old-d"), live("b", "old-b")).iterator()),
+          ScanDirection.DESCENDING);
+      var reversedValues = new java.util.ArrayList<String>();
+      for (var value = reversed.next().join(); value.isPresent(); value = reversed.next().join()) {
+        reversedValues.add(new String(value.orElseThrow().value().orElseThrow(), StandardCharsets.UTF_8));
+      }
+      assertEquals(List.of("old-d", "new-c", "new-b"), reversedValues);
       var otherBucket = working.merge(1, KeyRange.all(),
           AsyncCursor.fromIterator(List.of(live("a", "old-a")).iterator()));
       assertArrayEquals(bytes("new-a"), otherBucket.next().join().orElseThrow().value().orElseThrow());
