@@ -10,15 +10,18 @@ import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.PreparedEvent;
 import io.etcdhbase.core.commit.ResultIdentity;
 import io.etcdhbase.core.commit.SystemRecordStore;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.ToIntFunction;
 
 /** Durable private overlay whose completed operations alone are visible to this invocation. */
@@ -28,6 +31,7 @@ public final class TxnWorkingSet {
   private static final long COPY_ALLOWANCE = 16;
   // Leave the rest of the retained bound for a complete index path and the current event copies.
   private static final int PAGE_DEPTH_ALLOWANCE = 128;
+  private static final ContinuationExecutor CONTINUE = new ContinuationExecutor();
 
   private final InvocationBinding invocation;
   private final long maximumRetainedBytes;
@@ -38,6 +42,7 @@ public final class TxnWorkingSet {
   private final ToIntFunction<ByteKey> bucket;
   private final PagedWorksetIndex index;
   private final PutPlanner planner = new PutPlanner();
+  private final DeletePlanner deletePlanner = new DeletePlanner();
   private boolean begun;
   private boolean updating;
   private boolean frozen;
@@ -104,20 +109,10 @@ public final class TxnWorkingSet {
       }
       int selected = checkedBucket(command.key());
       operation = index.find(selected, command.key()).thenCompose(existing -> {
-        if (existing.isPresent()) return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.DUPLICATE_KEY));
-        PutPlanner.Plan plan = planner.plan(command, invocation, base);
-        if (manifests.candidateBucket(plan.candidate()) != selected) {
-          return CompletableFuture.failedFuture(new IllegalArgumentException("data and manifest buckets differ"));
-        }
-        PreparedEvent original = plan.event();
-        PreparedEvent event = new PreparedEvent(invocation.transactionId(), invocation.preparedOwnerEpoch(),
-            invocation.baseSequence(), invocation.baseRevision(), index.eventCount(), original.kind(),
-            original.current(), original.previous());
-        var reference = new PagedWorksetIndex.EventRef(selected, command.key(), event.ordinal(), event.digest());
-        return manifests.createEvent(event, scope).thenCompose(created -> {
-          requireCreated(created);
-          return index.commitOperation(AsyncCursor.fromIterator(List.of(reference).iterator()));
-        }).thenApply(ignored -> plan.result());
+        if (existing.isEmpty()) return preparePut(command, base, selected, false);
+        return event(existing.orElseThrow()).thenCompose(previous -> previous.kind() == PreparedEvent.Kind.DELETE
+            ? preparePut(command, Optional.of(previous.current()), selected, true)
+            : CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.DUPLICATE_KEY)));
       });
     } catch (BackendFailure | RuntimeException failure) {
       synchronized (this) { updating = false; failed = true; }
@@ -132,6 +127,157 @@ public final class TxnWorkingSet {
         updating = false;
       }
     }).copy();
+  }
+
+  private CompletableFuture<PutResult> preparePut(PutCommand command, Optional<StoredRecord> previous,
+      int selected, boolean workingView) {
+    PutPlanner.Plan plan = workingView ? planner.planWorking(command, invocation, previous)
+        : planner.plan(command, invocation, previous);
+    if (manifests.candidateBucket(plan.candidate()) != selected) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("data and manifest buckets differ"));
+    }
+    PreparedEvent original = plan.event();
+    PreparedEvent event = new PreparedEvent(invocation.transactionId(), invocation.preparedOwnerEpoch(),
+        invocation.baseSequence(), invocation.baseRevision(), index.eventCount(), original.kind(),
+        original.current(), original.previous());
+    var reference = new PagedWorksetIndex.EventRef(selected, command.key(), event.ordinal(), event.digest());
+    return manifests.createEvent(event, scope).thenCompose(created -> {
+      requireCreated(created);
+      return index.commitOperation(AsyncCursor.fromIterator(List.of(reference).iterator()));
+    }).thenApply(ignored -> plan.result());
+  }
+
+  /** Streams a single ordered delete into one private operation checkpoint. */
+  public CompletableFuture<Long> delete(KeyRange range, AsyncCursor<StoredRecord> view,
+      Consumer<StoredRecord> onDelete) {
+    Objects.requireNonNull(range, "range");
+    Objects.requireNonNull(view, "view");
+    Objects.requireNonNull(onDelete, "onDelete");
+    synchronized (this) {
+      if (!begun || failed || frozen || updating) return CompletableFuture.failedFuture(unavailable());
+      updating = true;
+    }
+    var input = new DeleteEvents(range, view, onDelete, index.eventCount());
+    CompletableFuture<Long> operation;
+    try {
+      operation = index.commitOperation(input).thenApply(ignored -> input.count);
+    } catch (RuntimeException | Error failure) {
+      synchronized (this) { updating = false; failed = true; }
+      throw failure;
+    }
+    return operation.whenComplete((ignored, failure) -> {
+      synchronized (TxnWorkingSet.this) {
+        if (failure != null) failed = true;
+        updating = false;
+      }
+    }).copy();
+  }
+
+  private final class DeleteEvents implements AsyncCursor<PagedWorksetIndex.EventRef> {
+    private final KeyRange range;
+    private final AsyncCursor<StoredRecord> view;
+    private final Consumer<StoredRecord> onDelete;
+    private final long firstOrdinal;
+    private ByteKey previousKey;
+    private long count;
+
+    private DeleteEvents(KeyRange range, AsyncCursor<StoredRecord> view,
+        Consumer<StoredRecord> onDelete, long firstOrdinal) {
+      this.range = range;
+      this.view = view;
+      this.onDelete = onDelete;
+      this.firstOrdinal = firstOrdinal;
+    }
+
+    @Override public CompletableFuture<Optional<PagedWorksetIndex.EventRef>> next() {
+      var result = new CompletableFuture<Optional<PagedWorksetIndex.EventRef>>();
+      advance(result);
+      return result;
+    }
+
+    private void advance(CompletableFuture<Optional<PagedWorksetIndex.EventRef>> result) {
+      try {
+        Objects.requireNonNull(view.next(), "delete view future").whenCompleteAsync((found, failure) -> {
+          if (failure != null) {
+            result.completeExceptionally(failure);
+            return;
+          }
+          accept(found, result);
+        }, CONTINUE);
+      } catch (RuntimeException failure) {
+        result.completeExceptionally(failure);
+      } catch (Error fatal) {
+        result.completeExceptionally(fatal);
+        throw fatal;
+      }
+    }
+
+    private void accept(Optional<StoredRecord> found,
+        CompletableFuture<Optional<PagedWorksetIndex.EventRef>> result) {
+      try {
+        if (Objects.requireNonNull(found, "delete view result").isEmpty()) {
+          result.complete(Optional.empty());
+          return;
+        }
+        StoredRecord observed = found.orElseThrow();
+        validateObserved(observed);
+        var planned = deletePlanner.planWorking(invocation, Optional.of(observed), Math.addExact(firstOrdinal, count));
+        if (planned.isEmpty()) {
+          advance(result);
+          return;
+        }
+        persist(observed, planned.orElseThrow(), result);
+      } catch (RuntimeException failure) {
+        result.completeExceptionally(failure);
+      } catch (Error fatal) {
+        result.completeExceptionally(fatal);
+        throw fatal;
+      }
+    }
+
+    private void validateObserved(StoredRecord observed) {
+      if (!range.contains(observed.key()) || previousKey != null && previousKey.compareTo(observed.key()) >= 0) {
+        throw new IllegalStateException("delete view is unordered or outside its requested range");
+      }
+      previousKey = observed.key();
+      if (observed.metadata().state() == StorageMetadata.State.LIVE
+          && Math.addExact(FIXED_OPERATION_BYTES, Math.multiplyExact(COPY_ALLOWANCE, observed.retainedBytes()))
+              > maximumRetainedBytes / 2) {
+        throw new java.util.concurrent.CompletionException(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+      }
+    }
+
+    private void persist(StoredRecord observed, DeletePlanner.Plan plan,
+        CompletableFuture<Optional<PagedWorksetIndex.EventRef>> result) {
+      int selected = checkedBucket(observed.key());
+      if (manifests.candidateBucket(plan.candidate()) != selected) {
+        throw new IllegalArgumentException("data and manifest buckets differ");
+      }
+      onDelete.accept(observed);
+      PreparedEvent event = plan.event();
+      Objects.requireNonNull(manifests.createEvent(event, scope), "delete event future")
+          .whenComplete((created, failure) -> completePersisted(observed, selected, event, created, failure, result));
+    }
+
+    private void completePersisted(StoredRecord observed, int selected, PreparedEvent event,
+        SystemRecordStore.CreateResult created, Throwable failure,
+        CompletableFuture<Optional<PagedWorksetIndex.EventRef>> result) {
+      if (failure != null) {
+        result.completeExceptionally(failure);
+        return;
+      }
+      try {
+        requireCreated(created);
+        count = Math.addExact(count, 1);
+        result.complete(Optional.of(new PagedWorksetIndex.EventRef(selected, observed.key(),
+            event.ordinal(), event.digest())));
+      } catch (RuntimeException invalid) {
+        result.completeExceptionally(invalid);
+      } catch (Error fatal) {
+        result.completeExceptionally(fatal);
+        throw fatal;
+      }
+    }
   }
 
   public boolean hasChanges() { return index.eventCount() > 0; }

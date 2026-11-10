@@ -766,7 +766,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J22/J31。
   - 完成标准：真实 deleted、PrevKV、统一删除视图。
   - 验证层次：L1 内核 + L2 协议/Go client。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=公开实现与验证进行中；负责人=Codex；完成日期=—；PR/commit=本任务 PR；验证入口=`scripts/verify/m3.sh --scope public --task J33 --artifact-root <新报告目录>`；评审人/结论=待评审。范围为无 Lease 的点删、范围删除、事务内删除与有界准备；真实目标身份/TLS、跨进程 owner 转发、混合版本运行与回退和完整 Range 选项仍待后续验证。
 
 - [ ] **J34｜revision、KeysOnly、min/max revision 等 Range 选项**
   - 依赖：J25。

@@ -1,6 +1,7 @@
 package io.etcdhbase.core.kv;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -8,7 +9,7 @@ import java.util.Objects;
 /** A bounded transaction request tree, after wire-level field validation. */
 public record TxnCommand(List<CompareCondition> compares, List<Operation> success,
     List<Operation> failure) {
-  public sealed interface Operation permits PointRange, Put, Nested, Unsupported {}
+  public sealed interface Operation permits PointRange, Put, Delete, Nested, Unsupported {}
 
   public record PointRange(ByteKey key, long revision) implements Operation {
     public PointRange(ByteKey key) { this(key, 0); }
@@ -20,6 +21,10 @@ public record TxnCommand(List<CompareCondition> compares, List<Operation> succes
 
   public record Put(PutCommand command) implements Operation {
     public Put { Objects.requireNonNull(command, "command"); }
+  }
+
+  public record Delete(KeyRange range, boolean previousRequested) implements Operation {
+    public Delete { Objects.requireNonNull(range, "range"); }
   }
 
   public record Nested(TxnCommand command) implements Operation {
@@ -51,7 +56,8 @@ public record TxnCommand(List<CompareCondition> compares, List<Operation> succes
   }
 
   private static boolean mayWrite(Operation operation) {
-    return operation instanceof Put || operation instanceof Nested nested && nested.command().mayWrite()
+    return operation instanceof Put || operation instanceof Delete
+        || operation instanceof Nested nested && nested.command().mayWrite()
         || operation instanceof Unsupported unsupported && unsupported.mayWrite();
   }
 

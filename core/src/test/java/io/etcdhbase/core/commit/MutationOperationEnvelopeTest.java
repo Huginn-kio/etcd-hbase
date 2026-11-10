@@ -1,6 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -18,6 +19,11 @@ class MutationOperationEnvelopeTest {
     payload[0] = 42;
     assertTrue(MutationOperationEnvelope.isTransaction(transaction));
     assertArrayEquals(new byte[] {0, (byte) 0xff, 1}, MutationOperationEnvelope.transactionBytes(transaction));
+    ByteKey delete = MutationOperationEnvelope.deleteRange(new byte[] {10, 1, 'a'});
+    assertEquals(MutationOperationEnvelope.Kind.DELETE_RANGE, MutationOperationEnvelope.kind(delete));
+    assertFalse(MutationOperationEnvelope.isTransaction(delete));
+    assertArrayEquals(new byte[] {10, 1, 'a'}, MutationOperationEnvelope.deleteRangeBytes(delete));
+    assertThrows(IllegalArgumentException.class, () -> MutationOperationEnvelope.transactionBytes(delete));
   }
 
   @Test

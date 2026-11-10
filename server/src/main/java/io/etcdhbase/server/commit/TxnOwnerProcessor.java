@@ -16,6 +16,7 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.protocol.TxnProtocolLimit;
 import io.etcdhbase.grpc.protocol.TxnRequestMapper;
+import io.etcdhbase.grpc.protocol.DeleteProtocolLimit;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
@@ -68,11 +69,19 @@ public final class TxnOwnerProcessor implements MutationForwardReceiver.Mutation
     }
     final TxnCommand command;
     try {
-      byte[] payload = MutationOperationEnvelope.transactionBytes(request.operationBytes());
-      var wire = Rpc.TxnRequest.parseFrom(payload);
-      command = TxnRequestMapper.fromWire(wire);
-      TxnProtocolLimit.requireWithin(wire, request.invocationId().value().getMostSignificantBits(),
-          maximumEtcdRequestBytes);
+      var kind = MutationOperationEnvelope.kind(request.operationBytes());
+      if (kind == MutationOperationEnvelope.Kind.DELETE_RANGE) {
+        var delete = Rpc.DeleteRangeRequest.parseFrom(MutationOperationEnvelope.deleteRangeBytes(request.operationBytes()));
+        var wire = Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder().setRequestDeleteRange(delete)).build();
+        command = TxnRequestMapper.fromWire(wire);
+        DeleteProtocolLimit.requireWithin(delete, request.invocationId().value().getMostSignificantBits(),
+            maximumEtcdRequestBytes);
+      } else {
+        var wire = Rpc.TxnRequest.parseFrom(MutationOperationEnvelope.transactionBytes(request.operationBytes()));
+        command = TxnRequestMapper.fromWire(wire);
+        TxnProtocolLimit.requireWithin(wire, request.invocationId().value().getMostSignificantBits(),
+            maximumEtcdRequestBytes);
+      }
       if (!command.mayWrite()) throw new KvFailure(KvFailure.Reason.UNSUPPORTED_OPERATION);
     } catch (KvFailure semantic) {
       return CompletableFuture.completedFuture(new OwnerForwarding.SemanticRejected(semantic.reason()));

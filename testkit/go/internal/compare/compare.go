@@ -22,10 +22,16 @@ func CompareM3PutTraces(left, right io.Reader) error {
 	return compareTraces(left, right, m3PutPolicy)
 }
 
-// CompareM3TxnTraces allows the same top-level non-Raft term projection for
-// the registered Put baseline and flat Txn cases. Child responses stay strict.
+// CompareM3TxnTraces allows the top-level non-Raft term projection for the
+// registered Put baseline and Txn cases. Child responses stay strict.
 func CompareM3TxnTraces(left, right io.Reader) error {
 	return compareTraces(left, right, m3TxnPolicy)
+}
+
+// CompareM3DeleteTraces adds the registered standalone DeleteRange method to
+// the M3 Txn policy without weakening its child-response checks.
+func CompareM3DeleteTraces(left, right io.Reader) error {
+	return compareTraces(left, right, m3DeletePolicy)
 }
 
 type tracePolicy int
@@ -34,6 +40,7 @@ const (
 	standardPolicy tracePolicy = iota
 	m3PutPolicy
 	m3TxnPolicy
+	m3DeletePolicy
 )
 
 func compareTraces(left, right io.Reader, policy tracePolicy) error {
@@ -107,7 +114,7 @@ func compare(left, right []trace.Record, policy tracePolicy) error {
 				return fmt.Errorf("trace record %d has invalid M3 header: %w", index+1, err)
 			}
 		}
-		if policy == m3TxnPolicy && leftScope != rightScope && bothSucceeded {
+		if (policy == m3TxnPolicy || policy == m3DeletePolicy) && leftScope != rightScope && bothSucceeded {
 			if applied, equal := equalTxnWithCountAllowance(leftNormalized[index], rightNormalized[index], leftScope); applied {
 				if !equal {
 					return fmt.Errorf("trace record %d violates the selected Txn Range Count policy", index+1)
