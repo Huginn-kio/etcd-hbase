@@ -82,6 +82,10 @@ public final class ErrorProjection {
       case REQUEST_TOO_LARGE -> status(Status.INVALID_ARGUMENT, "etcdserver: request is too large");
       case LEASE_UNAVAILABLE ->
           status(Status.UNIMPLEMENTED, "etcd-hbase: lease binding is not available");
+      case UNSUPPORTED_OPERATION ->
+          status(Status.UNIMPLEMENTED, "etcd-hbase: transaction operation is not available");
+      case REQUEST_BUDGET_EXHAUSTED ->
+          status(Status.RESOURCE_EXHAUSTED, "backend resource limit was reached");
     };
   }
 

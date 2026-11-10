@@ -26,7 +26,9 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   static final long WARNING_INTERVAL_NANOS = Duration.ofSeconds(30).toNanos();
   private final Map<Series, Counter> counters;
   private final Map<PutStage, StageCounter> putStages;
+  private final Map<TxnStage, StageCounter> txnStages;
   private final LongAdder putOutputBytes = new LongAdder();
+  private final LongAdder txnOutputBytes = new LongAdder();
   private final LongSupplier nanoTime;
   private final Consumer<FailureSummary> warnings;
   private final AtomicLong lastWarningNanos;
@@ -48,10 +50,38 @@ public final class RequestMetrics implements RequestCompletionRecorder {
     Map<PutStage, StageCounter> stages = new EnumMap<>(PutStage.class);
     for (PutStage stage : PutStage.values()) stages.put(stage, new StageCounter());
     putStages = Map.copyOf(stages);
+    Map<TxnStage, StageCounter> transactions = new EnumMap<>(TxnStage.class);
+    for (TxnStage stage : TxnStage.values()) transactions.put(stage, new StageCounter());
+    txnStages = Map.copyOf(transactions);
   }
 
   /** Bounded stages that J30 actually observes; publication includes M2 finalization. */
   public enum PutStage { QUEUE, PREPARE, PUBLISH_AND_FINALIZE, RESULT_RESOLUTION, RESPONSE }
+
+  /** Bounded stages measured for transaction requests. */
+  public enum TxnStage { QUEUE, COMPARE_AND_PREPARE, PUBLISH_AND_FINALIZE, RESULT_RESOLUTION, RESPONSE }
+
+  public void recordTxnStage(TxnStage stage, long elapsedNanos) {
+    Objects.requireNonNull(stage, "stage");
+    if (elapsedNanos < 0) throw new IllegalArgumentException("elapsedNanos must not be negative");
+    var counter = txnStages.get(stage);
+    counter.count.increment();
+    counter.totalNanos.add(elapsedNanos);
+  }
+
+  public Map<TxnStage, StageSnapshot> txnStages() {
+    Map<TxnStage, StageSnapshot> snapshot = new EnumMap<>(TxnStage.class);
+    txnStages.forEach((stage, counter) -> snapshot.put(stage,
+        new StageSnapshot(counter.count.sum(), counter.totalNanos.sum())));
+    return Map.copyOf(snapshot);
+  }
+
+  public void recordTxnOutputBytes(long bytes) {
+    if (bytes < 0) throw new IllegalArgumentException("output bytes must not be negative");
+    txnOutputBytes.add(bytes);
+  }
+
+  public long txnOutputBytes() { return txnOutputBytes.sum(); }
 
   public void recordPutStage(PutStage stage, long elapsedNanos) {
     Objects.requireNonNull(stage, "stage");

@@ -1,6 +1,7 @@
 package io.etcdhbase.server.commit;
 
 import io.etcdhbase.core.commit.MutationForwardRequest;
+import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
@@ -58,13 +59,19 @@ public final class MutationOwnerLane {
     if (!tableGroup.equals(request.tableGroupId())) {
       return CompletableFuture.completedFuture(new OwnerForwarding.Unknown(BackendFailure.Category.PERMISSION));
     }
+    final boolean transaction;
+    try { transaction = MutationOperationEnvelope.isTransaction(request.operationBytes()); }
+    catch (IllegalArgumentException malformed) {
+      return CompletableFuture.completedFuture(new OwnerForwarding.Unknown(BackendFailure.Category.UNKNOWN));
+    }
     long entered = nanoTime.getAsLong();
     long bytes = ENVELOPE_ALLOWANCE + 8L * request.operationBytes().length()
         + 2L * request.authorizationContextReference().length() + 2L * tableGroup.length();
     try {
       return queue.submit(bytes, scope, serviceScope -> {
         long elapsed = nanoTime.getAsLong() - entered;
-        metrics.recordPutStage(RequestMetrics.PutStage.QUEUE, Math.max(0, elapsed));
+        if (transaction) metrics.recordTxnStage(RequestMetrics.TxnStage.QUEUE, Math.max(0, elapsed));
+        else metrics.recordPutStage(RequestMetrics.PutStage.QUEUE, Math.max(0, elapsed));
         long remaining = elapsed < 0 || elapsed >= request.remainingTimeoutNanos()
             ? 0 : Math.min(request.remainingTimeoutNanos() - elapsed, serviceScope.remainingDeadlineNanos());
         if (remaining <= 0) {

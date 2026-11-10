@@ -3,14 +3,22 @@ package io.etcdhbase.core.commit;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
 
 /** Captures, pins, then revalidates one control-row read barrier before data access. */
 public final class ReadViewService {
+  private static final int MAX_TRANSACTION_TARGETS = 128;
+  private static final Executor TRANSACTION_CLEANUP =
+      task -> Thread.ofVirtual().name("txn-view-cleanup").start(task);
   private final CommitControlStore control;
   private final ManifestCatalog manifests;
   private final ReadViewPinRegistry pins;
@@ -45,6 +53,50 @@ public final class ReadViewService {
           ? requestedRevision.getAsLong() : state.publishedRevision();
       return captureSelection(state, target, authorizationScopeDigest, scope);
     }).thenCompose(capture -> registerAndRecheck(capture, scope));
+  }
+
+  /** Captures one barrier, then independently pins each distinct revision required by a transaction. */
+  CompletableFuture<TransactionViews> openForTransaction(List<Long> revisions,
+      ByteKey authorizationScopeDigest, RequestScope scope) {
+    Objects.requireNonNull(revisions, "revisions");
+    Objects.requireNonNull(authorizationScopeDigest, "authorizationScopeDigest");
+    Objects.requireNonNull(scope, "scope");
+    if (revisions.size() > MAX_TRANSACTION_TARGETS || authorizationScopeDigest.length() != 32
+        || revisions.stream().anyMatch(revision -> revision == null || revision < 0)) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid transaction read targets"));
+    }
+    List<Long> requested = List.copyOf(revisions);
+    return readControl(scope).thenCompose(snapshot -> {
+      CommitState state = snapshot.state();
+      requireProfile(state);
+      long current = state.publishedRevision();
+      var targets = new LinkedHashSet<Long>();
+      targets.add(current);
+      for (long revision : requested) targets.add(revision == 0 ? current : revision);
+      if (targets.size() > MAX_TRANSACTION_TARGETS) {
+        return CompletableFuture.failedFuture(new IllegalArgumentException("too many transaction read targets"));
+      }
+      Map<Long, PinnedReadView> opened = new LinkedHashMap<>();
+      CompletableFuture<Void> pending = CompletableFuture.completedFuture(null);
+      for (long target : targets) {
+        pending = pending.thenCompose(ignored -> captureSelection(state, target, authorizationScopeDigest, scope)
+            .thenCompose(capture -> registerAndRecheck(capture, scope))
+            .thenAccept(pinned -> opened.put(target, pinned)));
+      }
+      return pending.thenApply(ignored -> new TransactionViews(current, state.publishedSequence(), opened))
+          .whenComplete((ignored, failure) -> {
+            if (failure != null) {
+              try { scope.cancelAsync(TRANSACTION_CLEANUP); }
+              catch (RuntimeException | Error cleanup) {
+                if (cleanup != failure) failure.addSuppressed(cleanup);
+              }
+            }
+          });
+    });
+  }
+
+  record TransactionViews(long currentRevision, long barrierSequence, Map<Long, PinnedReadView> views) {
+    TransactionViews { views = Map.copyOf(views); }
   }
 
   private CompletableFuture<Capture> captureSelection(CommitState state, long target,

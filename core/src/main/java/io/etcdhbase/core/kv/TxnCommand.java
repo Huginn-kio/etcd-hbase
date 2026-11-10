@@ -1,0 +1,60 @@
+package io.etcdhbase.core.kv;
+
+import io.etcdhbase.core.bytes.ByteKey;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Objects;
+
+/** The currently supported flat transaction operations, after wire-level field validation. */
+public record TxnCommand(List<CompareCondition> compares, List<Operation> success,
+    List<Operation> failure) {
+  public sealed interface Operation permits PointRange, Put, Unsupported {}
+
+  public record PointRange(ByteKey key) implements Operation {
+    public PointRange {
+      Objects.requireNonNull(key, "key");
+      if (key.length() == 0) throw new KvFailure(KvFailure.Reason.EMPTY_KEY);
+    }
+  }
+
+  public record Put(PutCommand command) implements Operation {
+    public Put { Objects.requireNonNull(command, "command"); }
+  }
+
+  /** A statically valid operation whose dynamic behavior belongs to a later task. */
+  public record Unsupported(boolean mayWrite) implements Operation {}
+
+  public TxnCommand {
+    Objects.requireNonNull(compares, "compares");
+    Objects.requireNonNull(success, "success");
+    Objects.requireNonNull(failure, "failure");
+    if (compares.size() > ResultNode.MAX_OPERATIONS || success.size() > ResultNode.MAX_OPERATIONS
+        || failure.size() > ResultNode.MAX_OPERATIONS) {
+      throw new KvFailure(KvFailure.Reason.TOO_MANY_OPS);
+    }
+    compares = List.copyOf(compares);
+    success = List.copyOf(success);
+    failure = List.copyOf(failure);
+    requireDistinctWrites(success);
+    requireDistinctWrites(failure);
+  }
+
+  /** Both branches matter when choosing the read-only or owner/invocation route. */
+  public boolean mayWrite() {
+    return success.stream().anyMatch(TxnCommand::mayWrite)
+        || failure.stream().anyMatch(TxnCommand::mayWrite);
+  }
+
+  private static boolean mayWrite(Operation operation) {
+    return operation instanceof Put || operation instanceof Unsupported unsupported && unsupported.mayWrite();
+  }
+
+  private static void requireDistinctWrites(List<Operation> operations) {
+    var keys = new HashSet<ByteKey>();
+    for (Operation operation : operations) {
+      if (operation instanceof Put put && !keys.add(put.command().key())) {
+        throw new KvFailure(KvFailure.Reason.DUPLICATE_KEY);
+      }
+    }
+  }
+}

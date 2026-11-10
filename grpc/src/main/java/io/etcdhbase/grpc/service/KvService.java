@@ -6,18 +6,28 @@ import io.grpc.stub.StreamObserver;
 import java.util.Objects;
 import java.util.function.BiConsumer;
 
-/** M0 KV service surface; operations remain explicitly unimplemented. */
+/** KV service surface with explicitly installed handlers and unimplemented remaining methods. */
 public final class KvService extends KVGrpc.KVImplBase {
   private final BiConsumer<Rpc.PutRequest, StreamObserver<Rpc.PutResponse>> putHandler;
+  private final BiConsumer<Rpc.TxnRequest, StreamObserver<Rpc.TxnResponse>> txnHandler;
 
   /** Keeps the protocol-only skeleton explicitly unimplemented. */
   public KvService() {
     this.putHandler = null;
+    this.txnHandler = null;
   }
 
   /** Installs a fully assembled Put handler; other KV methods remain unimplemented. */
   public KvService(BiConsumer<Rpc.PutRequest, StreamObserver<Rpc.PutResponse>> putHandler) {
     this.putHandler = Objects.requireNonNull(putHandler, "putHandler");
+    this.txnHandler = null;
+  }
+
+  /** Installs both fully assembled handlers. */
+  public KvService(BiConsumer<Rpc.PutRequest, StreamObserver<Rpc.PutResponse>> putHandler,
+      BiConsumer<Rpc.TxnRequest, StreamObserver<Rpc.TxnResponse>> txnHandler) {
+    this.putHandler = Objects.requireNonNull(putHandler, "putHandler");
+    this.txnHandler = Objects.requireNonNull(txnHandler, "txnHandler");
   }
 
   @Override
@@ -39,7 +49,8 @@ public final class KvService extends KVGrpc.KVImplBase {
 
   @Override
   public void txn(Rpc.TxnRequest request, StreamObserver<Rpc.TxnResponse> responseObserver) {
-    UnimplementedStreams.failUnary(responseObserver, "KV.Txn");
+    if (txnHandler == null) UnimplementedStreams.failUnary(responseObserver, "KV.Txn");
+    else txnHandler.accept(request, responseObserver);
   }
 
   @Override

@@ -197,10 +197,11 @@ func compareTraces(args []string, stderr io.Writer) error {
 	leftPath := flags.String("left", "", "left complete trace JSONL")
 	rightPath := flags.String("right", "", "right complete trace JSONL")
 	m3Put := flags.Bool("m3-put", false, "apply the M3 Put non-Raft header projection")
+	m3Txn := flags.Bool("m3-txn", false, "apply the M3 flat Txn non-Raft header projection")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *leftPath == "" || *rightPath == "" {
+	if flags.NArg() != 0 || *leftPath == "" || *rightPath == "" || *m3Put && *m3Txn {
 		return errors.New("compare requires --left and --right")
 	}
 	left, err := os.Open(*leftPath)
@@ -216,6 +217,8 @@ func compareTraces(args []string, stderr io.Writer) error {
 	compareTraces := compare.CompareTraces
 	if *m3Put {
 		compareTraces = compare.CompareM3PutTraces
+	} else if *m3Txn {
+		compareTraces = compare.CompareM3TxnTraces
 	}
 	if err := compareTraces(left, right); err != nil {
 		return err

@@ -16,7 +16,9 @@ public final class KvFailure extends RuntimeException {
     COMPACTED,
     FUTURE_REVISION,
     REQUEST_TOO_LARGE,
-    LEASE_UNAVAILABLE
+    LEASE_UNAVAILABLE,
+    UNSUPPORTED_OPERATION,
+    REQUEST_BUDGET_EXHAUSTED
   }
 
   private final Reason reason;

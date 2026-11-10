@@ -48,7 +48,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (runErr e
 	if err != nil {
 		return err
 	}
-	suite, suiteSHA256, err := scenario.LoadM3PutSuite(options.scenario)
+	suite, suiteSHA256, err := scenario.LoadM3Suite(options.scenario)
 	if err != nil {
 		return err
 	}
@@ -64,7 +64,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (runErr e
 		return err
 	}
 	defer func() { runErr = evidence.finish(runErr) }()
-	return executeScenario(ctx, options, evidence.trace)
+	return executeScenario(ctx, options, suite.ID, evidence.trace)
 }
 
 type evidenceOutput struct {
@@ -104,16 +104,20 @@ func (output *evidenceOutput) finish(runErr error) error {
 		EmbeddedNative: output.options.nativeData != "", Layout: output.options.layout, Status: status}
 	runErr = errors.Join(runErr, json.NewEncoder(output.metadata).Encode(evidence), output.metadata.Close())
 	if runErr == nil && output.options.trace != "-" {
-		_, runErr = fmt.Fprintln(output.stdout, "M3 Put scenario passed")
+		_, runErr = fmt.Fprintln(output.stdout, "M3 scenario passed")
 	}
 	return runErr
 }
 
-func executeScenario(ctx context.Context, options options, output io.Writer) (runErr error) {
+func executeScenario(ctx context.Context, options options, suiteID string, output io.Writer) (runErr error) {
 	requestContext, cancel := context.WithTimeout(ctx, options.timeout)
 	defer cancel()
 	if options.nativeData != "" {
-		if err := scenario.RunM3NativePut(requestContext, options.nativeData, options.prefix, output); err != nil {
+		runNative := scenario.RunM3NativePut
+		if suiteID == "m3-txn-v1" {
+			runNative = scenario.RunM3NativeTxn
+		}
+		if err := runNative(requestContext, options.nativeData, options.prefix, output); err != nil {
 			return err
 		}
 	} else {
@@ -122,7 +126,11 @@ func executeScenario(ctx context.Context, options options, output io.Writer) (ru
 			return errors.New("M3 client initialization failed")
 		}
 		defer func() { runErr = errors.Join(runErr, connection.Close()) }()
-		if err := scenario.RunM3Put(requestContext, connection, options.scope, options.prefix, output); err != nil {
+		runScenario := scenario.RunM3Put
+		if suiteID == "m3-txn-v1" {
+			runScenario = scenario.RunM3Txn
+		}
+		if err := runScenario(requestContext, connection, options.scope, options.prefix, output); err != nil {
 			return err
 		}
 	}
@@ -146,7 +154,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	var result options
 	flags.StringVar(&result.endpoint, "endpoint", "", "explicit etcd-compatible endpoint")
 	flags.StringVar(&result.nativeData, "native-data-dir", "", "new isolated embedded etcd data directory")
-	flags.StringVar(&result.scenario, "scenario", "", "pinned M3 Put scenario manifest")
+	flags.StringVar(&result.scenario, "scenario", "", "registered pinned M3 scenario manifest")
 	flags.StringVar(&result.scope, "scope", "", "native-etcd or target-hbase")
 	flags.StringVar(&result.layout, "layout", "", "target layout HISTORY or NATIVE")
 	flags.StringVar(&result.prefix, "prefix", "", "fresh isolated M3 test prefix")

@@ -66,6 +66,10 @@ public final class CommitOutcomeResolver {
   }
 
   private CompletableFuture<Resolution> resolveDurable(InvocationBinding invocation, RequestScope scope) {
+    if (invocation.state() == InvocationBinding.State.NO_CHANGES) {
+      return CompletableFuture.failedFuture(
+          new IllegalArgumentException("no-change results have no publication decision"));
+    }
     if (invocation.state() == InvocationBinding.State.WINDOW_CLOSED) {
       // A closed result window still retains the immutable binding needed to finish an
       // already-selected publication. The public resolve() method hides it from callers.

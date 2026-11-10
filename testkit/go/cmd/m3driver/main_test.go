@@ -135,6 +135,26 @@ func TestEvidenceRecordsTraceCloseFailure(t *testing.T) {
 	}
 }
 
+func TestDriverCanRunAnIsolatedPinnedNativeTxnServer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trace.jsonl")
+	args := []string{"--scenario", "../../../scenarios/m3-txn.yaml", "--metadata", path + ".metadata",
+		"--native-data-dir", filepath.Join(dir, "data"), "--scope", "native-etcd",
+		"--prefix", "etcd-hbase-m3-test/native/", "--trace", path}
+	if err := run(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	records, err := trace.ReadJSONL(file)
+	if err != nil || len(records) != 30 || records[len(records)-1].CaseID != "J31-duplicate-put" {
+		t.Fatalf("native Txn trace incomplete: %d records, err=%v", len(records), err)
+	}
+}
+
 type fixedPutServer struct {
 	etcdserverpb.UnimplementedKVServer
 	calls *atomic.Int32

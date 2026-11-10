@@ -49,7 +49,7 @@ public final class RuntimeServer implements AutoCloseable {
     } catch (IOException | RuntimeException | Error failure) {
       try { closeAll(opened); }
       catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-      try { groups.close(); }
+      try { groups.closeAfterRequests(requestsDrained(opened)); }
       catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
       try { groups.drained().get(activation.shutdownTimeoutMs(), TimeUnit.MILLISECONDS); }
       catch (Exception cleanup) {
@@ -122,7 +122,7 @@ public final class RuntimeServer implements AutoCloseable {
     catch (RuntimeException | Error cleanup) { failure = cleanup; }
     if (groups != null) {
       try {
-        groups.close();
+        groups.closeAfterRequests(requestsDrained(listeners));
         groups.drained().get(shutdownTimeoutMs, TimeUnit.MILLISECONDS);
       } catch (Exception | Error cleanup) {
         if (cleanup instanceof InterruptedException) Thread.currentThread().interrupt();
@@ -147,6 +147,12 @@ public final class RuntimeServer implements AutoCloseable {
     }
     if (first instanceof Error fatal) throw fatal;
     if (first instanceof RuntimeException failure) throw failure;
+  }
+
+  private static java.util.concurrent.CompletableFuture<Void> requestsDrained(List<Bootstrap> listeners) {
+    return java.util.concurrent.CompletableFuture.allOf(listeners.stream()
+        .map(Bootstrap::requestsDrained).map(java.util.concurrent.CompletionStage::toCompletableFuture)
+        .toArray(java.util.concurrent.CompletableFuture[]::new));
   }
 
   static int run(String[] arguments) {

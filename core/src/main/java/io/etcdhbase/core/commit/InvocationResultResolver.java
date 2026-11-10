@@ -1,6 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import java.util.Objects;
@@ -18,6 +19,37 @@ public final class InvocationResultResolver {
       this.payload = Objects.requireNonNull(payload, "payload");
     }
     public CommitDecision decision() { return decision; }
+    public ResultCatalog.RetainedResult payload() { return payload; }
+    @Override public void close() { payload.close(); }
+  }
+
+  /** A no-change result has a read revision but no commit decision or publication sequence. */
+  public static final class ResolvedNoChanges implements AutoCloseable {
+    private final long revision;
+    private final ResultCatalog.RetainedResult payload;
+
+    private ResolvedNoChanges(long revision, ResultCatalog.RetainedResult payload) {
+      this.revision = revision;
+      this.payload = Objects.requireNonNull(payload, "payload");
+    }
+    public long revision() { return revision; }
+    public ResultCatalog.RetainedResult payload() { return payload; }
+    @Override public void close() { payload.close(); }
+  }
+
+  /** A replayable Txn result, with its original revision and whether it published KV changes. */
+  public static final class ResolvedTransaction implements AutoCloseable {
+    private final long revision;
+    private final boolean changed;
+    private final ResultCatalog.RetainedResult payload;
+
+    private ResolvedTransaction(long revision, boolean changed, ResultCatalog.RetainedResult payload) {
+      this.revision = revision;
+      this.changed = changed;
+      this.payload = Objects.requireNonNull(payload, "payload");
+    }
+    public long revision() { return revision; }
+    public boolean changed() { return changed; }
     public ResultCatalog.RetainedResult payload() { return payload; }
     @Override public void close() { payload.close(); }
   }
@@ -40,29 +72,16 @@ public final class InvocationResultResolver {
   public CompletableFuture<ResolvedResult> resolve(
       InvocationId id, ByteKey requestDigest, ByteKey authorizationDigest,
       RequestScope scope, BudgetManager.Account account) {
-    Objects.requireNonNull(id, "id");
-    Objects.requireNonNull(requestDigest, "requestDigest");
-    Objects.requireNonNull(authorizationDigest, "authorizationDigest");
-    Objects.requireNonNull(scope, "scope");
-    Objects.requireNonNull(account, "account");
-    if (requestDigest.length() != 32 || authorizationDigest.length() != 32 || !account.belongsTo(scope)) {
-      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid result query identity or budget"));
-    }
-    return readBinding(id, requestDigest, authorizationDigest, scope)
+    return readSelectedBinding(id, requestDigest, authorizationDigest, scope, account)
         .thenCompose(binding -> resolveSelectedInvocation(binding, scope))
         .thenCompose(selected -> readVerifiedResult(selected, scope))
         .thenCompose(verified -> loadAndMark(verified.binding(), verified.decision(),
             verified.reference(), scope, account));
   }
 
-  private CompletableFuture<InvocationBinding> readBinding(InvocationId id, ByteKey requestDigest,
-      ByteKey authorizationDigest, RequestScope scope) {
-    return repository.read(id, scope).thenCompose(found -> {
-      InvocationBinding binding = found.orElseThrow(() -> new IllegalStateException("invocation is missing"));
-      if (!binding.invocationId().equals(id) || !binding.requestDigest().equals(requestDigest)
-          || !binding.authorizationScopeDigest().equals(authorizationDigest)) {
-        return CompletableFuture.failedFuture(new IllegalArgumentException("invocation request or authorization differs"));
-      }
+  private CompletableFuture<InvocationBinding> readSelectedBinding(InvocationId id, ByteKey requestDigest,
+      ByteKey authorizationDigest, RequestScope scope, BudgetManager.Account account) {
+    return readMatching(id, requestDigest, authorizationDigest, scope, account).thenCompose(binding -> {
       if (binding.state() != InvocationBinding.State.SEALED
           && binding.state() != InvocationBinding.State.SELECTED) {
         return CompletableFuture.failedFuture(new IllegalStateException("invocation result is not queryable"));
@@ -102,6 +121,96 @@ public final class InvocationResultResolver {
         return CompletableFuture.failedFuture(new IllegalStateException("result belongs to another invocation"));
       }
       return CompletableFuture.completedFuture(new VerifiedResult(binding, decision, reference));
+    });
+  }
+
+  /** Replays only the original durable no-change result, without consulting current KV or control. */
+  public CompletableFuture<ResolvedNoChanges> resolveNoChanges(
+      InvocationId id, ByteKey requestDigest, ByteKey authorizationDigest,
+      RequestScope scope, BudgetManager.Account account) {
+    return readMatching(id, requestDigest, authorizationDigest, scope, account)
+        .thenCompose(binding -> loadNoChanges(binding, scope, account));
+  }
+
+  private CompletableFuture<ResolvedNoChanges> loadNoChanges(
+      InvocationBinding binding, RequestScope scope, BudgetManager.Account account) {
+    if (binding.state() != InvocationBinding.State.NO_CHANGES) {
+      return CompletableFuture.failedFuture(new IllegalStateException("no-change result is not queryable"));
+    }
+    ResultReference reference = ResultReference.fromToken(ResultIdentity.from(binding),
+        binding.resultReference().orElseThrow());
+    return results.load(reference, scope, account)
+        .thenCompose(payload -> verifyNoChangesWindow(binding, reference, payload, scope));
+  }
+
+  private CompletableFuture<ResolvedNoChanges> verifyNoChangesWindow(InvocationBinding binding,
+      ResultReference reference, ResultCatalog.RetainedResult payload, RequestScope scope) {
+    try {
+      return repository.read(binding.invocationId(), scope)
+          .thenApply(current -> deliverNoChanges(current, binding, reference, payload, scope))
+          .whenComplete((ignored, failure) -> { if (failure != null) payload.close(); });
+    } catch (RuntimeException | Error failure) {
+      try { payload.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+      throw failure;
+    }
+  }
+
+  private ResolvedNoChanges deliverNoChanges(java.util.Optional<InvocationBinding> current,
+      InvocationBinding binding, ResultReference reference, ResultCatalog.RetainedResult payload,
+      RequestScope scope) {
+    InvocationBinding latest = current.orElseThrow(() -> new IllegalStateException("invocation disappeared"));
+    if (!latest.sameAttempt(binding) || latest.state() != InvocationBinding.State.NO_CHANGES
+        || latest.resultReference().filter(reference.token()::equals).isEmpty()) {
+      throw new IllegalStateException("no-change result window changed during query");
+    }
+    if (scope.isClosed() || scope.isDeadlineExceeded()) {
+      throw new java.util.concurrent.CompletionException(new BackendFailure(scope.isDeadlineExceeded()
+          ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
+    }
+    return new ResolvedNoChanges(binding.baseRevision(), payload);
+  }
+
+  /** Resolves the original Txn outcome without recomputing a branch on newer data. */
+  public CompletableFuture<ResolvedTransaction> resolveTransaction(
+      InvocationId id, ByteKey requestDigest, ByteKey authorizationDigest,
+      RequestScope scope, BudgetManager.Account account) {
+    return readMatching(id, requestDigest, authorizationDigest, scope, account).thenCompose(binding -> {
+      if (binding.state() == InvocationBinding.State.NO_CHANGES) {
+        return resolveNoChanges(id, requestDigest, authorizationDigest, scope, account)
+            .thenApply(result -> new ResolvedTransaction(result.revision(), false, result.payload()));
+      }
+      if (binding.state() != InvocationBinding.State.SEALED
+          && binding.state() != InvocationBinding.State.SELECTED) {
+        return CompletableFuture.failedFuture(new IllegalStateException("transaction result is not queryable"));
+      }
+      return resolve(id, requestDigest, authorizationDigest, scope, account).thenApply(result -> {
+        if (!result.decision().containsKeyChanges()) {
+          result.close();
+          throw new IllegalStateException("published transaction has no KV changes");
+        }
+        return new ResolvedTransaction(result.decision().revision(), true, result.payload());
+      });
+    });
+  }
+
+  private CompletableFuture<InvocationBinding> readMatching(
+      InvocationId id, ByteKey requestDigest, ByteKey authorizationDigest,
+      RequestScope scope, BudgetManager.Account account) {
+    Objects.requireNonNull(id, "id");
+    Objects.requireNonNull(requestDigest, "requestDigest");
+    Objects.requireNonNull(authorizationDigest, "authorizationDigest");
+    Objects.requireNonNull(scope, "scope");
+    Objects.requireNonNull(account, "account");
+    if (requestDigest.length() != 32 || authorizationDigest.length() != 32 || !account.belongsTo(scope)) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid result query identity or budget"));
+    }
+    return repository.read(id, scope).thenCompose(found -> {
+      InvocationBinding binding = found.orElseThrow(() -> new IllegalStateException("invocation is missing"));
+      if (!binding.invocationId().equals(id) || !binding.requestDigest().equals(requestDigest)
+          || !binding.authorizationScopeDigest().equals(authorizationDigest)) {
+        return CompletableFuture.failedFuture(new IllegalArgumentException("invocation request or authorization differs"));
+      }
+      return CompletableFuture.completedFuture(binding);
     });
   }
 

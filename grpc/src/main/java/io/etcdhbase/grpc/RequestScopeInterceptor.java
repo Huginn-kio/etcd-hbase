@@ -10,6 +10,8 @@ import io.grpc.Status;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -24,6 +26,7 @@ public final class RequestScopeInterceptor implements ServerInterceptor, AutoClo
   private final ScheduledExecutorService scheduler;
   private final Semaphore admission;
   private final Object gate = new Object();
+  private final CompletableFuture<Void> drained = new CompletableFuture<>();
   private final java.util.concurrent.ThreadPoolExecutor cleanupExecutor;
   private boolean closing;
   private final int maxConcurrentRequests;
@@ -73,6 +76,9 @@ public final class RequestScopeInterceptor implements ServerInterceptor, AutoClo
   public int activeRequests() {
     return maxConcurrentRequests - admission.availablePermits();
   }
+
+  /** Completes after admission is closed and every admitted request has released its resources. */
+  public CompletionStage<Void> drained() { return drained.minimalCompletionStage(); }
 
   public long observationFailureCount() {
     return observationFailures.get();
@@ -136,16 +142,20 @@ public final class RequestScopeInterceptor implements ServerInterceptor, AutoClo
   }
 
   void release() {
+    boolean allDrained;
     synchronized (gate) {
       admission.release();
-      if (closing && activeRequests() == 0) cleanupExecutor.shutdown();
+      allDrained = closing && activeRequests() == 0;
+      if (allDrained) cleanupExecutor.shutdown();
       gate.notifyAll();
     }
+    if (allDrained) drained.complete(null);
   }
 
   @Override
   public void close() {
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    boolean allDrained;
     synchronized (gate) {
       closing = true;
       if (activeRequests() == 0) cleanupExecutor.shutdown();
@@ -159,7 +169,9 @@ public final class RequestScopeInterceptor implements ServerInterceptor, AutoClo
         Thread.currentThread().interrupt();
         throw new IllegalStateException("request cleanup drain interrupted");
       }
+      allDrained = activeRequests() == 0;
     }
+    if (allDrained) drained.complete(null);
     try {
       if (!cleanupExecutor.awaitTermination(5, TimeUnit.SECONDS))
         throw new IllegalStateException("request cleanup workers did not terminate");

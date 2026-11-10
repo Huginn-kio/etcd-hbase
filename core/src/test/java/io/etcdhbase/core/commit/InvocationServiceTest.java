@@ -134,6 +134,168 @@ class InvocationServiceTest {
     assertEquals(0, repository.readCount.get());
   }
 
+  @Test
+  void verifiedNoChangeWinsTheSameCasAsSealAndKeepsInvocationAfterWindowCloses() {
+    var repository = new InMemoryInvocationRepository();
+    var service = new InvocationService(repository);
+    var scope = RequestScope.withoutDeadline();
+    var preparing = service.bindOrJoin(binding(1, 0, transaction(10)), scope).join();
+    var result = resultFor(preparing);
+    var guardCalls = new AtomicInteger();
+    repository.loseFirstCasReply.set(true);
+
+    var completed = service.completeWithoutChanges(preparing, result.reference(),
+        new ResultCatalog(result.repository()), () -> {
+          guardCalls.incrementAndGet();
+          return CompletableFuture.completedFuture(null);
+        }, scope).join();
+    assertEquals(InvocationBinding.State.NO_CHANGES, completed.state());
+    assertEquals(Optional.of(result.reference().token()), completed.resultReference());
+    assertTrue(completed.manifestRoot().isEmpty());
+    assertEquals(1, guardCalls.get());
+    assertThrows(CompletionException.class, () -> service.transition(preparing,
+        preparing.seal(ByteKey.copyOf(new byte[] {1})), scope).join());
+    assertThrows(IllegalStateException.class, () -> completed.seal(ByteKey.copyOf(new byte[] {1})));
+
+    var closed = service.transition(completed, completed.closeQueryWindow(), scope).join();
+    assertEquals(InvocationBinding.State.WINDOW_CLOSED, closed.state());
+    assertTrue(closed.resultReference().isEmpty());
+    assertEquals(closed, service.bindOrJoin(preparing, scope).join());
+    scope.close();
+  }
+
+  @Test
+  void sealWinningPreventsNoChangeTerminalAndUnverifiedTransitions() {
+    var repository = new InMemoryInvocationRepository();
+    var service = new InvocationService(repository);
+    var scope = RequestScope.withoutDeadline();
+    var preparing = service.bindOrJoin(binding(1, 0, transaction(11)), scope).join();
+    var result = resultFor(preparing);
+    var unverified = preparing.completeWithoutChanges(result.reference().token());
+    assertThrows(IllegalArgumentException.class, () -> service.transition(preparing, unverified, scope));
+    var sealed = service.transition(preparing, preparing.seal(ByteKey.copyOf(new byte[] {2})), scope).join();
+    assertThrows(CompletionException.class, () -> service.completeWithoutChanges(preparing,
+        result.reference(), new ResultCatalog(result.repository()),
+        () -> CompletableFuture.completedFuture(null), scope).join());
+    assertEquals(sealed, repository.bindings.get(INVOCATION));
+    scope.close();
+  }
+
+  @Test
+  void concurrentSealAndNoChangeHaveExactlyOneDurableWinner() {
+    var repository = new InMemoryInvocationRepository();
+    var service = new InvocationService(repository);
+    var scope = RequestScope.withoutDeadline();
+    var preparing = service.bindOrJoin(binding(1, 0, transaction(16)), scope).join();
+    var result = resultFor(preparing);
+    repository.compareBarrier = new CyclicBarrier(2);
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var sealed = CompletableFuture.supplyAsync(() -> service.transition(preparing,
+          preparing.seal(ByteKey.copyOf(new byte[] {5})), scope).join(), executor)
+          .handle((value, failure) -> failure == null ? value : null);
+      var noChanges = CompletableFuture.supplyAsync(() -> service.completeWithoutChanges(preparing,
+          result.reference(), new ResultCatalog(result.repository()),
+          () -> CompletableFuture.completedFuture(null), scope).join(), executor)
+          .handle((value, failure) -> failure == null ? value : null);
+      var sealedResult = sealed.join();
+      var noChangeResult = noChanges.join();
+      assertTrue((sealedResult == null) != (noChangeResult == null));
+      var winner = sealedResult == null ? noChangeResult : sealedResult;
+      assertEquals(winner, repository.bindings.get(INVOCATION));
+    } finally {
+      scope.close();
+    }
+  }
+
+  @Test
+  void firstBindCannotStartFromAnAlreadyResolvedOrSealedState() {
+    var repository = new InMemoryInvocationRepository();
+    var service = new InvocationService(repository);
+    var scope = RequestScope.withoutDeadline();
+    var preparing = binding(1, 0, transaction(14));
+    assertThrows(IllegalArgumentException.class, () -> service.bindOrJoin(
+        preparing.completeWithoutChanges(ByteKey.copyOf(new byte[] {1})), scope));
+    assertThrows(IllegalArgumentException.class, () -> service.bindOrJoin(
+        preparing.seal(ByteKey.copyOf(new byte[] {2})), scope));
+    assertEquals(0, repository.createCount.get());
+    scope.close();
+  }
+
+  @Test
+  void missingResultsOrFailedReadProtectionCannotCompleteNoChange() {
+    var repository = new InMemoryInvocationRepository();
+    var service = new InvocationService(repository);
+    var scope = RequestScope.withoutDeadline();
+    var preparing = service.bindOrJoin(binding(1, 0, transaction(12)), scope).join();
+    var result = resultFor(preparing);
+    var guardCalls = new AtomicInteger();
+    result.repository().page = null;
+    assertThrows(CompletionException.class, () -> service.completeWithoutChanges(preparing,
+        result.reference(), new ResultCatalog(result.repository()), () -> {
+          guardCalls.incrementAndGet();
+          return CompletableFuture.completedFuture(null);
+        }, scope).join());
+    assertEquals(0, guardCalls.get());
+    result.repository().page = result.page();
+    assertThrows(CompletionException.class, () -> service.completeWithoutChanges(preparing,
+        result.reference(), new ResultCatalog(result.repository()),
+        () -> CompletableFuture.failedFuture(new IllegalStateException("read protection revoked")), scope).join());
+    assertEquals(InvocationBinding.State.PREPARING, repository.bindings.get(INVOCATION).state());
+    var other = resultFor(binding(1, 0, transaction(13)));
+    assertThrows(IllegalArgumentException.class, () -> service.completeWithoutChanges(preparing,
+        other.reference(), new ResultCatalog(other.repository()),
+        () -> CompletableFuture.completedFuture(null), scope));
+    scope.close();
+  }
+
+  @Test
+  void cancellationWhileReadProtectionFinishesCannotCommitNoChange() {
+    var repository = new InMemoryInvocationRepository();
+    var service = new InvocationService(repository);
+    var scope = RequestScope.withoutDeadline();
+    var preparing = service.bindOrJoin(binding(1, 0, transaction(15)), scope).join();
+    var result = resultFor(preparing);
+    var finishingRead = new CompletableFuture<Void>();
+    var pending = service.completeWithoutChanges(preparing, result.reference(),
+        new ResultCatalog(result.repository()), () -> finishingRead, scope);
+    assertTrue(scope.cancel());
+    finishingRead.complete(null);
+    var failure = assertThrows(CompletionException.class, pending::join);
+    assertEquals(BackendFailure.Category.CANCELLED, ((BackendFailure) failure.getCause()).category());
+    assertEquals(InvocationBinding.State.PREPARING, repository.bindings.get(INVOCATION).state());
+  }
+
+  private static NoChangeResult resultFor(InvocationBinding binding) {
+    var identity = ResultIdentity.from(binding);
+    var page = new ResultPage(identity, 0, new byte[] {1});
+    var directory = ResultDirectory.create(identity, java.util.List.of(ResultPageReference.from(page)));
+    return new NoChangeResult(directory.reference(), page, new FixedResultRepository(directory, page));
+  }
+
+  private record NoChangeResult(ResultReference reference, ResultPage page, FixedResultRepository repository) {}
+
+  private static final class FixedResultRepository implements ResultRepository {
+    private final ResultDirectory directory;
+    private ResultPage page;
+    private FixedResultRepository(ResultDirectory directory, ResultPage page) {
+      this.directory = directory;
+      this.page = page;
+    }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createPage(ResultPage page, RequestScope scope) {
+      throw new UnsupportedOperationException();
+    }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createDirectory(
+        ResultDirectory directory, RequestScope scope) { throw new UnsupportedOperationException(); }
+    @Override public CompletableFuture<Optional<ResultPage>> readPage(
+        ResultIdentity identity, int index, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.ofNullable(page));
+    }
+    @Override public CompletableFuture<Optional<ResultDirectory>> readDirectory(
+        ResultIdentity identity, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.of(directory));
+    }
+  }
+
   private static InvocationBinding binding(long epoch, long base, TransactionId transaction) {
     return InvocationBinding.begin(INVOCATION, REQUEST_DIGEST, AUTH_DIGEST,
         transaction, epoch, base, 1);
@@ -146,6 +308,7 @@ class InvocationServiceTest {
   private static final class InMemoryInvocationRepository implements InvocationRepository {
     private final ConcurrentHashMap<InvocationId, InvocationBinding> bindings = new ConcurrentHashMap<>();
     private final CyclicBarrier createBarrier;
+    private CyclicBarrier compareBarrier;
     private final AtomicBoolean loseFirstCreateReply = new AtomicBoolean();
     private final AtomicBoolean loseFirstCasReply = new AtomicBoolean();
     private final AtomicBoolean nullFirstCasReply = new AtomicBoolean();
@@ -191,6 +354,13 @@ class InvocationServiceTest {
     @Override
     public CompletableFuture<Boolean> compareAndSet(
         InvocationBinding expected, InvocationBinding replacement, RequestScope scope) {
+      if (compareBarrier != null) {
+        try {
+          compareBarrier.await(10, TimeUnit.SECONDS);
+        } catch (Exception failure) {
+          return CompletableFuture.failedFuture(failure);
+        }
+      }
       if (failCasPermission.get()) {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION));
       }

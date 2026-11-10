@@ -2,6 +2,7 @@ package io.etcdhbase.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
@@ -30,5 +31,11 @@ class M3RuntimeBudgetsTest {
       assertEquals(BackendFailure.Category.RESOURCE_LIMIT, failure.category());
     }
     assertEquals(0, budgets.snapshot().reservedBytes());
+    try (var scope = RequestScope.withoutDeadline();
+         var account = budgets.admit("a", scope, new BudgetManager.Reservation(0, 1, 1, 0, 0));
+         var queued = account.tryAcquire(BudgetManager.Work.queued(256)).orElseThrow()) {
+      assertTrue(budgets.snapshot().queued() > 0, "internal scan scheduling needs a bounded queue");
+    }
+    assertEquals(0, budgets.snapshot().queued());
   }
 }

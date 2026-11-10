@@ -31,6 +31,27 @@ class SkeletonServiceTest {
   }
 
   @Test
+  void defaultTxnRemainsUnimplementedUntilAHandlerIsAssembled() {
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    StreamObserver<Rpc.TxnResponse> observer = new StreamObserver<>() {
+      @Override public void onNext(Rpc.TxnResponse value) { throw new AssertionError("unexpected success"); }
+      @Override public void onError(Throwable value) { failure.set(value); }
+      @Override public void onCompleted() { throw new AssertionError("unexpected completion"); }
+    };
+    var request = Rpc.TxnRequest.getDefaultInstance();
+    new KvService().txn(request, observer);
+    assertEquals(Status.Code.UNIMPLEMENTED, Status.fromThrowable(failure.get()).getCode());
+    AtomicReference<Rpc.TxnRequest> forwarded = new AtomicReference<>();
+    AtomicReference<StreamObserver<Rpc.TxnResponse>> destination = new AtomicReference<>();
+    new KvService((value, response) -> { }, (value, response) -> {
+      forwarded.set(value);
+      destination.set(response);
+    }).txn(request, observer);
+    assertSame(request, forwarded.get());
+    assertSame(observer, destination.get());
+  }
+
+  @Test
   void emptyHalfClosedStreamFailsOnceWithoutReturningAResponse() {
     AtomicInteger terminalCount = new AtomicInteger();
     StreamObserver<Rpc.WatchRequest> requests =

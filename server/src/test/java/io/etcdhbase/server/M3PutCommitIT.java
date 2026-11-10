@@ -152,7 +152,8 @@ class M3PutCommitIT {
               1, 4L << 20, 1, 8L << 20)), invocations);
       handoff = new BoundedPublicationHandoff(1, 2, TIMEOUT);
       publisher = new CommitPublisher(stores.control(), outcomes,
-          new CommitPlanVerifier(manifests, stores.materialization(), results), handoff, stores.finalizer());
+          new CommitPlanVerifier(manifests, stores.materialization(), results),
+          invocationStore, handoff, stores.finalizer());
       resolver = stores.invocationResults();
       worker = new ThreadPoolExecutor(2, 2, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(32),
           Thread.ofPlatform().daemon().name("m3-fixture-reader-", 0).factory());

@@ -70,6 +70,7 @@ public final class InvocationMessages {
       case SELECTED -> CommitProtos.InvocationAttemptState.INVOCATION_SELECTED;
       case NOT_SELECTED -> CommitProtos.InvocationAttemptState.INVOCATION_NOT_SELECTED;
       case WINDOW_CLOSED -> CommitProtos.InvocationAttemptState.INVOCATION_WINDOW_CLOSED;
+      case NO_CHANGES -> CommitProtos.InvocationAttemptState.INVOCATION_NO_CHANGES;
     };
   }
 
@@ -80,6 +81,7 @@ public final class InvocationMessages {
       case INVOCATION_SELECTED -> InvocationBinding.State.SELECTED;
       case INVOCATION_NOT_SELECTED -> InvocationBinding.State.NOT_SELECTED;
       case INVOCATION_WINDOW_CLOSED -> InvocationBinding.State.WINDOW_CLOSED;
+      case INVOCATION_NO_CHANGES -> InvocationBinding.State.NO_CHANGES;
       case INVOCATION_STATE_UNSPECIFIED, UNRECOGNIZED -> throw invalid();
     };
   }

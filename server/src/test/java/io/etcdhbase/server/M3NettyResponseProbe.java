@@ -37,15 +37,26 @@ import java.util.function.LongSupplier;
 /** Exercises real Netty serialization; the response is from an already committed fixture call. */
 final class M3NettyResponseProbe {
   @FunctionalInterface
-  interface Responder {
-    void send(RequestScope scope, StreamObserver<Rpc.PutResponse> response) throws Exception;
+  interface Responder<T> {
+    void send(RequestScope scope, StreamObserver<T> response) throws Exception;
   }
 
   private M3NettyResponseProbe() {}
 
-  static void verifyCancellationDuringSerialization(Responder responder, LongSupplier allocatedBytes)
-      throws Exception {
-    var probe = new Probe(responder, allocatedBytes);
+  static void verifyCancellationDuringSerialization(Responder<Rpc.PutResponse> responder,
+      LongSupplier allocatedBytes) throws Exception {
+    verify(KVGrpc.getPutMethod(), Rpc.PutRequest.newBuilder()
+        .setKey(com.google.protobuf.ByteString.copyFromUtf8("probe")).build(), responder, allocatedBytes);
+  }
+
+  static void verifyTxnCancellationDuringSerialization(Responder<Rpc.TxnResponse> responder,
+      LongSupplier allocatedBytes) throws Exception {
+    verify(KVGrpc.getTxnMethod(), Rpc.TxnRequest.getDefaultInstance(), responder, allocatedBytes);
+  }
+
+  private static <Request, Response> void verify(MethodDescriptor<Request, Response> original,
+      Request request, Responder<Response> responder, LongSupplier allocatedBytes) throws Exception {
+    var probe = new Probe<>(original, request, responder, allocatedBytes);
     try {
       probe.start();
       probe.verifyCancellation();
@@ -55,8 +66,10 @@ final class M3NettyResponseProbe {
   }
 
   /** Owns the server, client and executors for one serialization probe. */
-  private static final class Probe implements AutoCloseable {
-    private final Responder responder;
+  private static final class Probe<Request, Response> implements AutoCloseable {
+    private final MethodDescriptor<Request, Response> original;
+    private final Request request;
+    private final Responder<Response> responder;
     private final LongSupplier allocatedBytes;
     private final CountDownLatch entered = new CountDownLatch(1);
     private final CountDownLatch release = new CountDownLatch(1);
@@ -69,17 +82,19 @@ final class M3NettyResponseProbe {
         new ArrayBlockingQueue<>(1), Thread.ofPlatform().daemon().name("m3-netty-probe-", 0).factory());
     private final RequestScopeInterceptor interceptor = new RequestScopeInterceptor(scheduler, 1,
         Duration.ofSeconds(30), 1024, (method, outcome, trace, scope, elapsed) -> completed.countDown());
-    private MethodDescriptor<Rpc.PutRequest, Rpc.PutResponse> descriptor;
+    private MethodDescriptor<Request, Response> descriptor;
     private Server server;
     private ManagedChannel channel;
 
-    private Probe(Responder responder, LongSupplier allocatedBytes) {
+    private Probe(MethodDescriptor<Request, Response> original, Request request,
+        Responder<Response> responder, LongSupplier allocatedBytes) {
+      this.original = original;
+      this.request = request;
       this.responder = responder;
       this.allocatedBytes = allocatedBytes;
     }
 
     private void start() throws IOException {
-      MethodDescriptor<Rpc.PutRequest, Rpc.PutResponse> original = KVGrpc.getPutMethod();
       descriptor = original.toBuilder(original.getRequestMarshaller(),
           slowMarshaller(original.getResponseMarshaller(), entered, release)).build();
       server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
@@ -97,7 +112,7 @@ final class M3NettyResponseProbe {
           })).build();
     }
 
-    private void send(RequestScope scope, StreamObserver<Rpc.PutResponse> response) {
+    private void send(RequestScope scope, StreamObserver<Response> response) {
       try {
         responder.send(scope, response);
       } catch (Throwable problem) {
@@ -107,12 +122,12 @@ final class M3NettyResponseProbe {
     }
 
     private void verifyCancellation() throws Exception {
-      ClientCall<Rpc.PutRequest, Rpc.PutResponse> call = channel.newCall(descriptor, CallOptions.DEFAULT);
+      ClientCall<Request, Response> call = channel.newCall(descriptor, CallOptions.DEFAULT);
       call.start(new ClientCall.Listener<>() {
         @Override public void onClose(Status status, Metadata trailers) {}
       }, new Metadata());
       call.request(1);
-      call.sendMessage(Rpc.PutRequest.newBuilder().setKey(com.google.protobuf.ByteString.copyFromUtf8("probe")).build());
+      call.sendMessage(request);
       call.halfClose();
       assertTrue(entered.await(10, TimeUnit.SECONDS), "Netty did not begin response serialization");
       call.cancel("synthetic cancellation", null);
@@ -144,11 +159,11 @@ final class M3NettyResponseProbe {
     }
   }
 
-  private static MethodDescriptor.Marshaller<Rpc.PutResponse> slowMarshaller(
-      MethodDescriptor.Marshaller<Rpc.PutResponse> delegate, CountDownLatch entered,
+  private static <Response> MethodDescriptor.Marshaller<Response> slowMarshaller(
+      MethodDescriptor.Marshaller<Response> delegate, CountDownLatch entered,
       CountDownLatch release) {
     return new MethodDescriptor.Marshaller<>() {
-      @Override public InputStream stream(Rpc.PutResponse value) {
+      @Override public InputStream stream(Response value) {
         return new FilterInputStream(delegate.stream(value)) {
           private final AtomicBoolean firstRead = new AtomicBoolean(true);
 
@@ -175,7 +190,7 @@ final class M3NettyResponseProbe {
         };
       }
 
-      @Override public Rpc.PutResponse parse(InputStream input) { return delegate.parse(input); }
+      @Override public Response parse(InputStream input) { return delegate.parse(input); }
     };
   }
 }

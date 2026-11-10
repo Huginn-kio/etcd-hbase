@@ -5,11 +5,13 @@ import (
 	"strconv"
 )
 
-// Only the top-level Put response is registered in J30. Do not suppress term
-// fields in arbitrary nested messages or change the original M0 comparison.
-func projectM3PutTerm(left, right map[string]any, leftScope string, bothSucceeded bool) error {
-	if left["method"] != "etcdserverpb.KV/Put" || right["method"] != "etcdserverpb.KV/Put" {
-		return errors.New("method is not registered for the J30 policy")
+// Only registered top-level methods have a term projection. Never suppress
+// child headers, arbitrary methods, or change the original M0 comparison.
+func projectM3Term(left, right map[string]any, leftScope string, bothSucceeded bool, policy tracePolicy) error {
+	method := left["method"]
+	if right["method"] != method ||
+		(method != "etcdserverpb.KV/Put" && !(policy == m3TxnPolicy && method == "etcdserverpb.KV/Txn")) {
+		return errors.New("method is not registered for the M3 policy")
 	}
 	if !bothSucceeded {
 		return nil // Error observations still compare strictly.

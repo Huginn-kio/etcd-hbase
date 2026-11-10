@@ -28,9 +28,13 @@ final class M3RuntimeBudgets {
     int scanners = Math.multiplyExact(resources.maxScannersPerTable(), groups.size());
     int cleanup = Math.addExact(operations, scanners);
     long memory = activation.memoryBytes();
-    var global = new BudgetManager.Limits(requests, 0, operations, scanners, cleanup, 0, memory);
-    var perGroup = new BudgetManager.Limits(requests, 0, operations,
-        resources.maxScannersPerTable(), cleanup, 0, memory);
+    // This queue belongs to finite-page scans within already admitted requests. It does not
+    // enable an external mutation request queue (which remains disabled for this runtime).
+    long scanQueueBytes = Math.min(memory, Math.multiplyExact((long) requests,
+        Math.addExact(256L, Math.multiplyExact(3L, resources.maxRequestBytes()))));
+    var global = new BudgetManager.Limits(requests, requests, operations, scanners, cleanup, scanQueueBytes, memory);
+    var perGroup = new BudgetManager.Limits(requests, requests, operations,
+        resources.maxScannersPerTable(), cleanup, scanQueueBytes, memory);
     Map<String, BudgetManager.Limits> groupLimits = new LinkedHashMap<>();
     for (String group : groups) groupLimits.put(group, perGroup);
     return new BudgetManager(global, groupLimits, perGroup);
