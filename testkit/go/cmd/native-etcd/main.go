@@ -199,11 +199,13 @@ func compareTraces(args []string, stderr io.Writer) error {
 	m3Put := flags.Bool("m3-put", false, "apply the M3 Put non-Raft header projection")
 	m3Txn := flags.Bool("m3-txn", false, "apply the M3 flat Txn non-Raft header projection")
 	m3Delete := flags.Bool("m3-delete", false, "apply the M3 DeleteRange non-Raft header projection")
+	m3Range := flags.Bool("m3-range", false, "apply the M3 Range non-Raft header projection")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || *leftPath == "" || *rightPath == "" ||
-		*m3Put && (*m3Txn || *m3Delete) || *m3Txn && *m3Delete {
+		*m3Put && (*m3Txn || *m3Delete || *m3Range) ||
+		*m3Txn && (*m3Delete || *m3Range) || *m3Delete && *m3Range {
 		return errors.New("compare requires --left and --right")
 	}
 	left, err := os.Open(*leftPath)
@@ -223,6 +225,8 @@ func compareTraces(args []string, stderr io.Writer) error {
 		compareTraces = compare.CompareM3TxnTraces
 	} else if *m3Delete {
 		compareTraces = compare.CompareM3DeleteTraces
+	} else if *m3Range {
+		compareTraces = compare.CompareM3RangeTraces
 	}
 	if err := compareTraces(left, right); err != nil {
 		return err

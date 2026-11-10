@@ -9,14 +9,10 @@ import java.util.Objects;
 /** A bounded transaction request tree, after wire-level field validation. */
 public record TxnCommand(List<CompareCondition> compares, List<Operation> success,
     List<Operation> failure) {
-  public sealed interface Operation permits PointRange, Put, Delete, Nested, Unsupported {}
+  public sealed interface Operation permits Range, Put, Delete, Nested, Unsupported {}
 
-  public record PointRange(ByteKey key, long revision) implements Operation {
-    public PointRange(ByteKey key) { this(key, 0); }
-    public PointRange {
-      Objects.requireNonNull(key, "key");
-      if (key.length() == 0) throw new KvFailure(KvFailure.Reason.EMPTY_KEY);
-    }
+  public record Range(RangeCommand command) implements Operation {
+    public Range { Objects.requireNonNull(command, "command"); }
   }
 
   public record Put(PutCommand command) implements Operation {

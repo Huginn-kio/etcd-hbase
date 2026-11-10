@@ -4,7 +4,7 @@
   "rules": [
     {
       "id": "exact_get",
-      "request": "Range exact key, count_only=false, limit=0",
+      "request": "Range exact key, count_only=false, any limit",
       "count": "len(Kvs), exactly 0 or 1",
       "more": "false",
       "case_ids": [
@@ -13,7 +13,7 @@
     },
     {
       "id": "unlimited_range",
-      "request": "Range with no positive limit and count_only=false",
+      "request": "Range non-exact key with no positive limit and count_only=false",
       "count": "len(all visible Kvs)",
       "more": "false",
       "case_ids": [
@@ -22,7 +22,7 @@
     },
     {
       "id": "limited_range",
-      "request": "Range with limit>0 and count_only=false",
+      "request": "Range non-exact key with limit>0 and count_only=false",
       "count": "len(Kvs in this page)",
       "more": "true iff a next visible matching KV exists",
       "case_ids": [
@@ -60,6 +60,46 @@
   ],
   "accepted_differences": [
     {
+      "rule_id": "exact_get",
+      "method": "etcdserverpb.KV/Range",
+      "case_ids": [
+        "C01",
+        "C06"
+      ],
+      "field": "Count",
+      "successful_responses_only": true,
+      "target_count": "result_length",
+      "request_guard": "ordinary_exact_with_revision_filter",
+      "scope": "Successful ordinary exact Range with a nonzero revision filter reports len(Kvs); native v3.5.23 may report the unfiltered count",
+      "preserved_fields": [
+        "Kvs",
+        "More",
+        "Header",
+        "revision",
+        "errors"
+      ]
+    },
+    {
+      "rule_id": "unlimited_range",
+      "method": "etcdserverpb.KV/Range",
+      "case_ids": [
+        "C02",
+        "C06"
+      ],
+      "field": "Count",
+      "successful_responses_only": true,
+      "target_count": "result_length",
+      "request_guard": "ordinary_nonpoint_without_positive_limit_with_revision_filter",
+      "scope": "Successful ordinary non-exact Range with no positive Limit and a nonzero revision filter reports len(Kvs); native v3.5.23 may report the unfiltered count",
+      "preserved_fields": [
+        "Kvs",
+        "More",
+        "Header",
+        "revision",
+        "errors"
+      ]
+    },
+    {
       "rule_id": "limited_range",
       "method": "etcdserverpb.KV/Range",
       "case_ids": [
@@ -75,7 +115,8 @@
         "Header",
         "revision",
         "errors"
-      ]
+      ],
+      "request_guard": "ordinary_nonpoint_positive_limit"
     },
     {
       "rule_id": "prefix_count_only_limit_one",
@@ -93,7 +134,8 @@
         "Header",
         "revision",
         "errors"
-      ]
+      ],
+      "request_guard": "nonpoint_count_only_limit_one"
     }
   ]
 }

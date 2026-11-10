@@ -3,6 +3,8 @@ package io.etcdhbase.grpc.protocol;
 import com.google.protobuf.ByteString;
 import etcdserverpb.Rpc;
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
+import io.etcdhbase.core.kv.RangeCommand;
 import io.etcdhbase.core.kv.ResultNode;
 import io.etcdhbase.core.kv.ResultTree;
 import io.etcdhbase.core.kv.TxnCommand;
@@ -84,8 +86,8 @@ public final class TxnResponseMapper {
       throw new IllegalArgumentException("transaction child response has an invalid revision");
     }
     Rpc.ResponseHeader header = Rpc.ResponseHeader.newBuilder().setRevision(result.header().revision()).build();
-    if (operation instanceof TxnCommand.PointRange point && result instanceof ResultNode.Range range) {
-      return projectRange(point, range, header);
+    if (operation instanceof TxnCommand.Range request && result instanceof ResultNode.Range range) {
+      return Rpc.ResponseOp.newBuilder().setResponseRange(projectRange(request.command(), range, header)).build();
     }
     if (operation instanceof TxnCommand.Put put && result instanceof ResultNode.Put written) {
       return projectPut(put, written, header);
@@ -104,17 +106,6 @@ public final class TxnResponseMapper {
         .setSucceeded(child.succeeded());
     appendChildren(nested.command(), child, revisions, response);
     return Rpc.ResponseOp.newBuilder().setResponseTxn(response).build();
-  }
-
-  private static Rpc.ResponseOp projectRange(TxnCommand.PointRange point, ResultNode.Range range,
-      Rpc.ResponseHeader header) {
-    if (range.more() || range.records().size() > 1 || range.count() != range.records().size()
-        || range.records().stream().anyMatch(record -> !record.key().equals(point.key()) || !record.hasValue())) {
-      throw new IllegalArgumentException("point response differs from its request");
-    }
-    var response = Rpc.RangeResponse.newBuilder().setHeader(header).setCount(range.count());
-    range.records().forEach(record -> response.addKvs(project(record)));
-    return Rpc.ResponseOp.newBuilder().setResponseRange(response).build();
   }
 
   private static Rpc.ResponseOp projectPut(TxnCommand.Put put, ResultNode.Put written, Rpc.ResponseHeader header) {
@@ -145,6 +136,36 @@ public final class TxnResponseMapper {
     return Rpc.ResponseOp.newBuilder().setResponseDeleteRange(response).build();
   }
 
+  private static Rpc.RangeResponse projectRange(RangeCommand command, ResultNode.Range range,
+      Rpc.ResponseHeader header) {
+    if (command.sort().target() != 0 || command.sort().order() < 0 || command.sort().order() > 1) {
+      throw new IllegalArgumentException("range result uses an unsupported sort");
+    }
+    if (command.countOnly()) {
+      if (!range.records().isEmpty() || range.count() > 1 || range.more()
+          || command.range().kind() != KeyRange.Kind.POINT && command.limit() != 1) {
+        throw new IllegalArgumentException("count-only result differs from its request");
+      }
+    } else if (range.count() != range.records().size()
+        || command.limit() > 0 && range.records().size() > command.limit()
+        || range.more() && (command.limit() <= 0 || range.records().size() != command.limit())
+        || command.range().kind() == KeyRange.Kind.POINT && (range.records().size() > 1 || range.more())) {
+      throw new IllegalArgumentException("range count or limit differs from its request");
+    }
+    ByteKey previous = null;
+    for (StoredRecord record : range.records()) {
+      if (!command.range().contains(record.key()) || previous != null && previous.compareTo(record.key()) >= 0
+          || !command.filter().matches(record.metadata()) || command.keysOnly() == record.hasValue()
+          || command.revision() > 0 && record.metadata().modificationRevision() > command.revision()) {
+        throw new IllegalArgumentException("range record differs from its request");
+      }
+      previous = record.key();
+    }
+    var response = Rpc.RangeResponse.newBuilder().setHeader(header).setCount(range.count()).setMore(range.more());
+    range.records().forEach(record -> response.addKvs(project(record, command.keysOnly())));
+    return response.build();
+  }
+
   private static final class RevisionCursor {
     private long current;
     private final long written;
@@ -155,10 +176,15 @@ public final class TxnResponseMapper {
   }
 
   private static Kv.KeyValue project(StoredRecord record) {
+    return project(record, false);
+  }
+
+  private static Kv.KeyValue project(StoredRecord record, boolean keysOnly) {
     var metadata = record.metadata();
-    return Kv.KeyValue.newBuilder().setKey(ByteString.copyFrom(record.key().bytes()))
-        .setValue(ByteString.copyFrom(record.value().orElseThrow()))
+    var value = Kv.KeyValue.newBuilder().setKey(ByteString.copyFrom(record.key().bytes()))
         .setCreateRevision(metadata.createRevision()).setModRevision(metadata.modificationRevision())
-        .setVersion(metadata.version()).setLease(metadata.leaseId()).build();
+        .setVersion(metadata.version()).setLease(metadata.leaseId());
+    if (!keysOnly) value.setValue(ByteString.copyFrom(record.value().orElseThrow()));
+    return value.build();
   }
 }

@@ -50,6 +50,66 @@ DELETE_METHODS = tuple(f"etcdserverpb.KV/{method}" for method in (
     "Put", "DeleteRange", "DeleteRange", "Put", "Txn", "Txn", "DeleteRange", "Txn", "Txn", "Put",
     "Txn", "Txn", "Txn", "DeleteRange", "DeleteRange", "DeleteRange",
 ))
+RANGE_CASES = (
+    "native-baseline",
+    "J34-seed",
+    "J34-update",
+    "J34-current",
+    "J34-historical",
+    "J34-negative-revision",
+    "J34-prefix-page",
+    "J34-keys-only",
+    "J34-negative-limit",
+    "J34-max-limit",
+    "J34-min-mod",
+    "J34-max-mod",
+    "J34-min-create",
+    "J34-max-create",
+    "J34-negative-min-mod",
+    "J34-negative-max-mod",
+    "J34-negative-min-create",
+    "J34-negative-max-create",
+    "J34-filtered-point-min-mod",
+    "J34-filtered-range-min-mod",
+    "J34-filtered-point-max-mod",
+    "J34-filtered-range-max-mod",
+    "J34-filtered-point-min-create",
+    "J34-filtered-range-min-create",
+    "J34-filtered-point-max-create",
+    "J34-filtered-range-max-create",
+    "J34-filtered-range-partial",
+    "J34-filtered-point-match",
+    "J34-filtered-nested-txn",
+    "J34-count-point-min-mod",
+    "J34-count-range-min-mod",
+    "J34-count-point-max-mod",
+    "J34-count-range-max-mod",
+    "J34-count-point-min-create",
+    "J34-count-range-min-create",
+    "J34-count-point-max-create",
+    "J34-count-range-max-create",
+    "J34-count-missing",
+    "J34-count-empty-range",
+    "J34-txn-overlay",
+    "J34-txn-history",
+    "J34-txn-negative",
+    "J34-delete",
+    "J34-recreate",
+    "J34-history-deleted",
+    "J34-history-count-deleted",
+    "J34-history-count-live",
+    "J34-history-recreated",
+    "J34-client-prefix",
+    "J34-txn-count-after-delete",
+    "J34-future",
+    "J34-empty-key",
+)
+RANGE_METHODS = tuple("etcdserverpb.KV/" + {
+    "native-baseline": "Put", "J34-seed": "Txn", "J34-update": "Put",
+    "J34-filtered-nested-txn": "Txn", "J34-txn-overlay": "Txn", "J34-txn-history": "Txn",
+    "J34-txn-negative": "Txn", "J34-txn-count-after-delete": "Txn",
+    "J34-delete": "DeleteRange", "J34-recreate": "Put",
+}.get(case, "Range") for case in RANGE_CASES)
 HBASE_SUITE = "io.etcdhbase.hbase.storage.M3ResultRepositoryIT"
 INIT_SUITE = "io.etcdhbase.admin.M3InitializeTablesIT"
 SERVER_SUITE = "io.etcdhbase.server.M3PutRpcIT"
@@ -229,6 +289,44 @@ J33_UNIT_CASES = {
 }
 
 
+J34_GO_REQUIRED_CASES = {
+    **{package: set(cases) for package, cases in J33_GO_REQUIRED_CASES.items()},
+    "internal/scenario": J33_GO_REQUIRED_CASES["internal/scenario"] | {
+        "TestM3RangeScenarioMatchesIndependentNativeServers", "TestM3RangeSuiteRejectsMissingCoverage"},
+    "internal/compare": J33_GO_REQUIRED_CASES["internal/compare"] | {
+        "TestM3RangeComparisonKeepsWireFieldsAndMethodsStrict", "TestM3RangeComparisonAllowsOnlyFilteredResultCounts",
+        "TestM3RangeFilteredCountRejectsMalformedFilterAndImpossibleMore",
+        "TestM3RangeComparisonAppliesOnlyExistingPageCountAllowance", "TestM3RangeComparisonKeepsTxnCountOneofsStrict"},
+}
+J34_INTEGRATION_CASES = {
+    **{suite: set(cases) for suite, cases in J33_INTEGRATION_CASES.items()},
+    "io.etcdhbase.server.M3RangeRpcIT": {"standaloneAndTransactionRangeUseTheSameProtectedViewOnBothLayouts"},
+    "io.etcdhbase.server.M3RangeComparisonIT": {"goRangesMatchNativeOnBothLayouts"},
+}
+J34_UNIT_CASES = {
+    **{suite: set(cases) for suite, cases in J33_UNIT_CASES.items()},
+    "io.etcdhbase.core.commit.ReadViewRecordStoreTest": J33_UNIT_CASES[
+        "io.etcdhbase.core.commit.ReadViewRecordStoreTest"] | {
+            "transactionRangeUsesWorkingAndHistoricalViewsWithFiltersAndProjection",
+            "rangeKeysOnlyAndCountOnlyDoNotFetchValues", "countOnlyUsesSelectedPendingCandidatesAndTombstones",
+            "rangeCountOnlyStopsAfterAMatchButChecksEveryBucketForAbsence",
+            "pointRangesUseOnePointReadAndRequestOnlyTheNeededProjection",
+            "cancelledPointRangeRetainsItsPinUntilThePhysicalReadCompletes",
+            "rangeOutputBudgetFailureDoesNotReturnPartialResults",
+            "cancelledRangeKeepsItsPinUntilAnInFlightValueReadDrains",
+            "rangeRejectsAValueThatDoesNotMatchItsSelectedMetadata",
+            "filteredPointAndUnlimitedRangeCountOnlyReturnedRecords",
+            "standaloneAndTransactionRangePreserveDifferentRevisionChecks"},
+    "io.etcdhbase.core.kv.RangeCommandTest": {"revisionFilterAppliesEveryNonzeroBoundaryInclusively", "negativeBoundariesRemainRealBoundaries"},
+    "io.etcdhbase.core.kv.RangeSelectorTest": {"limitAndMoreApplyAfterTombstonesAndRevisionFilters",
+        "countOnlyUsesExistenceWithoutApplyingRevisionFilters", "unlimitedAndExtremeLimitsDoNotOverflowOrHidePreFilterCount"},
+    "io.etcdhbase.core.kv.SequentialViewCursorTest": {"exhaustsTheMaximumBucketCountWithoutRecursionOverflow",
+        "closingDuringAReadRejectsLateResultsAndConcurrentReads", "backendFailureIsNotInterpretedAsAnEmptyBucket"},
+    "io.etcdhbase.grpc.protocol.RangeRequestMapperTest": {"decodesPointFromKeyFullSpaceAndEmptyIntervalsAsBytes",
+        "preservesRequestContextAndAllOptionValuesWithoutNarrowing", "rejectsAnEmptyKeyBeforeConstructingAnyRange"},
+}
+
+
 def unique_pairs(pairs):
     """Reject duplicate object keys wherever M3 metadata is parsed."""
     result = {}
@@ -320,7 +418,7 @@ def validate_metadata(metadata: dict, scope: str, layout: str,
 def validate_trace_cases(path: Path, scope: str, task: str = "J30") -> None:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 256 << 20:
         raise ValueError("M3 trace is missing, linked or oversized")
-    cases = {"J30": PUT_CASES, "J31": TXN_CASES, "J32": NESTED_CASES, "J33": DELETE_CASES}.get(task)
+    cases = {"J30": PUT_CASES, "J31": TXN_CASES, "J32": NESTED_CASES, "J33": DELETE_CASES, "J34": RANGE_CASES}.get(task)
     if cases is None:
         raise ValueError("unregistered M3 trace task")
     records = []
@@ -335,7 +433,7 @@ def validate_trace_cases(path: Path, scope: str, task: str = "J30") -> None:
     if (tuple(record.get("case_id") for record in records) != cases
             or any(record.get("schema") != "etcd-hbase-trace/v1"
                    or record.get("evidence_scope") != scope
-                   or record.get("method") != (DELETE_METHODS[index] if task == "J33" else
+                   or record.get("method") != (RANGE_METHODS[index] if task == "J34" else DELETE_METHODS[index] if task == "J33" else
                        "etcdserverpb.KV/Put" if task == "J30" or index == 0 else "etcdserverpb.KV/Txn")
                    for index, record in enumerate(records))):
         raise ValueError("M3 trace is incomplete or belongs to another scope")
@@ -377,19 +475,21 @@ def validate_run(root: Path, repository: Path = REPO) -> dict:
     limitations = ["raft_term=0 is a disclosed non-Raft projection",
                    "public MiniCluster is not target HBase or target identity acceptance",
                    "an unconfirmed scanner close retires local capacity; remote lifetime across restarts is unverified"]
-    if task in {"J32", "J33"}:
+    if task in {"J32", "J33", "J34"}:
         limitations.extend([
             "private workset pages are non-expiring until long-term collection is implemented in J53",
             "a started invocation with an unknown outcome requires a durable decision or fencing proof; "
             "automatic recovery is not yet integrated",
         ])
-    if task == "J33":
+    if task in {"J33", "J34"}:
         limitations.append("mixed-version recovery and rollback of same-revision previous-value events are unverified")
         limitations.append("zero-end delete followed by an ignore-value Put of the same key is rejected before publication; "
                            "native fault behavior is not compared")
+    if task == "J34":
+        limitations.append("filtered ordinary Range Count follows returned Kvs and may differ from native prefilter Count")
     return {"phase": "M3", "tasks": [task], "scope": run["scope"], "run_id": run["run_id"],
             "source_commit": source, "suites": suites,
-            "trace_cases": list({"J30": PUT_CASES, "J31": TXN_CASES, "J32": NESTED_CASES, "J33": DELETE_CASES}[task]),
+            "trace_cases": list({"J30": PUT_CASES, "J31": TXN_CASES, "J32": NESTED_CASES, "J33": DELETE_CASES, "J34": RANGE_CASES}[task]),
             "limitations": limitations}
 
 
@@ -398,7 +498,7 @@ def validate_run_identity(root: Path, repository: Path) -> tuple[dict, str, str]
     run_id = run.get("run_id")
     tasks = run.get("tasks")
     if (run.get("schema") != "etcd-hbase-m3-run/v1"
-            or run.get("scope") != "public-local-minicluster" or tasks not in (["J30"], ["J31"], ["J32"], ["J33"])
+            or run.get("scope") != "public-local-minicluster" or tasks not in (["J30"], ["J31"], ["J32"], ["J33"], ["J34"])
             or not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", run_id)
             or root.name != run_id or run.get("commands_passed") is not True):
         raise ValueError("M3 run identity, scope, tasks, or command status is invalid")
@@ -417,12 +517,13 @@ def validate_run_traces(root: Path, repository: Path, run: dict, source: str, ta
     run_id = run["run_id"]
     validate_case_registry(read_json(repository / "testkit/cases/m3-cases.json"))
     txn = task != "J30"
-    prefix = {"J30": "", "J31": "j31-", "J32": "j32-", "J33": "j33-"}[task]
+    prefix = {"J30": "", "J31": "j31-", "J32": "j32-", "J33": "j33-", "J34": "j34-"}[task]
     scenario, suite_file = {
         "J30": ("m3-put-v1", "m3-put.yaml"),
         "J31": ("m3-txn-v1", "m3-txn.yaml"),
         "J32": ("m3-nested-txn-v1", "m3-nested-txn.yaml"),
         "J33": ("m3-delete-v1", "m3-delete.yaml"),
+        "J34": ("m3-range-v1", "m3-range.yaml"),
     }[task]
     suite_sha = file_digest(repository / "testkit/scenarios" / suite_file)
     prefix_sha = hashlib.sha256(f"etcd-hbase-m3-test/{run_id}/".encode()).hexdigest()
@@ -444,14 +545,14 @@ def validate_run_traces(root: Path, repository: Path, run: dict, source: str, ta
 def validate_run_reports(root: Path, task: str) -> dict:
     txn = task != "J30"
     go_cases = {"J30": GO_REQUIRED_CASES, "J31": J31_GO_REQUIRED_CASES, "J32": J32_GO_REQUIRED_CASES,
-                "J33": J33_GO_REQUIRED_CASES}[task]
+                "J33": J33_GO_REQUIRED_CASES, "J34": J34_GO_REQUIRED_CASES}[task]
     validate_go_report(root / "go-test.jsonl", go_cases)
     integration = {"J30": REQUIRED_CASES, "J31": J31_INTEGRATION_CASES, "J32": J32_INTEGRATION_CASES,
-                   "J33": J33_INTEGRATION_CASES}[task]
+                   "J33": J33_INTEGRATION_CASES, "J34": J34_INTEGRATION_CASES}[task]
     _, suites = java_reports(root, set(integration), modules=("hbase", "admin", "server"),
                              required_cases=integration, report_kinds=("failsafe-reports",))
     if txn:
-        required_units = {"J31": J31_UNIT_CASES, "J32": J32_UNIT_CASES, "J33": J33_UNIT_CASES}[task]
+        required_units = {"J31": J31_UNIT_CASES, "J32": J32_UNIT_CASES, "J33": J33_UNIT_CASES, "J34": J34_UNIT_CASES}[task]
         unit_modules = ("core", "grpc", "server") if task == "J31" else (
             "protocol", "spi", "core", "hbase", "grpc", "admin", "server")
         _, units = java_reports(root, set(required_units), modules=unit_modules,
@@ -463,7 +564,7 @@ def validate_run_reports(root: Path, task: str) -> dict:
 def compare_run_traces(root: Path, repository: Path, prefix: str, txn: bool, task: str) -> None:
     for layout in ("history", "native"):
         command = [str(repository / "scripts/dev/go-program.sh"), "native-etcd", "compare",
-                   "--m3-delete" if task == "J33" else "--m3-txn" if txn else "--m3-put",
+                   "--m3-range" if task == "J34" else "--m3-delete" if task == "J33" else "--m3-txn" if txn else "--m3-put",
                    "--left", str(root / f"{prefix}native-trace.jsonl"),
                    "--right", str(root / f"{prefix}target-{layout}-trace.jsonl")]
         subprocess.run(command, cwd=repository, check=True, stdout=subprocess.DEVNULL)

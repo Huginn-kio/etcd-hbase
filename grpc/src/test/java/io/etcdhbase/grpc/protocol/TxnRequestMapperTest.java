@@ -42,7 +42,8 @@ class TxnRequestMapperTest {
         Rpc.DeleteRangeRequest.newBuilder().setKey(binary('x'))).build();
     var mapped = TxnRequestMapper.fromWire(Rpc.TxnRequest.newBuilder()
         .addSuccess(complexRange).addFailure(delete).build());
-    assertFalse(assertInstanceOf(TxnCommand.Unsupported.class, mapped.success().getFirst()).mayWrite());
+    var range = assertInstanceOf(TxnCommand.Range.class, mapped.success().getFirst());
+    assertTrue(range.command().range().contains(ByteKey.copyOf(new byte[] {'b'})));
     assertInstanceOf(TxnCommand.Delete.class, mapped.failure().getFirst());
     assertTrue(mapped.mayWrite());
     assertTrue(TxnRequestMapper.requiresNativeRaftLimit(Rpc.TxnRequest.newBuilder()

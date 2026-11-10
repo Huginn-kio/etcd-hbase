@@ -11,12 +11,14 @@ public final class KvService extends KVGrpc.KVImplBase {
   private final BiConsumer<Rpc.PutRequest, StreamObserver<Rpc.PutResponse>> putHandler;
   private final BiConsumer<Rpc.TxnRequest, StreamObserver<Rpc.TxnResponse>> txnHandler;
   private final BiConsumer<Rpc.DeleteRangeRequest, StreamObserver<Rpc.DeleteRangeResponse>> deleteHandler;
+  private final BiConsumer<Rpc.RangeRequest, StreamObserver<Rpc.RangeResponse>> rangeHandler;
 
   /** Keeps the protocol-only skeleton explicitly unimplemented. */
   public KvService() {
     this.putHandler = null;
     this.txnHandler = null;
     this.deleteHandler = null;
+    this.rangeHandler = null;
   }
 
   /** Installs a fully assembled Put handler; other KV methods remain unimplemented. */
@@ -24,6 +26,7 @@ public final class KvService extends KVGrpc.KVImplBase {
     this.putHandler = Objects.requireNonNull(putHandler, "putHandler");
     this.txnHandler = null;
     this.deleteHandler = null;
+    this.rangeHandler = null;
   }
 
   /** Installs both fully assembled handlers. */
@@ -32,6 +35,7 @@ public final class KvService extends KVGrpc.KVImplBase {
     this.putHandler = Objects.requireNonNull(putHandler, "putHandler");
     this.txnHandler = Objects.requireNonNull(txnHandler, "txnHandler");
     this.deleteHandler = null;
+    this.rangeHandler = null;
   }
 
   /** Installs Put, Txn and DeleteRange handlers backed by the same table-group runtime. */
@@ -41,11 +45,24 @@ public final class KvService extends KVGrpc.KVImplBase {
     this.putHandler = Objects.requireNonNull(putHandler, "putHandler");
     this.txnHandler = Objects.requireNonNull(txnHandler, "txnHandler");
     this.deleteHandler = Objects.requireNonNull(deleteHandler, "deleteHandler");
+    this.rangeHandler = null;
+  }
+
+  /** Installs the Range, Put, Txn and DeleteRange handlers for one table group. */
+  public KvService(BiConsumer<Rpc.PutRequest, StreamObserver<Rpc.PutResponse>> putHandler,
+      BiConsumer<Rpc.TxnRequest, StreamObserver<Rpc.TxnResponse>> txnHandler,
+      BiConsumer<Rpc.DeleteRangeRequest, StreamObserver<Rpc.DeleteRangeResponse>> deleteHandler,
+      BiConsumer<Rpc.RangeRequest, StreamObserver<Rpc.RangeResponse>> rangeHandler) {
+    this.putHandler = Objects.requireNonNull(putHandler, "putHandler");
+    this.txnHandler = Objects.requireNonNull(txnHandler, "txnHandler");
+    this.deleteHandler = Objects.requireNonNull(deleteHandler, "deleteHandler");
+    this.rangeHandler = Objects.requireNonNull(rangeHandler, "rangeHandler");
   }
 
   @Override
   public void range(Rpc.RangeRequest request, StreamObserver<Rpc.RangeResponse> responseObserver) {
-    UnimplementedStreams.failUnary(responseObserver, "KV.Range");
+    if (rangeHandler == null) UnimplementedStreams.failUnary(responseObserver, "KV.Range");
+    else rangeHandler.accept(request, responseObserver);
   }
 
   @Override

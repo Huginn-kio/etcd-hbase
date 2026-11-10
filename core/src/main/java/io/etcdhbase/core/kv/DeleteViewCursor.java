@@ -11,11 +11,8 @@ import io.etcdhbase.core.scan.DirectRecordReader;
 import io.etcdhbase.core.scan.PointResult;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
-import io.etcdhbase.core.storage.ScanSource;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -23,9 +20,7 @@ import java.util.function.ToIntFunction;
 
 /** Ordered fixed-base plus completed-workset view for one delete operation. */
 final class DeleteViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable {
-  private record BucketBounds(int first, int end) {}
-  private final List<BucketViewCursor> bases;
-  private final OrderedViewCursor ordered;
+  private final LogicalViewCursor ordered;
   private final DirectRecordReader values;
   private final long revision;
   private final RequestScope scope;
@@ -49,33 +44,10 @@ final class DeleteViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable
     this.revision = session.currentRevision();
     this.values = new DirectRecordReader(session.reader(0), account, pointBytes);
     var limits = comparisons.limits();
-    ScanSource source = comparisons.scanSource();
-    var opened = new ArrayList<BucketViewCursor>();
-    var merged = new ArrayList<AsyncCursor<StoredRecord>>();
-    try {
-      var bounds = bucketBounds(range, bucketSelector, limits.buckets());
-      for (int bucket = bounds.first(); bucket < bounds.end(); bucket++) {
-        var request = new ScanRequest(bucket, range, Optional.empty(), revision, ReadProjection.METADATA,
-            1, limits.pageBytes(), limits.physicalRowsPerPage());
-        var base = new BucketViewCursor(source, request, account, scope);
-        opened.add(base);
-        merged.add(working.merge(bucket, range, base));
-      }
-      if (merged.isEmpty()) merged.add(AsyncCursor.fromIterator(List.<StoredRecord>of().iterator()));
-      this.ordered = new OrderedViewCursor(merged, account, scope);
-      this.bases = List.copyOf(opened);
-    } catch (RuntimeException | Error failure) {
-      closeAll(opened, failure);
-      throw failure;
-    }
-  }
-
-  private static BucketBounds bucketBounds(KeyRange range, ToIntFunction<ByteKey> selector, int buckets) {
-    if (range.isEmpty()) return new BucketBounds(0, 0);
-    if (range.kind() != KeyRange.Kind.POINT) return new BucketBounds(0, buckets);
-    int selected = selector.applyAsInt(range.lowerInclusive().orElseThrow());
-    if (selected < 0 || selected >= buckets) throw new IllegalArgumentException("invalid delete bucket");
-    return new BucketBounds(selected, selected + 1);
+    var request = new ScanRequest(0, range, Optional.empty(), revision, ReadProjection.METADATA,
+        1, limits.pageBytes(), limits.physicalRowsPerPage());
+    this.ordered = new LogicalViewCursor(comparisons.scanSource(revision), Optional.of(working), request,
+        limits.buckets(), bucketSelector, account, scope);
   }
 
   @Override public CompletableFuture<Optional<StoredRecord>> next() {
@@ -131,7 +103,6 @@ final class DeleteViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable
     Throwable failure = null;
     try { ordered.close(); }
     catch (RuntimeException | Error problem) { failure = problem; }
-    failure = closeAll(bases, failure);
     if (!reading) {
       try { releaseValue(); }
       catch (RuntimeException | Error problem) {
@@ -141,17 +112,6 @@ final class DeleteViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable
     }
     if (failure instanceof Error fatal) throw fatal;
     if (failure instanceof RuntimeException problem) throw problem;
-  }
-
-  private static Throwable closeAll(List<BucketViewCursor> cursors, Throwable failure) {
-    for (BucketViewCursor cursor : cursors) {
-      try { cursor.close(); }
-      catch (RuntimeException | Error problem) {
-        if (failure == null) failure = problem;
-        else if (failure != problem) failure.addSuppressed(problem);
-      }
-    }
-    return failure;
   }
 
   private void releaseValue() {

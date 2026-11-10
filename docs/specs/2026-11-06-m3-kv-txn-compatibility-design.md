@@ -229,6 +229,8 @@ Put/Delete/Txn 的语义结果包含分支选择、嵌套响应顺序、PrevKV�
 | 范围 CountOnly + Limit=1 | Count=真实存在性 0/1，Kvs 为空，More=false；允许真实提前命中 |
 | 其他范围 CountOnly | 明确 `UNIMPLEMENTED`，不暗中执行全范围计数 |
 
+普通 Range 先过滤再按表 6 计算 Count。固定原生 etcd v3.5.23 的 Count 可保留过滤前的数量：例如 key 存在且 modRevision=2，min_mod_revision=3 时，首版普通精确 Get 返回 Kvs=[]、Count=0，原生返回 Kvs=[]、Count=1。无有效正 Limit 的普通范围也可能出现这一差异；仅对包含非零 revision 过滤条件的对应成功请求允许 Count 差异，其他响应字段仍严格对照。
+
 精确 CountOnly 和范围 CountOnly+Limit=1 依据相应当前或历史视图判断存活，事务内当前视图仍包括此前已执行的工作集；目标 revision、墓碑与授权约束不变，不能直接看到物理行就返回 1。固定原生的 Count 路径返回空 Kvs 和计数，四项 min/max create/mod revision 过滤只处理 Kvs，不改变 Count；因此这些过滤条件不能将存活 key 的 CountOnly 存在性变为 0。[MVCC Count][mvcc]、[Range 组装][apply] 例如视图中 `a` 存活且 modRevision=2，min_mod_revision=3 时，精确 CountOnly 与覆盖 `a` 的范围 CountOnly+Limit=1 均返回 Count=1。CountOnly 与 KeysOnly 组合保持 Kvs 为空。与原生差分仅按表中的 Count 口径作有限允许；CountOnly 的 More 仍为 false，不能豁免排序、遗漏、版本或错误。
 
 内部页重开持有同一 ReadView。多次独立 Range 不自动共享快照；需要跨 RPC 固定快照时客户端显式携带 revision。对降序响应，后续 RPC 通过缩小独占上界续读；不擅自新增公开 token。没有 Limit 的 unary 结果超预算时整次失败，不返回一部分且称已完成。

@@ -15,6 +15,6 @@ An etcd v3 API-compatible server backed by Apache HBase, built with Java 21.
 - [运行配置与请求生命周期](docs/config/j06-runtime-configuration.md)、[Go 原生对照工具](docs/testing/j07-protocol-oracle.md)、[SPI 契约](docs/spi/m0-spi-contract.md)。
 - [公开构建与运行包](docs/build/j09-public-delivery.md)：两次完整构建、真实运行包/镜像、证据索引与未决发行输入。
 
-当前提供可启动的协议骨架，未实现方法明确返回 UNIMPLEMENTED。完整存储和业务语义按后续 J 任务及阶段推进；首版 Count 与其他兼容范围以开发计划的能力矩阵为准。
+当前提供可启动的协议骨架，未实现方法明确返回 UNIMPLEMENTED。完整存储和业务语义按后续 J 任务及阶段推进；首版普通 Range 的 Count 是返回的 Kvs 数量，范围 CountOnly+Limit=1 返回存在性；revision 过滤场景也可能与原生 etcd 的 Count 不同。具体边界见[API 矩阵](docs/api-matrix.md#3-count-已接受差异)。
 
 部署目标为无本地业务持久化的 K8s 多副本；跨副本认证、提交接管和 Watch/KeepAlive 恢复，以及 HBase 原生多版本存储评估已纳入计划，均待实现与验证。

@@ -121,6 +121,8 @@ func executeScenario(ctx context.Context, options options, suiteID string, outpu
 			runNative = scenario.RunM3NativeNestedTxn
 		case "m3-delete-v1":
 			runNative = scenario.RunM3NativeDelete
+		case "m3-range-v1":
+			runNative = scenario.RunM3NativeRange
 		}
 		if err := runNative(requestContext, options.nativeData, options.prefix, output); err != nil {
 			return err
@@ -139,6 +141,8 @@ func executeScenario(ctx context.Context, options options, suiteID string, outpu
 			runScenario = scenario.RunM3NestedTxn
 		case "m3-delete-v1":
 			runScenario = scenario.RunM3Delete
+		case "m3-range-v1":
+			runScenario = scenario.RunM3Range
 		}
 		if err := runScenario(requestContext, connection, options.scope, options.prefix, output); err != nil {
 			return err

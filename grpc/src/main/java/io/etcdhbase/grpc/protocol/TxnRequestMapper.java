@@ -6,6 +6,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.kv.CompareCondition;
 import io.etcdhbase.core.kv.KvFailure;
+import io.etcdhbase.core.kv.RangeCommand;
 import io.etcdhbase.core.kv.ResultNode;
 import io.etcdhbase.core.kv.ResultTree;
 import io.etcdhbase.core.kv.TxnCommand;
@@ -13,7 +14,6 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 
 /** Validates both branches before mapping the supported transaction operations. */
@@ -74,27 +74,17 @@ public final class TxnRequestMapper {
     var mapped = new ArrayList<TxnCommand.Operation>(operations.size());
     for (Rpc.RequestOp operation : operations) {
       mapped.add(switch (operation.getRequestCase()) {
-        case REQUEST_RANGE -> isPointRange(operation.getRequestRange())
-            ? new TxnCommand.PointRange(key(operation.getRequestRange().getKey()),
-                operation.getRequestRange().getRevision())
-            : new TxnCommand.Unsupported(false);
+        case REQUEST_RANGE -> new TxnCommand.Range(
+            RangeRequestMapper.fromWire(operation.getRequestRange(), RangeCommand.Context.TRANSACTION));
         case REQUEST_PUT -> new TxnCommand.Put(PutRequestMapper.fromWire(operation.getRequestPut()));
         case REQUEST_DELETE_RANGE -> new TxnCommand.Delete(
-            range(operation.getRequestDeleteRange().getKey(), operation.getRequestDeleteRange().getRangeEnd()),
+            RangeRequestMapper.range(operation.getRequestDeleteRange().getKey(), operation.getRequestDeleteRange().getRangeEnd()),
             operation.getRequestDeleteRange().getPrevKv());
         case REQUEST_TXN -> new TxnCommand.Nested(command(operation.getRequestTxn()));
         case REQUEST_NOT_SET -> throw new KvFailure(KvFailure.Reason.KEY_NOT_FOUND);
       });
     }
     return List.copyOf(mapped);
-  }
-
-  private static boolean isPointRange(Rpc.RangeRequest range) {
-    return range.getRangeEnd().isEmpty() && range.getLimit() == 0
-        && range.getSortOrderValue() == 0 && range.getSortTargetValue() == 0
-        && !range.getKeysOnly() && !range.getCountOnly() && range.getMinModRevision() == 0
-        && range.getMaxModRevision() == 0 && range.getMinCreateRevision() == 0
-        && range.getMaxCreateRevision() == 0;
   }
 
   private static CompareCondition compare(Rpc.Compare input) {
@@ -105,7 +95,7 @@ public final class TxnRequestMapper {
       case LESS -> CompareCondition.Relation.LESS;
       case UNRECOGNIZED -> CompareCondition.Relation.UNRECOGNIZED;
     };
-    KeyRange range = range(input.getKey(), input.getRangeEnd());
+    KeyRange range = RangeRequestMapper.range(input.getKey(), input.getRangeEnd());
     return switch (input.getTarget()) {
       case VERSION -> CompareCondition.numeric(range, CompareCondition.Target.VERSION, relation, input.getVersion());
       case CREATE -> CompareCondition.numeric(range, CompareCondition.Target.CREATE, relation, input.getCreateRevision());
@@ -114,16 +104,6 @@ public final class TxnRequestMapper {
       case VALUE -> CompareCondition.value(range, relation, input.getValue().toByteArray());
       case UNRECOGNIZED -> CompareCondition.numeric(range, CompareCondition.Target.UNRECOGNIZED, relation, 0);
     };
-  }
-
-  private static KeyRange range(ByteString key, ByteString end) {
-    ByteKey start = key(key);
-    if (end.isEmpty()) return KeyRange.point(start);
-    if (end.size() == 1 && end.byteAt(0) == 0) {
-      return key.size() == 1 && key.byteAt(0) == 0 ? KeyRange.all()
-          : KeyRange.interval(Optional.of(start), Optional.empty());
-    }
-    return KeyRange.between(start, key(end));
   }
 
   /** Mirrors the upstream potential-write overlap check, including mutually exclusive children. */

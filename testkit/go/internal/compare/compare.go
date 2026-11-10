@@ -34,6 +34,11 @@ func CompareM3DeleteTraces(left, right io.Reader) error {
 	return compareTraces(left, right, m3DeletePolicy)
 }
 
+// CompareM3RangeTraces adds standalone Range to the registered M3 methods.
+func CompareM3RangeTraces(left, right io.Reader) error {
+	return compareTraces(left, right, m3RangePolicy)
+}
+
 type tracePolicy int
 
 const (
@@ -41,6 +46,7 @@ const (
 	m3PutPolicy
 	m3TxnPolicy
 	m3DeletePolicy
+	m3RangePolicy
 )
 
 func compareTraces(left, right io.Reader, policy tracePolicy) error {
@@ -114,7 +120,7 @@ func compare(left, right []trace.Record, policy tracePolicy) error {
 				return fmt.Errorf("trace record %d has invalid M3 header: %w", index+1, err)
 			}
 		}
-		if (policy == m3TxnPolicy || policy == m3DeletePolicy) && leftScope != rightScope && bothSucceeded {
+		if (policy == m3TxnPolicy || policy == m3DeletePolicy || policy == m3RangePolicy) && leftScope != rightScope && bothSucceeded {
 			if applied, equal := equalTxnWithCountAllowance(leftNormalized[index], rightNormalized[index], leftScope); applied {
 				if !equal {
 					return fmt.Errorf("trace record %d violates the selected Txn Range Count policy", index+1)

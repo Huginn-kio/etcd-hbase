@@ -18,7 +18,7 @@
       "case_id": "C06",
       "shapes": ["exact-key", "range-without-limit"],
       "filters": ["min_mod_revision", "max_mod_revision", "min_create_revision", "max_create_revision"],
-      "purpose": "compare native Count and Kvs after revision filtering; resolve any conflict with the approved Count policy before J34 completion"
+      "purpose": "verify native and target Count and Kvs after revision filtering under the approved lightweight Count policy"
     }
   ]
 }
