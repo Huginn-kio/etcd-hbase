@@ -102,6 +102,19 @@ class EvidenceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             go_report(path)
 
+    def test_go_requires_both_history_packages(self):
+        path = self.root / "go.jsonl"
+        history_packages = {"cmd/m3history", "internal/history"}
+        self.assertTrue(history_packages.issubset(GO_PACKAGES))
+        for missing in history_packages:
+            events = []
+            for package in sorted(GO_PACKAGES - {missing}):
+                events.extend([{"Action": "pass", "Package": GO_MODULE + package, "Test": "TestContract"},
+                               {"Action": "pass", "Package": GO_MODULE + package}])
+            path.write_text("".join(json.dumps(item) + "\n" for item in events))
+            with self.subTest(missing=missing), self.assertRaises(ValueError):
+                go_report(path)
+
 
     def test_source_changes_and_untracked_code_invalidate_evidence(self):
         def git(*arguments):

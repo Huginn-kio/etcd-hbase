@@ -33,6 +33,67 @@ def metadata(scope, layout=""):
 
 
 class M3ReportTest(unittest.TestCase):
+    def test_history_gate_rejects_missing_cases_and_invalid_failover_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                M3.validate_j28_histories(Path(directory), Path(directory), "a" * 40)
+        fixture = {"first_pid": 10, "second_pid": 11, "first_epoch": 2, "second_epoch": 3,
+                   "first_bucket": 1, "second_bucket": 2, "hbase_control_survived": True,
+                   "selected_before_recovery": True, "partial_rows": "one"}
+        M3.validate_j28_failover_fixture(fixture, "partial-materialization")
+        for key, value in (("second_pid", 10), ("second_epoch", 2), ("second_bucket", 1),
+                           ("hbase_control_survived", False), ("selected_before_recovery", False),
+                           ("partial_rows", "not-checked")):
+            broken = {**fixture, key: value}
+            with self.assertRaises(ValueError):
+                M3.validate_j28_failover_fixture(broken, "partial-materialization")
+        cancellation = {**fixture, "second_pid": 0, "second_epoch": 2, "partial_rows": "not-checked",
+                        "baseline_allocated": 1, "baseline_reserved": 2, "held_allocated": 3,
+                        "held_reserved": 2, "resources_drained": True}
+        M3.validate_j28_failover_fixture(cancellation, "cancel-after-cas")
+        for broken in ({**cancellation, "resources_drained": False},
+                       {**cancellation, "held_allocated": 1}, {**cancellation, "second_epoch": 3}):
+            with self.assertRaises(ValueError):
+                M3.validate_j28_failover_fixture(broken, "cancel-after-cas")
+
+    def test_history_gate_rechecks_every_source_bound_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = "a" * 40
+            paths = []
+            for layout in ("history-table.json", "native-cell-versions.json"):
+                for fault in ("none", *M3.J28_FAULTS):
+                    name = f"rpc-{layout}" if fault == "none" else f"failover-{layout}-{fault}"
+                    fixture = {"layout": layout, "fault": fault, "source_commit": source,
+                               "scope": "public-local-minicluster", "authentication": "simple-development"}
+                    if fault != "none":
+                        selected = fault in {"cas-ack-lost", "partial-materialization", "old-owner-resume", "cancel-after-cas"}
+                        fixture.update({"first_pid": 10, "second_pid": 11, "first_epoch": 2, "second_epoch": 3,
+                                        "first_bucket": 1, "second_bucket": 2, "hbase_control_survived": True,
+                                        "selected_before_recovery": selected,
+                                        "partial_rows": "one" if fault == "partial-materialization" else "not-checked"})
+                    if fault == "old-owner-resume":
+                        fixture["old_owner_resumed_and_drained"] = True
+                    if fault == "cancel-after-cas":
+                        fixture.update({"second_pid": 0, "second_epoch": 2, "baseline_allocated": 1,
+                                        "baseline_reserved": 2, "held_allocated": 3, "held_reserved": 2,
+                                        "resources_drained": True})
+                    history = root / f"{name}-history.json"
+                    history.write_text(json.dumps({"restart_mode": fault}))
+                    metadata = root / f"{name}-fixture.json"
+                    metadata.write_text(json.dumps(fixture))
+                    paths.append((history, metadata))
+            with mock.patch.object(M3.subprocess, "run") as recheck:
+                self.assertEqual(20, len(M3.validate_j28_histories(root, root, source)))
+                self.assertEqual(20, recheck.call_count)
+                metadata = paths[-1][1]
+                metadata.write_text(metadata.read_text().replace(source, "b" * 40))
+                with self.assertRaises(ValueError):
+                    M3.validate_j28_histories(root, root, source)
+                paths[0][0].unlink()
+                with self.assertRaises(ValueError):
+                    M3.validate_j28_histories(root, root, source)
+
     def test_registry_records_future_coverage_without_claiming_test_results(self):
         registry = M3.read_json(M3.REPO / "testkit/cases/m3-cases.json")
         M3.validate_case_registry(registry)

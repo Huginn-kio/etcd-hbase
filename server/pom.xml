@@ -24,6 +24,30 @@
   </build>
   <profiles>
     <profile>
+      <id>m3-j28-history-public</id>
+      <properties>
+        <j03.skipWire>false</j03.skipWire>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <failIfNoTests>true</failIfNoTests>
+              <includes combine.self="override">
+                <include>**/M3HistoryRpcIT.java</include>
+                <include>**/M3HistoryFailoverIT.java</include>
+                <include>**/M3ProcessRecoveryIT.java</include>
+                <include>**/M3TxnCommitIT.java</include>
+              </includes>
+              <forkedProcessTimeoutInSeconds>1200</forkedProcessTimeoutInSeconds>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
       <id>m3-j35-public</id>
       <properties>
         <j03.skipWire>false</j03.skipWire>
