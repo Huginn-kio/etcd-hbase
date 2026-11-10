@@ -7,7 +7,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import etcdserverpb.KVGrpc;
 import etcdserverpb.Rpc;
 import io.etcdhbase.core.request.RequestScope;
-import io.etcdhbase.grpc.RequestCompletionRecorder;
 import io.etcdhbase.grpc.RequestScopeInterceptor;
 import io.grpc.CallOptions;
 import io.grpc.ClientCall;

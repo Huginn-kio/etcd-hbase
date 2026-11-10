@@ -9,7 +9,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
-import io.etcdhbase.core.commit.CommitFinalizationService;
 import io.etcdhbase.core.commit.CommitOutcomeResolver;
 import io.etcdhbase.core.commit.CommitOwnerService;
 import io.etcdhbase.core.commit.CommitPlanVerifier;
@@ -36,10 +35,7 @@ import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.grpc.protocol.PutResponseEmitter;
 import io.etcdhbase.hbase.codec.ResultMessages;
-import io.etcdhbase.hbase.storage.HBaseCommitDecisionRepository;
 import io.etcdhbase.hbase.storage.HBaseInvocationRepository;
-import io.etcdhbase.hbase.storage.HBaseManifestRepository;
-import io.etcdhbase.hbase.storage.HBaseResultRepository;
 import io.etcdhbase.hbase.storage.M3TestEnvironment;
 import io.etcdhbase.hbase.storage.StorageTableBinding;
 import io.etcdhbase.server.commit.BoundedPublicationHandoff;
