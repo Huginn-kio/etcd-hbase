@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -109,6 +110,28 @@ func TestDriverCanRunAnIsolatedPinnedNativeServer(t *testing.T) {
 	}
 	if _, err := parseOptions(append(args, "--endpoint", "127.0.0.1:2379"), &bytes.Buffer{}); err == nil {
 		t.Fatal("native data directory and endpoint were accepted together")
+	}
+}
+
+func TestEvidenceRecordsTraceCloseFailure(t *testing.T) {
+	metadataFile, err := os.Create(filepath.Join(t.TempDir(), "metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeFailure := errors.New("trace close failed")
+	var stdout bytes.Buffer
+	output := evidenceOutput{options: options{trace: "trace.jsonl"}, stdout: &stdout,
+		traceHash: sha256.New(), closeTrace: func() error { return closeFailure }, metadata: metadataFile}
+	if err := output.finish(nil); !errors.Is(err, closeFailure) {
+		t.Fatalf("trace close failure was lost: %v", err)
+	}
+	contents, err := os.ReadFile(metadataFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evidence runMetadata
+	if err := json.Unmarshal(contents, &evidence); err != nil || evidence.Status != "failed" || stdout.Len() != 0 {
+		t.Fatalf("close failure produced a successful result: status=%q err=%v", evidence.Status, err)
 	}
 }
 

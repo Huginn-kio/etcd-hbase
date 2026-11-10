@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"os/signal"
@@ -58,32 +59,57 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (runErr e
 	if options.nativeData == "" {
 		build.Distribution = "remote endpoint; Go build metadata does not attest the server version"
 	}
-	output, closeOutput, err := openTrace(options.trace, stdout)
+	evidence, err := openEvidence(options, build, suiteSHA256, stdout)
 	if err != nil {
 		return err
 	}
+	defer func() { runErr = evidence.finish(runErr) }()
+	return executeScenario(ctx, options, evidence.trace)
+}
+
+type evidenceOutput struct {
+	options     options
+	build       scenario.Metadata
+	suiteSHA256 string
+	stdout      io.Writer
+	trace       io.Writer
+	traceHash   hash.Hash
+	closeTrace  func() error
+	metadata    *os.File
+}
+
+func openEvidence(options options, build scenario.Metadata, suiteSHA256 string, stdout io.Writer) (*evidenceOutput, error) {
+	output, closeOutput, err := openTrace(options.trace, stdout)
+	if err != nil {
+		return nil, err
+	}
 	metadataFile, err := os.OpenFile(options.metadata, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		_ = closeOutput()
-		return errors.New("M3 metadata output could not be opened")
+		return nil, errors.Join(errors.New("M3 metadata output could not be opened"), closeOutput())
 	}
 	traceHash := sha256.New()
-	output = io.MultiWriter(output, traceHash)
-	defer func() {
-		runErr = errors.Join(runErr, closeOutput())
-		status := "passed"
-		if runErr != nil {
-			status = "failed"
-		}
-		prefixHash := sha256.Sum256([]byte(options.prefix))
-		evidence := runMetadata{Build: build, SuiteSHA256: suiteSHA256, EvidenceScope: options.scope,
-			PrefixSHA256: hex.EncodeToString(prefixHash[:]), TraceSHA256: hex.EncodeToString(traceHash.Sum(nil)),
-			EmbeddedNative: options.nativeData != "", Layout: options.layout, Status: status}
-		runErr = errors.Join(runErr, json.NewEncoder(metadataFile).Encode(evidence), metadataFile.Close())
-		if runErr == nil && options.trace != "-" {
-			_, runErr = fmt.Fprintln(stdout, "M3 Put scenario passed")
-		}
-	}()
+	return &evidenceOutput{options: options, build: build, suiteSHA256: suiteSHA256, stdout: stdout,
+		trace: io.MultiWriter(output, traceHash), traceHash: traceHash, closeTrace: closeOutput, metadata: metadataFile}, nil
+}
+
+func (output *evidenceOutput) finish(runErr error) error {
+	runErr = errors.Join(runErr, output.closeTrace())
+	status := "passed"
+	if runErr != nil {
+		status = "failed"
+	}
+	prefixHash := sha256.Sum256([]byte(output.options.prefix))
+	evidence := runMetadata{Build: output.build, SuiteSHA256: output.suiteSHA256, EvidenceScope: output.options.scope,
+		PrefixSHA256: hex.EncodeToString(prefixHash[:]), TraceSHA256: hex.EncodeToString(output.traceHash.Sum(nil)),
+		EmbeddedNative: output.options.nativeData != "", Layout: output.options.layout, Status: status}
+	runErr = errors.Join(runErr, json.NewEncoder(output.metadata).Encode(evidence), output.metadata.Close())
+	if runErr == nil && output.options.trace != "-" {
+		_, runErr = fmt.Fprintln(output.stdout, "M3 Put scenario passed")
+	}
+	return runErr
+}
+
+func executeScenario(ctx context.Context, options options, output io.Writer) (runErr error) {
 	requestContext, cancel := context.WithTimeout(ctx, options.timeout)
 	defer cancel()
 	if options.nativeData != "" {

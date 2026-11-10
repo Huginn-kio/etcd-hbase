@@ -47,9 +47,7 @@ class SerialMutationQueueTest {
       firstWork.complete("finish");
       firstScope.close();
       waitingScope.close();
-      queue.close();
-      queue.drained().get(5, TimeUnit.SECONDS);
-      assertTrue(queue.awaitTermination(Duration.ofSeconds(5)));
+      closeAndAssertDrained(queue);
     }
   }
 
@@ -88,9 +86,7 @@ class SerialMutationQueueTest {
       firstScope.close();
       waitingScope.close();
       nextScope.close();
-      queue.close();
-      queue.drained().get(5, TimeUnit.SECONDS);
-      assertTrue(queue.awaitTermination(Duration.ofSeconds(5)));
+      closeAndAssertDrained(queue);
     }
   }
 
@@ -122,9 +118,7 @@ class SerialMutationQueueTest {
       firstScope.close();
       secondScope.close();
       rejectedScope.close();
-      queue.close();
-      queue.drained().get(5, TimeUnit.SECONDS);
-      assertTrue(queue.awaitTermination(Duration.ofSeconds(5)));
+      closeAndAssertDrained(queue);
     }
   }
 
@@ -164,9 +158,7 @@ class SerialMutationQueueTest {
       physical.complete(null);
       firstScope.close();
       secondScope.close();
-      queue.close();
-      queue.drained().get(5, TimeUnit.SECONDS);
-      assertTrue(queue.awaitTermination(Duration.ofSeconds(5)));
+      closeAndAssertDrained(queue);
     }
   }
 
@@ -196,9 +188,7 @@ class SerialMutationQueueTest {
       work.complete("finish");
       firstScope.close();
       secondScope.close();
-      queue.close();
-      queue.drained().get(5, TimeUnit.SECONDS);
-      assertTrue(queue.awaitTermination(Duration.ofSeconds(5)));
+      closeAndAssertDrained(queue);
     }
   }
 
@@ -213,15 +203,19 @@ class SerialMutationQueueTest {
         return processing;
       });
       assertCategory(BackendFailure.Category.TIMEOUT, result);
-      queue.close();
-      queue.drained().get(5, TimeUnit.SECONDS);
-      assertTrue(queue.awaitTermination(Duration.ofSeconds(5)));
+      closeAndAssertDrained(queue);
       assertEquals(0, queue.snapshot().retainedBytes());
     } finally {
       request.close();
       queue.close();
       queue.drained().get(5, TimeUnit.SECONDS);
     }
+  }
+
+  private static void closeAndAssertDrained(SerialMutationQueue queue) throws Exception {
+    queue.close();
+    queue.drained().get(5, TimeUnit.SECONDS);
+    assertTrue(queue.awaitTermination(Duration.ofSeconds(5)));
   }
 
   private static void assertCategory(BackendFailure.Category category, CompletableFuture<?> result) {

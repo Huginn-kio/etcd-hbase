@@ -35,6 +35,18 @@ import org.junit.jupiter.api.Test;
 class M3PutRpcIT {
   @Test
   void realGoPutMatchesNativeAcrossLayouts() throws Exception {
+    RunContext run = prepareRun();
+    prepareNativeEvidence(run);
+    for (StorageTableBinding.Layout layout : List.of(
+        StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
+      runAndCompareLayout(run, layout);
+    }
+    writeFixtureEvidence(run);
+  }
+
+  private record RunContext(Path root, Path artifacts, String runId, String prefix, Path nativeTrace) {}
+
+  private static RunContext prepareRun() throws Exception {
     Path root = WireProcesses.repositoryRoot();
     String configuredRun = System.getenv("M3_RUN_ID");
     String runId = configuredRun == null ? "rpc-" + UUID.randomUUID() : configuredRun;
@@ -49,45 +61,50 @@ class M3PutRpcIT {
       throw new IllegalArgumentException("M3 fixture output must be under its run directory");
     }
     Files.createDirectories(artifacts);
-    String prefix = "etcd-hbase-m3-test/" + runId + "/";
-    Path nativeTrace = artifacts.resolve("native-trace.jsonl");
-    if (!Files.exists(nativeTrace)) {
-      runDriver(root, artifacts.resolve("fixture-native.log"), "--native-data-dir",
-          artifacts.resolve("native-data").toString(), "--scope", "native-etcd", "--prefix", prefix,
-          "--trace", nativeTrace.toString(), "--metadata", artifacts.resolve("native-metadata.json").toString());
+    return new RunContext(root, artifacts, runId, "etcd-hbase-m3-test/" + runId + "/",
+        artifacts.resolve("native-trace.jsonl"));
+  }
+
+  private static void prepareNativeEvidence(RunContext run) throws Exception {
+    if (!Files.exists(run.nativeTrace())) {
+      runDriver(run.root(), run.artifacts().resolve("fixture-native.log"), "--native-data-dir",
+          run.artifacts().resolve("native-data").toString(), "--scope", "native-etcd", "--prefix", run.prefix(),
+          "--trace", run.nativeTrace().toString(), "--metadata", run.artifacts().resolve("native-metadata.json").toString());
     }
-    for (StorageTableBinding.Layout layout : List.of(
-        StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
-      String suffix = layout.name().toLowerCase(Locale.ROOT);
-      try (M3TestEnvironment fixture = M3TestEnvironment.start(layout);
-           M3PutCommitIT.Engine engine = new M3PutCommitIT.Engine(fixture);
-           Bootstrap server = Bootstrap.startConfigured(
-               new RuntimeConfiguration.Listener("m3-test", "127.0.0.1", 0,
-                   fixture.system().tableGroupId()),
-               new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000,
-                   4 << 20, 4 << 20, 16, 0), engine.putService())) {
-        assertForeignTableCannotJoinGroup(fixture);
-        runDriver(root, artifacts.resolve("target-" + suffix + ".log"),
-            "--endpoint", "127.0.0.1:" + server.boundListener().port(), "--scope", "target-hbase",
-            "--layout", layout.name(), "--prefix", prefix,
-            "--trace", artifacts.resolve("target-" + suffix + "-trace.jsonl").toString(),
-            "--metadata", artifacts.resolve("target-" + suffix + "-metadata.json").toString());
-        assertLeaseFailsBeforePublication(fixture, server, prefix);
-        assertPhysicalRecords(fixture, prefix);
-        assertLostOwnerReplyUsesOriginalResult(fixture, engine, server, prefix);
-      }
-      run(root, artifacts.resolve("compare-" + suffix + ".log"), List.of(
-          root.resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare", "--m3-put",
-          "--left", nativeTrace.toString(), "--right",
-          artifacts.resolve("target-" + suffix + "-trace.jsonl").toString()));
+  }
+
+  private static void runAndCompareLayout(RunContext run, StorageTableBinding.Layout layout) throws Exception {
+    String suffix = layout.name().toLowerCase(Locale.ROOT);
+    try (M3TestEnvironment fixture = M3TestEnvironment.start(layout);
+         M3PutCommitIT.Engine engine = new M3PutCommitIT.Engine(fixture);
+         Bootstrap server = Bootstrap.startConfigured(
+             new RuntimeConfiguration.Listener("m3-test", "127.0.0.1", 0, fixture.system().tableGroupId()),
+             new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000,
+                 4 << 20, 4 << 20, 16, 0), engine.putService())) {
+      assertForeignTableCannotJoinGroup(fixture);
+      runDriver(run.root(), run.artifacts().resolve("target-" + suffix + ".log"),
+          "--endpoint", "127.0.0.1:" + server.boundListener().port(), "--scope", "target-hbase",
+          "--layout", layout.name(), "--prefix", run.prefix(),
+          "--trace", run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString(),
+          "--metadata", run.artifacts().resolve("target-" + suffix + "-metadata.json").toString());
+      assertLeaseFailsBeforePublication(fixture, server, run.prefix());
+      assertPhysicalRecords(fixture, run.prefix());
+      assertLostOwnerReplyUsesOriginalResult(fixture, engine, server, run.prefix());
     }
+    run(run.root(), run.artifacts().resolve("compare-" + suffix + ".log"), List.of(
+        run.root().resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare", "--m3-put",
+        "--left", run.nativeTrace().toString(), "--right",
+        run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString()));
+  }
+
+  private static void writeFixtureEvidence(RunContext run) throws Exception {
     String source = System.getenv("M3_SOURCE_COMMIT");
     if (source != null) {
       if (!source.matches("[0-9a-f]{40}")) throw new IllegalArgumentException("invalid source commit");
-      String metadata = "{\"kind\":\"java-grpc-hbase-minicluster\",\"run_id\":\"" + runId
+      String metadata = "{\"kind\":\"java-grpc-hbase-minicluster\",\"run_id\":\"" + run.runId()
           + "\",\"source_commit\":\"" + source
           + "\",\"authentication\":\"dev-no-auth\",\"layouts\":[\"HISTORY\",\"NATIVE\"]}\n";
-      Files.writeString(artifacts.resolve("target-fixture.json"), metadata,
+      Files.writeString(run.artifacts().resolve("target-fixture.json"), metadata,
           java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE);
     }
   }

@@ -143,18 +143,9 @@ class M3PutCommitIT {
       this.fixture = fixture;
       var limits = new BudgetManager.Limits(4, 4, 4, 4, 4, 1L << 20, 256L << 20);
       budgets = new BudgetManager(limits, Map.of(fixture.system().tableGroupId(), limits), limits);
-      try (RequestScope scope = RequestScope.withTimeout(TIMEOUT)) {
-        stores = TableGroupStores.open(fixture.factory(), fixture.identity(), fixture.system(),
-            fixture.primary(), fixture.current(), new SnapshotPinConfiguration(
-                2, 16, Duration.ofSeconds(60)), scope).join();
-        assertEquals(fixture.clusterId(), stores.clusterId());
-        long now = System.currentTimeMillis();
-        if (ownerLease.isNegative() || ownerLease.isZero()) {
-          throw new IllegalArgumentException("fixture owner lease must be positive");
-        }
-        owner = new CommitOwnerService(stores.control()).claim("m3-test-owner", now,
-            Math.addExact(now, ownerLease.toMillis()), scope).join().orElseThrow();
-      }
+      var opened = openStoresAndClaimOwner(fixture, ownerLease);
+      stores = opened.stores();
+      owner = opened.owner();
       invocationStore = stores.invocations();
       invocations = new InvocationService(invocationStore);
       manifests = stores.manifests();
@@ -174,6 +165,29 @@ class M3PutCommitIT {
           fixture.system().profileFingerprint(), stores.control(), views, manifests,
           fixture.factory(), fixture.primary(), worker, preparation, publisher, 5L << 20, 8L << 20);
       ownerQueue = new SerialMutationQueue(4, 64L << 20, TIMEOUT);
+      relay = createRelay();
+    }
+
+    private record StoreOwner(TableGroupStores stores, CommitOwnerService.OwnerToken owner) {}
+
+    private static StoreOwner openStoresAndClaimOwner(M3TestEnvironment fixture, Duration ownerLease)
+        throws Exception {
+      try (RequestScope scope = RequestScope.withTimeout(TIMEOUT)) {
+        var stores = TableGroupStores.open(fixture.factory(), fixture.identity(), fixture.system(),
+            fixture.primary(), fixture.current(), new SnapshotPinConfiguration(
+                2, 16, Duration.ofSeconds(60)), scope).join();
+        assertEquals(fixture.clusterId(), stores.clusterId());
+        long now = System.currentTimeMillis();
+        if (ownerLease.isNegative() || ownerLease.isZero()) {
+          throw new IllegalArgumentException("fixture owner lease must be positive");
+        }
+        var owner = new CommitOwnerService(stores.control()).claim("m3-test-owner", now,
+            Math.addExact(now, ownerLease.toMillis()), scope).join().orElseThrow();
+        return new StoreOwner(stores, owner);
+      }
+    }
+
+    private MutationRelay createRelay() {
       var processor = new PutOwnerProcessor(fixture.system().tableGroupId(), owner, budgets,
           reservation(), mutations, outcomes);
       var receiver = new MutationForwardReceiver(stores.control(), invocations,
@@ -186,7 +200,7 @@ class M3PutCommitIT {
       var route = new OwnerForwarding.Route(owner.instance(), owner.epoch(),
           "fixture-loopback-endpoint", "fixture-loopback-peer");
       // This is an explicitly restricted in-process channel for the disposable fixture only.
-      relay = new MutationRelay(stores.control(),
+      return new MutationRelay(stores.control(),
           (group, instance, epoch) -> group.equals(fixture.system().tableGroupId())
               && instance.equals(owner.instance()) && epoch == owner.epoch()
                   ? java.util.concurrent.CompletableFuture.completedFuture(route)
@@ -358,20 +372,7 @@ class M3PutCommitIT {
         BudgetManager.Account account = account(scope);
         var resolved = resolver.resolve(receipt.id(), receipt.requestDigest(), AUTHORIZATION,
             scope, account).join();
-        var observer = new io.grpc.stub.StreamObserver<etcdserverpb.Rpc.PutResponse>() {
-          @Override public void onNext(etcdserverpb.Rpc.PutResponse value) {
-            assertEquals(receipt.result().revision(), value.getHeader().getRevision());
-            entered.countDown();
-            try {
-              if (!release.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("serializer stalled");
-            } catch (InterruptedException interrupted) {
-              Thread.currentThread().interrupt();
-              throw new IllegalStateException("serializer interrupted", interrupted);
-            }
-          }
-          @Override public void onError(Throwable failure) { errors.incrementAndGet(); }
-          @Override public void onCompleted() { completed.incrementAndGet(); }
-        };
+        var observer = blockingObserver(receipt, entered, release, completed, errors);
         var command = new PutCommand(KEY, new byte[] {2, (byte) 0xff}, 0, true, false, false);
         sending = Thread.ofPlatform().start(() -> {
           try {
@@ -396,6 +397,25 @@ class M3PutCommitIT {
         if (sending != null) sending.join(TimeUnit.SECONDS.toMillis(10));
         closeScope(scope);
       }
+    }
+
+    private io.grpc.stub.StreamObserver<etcdserverpb.Rpc.PutResponse> blockingObserver(
+        Receipt receipt, CountDownLatch entered, CountDownLatch release,
+        AtomicInteger completed, AtomicInteger errors) {
+      return new io.grpc.stub.StreamObserver<etcdserverpb.Rpc.PutResponse>() {
+        @Override public void onNext(etcdserverpb.Rpc.PutResponse value) {
+          assertEquals(receipt.result().revision(), value.getHeader().getRevision());
+          entered.countDown();
+          try {
+            if (!release.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("serializer stalled");
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("serializer interrupted", interrupted);
+          }
+        }
+        @Override public void onError(Throwable failure) { errors.incrementAndGet(); }
+        @Override public void onCompleted() { completed.incrementAndGet(); }
+      };
     }
 
     private void assertTerminalFailuresDoNotDoubleComplete(Receipt receipt) throws Exception {

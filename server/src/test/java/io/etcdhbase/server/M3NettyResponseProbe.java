@@ -46,39 +46,68 @@ final class M3NettyResponseProbe {
 
   static void verifyCancellationDuringSerialization(Responder responder, LongSupplier allocatedBytes)
       throws Exception {
-    var entered = new CountDownLatch(1);
-    var release = new CountDownLatch(1);
-    var cancelled = new CountDownLatch(1);
-    var completed = new CountDownLatch(1);
-    var requestScope = new AtomicReference<RequestScope>();
-    var failure = new AtomicReference<Throwable>();
-    var scheduler = new ScheduledThreadPoolExecutor(1);
-    var workers = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
-        new ArrayBlockingQueue<>(1), Thread.ofPlatform().daemon().name("m3-netty-probe-", 0).factory());
-    var interceptor = new RequestScopeInterceptor(scheduler, 1, Duration.ofSeconds(30), 1024,
-        (method, outcome, trace, scope, elapsed) -> completed.countDown());
-    MethodDescriptor<Rpc.PutRequest, Rpc.PutResponse> original = KVGrpc.getPutMethod();
-    var descriptor = original.toBuilder(original.getRequestMarshaller(),
-        slowMarshaller(original.getResponseMarshaller(), entered, release)).build();
-    var service = ServerServiceDefinition.builder(KVGrpc.SERVICE_NAME)
-        .addMethod(descriptor, ServerCalls.asyncUnaryCall((request, response) -> {
-          RequestScope scope = RequestScopeInterceptor.currentScope();
-          requestScope.set(scope);
-          scope.registerCleanup(cancelled::countDown);
-          workers.execute(() -> {
-            try {
-              responder.send(scope, response);
-            } catch (Throwable problem) {
-              failure.set(problem);
-              if (!scope.isClosed()) response.onError(problem);
-            }
-          });
-        })).build();
-    Server server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
-        .intercept(interceptor).addService(service).build().start();
-    ManagedChannel channel = NettyChannelBuilder.forAddress("127.0.0.1", server.getPort())
-        .usePlaintext().build();
+    var probe = new Probe(responder, allocatedBytes);
     try {
+      probe.start();
+      probe.verifyCancellation();
+    } finally {
+      probe.close();
+    }
+  }
+
+  /** Owns the server, client and executors for one serialization probe. */
+  private static final class Probe implements AutoCloseable {
+    private final Responder responder;
+    private final LongSupplier allocatedBytes;
+    private final CountDownLatch entered = new CountDownLatch(1);
+    private final CountDownLatch release = new CountDownLatch(1);
+    private final CountDownLatch cancelled = new CountDownLatch(1);
+    private final CountDownLatch completed = new CountDownLatch(1);
+    private final AtomicReference<RequestScope> requestScope = new AtomicReference<>();
+    private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    private final ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1);
+    private final ThreadPoolExecutor workers = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue<>(1), Thread.ofPlatform().daemon().name("m3-netty-probe-", 0).factory());
+    private final RequestScopeInterceptor interceptor = new RequestScopeInterceptor(scheduler, 1,
+        Duration.ofSeconds(30), 1024, (method, outcome, trace, scope, elapsed) -> completed.countDown());
+    private MethodDescriptor<Rpc.PutRequest, Rpc.PutResponse> descriptor;
+    private Server server;
+    private ManagedChannel channel;
+
+    private Probe(Responder responder, LongSupplier allocatedBytes) {
+      this.responder = responder;
+      this.allocatedBytes = allocatedBytes;
+    }
+
+    private void start() throws IOException {
+      MethodDescriptor<Rpc.PutRequest, Rpc.PutResponse> original = KVGrpc.getPutMethod();
+      descriptor = original.toBuilder(original.getRequestMarshaller(),
+          slowMarshaller(original.getResponseMarshaller(), entered, release)).build();
+      server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
+          .intercept(interceptor).addService(service()).build().start();
+      channel = NettyChannelBuilder.forAddress("127.0.0.1", server.getPort()).usePlaintext().build();
+    }
+
+    private ServerServiceDefinition service() {
+      return ServerServiceDefinition.builder(KVGrpc.SERVICE_NAME)
+          .addMethod(descriptor, ServerCalls.asyncUnaryCall((request, response) -> {
+            RequestScope scope = RequestScopeInterceptor.currentScope();
+            requestScope.set(scope);
+            scope.registerCleanup(cancelled::countDown);
+            workers.execute(() -> send(scope, response));
+          })).build();
+    }
+
+    private void send(RequestScope scope, StreamObserver<Rpc.PutResponse> response) {
+      try {
+        responder.send(scope, response);
+      } catch (Throwable problem) {
+        failure.set(problem);
+        if (!scope.isClosed()) response.onError(problem);
+      }
+    }
+
+    private void verifyCancellation() throws Exception {
       ClientCall<Rpc.PutRequest, Rpc.PutResponse> call = channel.newCall(descriptor, CallOptions.DEFAULT);
       call.start(new ClientCall.Listener<>() {
         @Override public void onClose(Status status, Metadata trailers) {}
@@ -96,12 +125,18 @@ final class M3NettyResponseProbe {
       requestScope.get().cleanupCompletion().toCompletableFuture().get(10, TimeUnit.SECONDS);
       assertTrue(completed.await(10, TimeUnit.SECONDS));
       assertNull(failure.get());
-    } finally {
+    }
+
+    @Override public void close() throws InterruptedException {
       release.countDown();
-      channel.shutdownNow();
-      channel.awaitTermination(10, TimeUnit.SECONDS);
-      server.shutdownNow();
-      server.awaitTermination(10, TimeUnit.SECONDS);
+      if (channel != null) {
+        channel.shutdownNow();
+        channel.awaitTermination(10, TimeUnit.SECONDS);
+      }
+      if (server != null) {
+        server.shutdownNow();
+        server.awaitTermination(10, TimeUnit.SECONDS);
+      }
       workers.shutdownNow();
       workers.awaitTermination(10, TimeUnit.SECONDS);
       interceptor.close();
