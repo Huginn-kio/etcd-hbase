@@ -2,6 +2,7 @@ package scenario
 
 import (
 	"bytes"
+	"context"
 	"math"
 	"testing"
 
@@ -80,6 +81,11 @@ func TestM3NativeNestedHistoricalReadAndRevisionPrecheck(t *testing.T) {
 		len(current.Kvs) != 1 || len(old.Kvs) != 1 || string(current.Kvs[0].Value) != "new" || string(old.Kvs[0].Value) != "old" {
 		t.Fatal("native nested historical read or response header differs")
 	}
+	assertNativeRevisionPrecheck(t, ctx, kv, key)
+}
+
+func assertNativeRevisionPrecheck(t *testing.T, ctx context.Context, kv etcdserverpb.KVClient, key []byte) {
+	t.Helper()
 	for _, test := range []struct {
 		revision int64
 		semantic string
@@ -113,22 +119,31 @@ func TestM3NativeNestedStaticOverlapAndDynamicErrorOrder(t *testing.T) {
 			RequestDeleteRange: &etcdserverpb.DeleteRangeRequest{Key: []byte(start), RangeEnd: []byte(end)},
 		}}
 	}
-	nested := func(then, otherwise []*etcdserverpb.RequestOp) *etcdserverpb.RequestOp {
-		return &etcdserverpb.RequestOp{Request: &etcdserverpb.RequestOp_RequestTxn{
-			RequestTxn: &etcdserverpb.TxnRequest{Success: then, Failure: otherwise},
-		}}
-	}
+
+	assertNativeStaticOverlaps(t, ctx, kv, put, del)
+	assertNativeDynamicOrder(t, ctx, kv)
+}
+
+func m3NativeNested(then, otherwise []*etcdserverpb.RequestOp) *etcdserverpb.RequestOp {
+	return &etcdserverpb.RequestOp{Request: &etcdserverpb.RequestOp_RequestTxn{
+		RequestTxn: &etcdserverpb.TxnRequest{Success: then, Failure: otherwise},
+	}}
+}
+
+func assertNativeStaticOverlaps(t *testing.T, ctx context.Context, kv etcdserverpb.KVClient,
+	put func(string) *etcdserverpb.RequestOp, del func(string, string) *etcdserverpb.RequestOp) {
+	t.Helper()
 	for _, test := range []struct {
 		name     string
 		ops      []*etcdserverpb.RequestOp
 		semantic string
 	}{
-		{"exclusive-child-puts", []*etcdserverpb.RequestOp{nested([]*etcdserverpb.RequestOp{put("a")}, []*etcdserverpb.RequestOp{put("a")})}, ""},
-		{"exclusive-child-put-delete", []*etcdserverpb.RequestOp{nested([]*etcdserverpb.RequestOp{put("a")}, []*etcdserverpb.RequestOp{del("a", "")})}, ""},
-		{"siblings-put-duplicate", []*etcdserverpb.RequestOp{nested([]*etcdserverpb.RequestOp{put("a")}, nil), nested([]*etcdserverpb.RequestOp{put("a")}, nil)}, "etcd/DuplicateKey"},
-		{"parent-delete-child-put", []*etcdserverpb.RequestOp{del("a", "z"), nested([]*etcdserverpb.RequestOp{put("a")}, nil)}, "etcd/DuplicateKey"},
-		{"child-put-parent-delete-reversed-order", []*etcdserverpb.RequestOp{nested([]*etcdserverpb.RequestOp{put("a")}, nil), del("a", "z")}, "etcd/DuplicateKey"},
-		{"sibling-delete-put", []*etcdserverpb.RequestOp{nested([]*etcdserverpb.RequestOp{del("a", "z")}, nil), nested([]*etcdserverpb.RequestOp{put("m")}, nil)}, "etcd/DuplicateKey"},
+		{"exclusive-child-puts", []*etcdserverpb.RequestOp{m3NativeNested([]*etcdserverpb.RequestOp{put("a")}, []*etcdserverpb.RequestOp{put("a")})}, ""},
+		{"exclusive-child-put-delete", []*etcdserverpb.RequestOp{m3NativeNested([]*etcdserverpb.RequestOp{put("a")}, []*etcdserverpb.RequestOp{del("a", "")})}, ""},
+		{"siblings-put-duplicate", []*etcdserverpb.RequestOp{m3NativeNested([]*etcdserverpb.RequestOp{put("a")}, nil), m3NativeNested([]*etcdserverpb.RequestOp{put("a")}, nil)}, "etcd/DuplicateKey"},
+		{"parent-delete-child-put", []*etcdserverpb.RequestOp{del("a", "z"), m3NativeNested([]*etcdserverpb.RequestOp{put("a")}, nil)}, "etcd/DuplicateKey"},
+		{"child-put-parent-delete-reversed-order", []*etcdserverpb.RequestOp{m3NativeNested([]*etcdserverpb.RequestOp{put("a")}, nil), del("a", "z")}, "etcd/DuplicateKey"},
+		{"sibling-delete-put", []*etcdserverpb.RequestOp{m3NativeNested([]*etcdserverpb.RequestOp{del("a", "z")}, nil), m3NativeNested([]*etcdserverpb.RequestOp{put("m")}, nil)}, "etcd/DuplicateKey"},
 		{"upper-bound-exclusive", []*etcdserverpb.RequestOp{del("a", "z"), put("z")}, ""},
 		{"overlapping-deletes", []*etcdserverpb.RequestOp{del("a", "z"), del("m", "zz")}, ""},
 		{"reversed-delete", []*etcdserverpb.RequestOp{del("z", "a"), put("m")}, ""},
@@ -146,19 +161,23 @@ func TestM3NativeNestedStaticOverlapAndDynamicErrorOrder(t *testing.T) {
 			}
 		})
 	}
+}
+
+func assertNativeDynamicOrder(t *testing.T, ctx context.Context, kv etcdserverpb.KVClient) {
+	t.Helper()
 	future := m3Range([]byte("missing"))
 	future.GetRequestRange().Revision = math.MaxInt64
 	ignoreMissing := &etcdserverpb.RequestOp{Request: &etcdserverpb.RequestOp_RequestPut{
 		RequestPut: &etcdserverpb.PutRequest{Key: []byte("missing-ignore"), IgnoreValue: true},
 	}}
-	_, err = kv.Txn(ctx, &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
-		future, nested([]*etcdserverpb.RequestOp{ignoreMissing}, nil),
+	_, err := kv.Txn(ctx, &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
+		future, m3NativeNested([]*etcdserverpb.RequestOp{ignoreMissing}, nil),
 	}})
 	if got := trace.ClassifyError(err); got == nil || got.SemanticKind != "etcd/KeyNotFound" {
 		t.Fatalf("native validates selected Put before Range revision, got %v", err)
 	}
 	_, err = kv.Txn(ctx, &etcdserverpb.TxnRequest{Failure: []*etcdserverpb.RequestOp{
-		nested([]*etcdserverpb.RequestOp{future, ignoreMissing}, nil),
+		m3NativeNested([]*etcdserverpb.RequestOp{future, ignoreMissing}, nil),
 	}})
 	if err != nil {
 		t.Fatalf("native evaluated an unselected dynamic operation: %v", err)

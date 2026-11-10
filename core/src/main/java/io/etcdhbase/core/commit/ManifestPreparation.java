@@ -1,9 +1,9 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -11,34 +11,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.Executor;
 import java.util.function.Supplier;
 
 /** Sequential, bounded writer for private candidates, ordered events, and Merkle directories. */
 public final class ManifestPreparation {
-  /** Queue for nested continuations currently draining on this thread. */
-  private static final ThreadLocal<ArrayDeque<Runnable>> CONTINUATION_QUEUE =
-      new ThreadLocal<>();
-  /** Runs queued continuations iteratively on the completing thread. */
-  private static final Executor CONTINUATION_EXECUTOR = command -> {
-    ArrayDeque<Runnable> queue = CONTINUATION_QUEUE.get();
-    if (queue != null) {
-      queue.addLast(command);
-      return;
-    }
-    queue = new ArrayDeque<>();
-    CONTINUATION_QUEUE.set(queue);
-    try {
-      queue.addLast(command);
-      Runnable next;
-      while ((next = queue.pollFirst()) != null) {
-        next.run();
-      }
-    } finally {
-      queue.clear();
-      CONTINUATION_QUEUE.remove();
-    }
-  };
+  private static final ContinuationExecutor CONTINUATION_EXECUTOR = new ContinuationExecutor();
 
   public record Limits(long maxCandidates, long maxValueBytes, long maxEvents, long maxEventBytes) {
     public Limits(long maxCandidates, long maxValueBytes) {

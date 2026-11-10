@@ -160,74 +160,93 @@ public final class TxnWorkingSet {
   /** Final candidates are streamed in bucket/key order, with each referenced event verified. */
   public AsyncCursor<PreparedCandidate> candidates() {
     requireFrozen();
-    AsyncCursor<PagedWorksetIndex.EventRef> source = index.scanAll();
-    long expected = index.entryCount();
-    return new AsyncCursor<>() {
-      private long count;
-      private final AtomicBoolean reading = new AtomicBoolean();
-      @Override public CompletableFuture<Optional<PreparedCandidate>> next() {
-        if (!reading.compareAndSet(false, true)) {
-          return CompletableFuture.failedFuture(new IllegalStateException("concurrent workset candidate reads"));
-        }
-        try {
-          return fenceOnFailure(source.next().thenCompose(found -> {
-            if (found.isEmpty()) {
-              if (count != expected) return CompletableFuture.failedFuture(new IllegalStateException("workset candidate count differs"));
-              return CompletableFuture.completedFuture(Optional.<PreparedCandidate>empty());
-            }
-            return event(found.orElseThrow()).thenApply(value -> {
-              count = Math.addExact(count, 1);
-              return Optional.of(new PreparedCandidate(invocation.transactionId(), invocation.preparedOwnerEpoch(),
-                  invocation.baseSequence(), invocation.baseRevision(), value.current()));
-            });
-          })).whenComplete((ignored, failure) -> reading.set(false)).copy();
-        } catch (RuntimeException failure) {
-          reading.set(false);
-          failed = true;
-          return CompletableFuture.failedFuture(failure);
-        } catch (Error fatal) {
-          reading.set(false);
-          failed = true;
-          throw fatal;
-        }
-      }
-    };
+    return new CandidateCursor(index.scanAll(), index.entryCount());
   }
 
   /** Replays the original event order and checks it against the completed checkpoint chain. */
   public AsyncCursor<PreparedEvent> events() {
     requireFrozen();
-    long expected = index.eventCount();
-    ByteKey expectedChain = index.eventChain();
-    return new AsyncCursor<>() {
-      private long ordinal;
-      private ByteKey chain = ByteKey.copyOf(new byte[32]);
-      private final AtomicBoolean reading = new AtomicBoolean();
+    return new EventCursor(index.eventCount(), index.eventChain());
+  }
 
-      @Override public CompletableFuture<Optional<PreparedEvent>> next() {
-        if (!reading.compareAndSet(false, true)) {
-          return CompletableFuture.failedFuture(new IllegalStateException("concurrent workset event reads"));
-        }
-        if (ordinal == expected) {
-          reading.set(false);
-          return fenceOnFailure(chain.equals(expectedChain) ? CompletableFuture.completedFuture(Optional.empty())
-              : CompletableFuture.failedFuture(new IllegalStateException("workset event chain differs")));
-        }
-        try {
-          return fenceOnFailure(readEvent(ordinal).thenApply(event -> {
-            var reference = new PagedWorksetIndex.EventRef(checkedBucket(event.current().key()),
-                event.current().key(), event.ordinal(), event.digest());
-            chain = PagedWorksetIndex.advanceEventChain(chain, reference);
-            ordinal++;
-            return Optional.of(event);
-          })).whenComplete((ignored, failure) -> reading.set(false)).copy();
-        } catch (Error fatal) {
-          reading.set(false);
-          failed = true;
-          throw fatal;
-        }
+  private final class CandidateCursor implements AsyncCursor<PreparedCandidate> {
+    private final AsyncCursor<PagedWorksetIndex.EventRef> source;
+    private final long expected;
+    private final AtomicBoolean reading = new AtomicBoolean();
+    private long count;
+
+    private CandidateCursor(AsyncCursor<PagedWorksetIndex.EventRef> source, long expected) {
+      this.source = source;
+      this.expected = expected;
+    }
+
+    @Override public CompletableFuture<Optional<PreparedCandidate>> next() {
+      if (!reading.compareAndSet(false, true)) {
+        return CompletableFuture.failedFuture(new IllegalStateException("concurrent workset candidate reads"));
       }
-    };
+      try {
+        return settleRead(source.next().thenCompose(this::accept), reading);
+      } catch (RuntimeException failure) {
+        reading.set(false);
+        failed = true;
+        return CompletableFuture.failedFuture(failure);
+      } catch (Error fatal) {
+        reading.set(false);
+        failed = true;
+        throw fatal;
+      }
+    }
+
+    private CompletableFuture<Optional<PreparedCandidate>> accept(Optional<PagedWorksetIndex.EventRef> found) {
+      if (found.isEmpty()) {
+        if (count != expected) return CompletableFuture.failedFuture(new IllegalStateException("workset candidate count differs"));
+        return CompletableFuture.completedFuture(Optional.empty());
+      }
+      return event(found.orElseThrow()).thenApply(value -> {
+        count = Math.addExact(count, 1);
+        return Optional.of(new PreparedCandidate(invocation.transactionId(), invocation.preparedOwnerEpoch(),
+            invocation.baseSequence(), invocation.baseRevision(), value.current()));
+      });
+    }
+  }
+
+  private final class EventCursor implements AsyncCursor<PreparedEvent> {
+    private final long expected;
+    private final ByteKey expectedChain;
+    private final AtomicBoolean reading = new AtomicBoolean();
+    private long ordinal;
+    private ByteKey chain = ByteKey.copyOf(new byte[32]);
+
+    private EventCursor(long expected, ByteKey expectedChain) {
+      this.expected = expected;
+      this.expectedChain = expectedChain;
+    }
+
+    @Override public CompletableFuture<Optional<PreparedEvent>> next() {
+      if (!reading.compareAndSet(false, true)) {
+        return CompletableFuture.failedFuture(new IllegalStateException("concurrent workset event reads"));
+      }
+      if (ordinal == expected) {
+        reading.set(false);
+        return fenceOnFailure(chain.equals(expectedChain) ? CompletableFuture.completedFuture(Optional.empty())
+            : CompletableFuture.failedFuture(new IllegalStateException("workset event chain differs")));
+      }
+      try {
+        return settleRead(readEvent(ordinal).thenApply(this::accept), reading);
+      } catch (Error fatal) {
+        reading.set(false);
+        failed = true;
+        throw fatal;
+      }
+    }
+
+    private Optional<PreparedEvent> accept(PreparedEvent event) {
+      var reference = new PagedWorksetIndex.EventRef(checkedBucket(event.current().key()),
+          event.current().key(), event.ordinal(), event.digest());
+      chain = PagedWorksetIndex.advanceEventChain(chain, reference);
+      ordinal++;
+      return Optional.of(event);
+    }
   }
 
   private CompletableFuture<PreparedEvent> event(PagedWorksetIndex.EventRef reference) {
@@ -304,30 +323,7 @@ public final class TxnWorkingSet {
       }
       try {
         requireReady();
-        return fenceOnFailure(fillBase().thenCompose(ignored -> fillOverlay()).thenApply(ignored -> {
-          requireReady();
-          if (baseHead == null && overlayHead == null) return Optional.<StoredRecord>empty();
-          if (baseHead == null) {
-            StoredRecord selected = overlayHead;
-            overlayHead = null;
-            return Optional.of(selected);
-          }
-          if (overlayHead == null) {
-            StoredRecord selected = baseHead;
-            baseHead = null;
-            return Optional.of(selected);
-          }
-          int order = baseHead.key().compareTo(overlayHead.key());
-          if (order < 0) {
-            StoredRecord selected = baseHead;
-            baseHead = null;
-            return Optional.of(selected);
-          }
-          StoredRecord selected = overlayHead;
-          overlayHead = null;
-          if (order == 0) baseHead = null;
-          return Optional.of(selected);
-        })).whenComplete((ignored, failure) -> reading.set(false)).copy();
+        return settleRead(fillBase().thenCompose(ignored -> fillOverlay()).thenApply(ignored -> selectHead()), reading);
       } catch (RuntimeException failure) {
         reading.set(false);
         failed = true;
@@ -337,6 +333,28 @@ public final class TxnWorkingSet {
         failed = true;
         throw fatal;
       }
+    }
+
+    private Optional<StoredRecord> selectHead() {
+      requireReady();
+      if (baseHead == null && overlayHead == null) return Optional.empty();
+      if (baseHead == null) return consumeOverlay(false);
+      if (overlayHead == null) return consumeBase();
+      int order = baseHead.key().compareTo(overlayHead.key());
+      return order < 0 ? consumeBase() : consumeOverlay(order == 0);
+    }
+
+    private Optional<StoredRecord> consumeBase() {
+      StoredRecord selected = baseHead;
+      baseHead = null;
+      return Optional.of(selected);
+    }
+
+    private Optional<StoredRecord> consumeOverlay(boolean consumesBase) {
+      StoredRecord selected = overlayHead;
+      overlayHead = null;
+      if (consumesBase) baseHead = null;
+      return Optional.of(selected);
     }
 
     private CompletableFuture<Void> fillBase() {
@@ -369,6 +387,10 @@ public final class TxnWorkingSet {
         return event(found.orElseThrow()).thenAccept(value -> overlayHead = value.current());
       });
     }
+  }
+
+  private <T> CompletableFuture<T> settleRead(CompletableFuture<T> operation, AtomicBoolean reading) {
+    return fenceOnFailure(operation).whenComplete((ignored, failure) -> reading.set(false)).copy();
   }
 
   private <T> CompletableFuture<T> fenceOnFailure(CompletableFuture<T> operation) {

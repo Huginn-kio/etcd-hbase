@@ -60,13 +60,24 @@ func (runner *runner) m3NestedTxnScenario(ctx context.Context, prefix string) er
 		return errors.New("nested Txn baseline did not create a key")
 	}
 	base := baseline.Header.Revision
-	versionZero := func(key []byte) *etcdserverpb.Compare {
-		return &etcdserverpb.Compare{Key: key, Target: etcdserverpb.Compare_VERSION,
-			Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: 0}}
+	if err := runner.m3NestedBranch(ctx, kv, key, newKey, base); err != nil {
+		return err
 	}
+	if err := runner.m3NestedHistory(ctx, kv, key, base); err != nil {
+		return err
+	}
+	return runner.m3NestedOtherCases(ctx, kv, key, newKey, prefix, base)
+}
+
+func m3VersionZero(key []byte) *etcdserverpb.Compare {
+	return &etcdserverpb.Compare{Key: key, Target: etcdserverpb.Compare_VERSION,
+		Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: 0}}
+}
+
+func (runner *runner) m3NestedBranch(ctx context.Context, kv etcdserverpb.KVClient, key, newKey []byte, base int64) error {
 	branch, err := runner.m3Txn(ctx, kv, "J32-branch-base", &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
 		m3PutOp(newKey, []byte("new"), false), m3PutOp(key, []byte("base"), false),
-		m3Nested(&etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{versionZero(newKey)},
+		m3Nested(&etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{m3VersionZero(newKey)},
 			Success: []*etcdserverpb.RequestOp{m3Range(newKey)}}),
 	}})
 	if err != nil {
@@ -76,14 +87,17 @@ func (runner *runner) m3NestedTxnScenario(ctx context.Context, prefix string) er
 		return errors.New("nested branch did not commit exactly once")
 	}
 	child := branch.Responses[2].GetResponseTxn()
-	if child == nil || !child.Succeeded || child.Header == nil || child.Header.Revision != 0 ||
-		child.Header.ClusterId != 0 || child.Header.MemberId != 0 || child.Header.RaftTerm != 0 || len(child.Responses) != 1 {
+	if !m3NativeChildSucceeded(child) {
 		return errors.New("nested comparison or child header differs from native semantics")
 	}
 	read := child.Responses[0].GetResponseRange()
 	if read == nil || len(read.Kvs) != 1 || !bytes.Equal(read.Kvs[0].Value, []byte("new")) {
 		return errors.New("nested current read did not observe the completed prior Put")
 	}
+	return nil
+}
+
+func (runner *runner) m3NestedHistory(ctx context.Context, kv etcdserverpb.KVClient, key []byte, base int64) error {
 	old, explicitBase, negative := m3Range(key), m3Range(key), m3Range(key)
 	old.GetRequestRange().Revision = base
 	explicitBase.GetRequestRange().Revision = base + 1
@@ -104,12 +118,15 @@ func (runner *runner) m3NestedTxnScenario(ctx context.Context, prefix string) er
 	}
 	for index, expected := range []string{"latest", "old", "base", "latest"} {
 		rangeResult := historical.Responses[index].GetResponseRange()
-		if rangeResult == nil || rangeResult.Header == nil || rangeResult.Header.Revision != base+2 ||
-			len(rangeResult.Kvs) != 1 || string(rangeResult.Kvs[0].Value) != expected {
+		if !m3RangeHasValue(rangeResult, base+2, expected) {
 			return fmt.Errorf("nested historical response %d differs", index)
 		}
 	}
-	elseTxn := &etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{versionZero(newKey)},
+	return nil
+}
+
+func (runner *runner) m3NestedOtherCases(ctx context.Context, kv etcdserverpb.KVClient, key, newKey []byte, prefix string, base int64) error {
+	elseTxn := &etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{m3VersionZero(newKey)},
 		Success: []*etcdserverpb.RequestOp{m3Range(newKey)}, Failure: []*etcdserverpb.RequestOp{
 			m3Nested(&etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{m3Range(key)}})}}
 	otherwise, err := runner.m3Txn(ctx, kv, "J32-nested-else", &etcdserverpb.TxnRequest{
@@ -117,8 +134,7 @@ func (runner *runner) m3NestedTxnScenario(ctx context.Context, prefix string) er
 	if err != nil {
 		return err
 	}
-	if otherwise.Header == nil || otherwise.Header.Revision != base+2 || len(otherwise.Responses) != 1 ||
-		otherwise.Responses[0].GetResponseTxn() == nil || otherwise.Responses[0].GetResponseTxn().Succeeded {
+	if !m3NestedElseSelected(otherwise, base+2) {
 		return errors.New("nested Else branch or read-only revision differs")
 	}
 	future := m3Range(key)
@@ -135,6 +151,10 @@ func (runner *runner) m3NestedTxnScenario(ctx context.Context, prefix string) er
 			Success: []*etcdserverpb.RequestOp{exclusive}, Failure: []*etcdserverpb.RequestOp{exclusive}})}}); err != nil {
 		return err
 	}
+	return runner.m3NestedErrors(ctx, kv, key, prefix, future, ignored, exclusive)
+}
+
+func (runner *runner) m3NestedErrors(ctx context.Context, kv etcdserverpb.KVClient, key []byte, prefix string, future, ignored, exclusive *etcdserverpb.RequestOp) error {
 	negativeTooOld := m3Range(key)
 	negativeTooOld.GetRequestRange().Revision = -2
 	deleteRange := &etcdserverpb.RequestOp{Request: &etcdserverpb.RequestOp_RequestDeleteRange{
@@ -163,6 +183,24 @@ func (runner *runner) m3NestedTxnScenario(ctx context.Context, prefix string) er
 		}
 	}
 	return nil
+}
+
+func m3NativeChildSucceeded(child *etcdserverpb.TxnResponse) bool {
+	return child != nil && child.Succeeded && child.Header != nil && child.Header.Revision == 0 &&
+		child.Header.ClusterId == 0 && child.Header.MemberId == 0 && child.Header.RaftTerm == 0 && len(child.Responses) == 1
+}
+
+func m3RangeHasValue(result *etcdserverpb.RangeResponse, revision int64, expected string) bool {
+	return result != nil && result.Header != nil && result.Header.Revision == revision &&
+		len(result.Kvs) == 1 && string(result.Kvs[0].Value) == expected
+}
+
+func m3NestedElseSelected(response *etcdserverpb.TxnResponse, revision int64) bool {
+	if response.Header == nil || response.Header.Revision != revision || len(response.Responses) != 1 {
+		return false
+	}
+	child := response.Responses[0].GetResponseTxn()
+	return child != nil && !child.Succeeded
 }
 
 func m3Nested(request *etcdserverpb.TxnRequest) *etcdserverpb.RequestOp {

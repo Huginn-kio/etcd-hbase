@@ -260,27 +260,14 @@ class M3TxnCommitIT {
     }
 
     private void assertUncertainWorksetCannotReplay() throws Exception {
-      var deliveredPage = new AtomicBoolean();
-      SystemRecordStore underlying = stores.records();
-      SystemRecordStore uncertain = new SystemRecordStore() {
-        @Override public CompletableFuture<Optional<ByteKey>> read(
-            SystemRecordType type, ByteKey id, RequestScope scope) { return underlying.read(type, id, scope); }
-        @Override public int bucket(SystemRecordType type, ByteKey id) { return underlying.bucket(type, id); }
-        @Override public CompletableFuture<CreateResult> createIfAbsent(
-            SystemRecordType type, ByteKey id, ByteKey value, RequestScope scope) {
-          return underlying.createIfAbsent(type, id, value, scope).thenCompose(result -> {
-            if (type == SystemRecordType.WORKSET && id.length() == 29 && deliveredPage.compareAndSet(false, true)) {
-              return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
-            }
-            return CompletableFuture.completedFuture(result);
-          });
-        }
-        @Override public CompletableFuture<Boolean> compareAndSet(SystemRecordType type, ByteKey id,
-            Optional<ByteKey> expected, ByteKey replacement, RequestScope scope) {
-          return underlying.compareAndSet(type, id, expected, replacement, scope);
-        }
-      };
+      var uncertain = new UncertainPageStore(stores.records());
       var command = new TxnCommand(List.of(), List.of(put("uncertain", "private")), List.of());
+      InvocationBinding binding = writeUncertainPage(command, uncertain);
+      assertUncertainRetryRejected(command, binding);
+      recoverFencedAttempt(command, binding);
+    }
+
+    private InvocationBinding writeUncertainPage(TxnCommand command, UncertainPageStore uncertain) throws Exception {
       InvocationBinding binding;
       RequestScope first = RequestScope.withTimeout(TIMEOUT);
       try {
@@ -291,10 +278,15 @@ class M3TxnCommitIT {
             control.publishedRevision()), first).join();
         var evaluator = evaluator(first, account, uncertain);
         assertThrows(CompletionException.class, () -> evaluator.evaluate(command, Optional.of(binding)).join());
-        assertTrue(deliveredPage.get(), "HBase accepted the page before its reply was lost");
+        assertTrue(uncertain.deliveredPage.get(), "HBase accepted the page before its reply was lost");
       } finally {
         closeScope(first);
       }
+      return binding;
+    }
+
+    private void assertUncertainRetryRejected(TxnCommand command, InvocationBinding binding) throws Exception {
+      SystemRecordStore underlying = stores.records();
       RequestScope retry = RequestScope.withTimeout(TIMEOUT);
       try {
         var evaluator = evaluator(retry, account(retry), underlying);
@@ -306,6 +298,10 @@ class M3TxnCommitIT {
       } finally {
         closeScope(retry);
       }
+    }
+
+    private void recoverFencedAttempt(TxnCommand command, InvocationBinding binding) throws Exception {
+      SystemRecordStore underlying = stores.records();
       RequestScope recovery = RequestScope.withTimeout(TIMEOUT);
       try {
         long afterExpiry = System.currentTimeMillis() + Duration.ofHours(2).toMillis();
@@ -329,6 +325,29 @@ class M3TxnCommitIT {
         assertEquals(4, published.decision().orElseThrow().revision());
       } finally {
         closeScope(recovery);
+      }
+    }
+
+    private static final class UncertainPageStore implements SystemRecordStore {
+      private final SystemRecordStore underlying;
+      private final AtomicBoolean deliveredPage = new AtomicBoolean();
+
+      private UncertainPageStore(SystemRecordStore underlying) { this.underlying = underlying; }
+      @Override public CompletableFuture<Optional<ByteKey>> read(
+          SystemRecordType type, ByteKey id, RequestScope scope) { return underlying.read(type, id, scope); }
+      @Override public int bucket(SystemRecordType type, ByteKey id) { return underlying.bucket(type, id); }
+      @Override public CompletableFuture<CreateResult> createIfAbsent(
+          SystemRecordType type, ByteKey id, ByteKey value, RequestScope scope) {
+        return underlying.createIfAbsent(type, id, value, scope).thenCompose(result -> lostReply(type, id)
+            ? CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN))
+            : CompletableFuture.completedFuture(result));
+      }
+      private boolean lostReply(SystemRecordType type, ByteKey id) {
+        return type == SystemRecordType.WORKSET && id.length() == 29 && deliveredPage.compareAndSet(false, true);
+      }
+      @Override public CompletableFuture<Boolean> compareAndSet(SystemRecordType type, ByteKey id,
+          Optional<ByteKey> expected, ByteKey replacement, RequestScope scope) {
+        return underlying.compareAndSet(type, id, expected, replacement, scope);
       }
     }
 

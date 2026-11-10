@@ -197,15 +197,28 @@ func collectTxnCountMatches(request, leftResponse, rightResponse map[string]any,
 	if depth > 16 {
 		return false, false
 	}
+	operations, leftOps, rightOps, ok := selectedTxnFrame(request, leftResponse, rightResponse)
+	if !ok {
+		return false, false
+	}
+	for index, operation := range operations {
+		if valid, rejected := matchTxnOperation(operation, leftOps[index], rightOps[index], depth, matches); !valid {
+			return false, rejected
+		}
+	}
+	return true, false
+}
+
+func selectedTxnFrame(request, leftResponse, rightResponse map[string]any) ([]any, []any, []any, bool) {
 	requestFields, requestOK := request["fields"].(map[string]any)
 	leftFields, leftOK := leftResponse["fields"].(map[string]any)
 	rightFields, rightOK := rightResponse["fields"].(map[string]any)
 	if !requestOK || !leftOK || !rightOK {
-		return false, false
+		return nil, nil, nil, false
 	}
 	succeeded, ok := leftFields["succeeded"].(bool)
 	if !ok || rightFields["succeeded"] != succeeded {
-		return false, false
+		return nil, nil, nil, false
 	}
 	branch := "failure"
 	if succeeded {
@@ -213,54 +226,57 @@ func collectTxnCountMatches(request, leftResponse, rightResponse map[string]any,
 	}
 	operations, ok := requestFields[branch].([]any)
 	if !ok {
-		return false, false
+		return nil, nil, nil, false
 	}
 	leftOps, leftOK := leftFields["responses"].([]any)
 	rightOps, rightOK := rightFields["responses"].([]any)
 	if !leftOK || !rightOK || len(operations) != len(leftOps) || len(operations) != len(rightOps) {
+		return nil, nil, nil, false
+	}
+	return operations, leftOps, rightOps, true
+}
+
+func matchTxnOperation(raw, left, right any, depth int, matches *[]countPair) (bool, bool) {
+	op, ok := raw.(map[string]any)
+	if !ok {
 		return false, false
 	}
-	for index, raw := range operations {
-		op, ok := raw.(map[string]any)
-		if !ok {
-			return false, false
-		}
-		fields, ok := op["fields"].(map[string]any)
-		if !ok {
-			return false, false
-		}
-		if nested, exists := fields["requestTxn"]; exists {
-			child, ok := nested.(map[string]any)
-			leftChild, leftOK := txnResponse(leftOps[index])
-			rightChild, rightOK := txnResponse(rightOps[index])
-			if !ok || !hasTxnOneof(op, "request", "request_txn") || !leftOK || !rightOK {
-				return false, true
-			}
-			if valid, rejected := collectTxnCountMatches(child, leftChild, rightChild, depth+1, matches); !valid {
-				return false, rejected
-			}
-			continue
-		}
-		rangeRequest, ok := fields["requestRange"].(map[string]any)
-		if !ok {
-			continue
-		}
-		rangeFields, ok := rangeRequest["fields"].(map[string]any)
-		if !ok {
-			return false, false
-		}
-		if !hasTxnOneof(op, "request", "request_range") {
+	fields, ok := op["fields"].(map[string]any)
+	if !ok {
+		return false, false
+	}
+	if nested, exists := fields["requestTxn"]; exists {
+		child, ok := nested.(map[string]any)
+		leftChild, leftOK := txnResponse(left)
+		rightChild, rightOK := txnResponse(right)
+		if !ok || !hasTxnOneof(op, "request", "request_txn") || !leftOK || !rightOK {
 			return false, true
 		}
-		leftRange, leftOK := txnRangeResponse(leftOps[index])
-		rightRange, rightOK := txnRangeResponse(rightOps[index])
-		if !leftOK || !rightOK {
-			return false, true
-		}
-		policy := countPolicyForRange(rangeFields)
-		if policy != strictCount {
-			*matches = append(*matches, countPair{leftRange, rightRange, policy})
-		}
+		return collectTxnCountMatches(child, leftChild, rightChild, depth+1, matches)
+	}
+	rangeRequest, ok := fields["requestRange"].(map[string]any)
+	if !ok {
+		return true, false
+	}
+	return matchTxnRange(op, rangeRequest, left, right, matches)
+}
+
+func matchTxnRange(op, rangeRequest map[string]any, left, right any, matches *[]countPair) (bool, bool) {
+	rangeFields, ok := rangeRequest["fields"].(map[string]any)
+	if !ok {
+		return false, false
+	}
+	if !hasTxnOneof(op, "request", "request_range") {
+		return false, true
+	}
+	leftRange, leftOK := txnRangeResponse(left)
+	rightRange, rightOK := txnRangeResponse(right)
+	if !leftOK || !rightOK {
+		return false, true
+	}
+	policy := countPolicyForRange(rangeFields)
+	if policy != strictCount {
+		*matches = append(*matches, countPair{leftRange, rightRange, policy})
 	}
 	return true, false
 }

@@ -198,71 +198,69 @@ func m3TxnTrace(t *testing.T, scope string, term uint64) []trace.Record {
 }
 
 func TestM3TxnCountAllowanceRejectsMatchingMalformedOneof(t *testing.T) {
-	for _, nested := range []bool{false, true} {
-		for _, request := range []bool{false, true} {
-			name := fmt.Sprintf("nested=%t/request=%t", nested, request)
-			t.Run(name, func(t *testing.T) {
-				var native, target []trace.Record
-				if nested {
-					native = m3NestedCountTrace(t, "native-etcd", 3, 1, 1, true)
-					target = m3NestedCountTrace(t, "target-hbase", 0, 1, 1, true)
-				} else {
-					native = m3CountTxnTrace(t, "native-etcd", 3, 1, 1, true)
-					target = m3CountTxnTrace(t, "target-hbase", 0, 1, 1, true)
-				}
-				for _, records := range [][]trace.Record{native, target} {
-					if request {
-						records[1].Request = replaceSecond(records[1].Request, `"request":"request_range"`, `"request":"request_put"`)
-					} else {
-						records[1].Response = replace(records[1].Response, `"response":"response_range"`, `"response":"response_put"`)
-					}
-				}
-				if err := CompareM3TxnTraces(bytes.NewReader(encodeTrace(t, native)),
-					bytes.NewReader(encodeTrace(t, target))); err == nil {
-					t.Fatal("matching malformed oneof was accepted by strict fallback")
-				}
-			})
-		}
-	}
-}
-
-func replaceSecond(raw json.RawMessage, old, replacement string) json.RawMessage {
-	text := string(raw)
-	first := strings.Index(text, old)
-	if first < 0 {
-		return raw
-	}
-	end := first + len(old)
-	return json.RawMessage(text[:end] + strings.Replace(text[end:], old, replacement, 1))
+	runMalformedCountMatrix(t, false)
 }
 
 func TestM3TxnCountAllowanceRejectsMalformedStrictSibling(t *testing.T) {
+	runMalformedCountMatrix(t, true)
+}
+
+func runMalformedCountMatrix(t *testing.T, strictSibling bool) {
+	t.Helper()
 	for _, nested := range []bool{false, true} {
 		for _, request := range []bool{false, true} {
 			t.Run(fmt.Sprintf("nested=%t/request=%t", nested, request), func(t *testing.T) {
-				var native, target []trace.Record
-				if nested {
-					native = m3NestedCountTrace(t, "native-etcd", 3, 2, 1, true)
-					target = m3NestedCountTrace(t, "target-hbase", 0, 1, 1, true)
-				} else {
-					native = m3CountTxnTrace(t, "native-etcd", 3, 2, 1, true)
-					target = m3CountTxnTrace(t, "target-hbase", 0, 1, 1, true)
-				}
-				for _, records := range [][]trace.Record{native, target} {
-					if request {
-						records[1].Request = replaceNth(records[1].Request, `"request":"request_range"`, `"request":"request_put"`, 3)
-					} else {
-						records[1].Response = replaceNth(records[1].Response, `"response":"response_range"`, `"response":"response_put"`, 2)
-					}
-				}
-				for _, pair := range [][2][]trace.Record{{native, target}, {target, native}} {
-					if err := CompareM3TxnTraces(bytes.NewReader(encodeTrace(t, pair[0])),
-						bytes.NewReader(encodeTrace(t, pair[1]))); err == nil {
-						t.Fatal("malformed strict sibling was accepted during Count projection")
-					}
-				}
+				assertMalformedCountRejected(t, nested, request, strictSibling)
 			})
 		}
+	}
+}
+
+func assertMalformedCountRejected(t *testing.T, nested, request, strictSibling bool) {
+	t.Helper()
+	native, target := malformedCountTraces(t, nested, strictSibling)
+	mutateCountOneof(native, request, strictSibling)
+	mutateCountOneof(target, request, strictSibling)
+	assertCountTraceRejected(t, native, target)
+	if strictSibling {
+		assertCountTraceRejected(t, target, native)
+	}
+}
+
+func malformedCountTraces(t *testing.T, nested, strictSibling bool) ([]trace.Record, []trace.Record) {
+	t.Helper()
+	nativeCount := int64(1)
+	if strictSibling {
+		nativeCount = 2
+	}
+	if nested {
+		return m3NestedCountTrace(t, "native-etcd", 3, nativeCount, 1, true),
+			m3NestedCountTrace(t, "target-hbase", 0, 1, 1, true)
+	}
+	return m3CountTxnTrace(t, "native-etcd", 3, nativeCount, 1, true),
+		m3CountTxnTrace(t, "target-hbase", 0, 1, 1, true)
+}
+
+func mutateCountOneof(records []trace.Record, request, strictSibling bool) {
+	occurrence := 1
+	if request {
+		occurrence = 2
+		if strictSibling {
+			occurrence = 3
+		}
+		records[1].Request = replaceNth(records[1].Request, `"request":"request_range"`, `"request":"request_put"`, occurrence)
+		return
+	}
+	if strictSibling {
+		occurrence = 2
+	}
+	records[1].Response = replaceNth(records[1].Response, `"response":"response_range"`, `"response":"response_put"`, occurrence)
+}
+
+func assertCountTraceRejected(t *testing.T, left, right []trace.Record) {
+	t.Helper()
+	if err := CompareM3TxnTraces(bytes.NewReader(encodeTrace(t, left)), bytes.NewReader(encodeTrace(t, right))); err == nil {
+		t.Fatal("malformed oneof was accepted during Count comparison")
 	}
 }
 

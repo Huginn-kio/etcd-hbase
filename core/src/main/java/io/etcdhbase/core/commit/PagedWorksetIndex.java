@@ -2,6 +2,7 @@ package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
@@ -10,14 +11,12 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Copy-on-write private index. Only a fully written operation checkpoint advances its root. */
@@ -33,24 +32,7 @@ public final class PagedWorksetIndex {
   private static final byte PAGE_KIND = 1;
   private static final byte CHECKPOINT_KIND = 2;
   private static final byte START_KIND = 3;
-  private static final ThreadLocal<ArrayDeque<Runnable>> CONTINUATIONS = new ThreadLocal<>();
-  private static final Executor CONTINUE = command -> {
-    ArrayDeque<Runnable> queue = CONTINUATIONS.get();
-    if (queue != null) {
-      queue.addLast(command);
-      return;
-    }
-    queue = new ArrayDeque<>();
-    CONTINUATIONS.set(queue);
-    try {
-      queue.addLast(command);
-      Runnable next;
-      while ((next = queue.pollFirst()) != null) next.run();
-    } finally {
-      queue.clear();
-      CONTINUATIONS.remove();
-    }
-  };
+  private static final ContinuationExecutor CONTINUE = new ContinuationExecutor();
 
   /** Refers to one immutable event; its digest is checked again before consuming its value. */
   public record EventRef(int bucket, ByteKey key, long ordinal, ByteKey digest) {
@@ -275,41 +257,55 @@ public final class PagedWorksetIndex {
       if (!started || failed || inactive()) throw new IllegalStateException("workset is not active");
       snapshot = root;
     }
-    return new AsyncCursor<>() {
-      private final AtomicBoolean reading = new AtomicBoolean();
-      private SortKey after;
-      private boolean ended;
+    return new IndexCursor(bucket, range, snapshot);
+  }
 
-      @Override public CompletableFuture<Optional<EventRef>> next() {
-        if (!reading.compareAndSet(false, true)) {
-          return CompletableFuture.failedFuture(new IllegalStateException("concurrent workset cursor reads"));
-        }
-        try {
-          CompletableFuture<Optional<EventRef>> next;
-          synchronized (PagedWorksetIndex.this) {
-            if (!started || failed || inactive()) {
-              reading.set(false);
-              return CompletableFuture.failedFuture(unavailable());
-            }
-            next = ended || snapshot == null || range.isEmpty()
-                ? CompletableFuture.completedFuture(Optional.empty()) : seek(snapshot, after, bucket, range);
-          }
-          return fenceOnFailure(next.thenApply(value -> {
-            if (value.isPresent()) after = value.orElseThrow().sortKey();
-            else ended = true;
-            return value;
-          })).whenComplete((ignored, failure) -> reading.set(false)).copy();
-        } catch (RuntimeException failure) {
-          reading.set(false);
-          synchronized (PagedWorksetIndex.this) { failed = true; }
-          return CompletableFuture.failedFuture(failure);
-        } catch (Error fatal) {
-          reading.set(false);
-          synchronized (PagedWorksetIndex.this) { failed = true; }
-          throw fatal;
-        }
+  private final class IndexCursor implements AsyncCursor<EventRef> {
+    private final int bucket;
+    private final KeyRange range;
+    private final PageRef snapshot;
+    private final AtomicBoolean reading = new AtomicBoolean();
+    private SortKey after;
+    private boolean ended;
+
+    private IndexCursor(int bucket, KeyRange range, PageRef snapshot) {
+      this.bucket = bucket;
+      this.range = range;
+      this.snapshot = snapshot;
+    }
+
+    @Override public CompletableFuture<Optional<EventRef>> next() {
+      if (!reading.compareAndSet(false, true)) {
+        return CompletableFuture.failedFuture(new IllegalStateException("concurrent workset cursor reads"));
       }
-    };
+      try {
+        CompletableFuture<Optional<EventRef>> next;
+        synchronized (PagedWorksetIndex.this) {
+          if (!started || failed || inactive()) {
+            reading.set(false);
+            return CompletableFuture.failedFuture(unavailable());
+          }
+          next = ended || snapshot == null || range.isEmpty()
+              ? CompletableFuture.completedFuture(Optional.empty()) : seek(snapshot, after, bucket, range);
+        }
+        return fenceOnFailure(next.thenApply(this::advance)).whenComplete((ignored, failure) ->
+            reading.set(false)).copy();
+      } catch (RuntimeException failure) {
+        reading.set(false);
+        synchronized (PagedWorksetIndex.this) { failed = true; }
+        return CompletableFuture.failedFuture(failure);
+      } catch (Error fatal) {
+        reading.set(false);
+        synchronized (PagedWorksetIndex.this) { failed = true; }
+        throw fatal;
+      }
+    }
+
+    private Optional<EventRef> advance(Optional<EventRef> value) {
+      if (value.isPresent()) after = value.orElseThrow().sortKey();
+      else ended = true;
+      return value;
+    }
   }
 
   private CompletableFuture<Optional<EventRef>> find(PageRef reference, SortKey target) {
@@ -402,43 +398,52 @@ public final class PagedWorksetIndex {
         return;
       }
       try {
-        if (inactive()) {
-          completion.completeExceptionally(unavailable());
-          return;
-        }
-        Optional<EventRef> entry = Objects.requireNonNull(value, "workset source value");
-        if (entry.isEmpty()) {
-          checkpoint().whenComplete((ignored, problem) -> {
-            if (problem == null) completion.complete(null);
-            else completion.completeExceptionally(problem);
-          });
-          return;
-        }
-        EventRef event = entry.orElseThrow();
-        if (event.ordinal() != nextEvent || nextEvent == Long.MAX_VALUE) {
-          throw new IllegalArgumentException("workset events must be contiguous");
-        }
-        insertedKey = nextRoot == null;
-        insert(nextRoot, event).thenComposeAsync(this::growRoot, CONTINUE)
-            .whenCompleteAsync((updated, problem) -> {
-              if (problem != null) completion.completeExceptionally(problem);
-              else {
-                try {
-                  nextRoot = updated;
-                  nextChain = advanceEventChain(nextChain, event);
-                  if (insertedKey) nextEntries = Math.addExact(nextEntries, 1);
-                  nextEvent++;
-                  next();
-                } catch (RuntimeException failureDuringAdvance) {
-                  completion.completeExceptionally(failureDuringAdvance);
-                } catch (Error fatal) {
-                  completion.completeExceptionally(fatal);
-                  throw fatal;
-                }
-              }
-            }, CONTINUE);
+        acceptValue(value);
       } catch (RuntimeException problem) {
         completion.completeExceptionally(problem);
+      } catch (Error fatal) {
+        completion.completeExceptionally(fatal);
+        throw fatal;
+      }
+    }
+
+    private void acceptValue(Optional<EventRef> entry) {
+      if (inactive()) {
+        completion.completeExceptionally(unavailable());
+        return;
+      }
+      Objects.requireNonNull(entry, "workset source value");
+      if (entry.isEmpty()) {
+        checkpoint().whenComplete(this::finishCheckpoint);
+        return;
+      }
+      EventRef event = entry.orElseThrow();
+      if (event.ordinal() != nextEvent || nextEvent == Long.MAX_VALUE) {
+        throw new IllegalArgumentException("workset events must be contiguous");
+      }
+      insertedKey = nextRoot == null;
+      insert(nextRoot, event).thenComposeAsync(this::growRoot, CONTINUE)
+          .whenCompleteAsync((updated, problem) -> advance(event, updated, problem), CONTINUE);
+    }
+
+    private void finishCheckpoint(Void ignored, Throwable problem) {
+      if (problem == null) completion.complete(null);
+      else completion.completeExceptionally(problem);
+    }
+
+    private void advance(EventRef event, PageRef updated, Throwable problem) {
+      if (problem != null) {
+        completion.completeExceptionally(problem);
+        return;
+      }
+      try {
+        nextRoot = updated;
+        nextChain = advanceEventChain(nextChain, event);
+        if (insertedKey) nextEntries = Math.addExact(nextEntries, 1);
+        nextEvent++;
+        next();
+      } catch (RuntimeException failureDuringAdvance) {
+        completion.completeExceptionally(failureDuringAdvance);
       } catch (Error fatal) {
         completion.completeExceptionally(fatal);
         throw fatal;

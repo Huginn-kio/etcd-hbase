@@ -8,6 +8,7 @@ import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.PreparedEvent;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.TxnReadSession;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
@@ -15,37 +16,19 @@ import io.etcdhbase.core.scan.DirectRecordReader;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.ToIntFunction;
 
 /** Selects transaction branches on one base, then plans their operations in order. */
 public final class TxnEvaluator {
-  private static final ThreadLocal<ArrayDeque<Runnable>> CONTINUATIONS = new ThreadLocal<>();
-  private static final Executor CONTINUATION_EXECUTOR = command -> {
-    ArrayDeque<Runnable> queue = CONTINUATIONS.get();
-    if (queue != null) {
-      queue.addLast(command);
-      return;
-    }
-    queue = new ArrayDeque<>();
-    CONTINUATIONS.set(queue);
-    try {
-      queue.addLast(command);
-      Runnable next;
-      while ((next = queue.pollFirst()) != null) next.run();
-    } finally {
-      queue.clear();
-      CONTINUATIONS.remove();
-    }
-  };
+  private static final ContinuationExecutor CONTINUATION_EXECUTOR = new ContinuationExecutor();
+
   public record Limits(long pointBytes, long resultBytes, long workingBytes) {
     public Limits {
       if (pointBytes < 1 || resultBytes < 128 || resultBytes > ResultTree.MAX_RETAINED_BYTES
@@ -289,56 +272,65 @@ public final class TxnEvaluator {
       session.reader(0);
       if (index == plan.operations().size()) return CompletableFuture.completedFuture(List.copyOf(responses));
       SelectedOperation selected = plan.operations().get(index);
-      if (selected instanceof SelectedNested nested) {
-        return execute(nested.plan(), 0, new ArrayList<>(), state).thenComposeAsync(children -> {
-          try {
-            state.reserve(128);
-            responses.add(new ResultNode.Txn(index, new ResultNode.Header(true, 0),
-                nested.plan().succeeded(), children));
-            return execute(plan, index + 1, responses, state);
-          } catch (BackendFailure failure) {
-            return CompletableFuture.failedFuture(failure);
-          }
-        }, CONTINUATION_EXECUTOR);
-      }
+      if (selected instanceof SelectedNested nested) return executeNested(plan, index, responses, state, nested);
       TxnCommand.Operation operation = ((SelectedLeaf) selected).operation();
       if (operation instanceof TxnCommand.Unsupported) {
         return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.UNSUPPORTED_OPERATION));
       }
-      if (operation instanceof TxnCommand.PointRange range) {
-        boolean current = range.revision() <= 0;
-        CompletableFuture<Optional<StoredRecord>> overlay = !current || state.working == null
-            ? CompletableFuture.completedFuture(Optional.empty())
-            : state.working.current(range.key(), Optional.empty());
-        return overlay.thenComposeAsync(value -> {
-          if (value.isPresent()) {
-            try { appendRange(state, responses, index, value); }
-            catch (BackendFailure failure) { return CompletableFuture.failedFuture(failure); }
-            return CompletableFuture.completedFuture(null);
-          }
-          return point(range.key(), current ? session.currentRevision() : range.revision()).thenAccept(point -> {
-            try (point) { appendRange(state, responses, index, point.record()); }
-            catch (BackendFailure failure) { throw new java.util.concurrent.CompletionException(failure); }
-          });
-        }, CONTINUATION_EXECUTOR).thenComposeAsync(ignored -> {
-          return execute(plan, index + 1, responses, state);
-        }, CONTINUATION_EXECUTOR);
-      }
-      TxnCommand.Put put = (TxnCommand.Put) operation;
-      return point(put.command().key(), session.currentRevision()).thenComposeAsync(point -> {
-        CompletableFuture<Void> write;
-        try { write = appendPut(state, responses, index, put.command(), point.record()); }
-        catch (RuntimeException | Error failure) {
-          try { point.close(); }
-          catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-          throw failure;
-        }
-        return write.whenComplete((ignored, failure) -> point.close()).thenComposeAsync(ignored ->
-            execute(plan, index + 1, responses, state), CONTINUATION_EXECUTOR);
-      }, CONTINUATION_EXECUTOR);
+      if (operation instanceof TxnCommand.PointRange range) return executeRange(plan, index, responses, state, range);
+      return executePut(plan, index, responses, state, (TxnCommand.Put) operation);
     } catch (BackendFailure | RuntimeException failure) {
       return CompletableFuture.failedFuture(failure);
     }
+  }
+
+  private CompletableFuture<List<ResultNode>> executeNested(BranchPlan plan, int index,
+      List<ResultNode> responses, State state, SelectedNested nested) {
+    return execute(nested.plan(), 0, new ArrayList<>(), state).thenComposeAsync(children -> {
+      try {
+        state.reserve(128);
+        responses.add(new ResultNode.Txn(index, new ResultNode.Header(true, 0),
+            nested.plan().succeeded(), children));
+        return execute(plan, index + 1, responses, state);
+      } catch (BackendFailure failure) {
+        return CompletableFuture.failedFuture(failure);
+      }
+    }, CONTINUATION_EXECUTOR);
+  }
+
+  private CompletableFuture<List<ResultNode>> executeRange(BranchPlan plan, int index,
+      List<ResultNode> responses, State state, TxnCommand.PointRange range) {
+    boolean current = range.revision() <= 0;
+    CompletableFuture<Optional<StoredRecord>> overlay = !current || state.working == null
+        ? CompletableFuture.completedFuture(Optional.empty())
+        : state.working.current(range.key(), Optional.empty());
+    return overlay.thenComposeAsync(value -> {
+      if (value.isPresent()) {
+        try { appendRange(state, responses, index, value); }
+        catch (BackendFailure failure) { return CompletableFuture.failedFuture(failure); }
+        return CompletableFuture.completedFuture(null);
+      }
+      return point(range.key(), current ? session.currentRevision() : range.revision()).thenAccept(point -> {
+        try (point) { appendRange(state, responses, index, point.record()); }
+        catch (BackendFailure failure) { throw new java.util.concurrent.CompletionException(failure); }
+      });
+    }, CONTINUATION_EXECUTOR).thenComposeAsync(ignored ->
+        execute(plan, index + 1, responses, state), CONTINUATION_EXECUTOR);
+  }
+
+  private CompletableFuture<List<ResultNode>> executePut(BranchPlan plan, int index,
+      List<ResultNode> responses, State state, TxnCommand.Put put) {
+    return point(put.command().key(), session.currentRevision()).thenComposeAsync(point -> {
+      CompletableFuture<Void> write;
+      try { write = appendPut(state, responses, index, put.command(), point.record()); }
+      catch (RuntimeException | Error failure) {
+        try { point.close(); }
+        catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+        throw failure;
+      }
+      return write.whenComplete((ignored, failure) -> point.close()).thenComposeAsync(ignored ->
+          execute(plan, index + 1, responses, state), CONTINUATION_EXECUTOR);
+    }, CONTINUATION_EXECUTOR);
   }
 
   private CompletableFuture<io.etcdhbase.core.scan.PointResult> point(ByteKey key, long revision) {
