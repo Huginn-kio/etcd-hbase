@@ -8,11 +8,8 @@ import (
 // Only registered top-level methods have a term projection. Never suppress
 // child headers, arbitrary methods, or change the original M0 comparison.
 func projectM3Term(left, right map[string]any, leftScope string, bothSucceeded bool, policy tracePolicy) error {
-	method := left["method"]
-	if right["method"] != method ||
-		(method != "etcdserverpb.KV/Put" &&
-			!((policy == m3TxnPolicy || policy == m3DeletePolicy) && method == "etcdserverpb.KV/Txn") &&
-			!(policy == m3DeletePolicy && method == "etcdserverpb.KV/DeleteRange")) {
+	method, ok := left["method"].(string)
+	if !ok || right["method"] != method || !registeredM3Method(method, policy) {
 		return errors.New("method is not registered for the M3 policy")
 	}
 	if !bothSucceeded {
@@ -46,4 +43,19 @@ func projectM3Term(left, right map[string]any, leftScope string, bothSucceeded b
 	}
 	targetHeader["raftTerm"] = nativeTerm
 	return nil
+}
+
+func registeredM3Method(method string, policy tracePolicy) bool {
+	switch method {
+	case "etcdserverpb.KV/Put":
+		return true
+	case "etcdserverpb.KV/Txn":
+		return policy == m3TxnPolicy || policy == m3DeletePolicy || policy == m3RangePolicy
+	case "etcdserverpb.KV/DeleteRange":
+		return policy == m3DeletePolicy || policy == m3RangePolicy
+	case "etcdserverpb.KV/Range":
+		return policy == m3RangePolicy
+	default:
+		return false
+	}
 }

@@ -10,12 +10,14 @@ import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.kv.KvFailure;
+import io.etcdhbase.core.kv.RangeCommand;
 import io.etcdhbase.core.kv.TxnCommand;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.RequestScopeInterceptor;
 import io.etcdhbase.grpc.protocol.DeleteProtocolLimit;
 import io.etcdhbase.grpc.protocol.ErrorProjection;
+import io.etcdhbase.grpc.protocol.RangeRequestMapper;
 import io.etcdhbase.grpc.protocol.TxnProtocolLimit;
 import io.etcdhbase.grpc.protocol.TxnRequestMapper;
 import io.etcdhbase.grpc.protocol.TxnResponseEmitter;
@@ -25,6 +27,7 @@ import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.grpc.stub.StreamObserver;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -78,7 +81,27 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
 
   @Override
   public void accept(Rpc.TxnRequest request, StreamObserver<Rpc.TxnResponse> observer) {
-    accept(request, null, observer);
+    accept(request, null, null, observer);
+  }
+
+  /** A standalone range shares the read barrier while retaining standalone revision semantics. */
+  public void range(Rpc.RangeRequest request, StreamObserver<Rpc.RangeResponse> observer) {
+    Objects.requireNonNull(request, "request");
+    Objects.requireNonNull(observer, "observer");
+    var transaction = Rpc.TxnRequest.newBuilder()
+        .addSuccess(Rpc.RequestOp.newBuilder().setRequestRange(request)).build();
+    accept(transaction, null, request, new StreamObserver<>() {
+      @Override public void onNext(Rpc.TxnResponse response) {
+        if (!response.hasHeader() || response.getResponsesCount() != 1
+            || !response.getResponses(0).hasResponseRange()) {
+          throw new IllegalStateException("standalone range result differs from its request");
+        }
+        observer.onNext(response.getResponses(0).getResponseRange().toBuilder()
+            .setHeader(response.getHeader()).build());
+      }
+      @Override public void onError(Throwable failure) { observer.onError(failure); }
+      @Override public void onCompleted() { observer.onCompleted(); }
+    });
   }
 
   /** A standalone delete uses the same transaction evaluation and durable result path. */
@@ -87,7 +110,7 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
     Objects.requireNonNull(observer, "observer");
     var transaction = Rpc.TxnRequest.newBuilder()
         .addSuccess(Rpc.RequestOp.newBuilder().setRequestDeleteRange(request)).build();
-    accept(transaction, request, new StreamObserver<>() {
+    accept(transaction, request, null, new StreamObserver<>() {
       @Override public void onNext(Rpc.TxnResponse response) {
         if (!response.hasHeader() || response.getResponsesCount() != 1
             || !response.getResponses(0).hasResponseDeleteRange()) {
@@ -101,7 +124,7 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
     });
   }
 
-  private void accept(Rpc.TxnRequest request, Rpc.DeleteRangeRequest delete,
+  private void accept(Rpc.TxnRequest request, Rpc.DeleteRangeRequest delete, Rpc.RangeRequest range,
       StreamObserver<Rpc.TxnResponse> observer) {
     Objects.requireNonNull(request, "request");
     Objects.requireNonNull(observer, "observer");
@@ -117,7 +140,7 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
           .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
       PutCommitPreparation.retainUntilDrain(scope, input);
       worker.execute(() -> {
-        if (dispatchState.compareAndSet(0, 1)) begin(request, delete, observer, scope, account, terminal, gatewayDrained);
+        if (dispatchState.compareAndSet(0, 1)) begin(request, delete, range, observer, scope, account, terminal, gatewayDrained);
       });
     } catch (BackendFailure | RuntimeException failure) {
       if (dispatchState.compareAndSet(0, 2)) {
@@ -133,11 +156,14 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
     }
   }
 
-  private void begin(Rpc.TxnRequest request, Rpc.DeleteRangeRequest delete, StreamObserver<Rpc.TxnResponse> observer,
+  private void begin(Rpc.TxnRequest request, Rpc.DeleteRangeRequest delete, Rpc.RangeRequest range,
+      StreamObserver<Rpc.TxnResponse> observer,
       RequestScope scope, BudgetManager.Account account, AtomicBoolean terminal,
       CompletableFuture<Void> gatewayDrained) {
     try {
-      TxnCommand command = TxnRequestMapper.fromWire(request);
+      TxnCommand command = range == null ? TxnRequestMapper.fromWire(request)
+          : new TxnCommand(List.of(), List.of(new TxnCommand.Range(
+              RangeRequestMapper.fromWire(range, RangeCommand.Context.STANDALONE))), List.of());
       InvocationId invocation = InvocationId.create();
       if (delete != null) {
         DeleteProtocolLimit.requireWithin(delete, invocation.value().getMostSignificantBits(), maximumEtcdRequestBytes);
@@ -145,13 +171,14 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
         TxnProtocolLimit.requireWithin(request, invocation.value().getMostSignificantBits(), maximumEtcdRequestBytes);
       }
       if (!command.mayWrite()) {
-        reads.execute(command, authorizationDigest, identity, scope, account).whenComplete((result, failure) ->
-            dispatchResponse(observer, scope, terminal, gatewayDrained, result, failure,
+        reads.execute(command, authorizationDigest, identity, scope, account, range == null).whenComplete((result, failure) ->
+            dispatchResponse(observer, scope, terminal, gatewayDrained, result, failure, range == null,
                 value -> TxnResponseEmitter.sendReadOnly(command, value, clusterId, memberId, scope, account,
-                    countOutput(observer, delete == null)),
+                    countOutput(observer, delete == null && range == null)),
                 ignored -> { }));
         return;
       }
+      if (range != null) throw new IllegalStateException("standalone range cannot mutate");
       ByteKey operation = delete == null ? MutationOperationEnvelope.transaction(request.toByteArray())
           : MutationOperationEnvelope.deleteRange(delete.toByteArray());
       ByteKey digest = MutationForwardRequest.digest(tableGroup, operation);
@@ -169,7 +196,7 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
         return relay.forward(envelope, scope);
       }).thenCompose(reply -> resolveReply(reply, invocation, digest, scope, account))
           .whenComplete((resolved, failure) -> dispatchResponse(observer, scope, terminal, gatewayDrained,
-              resolved, failure, value -> TxnResponseEmitter.sendResolved(command, value,
+              resolved, failure, true, value -> TxnResponseEmitter.sendResolved(command, value,
                   ResultMessages::decodeTree, clusterId, memberId, scope, account, countOutput(observer, delete == null)),
               value -> { if (value != null) value.close(); }));
     } catch (RuntimeException failure) {
@@ -216,16 +243,24 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
 
   private <T> void dispatchResponse(StreamObserver<Rpc.TxnResponse> observer, RequestScope scope,
       AtomicBoolean terminal, CompletableFuture<Void> gatewayDrained, T value, Throwable failure,
-      Consumer<T> send, Consumer<T> discard) {
+      boolean recordTxnMetrics, Consumer<T> send, Consumer<T> discard) {
     var responseDrained = new CompletableFuture<Void>();
     if (!scope.startIfOpen(() -> scope.trackPhysicalProducer(responseDrained))) {
       try { discard.accept(value); }
-      finally { gatewayDrained.complete(null); }
+      finally {
+        try {
+          // A failed read may close its scope to release pins before reporting the failure.
+          // The transport still needs a terminal error if it has not already closed.
+          if (failure != null) signalCompletionError(observer, terminal, failure);
+        } finally {
+          gatewayDrained.complete(null);
+        }
+      }
       return;
     }
     var dispatchState = new AtomicInteger();
     try {
-      scheduleResponse(observer, scope, terminal, responseDrained, value, failure, send, discard, dispatchState);
+      scheduleResponse(observer, scope, terminal, responseDrained, value, failure, recordTxnMetrics, send, discard, dispatchState);
     } finally {
       gatewayDrained.complete(null);
     }
@@ -233,11 +268,11 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
 
   private <T> void scheduleResponse(StreamObserver<Rpc.TxnResponse> observer, RequestScope scope,
       AtomicBoolean terminal, CompletableFuture<Void> responseDrained, T value, Throwable failure,
-      Consumer<T> send, Consumer<T> discard, AtomicInteger dispatchState) {
+      boolean recordTxnMetrics, Consumer<T> send, Consumer<T> discard, AtomicInteger dispatchState) {
     try {
       worker.execute(() -> {
         if (dispatchState.compareAndSet(0, 1)) {
-          deliverResponse(observer, scope, terminal, responseDrained, value, failure, send, discard);
+          deliverResponse(observer, scope, terminal, responseDrained, value, failure, recordTxnMetrics, send, discard);
         }
       });
     } catch (RuntimeException rejected) {
@@ -254,13 +289,13 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
 
   private <T> void deliverResponse(StreamObserver<Rpc.TxnResponse> observer, RequestScope scope,
       AtomicBoolean terminal, CompletableFuture<Void> responseDrained, T value, Throwable failure,
-      Consumer<T> send, Consumer<T> discard) {
+      boolean recordTxnMetrics, Consumer<T> send, Consumer<T> discard) {
     try {
-      if (failure != null) signalError(scope, observer, terminal, failure);
+      if (failure != null) signalCompletionError(observer, terminal, failure);
       else if (terminal.compareAndSet(false, true)) {
         long started = System.nanoTime();
         try { send.accept(value); }
-        finally { metrics.recordTxnStage(RequestMetrics.TxnStage.RESPONSE, Math.max(0, System.nanoTime() - started)); }
+        finally { if (recordTxnMetrics) metrics.recordTxnStage(RequestMetrics.TxnStage.RESPONSE, Math.max(0, System.nanoTime() - started)); }
       } else discard.accept(value);
     } finally {
       responseDrained.complete(null);
@@ -291,7 +326,13 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
 
   private static void signalError(RequestScope scope, StreamObserver<Rpc.TxnResponse> observer,
       AtomicBoolean terminal, Throwable failure) {
-    if (scope.isClosed() || !terminal.compareAndSet(false, true)) return;
+    if (scope.isClosed()) return;
+    signalCompletionError(observer, terminal, failure);
+  }
+
+  private static void signalCompletionError(StreamObserver<Rpc.TxnResponse> observer,
+      AtomicBoolean terminal, Throwable failure) {
+    if (!terminal.compareAndSet(false, true)) return;
     observer.onError(ErrorProjection.project(failure));
   }
 }

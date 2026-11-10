@@ -314,7 +314,9 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     synchronized (this) {
       activeScans.add(operation);
     }
-    operation.completion().whenComplete((ignored, failure) -> {
+    // A consumer may immediately finish the view from its scan callback. Publish completion
+    // only after this store has retired the scan and its operation lease.
+    var completion = operation.completion().whenComplete((ignored, failure) -> {
       synchronized (ReadViewRecordStore.this) {
         activeScans.remove(operation);
       }
@@ -331,7 +333,12 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
         if (failure instanceof Error fatal) throw fatal;
       }
     }
-    return operation;
+    return new ScanOperation() {
+      @Override public CompletionStage<StoragePage> completion() {
+        return completion.toCompletableFuture().minimalCompletionStage();
+      }
+      @Override public void close() { operation.close(); }
+    };
   }
 
   private void completeOperation() {

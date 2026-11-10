@@ -61,6 +61,12 @@ public final class TxnReadExecutor {
   public CompletableFuture<TxnEvaluator.ValidatedRead> execute(TxnCommand command,
       ByteKey authorizationDigest, AuthorizedBackendIdentity identity,
       RequestScope scope, BudgetManager.Account account) {
+    return execute(command, authorizationDigest, identity, scope, account, true);
+  }
+
+  CompletableFuture<TxnEvaluator.ValidatedRead> execute(TxnCommand command,
+      ByteKey authorizationDigest, AuthorizedBackendIdentity identity,
+      RequestScope scope, BudgetManager.Account account, boolean recordTxnMetrics) {
     Objects.requireNonNull(command, "command");
     Objects.requireNonNull(authorizationDigest, "authorizationDigest");
     Objects.requireNonNull(identity, "identity");
@@ -98,8 +104,10 @@ public final class TxnReadExecutor {
                 primary.codec()::bucket);
             return evaluator.evaluate(command, Optional.empty());
           }).thenCompose(TxnEvaluator.Evaluation::finishReadOnly)
-          .whenComplete((ignored, failure) -> metrics.recordTxnStage(
-              RequestMetrics.TxnStage.COMPARE_AND_PREPARE, Math.max(0, System.nanoTime() - started)));
+          .whenComplete((ignored, failure) -> {
+            if (recordTxnMetrics) metrics.recordTxnStage(
+                RequestMetrics.TxnStage.COMPARE_AND_PREPARE, Math.max(0, System.nanoTime() - started));
+          });
     } catch (RuntimeException failure) {
       drained.complete(null);
       return CompletableFuture.failedFuture(failure);

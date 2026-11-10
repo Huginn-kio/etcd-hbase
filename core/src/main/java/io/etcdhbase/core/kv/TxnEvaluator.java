@@ -213,12 +213,14 @@ public final class TxnEvaluator {
   /** Native Txn validates selected Put conditions before validating any selected Range revision. */
   private CompletableFuture<Void> preflight(BranchPlan plan) {
     var writes = new ArrayList<PutCommand>();
-    var revisions = new ArrayList<Long>();
+    var revisions = new ArrayList<RevisionTarget>();
     collectSelected(plan, writes, revisions);
     return checkPut(writes, 0).thenComposeAsync(ignored -> {
       long firstRevision = session.compactRevision() == 0 ? -1 : session.compactRevision();
       var historical = new LinkedHashSet<Long>();
-      for (long revision : revisions) {
+      for (RevisionTarget target : revisions) {
+        long revision = target.revision();
+        if (target.context() == RangeCommand.Context.STANDALONE && revision <= 0) continue;
         if (revision != 0 && revision > session.currentRevision()) {
           return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.FUTURE_REVISION));
         }
@@ -231,11 +233,13 @@ public final class TxnEvaluator {
     }, CONTINUATION_EXECUTOR);
   }
 
-  private static void collectSelected(BranchPlan plan, List<PutCommand> writes, List<Long> revisions) {
+  private static void collectSelected(BranchPlan plan, List<PutCommand> writes, List<RevisionTarget> revisions) {
     for (SelectedOperation selected : plan.operations()) {
       if (selected instanceof SelectedNested nested) collectSelected(nested.plan(), writes, revisions);
       else if (((SelectedLeaf) selected).operation() instanceof TxnCommand.Put put) writes.add(put.command());
-      else if (((SelectedLeaf) selected).operation() instanceof TxnCommand.PointRange range) revisions.add(range.revision());
+      else if (((SelectedLeaf) selected).operation() instanceof TxnCommand.Range range) {
+        revisions.add(new RevisionTarget(range.command().revision(), range.command().context()));
+      }
     }
   }
 
@@ -277,7 +281,10 @@ public final class TxnEvaluator {
       if (operation instanceof TxnCommand.Unsupported) {
         return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.UNSUPPORTED_OPERATION));
       }
-      if (operation instanceof TxnCommand.PointRange range) return executeRange(plan, index, responses, state, range);
+      if (operation instanceof TxnCommand.Range range) {
+        return appendRange(state, responses, index, range.command()).thenComposeAsync(ignored ->
+            execute(plan, index + 1, responses, state), CONTINUATION_EXECUTOR);
+      }
       if (operation instanceof TxnCommand.Delete delete) {
         return appendDelete(state, responses, index, delete).thenComposeAsync(ignored ->
             execute(plan, index + 1, responses, state), CONTINUATION_EXECUTOR);
@@ -302,26 +309,6 @@ public final class TxnEvaluator {
     }, CONTINUATION_EXECUTOR);
   }
 
-  private CompletableFuture<List<ResultNode>> executeRange(BranchPlan plan, int index,
-      List<ResultNode> responses, State state, TxnCommand.PointRange range) {
-    boolean current = range.revision() <= 0;
-    CompletableFuture<Optional<StoredRecord>> overlay = !current || state.working == null
-        ? CompletableFuture.completedFuture(Optional.empty())
-        : state.working.current(range.key(), Optional.empty());
-    return overlay.thenComposeAsync(value -> {
-      if (value.isPresent()) {
-        try { appendRange(state, responses, index, value); }
-        catch (BackendFailure failure) { return CompletableFuture.failedFuture(failure); }
-        return CompletableFuture.completedFuture(null);
-      }
-      return point(range.key(), current ? session.currentRevision() : range.revision()).thenAccept(point -> {
-        try (point) { appendRange(state, responses, index, point.record()); }
-        catch (BackendFailure failure) { throw new java.util.concurrent.CompletionException(failure); }
-      });
-    }, CONTINUATION_EXECUTOR).thenComposeAsync(ignored ->
-        execute(plan, index + 1, responses, state), CONTINUATION_EXECUTOR);
-  }
-
   private CompletableFuture<List<ResultNode>> executePut(BranchPlan plan, int index,
       List<ResultNode> responses, State state, TxnCommand.Put put) {
     return point(put.command().key(), session.currentRevision()).thenComposeAsync(point -> {
@@ -342,15 +329,26 @@ public final class TxnEvaluator {
         .readForPreparation(key, revision, ReadProjection.FULL);
   }
 
-  private void appendRange(State state, List<ResultNode> responses, int ordinal,
-      Optional<StoredRecord> observed) throws BackendFailure {
-    List<StoredRecord> records = observed.filter(record -> record.metadata().state() == StorageMetadata.State.LIVE)
-        .map(List::of).orElseGet(List::of);
-    long bytes = 128;
-    if (!records.isEmpty()) bytes = Math.addExact(bytes, resultRecordBytes(records.getFirst()));
-    state.reserve(bytes);
-    responses.add(new ResultNode.Range(ordinal, new ResultNode.Header(true, state.currentRevision()),
-        records, records.size(), false));
+  private CompletableFuture<Void> appendRange(State state, List<ResultNode> responses, int ordinal,
+      RangeCommand command) throws BackendFailure {
+    state.reserve(128);
+    var records = new ArrayList<StoredRecord>();
+    long target = command.revision() > 0 ? command.revision() : session.currentRevision();
+    Optional<TxnWorkingSet> overlay = command.context() == RangeCommand.Context.TRANSACTION
+        && command.revision() <= 0 ? Optional.ofNullable(state.working) : Optional.empty();
+    var reader = new RangeReadExecutor(session, compares, account, scope, bucket, limits.pointBytes());
+    return reader.read(command, target, overlay, record -> {
+      if (records.size() >= ResultNode.MAX_RECORDS_PER_NODE) {
+        throw new java.util.concurrent.CompletionException(resourceLimit());
+      }
+      try { state.reserve(resultRecordBytes(record)); }
+      catch (BackendFailure failure) { throw new java.util.concurrent.CompletionException(failure); }
+      records.add(record);
+    }).thenAccept(selection -> {
+      long count = command.countOnly() ? selection.observedLive() : selection.included();
+      responses.add(new ResultNode.Range(ordinal, new ResultNode.Header(true, state.currentRevision()),
+          records, count, selection.more()));
+    });
   }
 
   private CompletableFuture<Void> appendPut(State state, List<ResultNode> responses, int ordinal, PutCommand command,
@@ -471,4 +469,5 @@ public final class TxnEvaluator {
   private record SelectedLeaf(TxnCommand.Operation operation) implements SelectedOperation {}
   private record SelectedNested(BranchPlan plan) implements SelectedOperation {}
   private record BranchPlan(boolean succeeded, List<SelectedOperation> operations) {}
+  private record RevisionTarget(long revision, RangeCommand.Context context) {}
 }

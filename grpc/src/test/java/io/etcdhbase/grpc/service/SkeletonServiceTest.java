@@ -12,6 +12,25 @@ import org.junit.jupiter.api.Test;
 
 class SkeletonServiceTest {
   @Test
+  void defaultRangeRemainsUnimplementedUntilAHandlerIsAssembled() {
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    StreamObserver<Rpc.RangeResponse> observer = new StreamObserver<>() {
+      @Override public void onNext(Rpc.RangeResponse value) { throw new AssertionError("unexpected success"); }
+      @Override public void onError(Throwable value) { failure.set(value); }
+      @Override public void onCompleted() { throw new AssertionError("unexpected completion"); }
+    };
+    var request = Rpc.RangeRequest.newBuilder().setKey(com.google.protobuf.ByteString.copyFromUtf8("k")).build();
+    new KvService().range(request, observer);
+    assertEquals(Status.Code.UNIMPLEMENTED, Status.fromThrowable(failure.get()).getCode());
+    AtomicReference<Rpc.RangeRequest> forwarded = new AtomicReference<>();
+    AtomicReference<StreamObserver<Rpc.RangeResponse>> destination = new AtomicReference<>();
+    new KvService((value, response) -> { }, (value, response) -> { }, (value, response) -> { },
+        (value, response) -> { forwarded.set(value); destination.set(response); }).range(request, observer);
+    assertSame(request, forwarded.get());
+    assertSame(observer, destination.get());
+  }
+
+  @Test
   void defaultPutRemainsUnimplementedAndAnAssembledHandlerReceivesTheOriginalRequest() {
     AtomicReference<Throwable> failure = new AtomicReference<>();
     StreamObserver<Rpc.PutResponse> observer = new StreamObserver<>() {

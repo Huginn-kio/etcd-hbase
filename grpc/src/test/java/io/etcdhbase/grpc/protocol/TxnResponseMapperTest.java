@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.kv.PutCommand;
+import io.etcdhbase.core.kv.RangeCommand;
 import io.etcdhbase.core.kv.ResultNode;
 import io.etcdhbase.core.kv.ResultTree;
 import io.etcdhbase.core.kv.TxnCommand;
@@ -30,7 +31,7 @@ class TxnResponseMapperTest {
         new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, 1), new byte[] {1});
     StoredRecord second = StoredRecord.live(b,
         new StorageMetadata(1, 2, 1, 0, StorageMetadata.State.LIVE, 1), new byte[] {2});
-    var command = new TxnCommand(List.of(), List.of(new TxnCommand.PointRange(a),
+    var command = new TxnCommand(List.of(), List.of(pointRange(a),
         new TxnCommand.Delete(KeyRange.between(a, z), true),
         new TxnCommand.Delete(KeyRange.between(a, z), true)), List.of());
     var tree = new ResultTree(new ResultNode.Txn(0, header(3), true, List.of(
@@ -88,8 +89,49 @@ class TxnResponseMapperTest {
   }
 
   @Test
+  void projectsRangeKeysOnlyAndCountOnlyWithoutInventingValues() {
+    ByteKey a = ByteKey.copyOf(new byte[] {'a'});
+    ByteKey z = ByteKey.copyOf(new byte[] {'z'});
+    var filter = new RangeCommand.RevisionFilter(0, 0, 0, 0);
+    var keys = new RangeCommand(KeyRange.between(a, z), RangeCommand.Context.TRANSACTION,
+        0, 1, new RangeCommand.Sort(0, 0), filter, false, true, false);
+    var count = new RangeCommand(KeyRange.point(a), RangeCommand.Context.TRANSACTION,
+        0, 0, new RangeCommand.Sort(0, 0), filter, false, false, true);
+    var metadata = new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, 3);
+    var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(keys), new TxnCommand.Range(count)), List.of());
+    var tree = new ResultTree(new ResultNode.Txn(0, header(2), true, List.of(
+        new ResultNode.Range(0, header(2), List.of(StoredRecord.metadataOnly(a, metadata)), 1, true),
+        new ResultNode.Range(1, header(2), List.of(), 1, false))));
+    var response = TxnResponseMapper.toWire(command, tree, 2, false, 1, 2);
+    var range = response.getResponses(0).getResponseRange();
+    assertEquals(1, range.getCount());
+    assertTrue(range.getMore());
+    assertArrayEquals(a.bytes(), range.getKvs(0).getKey().toByteArray());
+    assertTrue(range.getKvs(0).getValue().isEmpty());
+    assertEquals(2, range.getKvs(0).getModRevision());
+    assertEquals(1, response.getResponses(1).getResponseRange().getCount());
+    assertEquals(0, response.getResponses(1).getResponseRange().getKvsCount());
+  }
+
+  @Test
+  void refusesRangeRecordsOutsideTheRequestedIntervalOrProjection() {
+    ByteKey a = ByteKey.copyOf(new byte[] {'a'});
+    ByteKey z = ByteKey.copyOf(new byte[] {'z'});
+    var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(new RangeCommand(
+        KeyRange.between(a, z), RangeCommand.Context.TRANSACTION, 0, 1,
+        new RangeCommand.Sort(0, 0), new RangeCommand.RevisionFilter(0, 0, 0, 0), false, true, false))), List.of());
+    var metadata = new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, 1);
+    var outside = new ResultTree(new ResultNode.Txn(0, header(2), true,
+        List.of(new ResultNode.Range(0, header(2), List.of(StoredRecord.metadataOnly(z, metadata)), 1, false))));
+    assertThrows(IllegalArgumentException.class, () -> TxnResponseMapper.toWire(command, outside, 2, false, 1, 2));
+    var withValue = new ResultTree(new ResultNode.Txn(0, header(2), true,
+        List.of(new ResultNode.Range(0, header(2), List.of(StoredRecord.live(a, metadata, new byte[] {1})), 1, false))));
+    assertThrows(IllegalArgumentException.class, () -> TxnResponseMapper.toWire(command, withValue, 2, false, 1, 2));
+  }
+
+  @Test
   void projectsNestedTxnHeaderAndOrderedChildrenWithoutInventingIdentity() {
-    var childCommand = new TxnCommand(List.of(), List.of(new TxnCommand.PointRange(KEY)), List.of());
+    var childCommand = new TxnCommand(List.of(), List.of(pointRange(KEY)), List.of());
     var outerCommand = new TxnCommand(List.of(), List.of(
         new TxnCommand.Put(new PutCommand(KEY, new byte[] {1}, 0, false, false, false)),
         new TxnCommand.Nested(childCommand)), List.of());
@@ -143,8 +185,14 @@ class TxnResponseMapperTest {
   }
 
   private static TxnCommand command(boolean previous) {
-    return new TxnCommand(List.of(), List.of(new TxnCommand.PointRange(KEY),
+    return new TxnCommand(List.of(), List.of(pointRange(KEY),
         new TxnCommand.Put(new PutCommand(KEY, new byte[] {1}, 0, previous, false, false))), List.of());
+  }
+
+  private static TxnCommand.Range pointRange(ByteKey key) {
+    return new TxnCommand.Range(new RangeCommand(KeyRange.point(key), RangeCommand.Context.TRANSACTION,
+        0, 0, new RangeCommand.Sort(0, 0), new RangeCommand.RevisionFilter(0, 0, 0, 0),
+        false, false, false));
   }
   private static ResultNode.Header header(long revision) { return new ResultNode.Header(true, revision); }
 }

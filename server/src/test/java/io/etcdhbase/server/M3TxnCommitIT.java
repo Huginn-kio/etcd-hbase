@@ -27,6 +27,8 @@ import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.PreparedCandidate;
+import io.etcdhbase.core.commit.ReadViewPinRegistry;
+import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.commit.ResultPreparation;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
 import io.etcdhbase.core.commit.SystemRecordStore;
@@ -37,6 +39,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.kv.CompareCondition;
 import io.etcdhbase.core.kv.CompareReadExecutor;
 import io.etcdhbase.core.kv.PutCommand;
+import io.etcdhbase.core.kv.RangeCommand;
 import io.etcdhbase.core.kv.ResultNode;
 import io.etcdhbase.core.kv.TxnCommand;
 import io.etcdhbase.core.kv.TxnEvaluator;
@@ -92,6 +95,15 @@ class M3TxnCommitIT {
   private static final ByteKey AUTHORIZATION = digest(9);
 
   @Test
+  void failedFinalReadPinReturnsAnErrorWithoutAResult() throws Exception {
+    try (M3TestEnvironment environment = M3TestEnvironment.start(StorageTableBinding.Layout.HISTORY, 1);
+         Engine engine = new Engine(environment)) {
+      engine.run(new TxnCommand(List.of(), List.of(put("pin-failure", "value")), List.of()), 70);
+      engine.assertFailedReadPinReturnsError();
+    }
+  }
+
+  @Test
   void nestedWorksetExceedsMemoryAndDoesNotReplayAnUncertainPageOnBothLayouts() throws Exception {
     for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
       try (M3TestEnvironment environment = M3TestEnvironment.start(layout, 1);
@@ -103,7 +115,7 @@ class M3TxnCommitIT {
               value, 0, false, false, false)));
         }
         operations.add(new TxnCommand.Nested(new TxnCommand(List.of(), List.of(
-            new TxnCommand.PointRange(key("bulk-000")), new TxnCommand.PointRange(key("bulk-079"))), List.of())));
+            pointRange(key("bulk-000")), pointRange(key("bulk-079"))), List.of())));
         var command = new TxnCommand(List.of(), operations, List.of());
         Receipt result = engine.run(command, 40, 64 * 1024);
         assertTrue(result.changed());
@@ -251,6 +263,108 @@ class M3TxnCommitIT {
     private final TxnMutationExecutor mutations;
     private final TxnOwnerProcessor processor;
     private final TxnReadExecutor readOnly;
+
+    private record PinFailureHarness(AtomicBoolean blockCompletion, CountDownLatch pinStarted,
+        CompletableFuture<Void> pendingPin) {}
+
+    private record CancellationEvidence(AtomicInteger responses, AtomicInteger terminations,
+        AtomicReference<Status.Code> terminalCode) {}
+
+    private void assertFailedReadPinReturnsError() throws Exception {
+      var evidence = new CancellationEvidence(new AtomicInteger(), new AtomicInteger(), new AtomicReference<>());
+      var harness = new PinFailureHarness(new AtomicBoolean(), new CountDownLatch(1), new CompletableFuture<>());
+      var resources = new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000, 4 << 20, 4 << 20, 4, 0);
+      try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
+          "m3-read-pin-failure", "127.0.0.1", 0, environment.system().tableGroupId()), resources,
+          pinFailureService(harness))) {
+        var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port()).usePlaintext().build();
+        try {
+          var range = Rpc.RangeRequest.newBuilder().setKey(ByteString.copyFromUtf8("pin-failure"))
+              .setKeysOnly(true).build();
+          assertPinFailureReturnsUnavailable(channel, range);
+          cancelDuringPinFailure(channel, range, harness, evidence);
+        } finally {
+          channel.shutdownNow();
+          assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+        }
+      }
+      assertEquals(0, evidence.responses().get());
+      assertEquals(1, evidence.terminations().get());
+      assertEquals(Status.Code.CANCELLED, evidence.terminalCode().get());
+      assertEquals(0, budgets.snapshot().allocatedBytes());
+      assertEquals(0, budgets.snapshot().reservedBytes());
+    }
+
+    private ReadViewPinRegistry failingPins(PinFailureHarness harness) {
+      return (view, scope) -> stores.pins().register(view, scope).thenApply(pin ->
+          new ReadViewPinRegistry.Pin() {
+            @Override public long generation() { return pin.generation(); }
+            @Override public CompletableFuture<Void> renew(RequestScope request) { return pin.renew(request); }
+            @Override public CompletableFuture<Void> complete(RequestScope request) {
+              if (harness.blockCompletion().get()) {
+                harness.pinStarted().countDown();
+                return harness.pendingPin();
+              }
+              return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+            }
+            @Override public java.util.concurrent.CompletionStage<Void> releaseCompletion() {
+              return pin.releaseCompletion();
+            }
+            @Override public void close() { pin.close(); }
+          });
+    }
+
+    private KvService pinFailureService(PinFailureHarness harness) {
+      var views = new ReadViewService(stores.control(), stores.manifests(), failingPins(harness),
+          environment.system().profileFingerprint());
+      var reads = new TxnReadExecutor(environment.system().tableGroupId(), views, stores.manifests(),
+          environment.factory(), environment.primary(), worker, scans,
+          new TxnExecutionLimits(4096, 1L << 20, 8L << 20, 4096, 64));
+      var relay = new MutationRelay(stores.control(),
+          (group, instance, epoch) -> CompletableFuture.failedFuture(new AssertionError("unexpected mutation")),
+          (route, request, scope) -> CompletableFuture.failedFuture(new AssertionError("unexpected mutation")));
+      var gateway = new TxnGateway(environment.system().tableGroupId(), environment.identity(), AUTHORIZATION,
+          stores.clusterId(), 1, 1_572_864, stores.control(), relay, stores.invocationResults(),
+          reads, budgets, reservation(), worker, new RequestMetrics());
+      return new KvService((request, observer) -> observer.onError(Status.UNIMPLEMENTED.asRuntimeException()),
+          gateway, gateway::deleteRange, gateway::range);
+    }
+
+    private static void assertPinFailureReturnsUnavailable(io.grpc.ManagedChannel channel,
+        Rpc.RangeRequest range) {
+      var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(5, TimeUnit.SECONDS);
+      var failure = assertThrows(io.grpc.StatusRuntimeException.class, () -> stub.range(range));
+      assertEquals(Status.Code.UNAVAILABLE, failure.getStatus().getCode());
+      var txn = Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder().setRequestRange(range)).build();
+      var txnStub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(5, TimeUnit.SECONDS);
+      var txnFailure = assertThrows(io.grpc.StatusRuntimeException.class, () -> txnStub.txn(txn));
+      assertEquals(Status.Code.UNAVAILABLE, txnFailure.getStatus().getCode());
+    }
+
+    private static void cancelDuringPinFailure(io.grpc.ManagedChannel channel,
+        Rpc.RangeRequest range, PinFailureHarness harness, CancellationEvidence evidence) throws Exception {
+      harness.blockCompletion().set(true);
+      var cancelled = new CountDownLatch(1);
+      var context = io.grpc.Context.current().withCancellation();
+      try {
+        context.run(() -> KVGrpc.newStub(channel).range(range, new StreamObserver<>() {
+          @Override public void onNext(Rpc.RangeResponse response) { evidence.responses().incrementAndGet(); }
+          @Override public void onError(Throwable failure) {
+            evidence.terminalCode().set(Status.fromThrowable(failure).getCode());
+            evidence.terminations().incrementAndGet();
+            cancelled.countDown();
+          }
+          @Override public void onCompleted() { evidence.terminations().incrementAndGet(); cancelled.countDown(); }
+        }));
+        assertTrue(harness.pinStarted().await(5, TimeUnit.SECONDS));
+        context.cancel(null);
+        assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+        harness.pendingPin().completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      } finally {
+        context.cancel(null);
+        harness.pendingPin().completeExceptionally(new BackendFailure(BackendFailure.Category.CANCELLED));
+      }
+    }
 
     private Engine(M3TestEnvironment environment) throws Exception {
       this.environment = environment;
@@ -709,7 +823,7 @@ class M3TxnCommitIT {
         BudgetManager.Account account = account(scope);
         var command = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key("a")),
             CompareCondition.Target.VERSION, CompareCondition.Relation.GREATER, 0)),
-            List.of(new TxnCommand.PointRange(key("a")), new TxnCommand.PointRange(key("tagged"))), List.of());
+            List.of(pointRange(key("a")), pointRange(key("tagged"))), List.of());
         var evaluated = readOnly.execute(command, AUTHORIZATION, environment.identity(), scope, account).join();
         var result = assertInstanceOf(ResultNode.Txn.class, evaluated.result().root());
         assertTrue(result.succeeded());
@@ -956,6 +1070,12 @@ class M3TxnCommitIT {
   private static TxnCommand.Put put(String key, String value) {
     return new TxnCommand.Put(new PutCommand(key(key), bytes(value), 0, false, false, false));
   }
+  private static TxnCommand.Range pointRange(ByteKey key) {
+    return new TxnCommand.Range(new RangeCommand(KeyRange.point(key), RangeCommand.Context.TRANSACTION,
+        0, 0, new RangeCommand.Sort(0, 0), new RangeCommand.RevisionFilter(0, 0, 0, 0),
+        false, false, false));
+  }
+
   private static ByteKey key(String value) { return ByteKey.copyOf(bytes(value)); }
   private static byte[] bytes(String value) { return value.getBytes(StandardCharsets.UTF_8); }
   private static ByteKey digest(int value) {

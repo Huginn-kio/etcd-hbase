@@ -59,6 +59,37 @@ var expectedM3DeleteSteps = []Step{
 	{CaseID: "C09", ID: "J33-empty-key"},
 }
 
+var expectedM3RangeSteps = func() []Step {
+	steps := []Step{{CaseID: "C02", ID: "native-baseline"}}
+	for _, id := range []string{"seed", "update", "current", "historical", "negative-revision", "prefix-page", "keys-only",
+		"negative-limit", "max-limit"} {
+		steps = append(steps, Step{CaseID: "C02", ID: "J34-" + id})
+	}
+	for _, id := range []string{"min-mod", "max-mod", "min-create", "max-create", "negative-min-mod",
+		"negative-max-mod", "negative-min-create", "negative-max-create"} {
+		steps = append(steps, Step{CaseID: "C06", ID: "J34-" + id})
+	}
+	for _, id := range []string{"min-mod", "max-mod", "min-create", "max-create"} {
+		steps = append(steps, Step{CaseID: "C06", ID: "J34-filtered-point-" + id},
+			Step{CaseID: "C06", ID: "J34-filtered-range-" + id})
+	}
+	for _, id := range []string{"range-partial", "point-match", "nested-txn"} {
+		steps = append(steps, Step{CaseID: "C06", ID: "J34-filtered-" + id})
+	}
+	for _, id := range []string{"min-mod", "max-mod", "min-create", "max-create"} {
+		steps = append(steps, Step{CaseID: "C04", ID: "J34-count-point-" + id},
+			Step{CaseID: "C05", ID: "J34-count-range-" + id})
+	}
+	steps = append(steps, Step{CaseID: "C04", ID: "J34-count-missing"},
+		Step{CaseID: "C05", ID: "J34-count-empty-range"})
+	for _, id := range []string{"txn-overlay", "txn-history", "txn-negative", "delete", "recreate",
+		"history-deleted", "history-count-deleted", "history-count-live", "history-recreated",
+		"client-prefix", "txn-count-after-delete", "future", "empty-key"} {
+		steps = append(steps, Step{CaseID: "C02", ID: "J34-" + id})
+	}
+	return steps
+}()
+
 func txnSteps() []Step {
 	steps := []Step{{CaseID: "C11", ID: "native-baseline"}}
 	for _, target := range []string{"version", "create", "mod", "value", "lease"} {
@@ -112,6 +143,8 @@ func LoadM3Suite(path string) (Suite, string, error) {
 		expected = expectedM3NestedTxnSteps
 	case "m3-delete-v1":
 		expected = expectedM3DeleteSteps
+	case "m3-range-v1":
+		expected = expectedM3RangeSteps
 	default:
 		return Suite{}, "", errors.New("M3 scenario identity is not registered")
 	}

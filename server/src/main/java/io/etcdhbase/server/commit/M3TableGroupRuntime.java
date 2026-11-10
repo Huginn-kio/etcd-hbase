@@ -180,7 +180,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     var txnGateway = new TxnGateway(plan.source().tableGroupId(), identity, authorization,
         stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
         stores.control(), relay, stores.invocationResults(), business.txnReads(), budgets, REQUEST_MEMORY, pending.worker, business.metrics());
-    return new KvService(gateway, txnGateway, txnGateway::deleteRange);
+    return new KvService(gateway, txnGateway, txnGateway::deleteRange, txnGateway::range);
   }
 
   public KvService kvService() { return kvService; }

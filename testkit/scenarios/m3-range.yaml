@@ -1,0 +1,56 @@
+schema_version: 1
+id: m3-range-v1
+protocol: etcd-v3.5.23
+steps:
+  - {case_id: C02, id: native-baseline}
+  - {case_id: C02, id: J34-seed}
+  - {case_id: C02, id: J34-update}
+  - {case_id: C02, id: J34-current}
+  - {case_id: C02, id: J34-historical}
+  - {case_id: C02, id: J34-negative-revision}
+  - {case_id: C02, id: J34-prefix-page}
+  - {case_id: C02, id: J34-keys-only}
+  - {case_id: C02, id: J34-negative-limit}
+  - {case_id: C02, id: J34-max-limit}
+  - {case_id: C06, id: J34-min-mod}
+  - {case_id: C06, id: J34-max-mod}
+  - {case_id: C06, id: J34-min-create}
+  - {case_id: C06, id: J34-max-create}
+  - {case_id: C06, id: J34-negative-min-mod}
+  - {case_id: C06, id: J34-negative-max-mod}
+  - {case_id: C06, id: J34-negative-min-create}
+  - {case_id: C06, id: J34-negative-max-create}
+  - {case_id: C06, id: J34-filtered-point-min-mod}
+  - {case_id: C06, id: J34-filtered-range-min-mod}
+  - {case_id: C06, id: J34-filtered-point-max-mod}
+  - {case_id: C06, id: J34-filtered-range-max-mod}
+  - {case_id: C06, id: J34-filtered-point-min-create}
+  - {case_id: C06, id: J34-filtered-range-min-create}
+  - {case_id: C06, id: J34-filtered-point-max-create}
+  - {case_id: C06, id: J34-filtered-range-max-create}
+  - {case_id: C06, id: J34-filtered-range-partial}
+  - {case_id: C06, id: J34-filtered-point-match}
+  - {case_id: C06, id: J34-filtered-nested-txn}
+  - {case_id: C04, id: J34-count-point-min-mod}
+  - {case_id: C05, id: J34-count-range-min-mod}
+  - {case_id: C04, id: J34-count-point-max-mod}
+  - {case_id: C05, id: J34-count-range-max-mod}
+  - {case_id: C04, id: J34-count-point-min-create}
+  - {case_id: C05, id: J34-count-range-min-create}
+  - {case_id: C04, id: J34-count-point-max-create}
+  - {case_id: C05, id: J34-count-range-max-create}
+  - {case_id: C04, id: J34-count-missing}
+  - {case_id: C05, id: J34-count-empty-range}
+  - {case_id: C02, id: J34-txn-overlay}
+  - {case_id: C02, id: J34-txn-history}
+  - {case_id: C02, id: J34-txn-negative}
+  - {case_id: C02, id: J34-delete}
+  - {case_id: C02, id: J34-recreate}
+  - {case_id: C02, id: J34-history-deleted}
+  - {case_id: C02, id: J34-history-count-deleted}
+  - {case_id: C02, id: J34-history-count-live}
+  - {case_id: C02, id: J34-history-recreated}
+  - {case_id: C02, id: J34-client-prefix}
+  - {case_id: C02, id: J34-txn-count-after-delete}
+  - {case_id: C02, id: J34-future}
+  - {case_id: C02, id: J34-empty-key}

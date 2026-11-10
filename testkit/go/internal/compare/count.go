@@ -8,9 +8,11 @@ import (
 type countPolicy string
 
 const (
-	strictCount    countPolicy = ""
-	pageCount      countPolicy = "page"
-	existenceCount countPolicy = "existence"
+	strictCount        countPolicy = ""
+	pageCount          countPolicy = "page"
+	existenceCount     countPolicy = "existence"
+	filteredPointCount countPolicy = "filtered-point"
+	filteredRangeCount countPolicy = "filtered-range"
 )
 
 func equalWithCountAllowance(left, right map[string]any, leftScope string, policy countPolicy) bool {
@@ -44,10 +46,19 @@ func validTargetCount(nativeFields, targetFields map[string]any, policy countPol
 		return false
 	}
 	switch policy {
-	case pageCount:
+	case pageCount, filteredPointCount, filteredRangeCount:
 		kvs, ok := targetFields["kvs"].([]any)
 		pageSize := int64(len(kvs))
-		return ok && nativeCount >= pageSize && targetCount == pageSize
+		if !ok || nativeCount < pageSize || targetCount != pageSize {
+			return false
+		}
+		if policy == filteredPointCount && (nativeCount > 1 || pageSize > 1) {
+			return false
+		}
+		if policy == filteredPointCount || policy == filteredRangeCount {
+			return targetFields["more"] == false
+		}
+		return true
 	case existenceCount:
 		if nativeCount == 0 {
 			return targetCount == 0
@@ -106,7 +117,8 @@ func countPolicyForRequest(record map[string]any) countPolicy {
 }
 
 func countPolicyForRange(fields map[string]any) countPolicy {
-	if end, ok := fields["rangeEnd"].(string); !ok || end == "" {
+	end, ok := fields["rangeEnd"].(string)
+	if !ok {
 		return strictCount
 	}
 	encodedLimit, ok := fields["limit"].(string)
@@ -114,20 +126,42 @@ func countPolicyForRange(fields map[string]any) countPolicy {
 		return strictCount
 	}
 	limit, err := strconv.ParseInt(encodedLimit, 10, 64)
-	if err != nil || limit <= 0 || strconv.FormatInt(limit, 10) != encodedLimit {
+	if err != nil || strconv.FormatInt(limit, 10) != encodedLimit {
 		return strictCount
 	}
 	countOnly, ok := fields["countOnly"].(bool)
 	if !ok {
 		return strictCount
 	}
-	if !countOnly {
+	if end != "" && limit > 0 && !countOnly {
 		return pageCount
 	}
-	if limit == 1 {
+	if end != "" && limit == 1 && countOnly {
 		return existenceCount
 	}
+	if !countOnly && (end == "" || limit <= 0) && hasRevisionFilter(fields) {
+		if end == "" {
+			return filteredPointCount
+		}
+		return filteredRangeCount
+	}
 	return strictCount
+}
+
+func hasRevisionFilter(fields map[string]any) bool {
+	active := false
+	for _, name := range []string{"minModRevision", "maxModRevision", "minCreateRevision", "maxCreateRevision"} {
+		value, ok := fields[name].(string)
+		if !ok {
+			return false
+		}
+		revision, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || strconv.FormatInt(revision, 10) != value {
+			return false
+		}
+		active = active || revision != 0
+	}
+	return active
 }
 
 // Apply Count allowances only to matching selected Range positions, including nested branches.

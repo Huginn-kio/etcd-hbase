@@ -81,7 +81,7 @@ class APIMatrixTest(unittest.TestCase):
                 with self.assertRaisesRegex(matrix.MatrixError, expected_error):
                     matrix.validate(self.args)
 
-    def test_count_policy_requires_both_success_allowances(self):
+    def test_count_policy_requires_all_success_allowances(self):
         path = self.args.cases.parent.parent / "count-policy.json"
         matrix.validate_count_policy(path)
         original = path.read_text()
@@ -98,8 +98,9 @@ class APIMatrixTest(unittest.TestCase):
         original = path.read_text()
         mutations = ({"case_ids": ["C04"]}, {"field": "Header"}, {"method": "etcdserverpb.KV/Put"},
                      {"preserved_fields": ["Kvs", "More", "Header", "revision"]},
-                     {"successful_responses_only": False}, {"target_count": "total_count"})
-        for rule_index in (0, 1):
+                     {"successful_responses_only": False}, {"target_count": "total_count"},
+                     {"request_guard": "all_range_requests"})
+        for rule_index in range(len(json.loads(original)["accepted_differences"])):
             for change in mutations:
                 with self.subTest(rule_index=rule_index, change=change):
                     document = json.loads(original)

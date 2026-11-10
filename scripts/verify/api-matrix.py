@@ -24,8 +24,10 @@ REQUIRED_COUNT_RULES = {
     "other_range_count_only",
 }
 REQUIRED_COUNT_DIFFERENCES = {
-    "limited_range": ("C03", "page_length"),
-    "prefix_count_only_limit_one": ("C05", "existence_0_or_1"),
+    "exact_get": (["C01", "C06"], "result_length", "ordinary_exact_with_revision_filter"),
+    "unlimited_range": (["C02", "C06"], "result_length", "ordinary_nonpoint_without_positive_limit_with_revision_filter"),
+    "limited_range": (["C03"], "page_length", "ordinary_nonpoint_positive_limit"),
+    "prefix_count_only_limit_one": (["C05"], "existence_0_or_1", "nonpoint_count_only_limit_one"),
 }
 PRESERVED_COUNT_FIELDS = {"Kvs", "More", "Header", "revision", "errors"}
 
@@ -227,22 +229,23 @@ def validate_count_policy(path: Path) -> None:
 
 def validate_count_differences(policy: dict[str, Any]) -> None:
     differences = policy.get("accepted_differences")
-    if "accepted_difference" in policy or not isinstance(differences, list) or len(differences) != 2:
-        raise MatrixError("accepted Count differences require page and existence success rules")
+    if "accepted_difference" in policy or not isinstance(differences, list) or len(differences) != len(REQUIRED_COUNT_DIFFERENCES):
+        raise MatrixError("accepted Count differences require all approved success rules")
     if any(not isinstance(item, dict) or not isinstance(item.get("rule_id"), str) for item in differences):
         raise MatrixError("accepted Count differences require named rule objects")
     rule_ids = [item["rule_id"] for item in differences]
     if set(rule_ids) != set(REQUIRED_COUNT_DIFFERENCES) or len(set(rule_ids)) != len(rule_ids):
-        raise MatrixError("accepted Count differences must uniquely cover page and existence rules")
+        raise MatrixError("accepted Count differences must uniquely cover the approved rules")
     for difference in differences:
         validate_count_difference(difference)
 
 
 def validate_count_difference(difference: dict[str, Any]) -> None:
-    case_id, target_count = REQUIRED_COUNT_DIFFERENCES[difference["rule_id"]]
+    case_ids, target_count, request_guard = REQUIRED_COUNT_DIFFERENCES[difference["rule_id"]]
     preserved = difference.get("preserved_fields")
     if (difference.get("method") != "etcdserverpb.KV/Range" or difference.get("field") != "Count"
-            or difference.get("case_ids") != [case_id] or difference.get("target_count") != target_count
+            or difference.get("case_ids") != case_ids or difference.get("target_count") != target_count
+            or difference.get("request_guard") != request_guard
             or difference.get("successful_responses_only") is not True):
         raise MatrixError("accepted Count differences must only adjust approved successful Range Counts")
     if (not isinstance(preserved, list) or not all(isinstance(field, str) for field in preserved)

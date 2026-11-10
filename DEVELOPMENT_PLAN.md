@@ -275,6 +275,8 @@ gRPC 基于 HTTP/2，可在一个 TCP 连接上复用多个调用。四层均衡
 | 范围 CountOnly + Limit=1 | 真实存在为 1，否则 0，Kvs 为空 | 有结果可提前结束；确认不存在要检查各桶 |
 | 其他范围 CountOnly | 首版明确不支持 | 不执行准确范围总数扫描 |
 
+普通精确 Get 和无正 Limit 范围的 Count 随 revision 条件过滤后的 Kvs 计算；固定原生 etcd v3.5.23 可能保留过滤前数量，例如存活 key 的 modRevision=2、min_mod_revision=3 时首版返回 Count=0，原生返回 Count=1。该差异属于首版轻量 Count 边界，M6 仍须复核实际消费者。
+
 不返回随机 Count。对照验证只豁免上述已接受差异；More、deleted、Version、Revision、Txn 成败和 Watch 事件不能 mock。忽略历史迁移工具后的当前调用分析支持此选择，但 M6 仍需确认实际部署路径没有新增总数依赖。
 
 轻量 Count 是首版公开能力边界，必须在 README、API 矩阵、示例和版本说明中显式披露。扩展发行版不能在未验证的情况下宣称严格等价于原生 etcd；未来若增加准确范围计数模式，需另立成本与兼容验收，不作为本计划首版默认任务。
@@ -772,7 +774,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J25。
   - 完成标准：矩阵内选项正确；超预算不部分返回。
   - 验证层次：L1 内核 + L2 协议/Go client。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=公开实现与验证进行中；负责人=Codex；完成日期=—；PR/commit=本任务 PR；验证入口=`scripts/verify/m3.sh --scope public --task J34 --artifact-root <新报告目录>`；评审人/结论=待评审。包含点查、范围和事务内 Range 的 revision、过滤、投影与轻量 Count；真实目标身份及 TLS 验收仍待后续证据。
 
 - [ ] **J35｜key 升降序与非 key 排序的支持边界**
   - 依赖：J34。

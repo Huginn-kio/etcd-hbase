@@ -118,9 +118,14 @@ class M3TxnRpcIT {
       assertEquals(0, budgets.snapshot().reservedBytes());
       assertEquals(0, budgets.snapshot().allocatedBytes());
     }
+    String comparison = switch (run.task()) {
+      case "j33" -> "--m3-delete";
+      case "j34" -> "--m3-range";
+      default -> "--m3-txn";
+    };
     run(run.root(), run.artifacts().resolve(run.task() + "-compare-" + suffix + ".log"), List.of(
         run.root().resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare",
-        run.task().equals("j33") ? "--m3-delete" : "--m3-txn",
+        comparison,
         "--left", run.nativeTrace().toString(), "--right",
         run.artifacts().resolve(run.task() + "-target-" + suffix + "-trace.jsonl").toString()));
   }

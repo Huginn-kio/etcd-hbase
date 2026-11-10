@@ -57,8 +57,8 @@ public final class CompareReadExecutor {
 
   Limits limits() { return limits; }
 
-  ScanSource scanSource() {
-    return scheduler.bind(session.reader(0), account);
+  ScanSource scanSource(long revision) {
+    return scheduler.bind(session.reader(revision), account);
   }
 
   /** The caller must complete the session's final protection check before using this result. */
