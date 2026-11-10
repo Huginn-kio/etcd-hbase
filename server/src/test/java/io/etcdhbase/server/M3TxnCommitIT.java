@@ -45,6 +45,7 @@ import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.DirectRecordReader;
 import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.core.storage.ReadProjection;
+import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.grpc.protocol.TxnResponseEmitter;
 import io.etcdhbase.grpc.service.KvService;
@@ -346,6 +347,11 @@ class M3TxnCommitIT {
     }
 
     private void assertPartialDeleteMaterializationRecovers() throws Exception {
+      InvocationBinding selected = interruptDeleteMaterialization();
+      assertPendingDeleteAndRecover(selected);
+    }
+
+    private InvocationBinding interruptDeleteMaterialization() throws Exception {
       InvocationBinding selected;
       RequestScope scope = RequestScope.withTimeout(TIMEOUT);
       try {
@@ -360,19 +366,7 @@ class M3TxnCommitIT {
         var sealed = assertInstanceOf(TxnCommitPreparation.Sealed.class,
             preparation.prepare(evaluated, binding, scope, account).join());
         selected = sealed.invocation();
-        var applied = new AtomicInteger();
-        MaterializationStore interrupted = new MaterializationStore() {
-          @Override public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope requestScope) {
-            return stores.materialization().preflight(candidate, requestScope);
-          }
-          @Override public CompletableFuture<ApplyResult> applySelected(
-              CommitDecision decision, PreparedCandidate candidate, RequestScope requestScope) {
-            if (applied.incrementAndGet() == 2) {
-              return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
-            }
-            return stores.materialization().applySelected(decision, candidate, requestScope);
-          }
-        };
+        var interrupted = new FailSecondMaterialization(stores.materialization());
         var finalizer = new CommitFinalizationService(stores.control(), stores.outcomes(), stores.decisions(),
             stores.manifests(), interrupted, stores.results());
         var interruptedPublisher = new CommitPublisher(stores.control(), stores.outcomes(),
@@ -380,50 +374,87 @@ class M3TxnCommitIT {
             stores.invocations(), handoff, finalizer);
         assertThrows(CompletionException.class,
             () -> interruptedPublisher.publish(sealed.invocation(), owner, sealed.manifest(), scope).join());
-        assertEquals(2, applied.get());
+        assertEquals(2, interrupted.applied.get());
         var pending = stores.outcomes().resolve(sealed.invocation(), scope).join();
         assertEquals(CommitOutcomeResolver.State.SELECTED_PENDING, pending.state());
         assertEquals(3, currentRevision());
         assertEquals(1, control().finalizedSequence());
-        var physical = environment.openPrimary(scope);
-        assertEquals(StorageMetadata.State.TOMBSTONE,
-            physical.get(key("a"), 3, ReadProjection.METADATA).join().orElseThrow().metadata().state());
-        assertEquals(StorageMetadata.State.LIVE,
-            physical.get(key("b"), 3, ReadProjection.METADATA).join().orElseThrow().metadata().state());
+        assertPartialPhysicalState(scope);
       } finally {
         closeScope(scope);
       }
+      return selected;
+    }
+
+    private void assertPartialPhysicalState(RequestScope scope) throws Exception {
+      var physical = environment.openPrimary(scope);
+      assertEquals(StorageMetadata.State.TOMBSTONE,
+          physical.get(key("a"), 3, ReadProjection.METADATA).join().orElseThrow().metadata().state());
+      assertEquals(StorageMetadata.State.LIVE,
+          physical.get(key("b"), 3, ReadProjection.METADATA).join().orElseThrow().metadata().state());
+    }
+
+    private void assertPendingDeleteAndRecover(InvocationBinding selected) throws Exception {
       RequestScope readScope = RequestScope.withTimeout(TIMEOUT);
       try {
         var account = account(readScope);
         var physical = environment.openPrimary(readScope);
-        var read = TxnReadSession.open(stores.views(), List.of(), AUTHORIZATION, physical,
-            stores.manifests(), environment.primary().codec()::bucket, 1, readScope).join();
-        for (String name : List.of("a", "b")) {
-          try (var point = new DirectRecordReader(read.reader(0), account, 4096)
-              .readForPreparation(key(name), 3, ReadProjection.METADATA).join()) {
-            assertEquals(StorageMetadata.State.TOMBSTONE, point.record().orElseThrow().metadata().state());
-          }
-        }
-        read.finish().join();
-        var pending = stores.outcomes().resolve(selected, readScope).join();
-        assertEquals(CommitOutcomeResolver.State.SELECTED_PENDING, pending.state());
-        assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED,
-            stores.finalizer().finish(selected, pending, readScope).join().state());
-        for (String name : List.of("a", "b")) {
-          assertEquals(StorageMetadata.State.TOMBSTONE,
-              physical.get(key(name), 3, ReadProjection.METADATA).join().orElseThrow().metadata().state());
-        }
-        assertEquals(2, control().finalizedSequence());
-        try (var result = stores.invocationResults().resolveTransaction(selected.invocationId(),
-            selected.requestDigest(), AUTHORIZATION, readScope, account).join()) {
-          var root = assertInstanceOf(ResultNode.Txn.class, ResultMessages.decodeTree(result.payload().buffer()).root());
-          var deleted = assertInstanceOf(ResultNode.Delete.class, root.responses().getFirst());
-          assertEquals(2, deleted.deleted());
-          assertEquals(2, deleted.previous().size());
-        }
+        assertPendingDeleteView(physical, account, readScope);
+        finalizeDeleteAndVerifyResult(selected, physical, account, readScope);
       } finally {
         closeScope(readScope);
+      }
+    }
+
+    private void assertPendingDeleteView(RecordStore physical, BudgetManager.Account account,
+        RequestScope readScope) {
+      var read = TxnReadSession.open(stores.views(), List.of(), AUTHORIZATION, physical,
+          stores.manifests(), environment.primary().codec()::bucket, 1, readScope).join();
+      for (String name : List.of("a", "b")) {
+        try (var point = new DirectRecordReader(read.reader(0), account, 4096)
+            .readForPreparation(key(name), 3, ReadProjection.METADATA).join()) {
+          assertEquals(StorageMetadata.State.TOMBSTONE, point.record().orElseThrow().metadata().state());
+        }
+      }
+      read.finish().join();
+    }
+
+    private void finalizeDeleteAndVerifyResult(InvocationBinding selected, RecordStore physical,
+        BudgetManager.Account account, RequestScope readScope) {
+      var pending = stores.outcomes().resolve(selected, readScope).join();
+      assertEquals(CommitOutcomeResolver.State.SELECTED_PENDING, pending.state());
+      assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED,
+          stores.finalizer().finish(selected, pending, readScope).join().state());
+      for (String name : List.of("a", "b")) {
+        assertEquals(StorageMetadata.State.TOMBSTONE,
+            physical.get(key(name), 3, ReadProjection.METADATA).join().orElseThrow().metadata().state());
+      }
+      assertEquals(2, control().finalizedSequence());
+      try (var result = stores.invocationResults().resolveTransaction(selected.invocationId(),
+          selected.requestDigest(), AUTHORIZATION, readScope, account).join()) {
+        var root = assertInstanceOf(ResultNode.Txn.class, ResultMessages.decodeTree(result.payload().buffer()).root());
+        var deleted = assertInstanceOf(ResultNode.Delete.class, root.responses().getFirst());
+        assertEquals(2, deleted.deleted());
+        assertEquals(2, deleted.previous().size());
+      }
+    }
+
+    private static final class FailSecondMaterialization implements MaterializationStore {
+      private final MaterializationStore delegate;
+      private final AtomicInteger applied = new AtomicInteger();
+
+      private FailSecondMaterialization(MaterializationStore delegate) { this.delegate = delegate; }
+
+      @Override public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope scope) {
+        return delegate.preflight(candidate, scope);
+      }
+
+      @Override public CompletableFuture<ApplyResult> applySelected(
+          CommitDecision decision, PreparedCandidate candidate, RequestScope scope) {
+        if (applied.incrementAndGet() == 2) {
+          return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+        }
+        return delegate.applySelected(decision, candidate, scope);
       }
     }
 

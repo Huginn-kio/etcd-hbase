@@ -220,46 +220,59 @@ public final class TxnWorkingSet {
           return;
         }
         StoredRecord observed = found.orElseThrow();
-        if (!range.contains(observed.key()) || previousKey != null && previousKey.compareTo(observed.key()) >= 0) {
-          throw new IllegalStateException("delete view is unordered or outside its requested range");
-        }
-        previousKey = observed.key();
-        if (observed.metadata().state() == StorageMetadata.State.LIVE
-            && Math.addExact(FIXED_OPERATION_BYTES, Math.multiplyExact(COPY_ALLOWANCE, observed.retainedBytes()))
-                > maximumRetainedBytes / 2) {
-          throw new java.util.concurrent.CompletionException(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-        }
+        validateObserved(observed);
         var planned = deletePlanner.planWorking(invocation, Optional.of(observed), Math.addExact(firstOrdinal, count));
         if (planned.isEmpty()) {
           advance(result);
           return;
         }
-        var plan = planned.orElseThrow();
-        int selected = checkedBucket(observed.key());
-        if (manifests.candidateBucket(plan.candidate()) != selected) {
-          throw new IllegalArgumentException("data and manifest buckets differ");
-        }
-        onDelete.accept(observed);
-        PreparedEvent event = plan.event();
-        Objects.requireNonNull(manifests.createEvent(event, scope), "delete event future").whenComplete((created, failure) -> {
-          if (failure != null) {
-            result.completeExceptionally(failure);
-            return;
-          }
-          try {
-            requireCreated(created);
-            count = Math.addExact(count, 1);
-            result.complete(Optional.of(new PagedWorksetIndex.EventRef(selected, observed.key(),
-                event.ordinal(), event.digest())));
-          } catch (RuntimeException invalid) {
-            result.completeExceptionally(invalid);
-          } catch (Error fatal) {
-            result.completeExceptionally(fatal);
-            throw fatal;
-          }
-        });
+        persist(observed, planned.orElseThrow(), result);
       } catch (RuntimeException failure) {
         result.completeExceptionally(failure);
+      } catch (Error fatal) {
+        result.completeExceptionally(fatal);
+        throw fatal;
+      }
+    }
+
+    private void validateObserved(StoredRecord observed) {
+      if (!range.contains(observed.key()) || previousKey != null && previousKey.compareTo(observed.key()) >= 0) {
+        throw new IllegalStateException("delete view is unordered or outside its requested range");
+      }
+      previousKey = observed.key();
+      if (observed.metadata().state() == StorageMetadata.State.LIVE
+          && Math.addExact(FIXED_OPERATION_BYTES, Math.multiplyExact(COPY_ALLOWANCE, observed.retainedBytes()))
+              > maximumRetainedBytes / 2) {
+        throw new java.util.concurrent.CompletionException(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+      }
+    }
+
+    private void persist(StoredRecord observed, DeletePlanner.Plan plan,
+        CompletableFuture<Optional<PagedWorksetIndex.EventRef>> result) {
+      int selected = checkedBucket(observed.key());
+      if (manifests.candidateBucket(plan.candidate()) != selected) {
+        throw new IllegalArgumentException("data and manifest buckets differ");
+      }
+      onDelete.accept(observed);
+      PreparedEvent event = plan.event();
+      Objects.requireNonNull(manifests.createEvent(event, scope), "delete event future")
+          .whenComplete((created, failure) -> completePersisted(observed, selected, event, created, failure, result));
+    }
+
+    private void completePersisted(StoredRecord observed, int selected, PreparedEvent event,
+        SystemRecordStore.CreateResult created, Throwable failure,
+        CompletableFuture<Optional<PagedWorksetIndex.EventRef>> result) {
+      if (failure != null) {
+        result.completeExceptionally(failure);
+        return;
+      }
+      try {
+        requireCreated(created);
+        count = Math.addExact(count, 1);
+        result.complete(Optional.of(new PagedWorksetIndex.EventRef(selected, observed.key(),
+            event.ordinal(), event.digest())));
+      } catch (RuntimeException invalid) {
+        result.completeExceptionally(invalid);
       } catch (Error fatal) {
         result.completeExceptionally(fatal);
         throw fatal;

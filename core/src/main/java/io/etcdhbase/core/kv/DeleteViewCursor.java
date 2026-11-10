@@ -23,6 +23,7 @@ import java.util.function.ToIntFunction;
 
 /** Ordered fixed-base plus completed-workset view for one delete operation. */
 final class DeleteViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable {
+  private record BucketBounds(int first, int end) {}
   private final List<BucketViewCursor> bases;
   private final OrderedViewCursor ordered;
   private final DirectRecordReader values;
@@ -52,15 +53,8 @@ final class DeleteViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable
     var opened = new ArrayList<BucketViewCursor>();
     var merged = new ArrayList<AsyncCursor<StoredRecord>>();
     try {
-      int first = 0;
-      int end = limits.buckets();
-      if (range.isEmpty()) end = 0;
-      else if (range.kind() == KeyRange.Kind.POINT) {
-        first = bucketSelector.applyAsInt(range.lowerInclusive().orElseThrow());
-        if (first < 0 || first >= limits.buckets()) throw new IllegalArgumentException("invalid delete bucket");
-        end = first + 1;
-      }
-      for (int bucket = first; bucket < end; bucket++) {
+      var bounds = bucketBounds(range, bucketSelector, limits.buckets());
+      for (int bucket = bounds.first(); bucket < bounds.end(); bucket++) {
         var request = new ScanRequest(bucket, range, Optional.empty(), revision, ReadProjection.METADATA,
             1, limits.pageBytes(), limits.physicalRowsPerPage());
         var base = new BucketViewCursor(source, request, account, scope);
@@ -76,6 +70,14 @@ final class DeleteViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable
     }
   }
 
+  private static BucketBounds bucketBounds(KeyRange range, ToIntFunction<ByteKey> selector, int buckets) {
+    if (range.isEmpty()) return new BucketBounds(0, 0);
+    if (range.kind() != KeyRange.Kind.POINT) return new BucketBounds(0, buckets);
+    int selected = selector.applyAsInt(range.lowerInclusive().orElseThrow());
+    if (selected < 0 || selected >= buckets) throw new IllegalArgumentException("invalid delete bucket");
+    return new BucketBounds(selected, selected + 1);
+  }
+
   @Override public CompletableFuture<Optional<StoredRecord>> next() {
     synchronized (this) {
       if (closed || scope.isClosed() || scope.isDeadlineExceeded()) return CompletableFuture.failedFuture(inactive());
@@ -83,39 +85,44 @@ final class DeleteViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable
       releaseValue();
       reading = true;
     }
-    CompletableFuture<Optional<StoredRecord>> operation = ordered.next().thenCompose(found -> {
-      if (found.isEmpty()) return CompletableFuture.completedFuture(Optional.empty());
-      StoredRecord selected = found.orElseThrow();
-      if (selected.metadata().state() == StorageMetadata.State.TOMBSTONE || selected.hasValue()) {
-        return CompletableFuture.completedFuture(found);
+    CompletableFuture<Optional<StoredRecord>> operation = ordered.next().thenCompose(this::loadValue);
+    return operation.whenComplete(this::finishRead).copy();
+  }
+
+  private CompletableFuture<Optional<StoredRecord>> loadValue(Optional<StoredRecord> found) {
+    if (found.isEmpty()) return CompletableFuture.completedFuture(Optional.empty());
+    StoredRecord selected = found.orElseThrow();
+    if (selected.metadata().state() == StorageMetadata.State.TOMBSTONE || selected.hasValue()) {
+      return CompletableFuture.completedFuture(found);
+    }
+    return values.readForPreparation(selected.key(), revision, ReadProjection.FULL)
+        .thenApply(point -> receiveValue(selected, point));
+  }
+
+  private Optional<StoredRecord> receiveValue(StoredRecord selected, PointResult point) {
+    try {
+      StoredRecord value = point.record().orElseThrow(() -> new IllegalStateException("delete value is missing"));
+      if (!value.hasValue() || !value.key().equals(selected.key()) || !value.metadata().equals(selected.metadata())) {
+        throw new IllegalStateException("delete value differs from its selected metadata");
       }
-      return values.readForPreparation(selected.key(), revision, ReadProjection.FULL).thenApply(point -> {
-        try {
-          StoredRecord value = point.record().orElseThrow(() -> new IllegalStateException("delete value is missing"));
-          if (!value.hasValue() || !value.key().equals(selected.key()) || !value.metadata().equals(selected.metadata())) {
-            throw new IllegalStateException("delete value differs from its selected metadata");
-          }
-          synchronized (DeleteViewCursor.this) {
-            if (closed || scope.isClosed() || scope.isDeadlineExceeded()) {
-              throw new java.util.concurrent.CompletionException(inactive());
-            }
-            deliveredValue = point;
-          }
-          return Optional.of(value);
-        } catch (RuntimeException | Error failure) {
-          try { point.close(); }
-          catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-          throw failure;
+      synchronized (this) {
+        if (closed || scope.isClosed() || scope.isDeadlineExceeded()) {
+          throw new java.util.concurrent.CompletionException(inactive());
         }
-      });
-    });
-    return operation.whenComplete((ignored, failure) -> {
-      synchronized (DeleteViewCursor.this) {
-        reading = false;
-        if (failure != null || closed) releaseValue();
-        if (failure == null && closed) throw new java.util.concurrent.CompletionException(inactive());
+        deliveredValue = point;
       }
-    }).copy();
+      return Optional.of(value);
+    } catch (RuntimeException | Error failure) {
+      try { point.close(); }
+      catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+      throw failure;
+    }
+  }
+
+  private synchronized void finishRead(Optional<StoredRecord> ignored, Throwable failure) {
+    reading = false;
+    if (failure != null || closed) releaseValue();
+    if (failure == null && closed) throw new java.util.concurrent.CompletionException(inactive());
   }
 
   @Override public synchronized void close() {

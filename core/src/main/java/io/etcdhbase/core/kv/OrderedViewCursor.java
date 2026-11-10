@@ -2,41 +2,24 @@ package io.etcdhbase.core.kv;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.AsyncCursor;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StoredRecord;
-import java.util.ArrayDeque;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
 
 /** Merges ordered bucket views while retaining at most one charged head per input. */
 final class OrderedViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable {
-  private static final ThreadLocal<ArrayDeque<Runnable>> CONTINUATIONS = new ThreadLocal<>();
-  private static final Executor CONTINUE = command -> {
-    ArrayDeque<Runnable> queue = CONTINUATIONS.get();
-    if (queue != null) {
-      queue.addLast(command);
-      return;
-    }
-    queue = new ArrayDeque<>();
-    CONTINUATIONS.set(queue);
-    try {
-      queue.addLast(command);
-      Runnable next;
-      while ((next = queue.pollFirst()) != null) next.run();
-    } finally {
-      queue.clear();
-      CONTINUATIONS.remove();
-    }
-  };
+  private static final ContinuationExecutor CONTINUE = new ContinuationExecutor();
 
   private record Head(int source, StoredRecord record, BudgetManager.Lease lease) {}
+  private record ReadStart(int refill, CompletableFuture<Optional<StoredRecord>> immediate) {}
 
   private final List<AsyncCursor<StoredRecord>> sources;
   private final BudgetManager.Account account;
@@ -61,19 +44,9 @@ final class OrderedViewCursor implements AsyncCursor<StoredRecord>, AutoCloseabl
 
   /** The previous item remains owned until the next call or close; sources remain caller-owned. */
   @Override public CompletableFuture<Optional<StoredRecord>> next() {
-    int refill = -1;
+    ReadStart start;
     try {
-      synchronized (this) {
-        if (closed || failed) return CompletableFuture.failedFuture(inactive());
-        if (reading) return CompletableFuture.failedFuture(new IllegalStateException("concurrent ordered view reads"));
-        if (ended) return CompletableFuture.completedFuture(Optional.empty());
-        reading = true;
-        if (delivered != null) {
-          refill = delivered.source();
-          delivered.lease().close();
-          delivered = null;
-        }
-      }
+      start = beginRead();
     } catch (RuntimeException failure) {
       failAndRelease(failure);
       return CompletableFuture.failedFuture(failure);
@@ -81,9 +54,10 @@ final class OrderedViewCursor implements AsyncCursor<StoredRecord>, AutoCloseabl
       failAndRelease(fatal);
       throw fatal;
     }
+    if (start.immediate() != null) return start.immediate();
     CompletableFuture<Optional<StoredRecord>> operation;
     try {
-      CompletableFuture<Void> first = refill < 0 ? CompletableFuture.completedFuture(null) : load(refill);
+      CompletableFuture<Void> first = start.refill() < 0 ? CompletableFuture.completedFuture(null) : load(start.refill());
       operation = first.thenComposeAsync(ignored -> initialize(), CONTINUE).thenApply(ignored -> take());
     } catch (RuntimeException failure) {
       failAndRelease(failure);
@@ -92,20 +66,34 @@ final class OrderedViewCursor implements AsyncCursor<StoredRecord>, AutoCloseabl
       failAndRelease(fatal);
       throw fatal;
     }
-    return operation.whenComplete((ignored, failure) -> {
-      synchronized (OrderedViewCursor.this) {
-        reading = false;
-        if (failure != null) failed = true;
-        if (failed || closed) {
-          try { releaseHeads(); }
-          catch (RuntimeException | Error cleanup) {
-            if (failure == null) throw cleanup;
-            if (cleanup != failure) failure.addSuppressed(cleanup);
-          }
-        }
-        if (failure == null && closed) throw new java.util.concurrent.CompletionException(inactive());
+    return operation.whenComplete(this::finishRead).copy();
+  }
+
+  private synchronized ReadStart beginRead() {
+    if (closed || failed) return new ReadStart(-1, CompletableFuture.failedFuture(inactive()));
+    if (reading) return new ReadStart(-1, CompletableFuture.failedFuture(new IllegalStateException("concurrent ordered view reads")));
+    if (ended) return new ReadStart(-1, CompletableFuture.completedFuture(Optional.empty()));
+    reading = true;
+    int refill = -1;
+    if (delivered != null) {
+      refill = delivered.source();
+      delivered.lease().close();
+      delivered = null;
+    }
+    return new ReadStart(refill, null);
+  }
+
+  private synchronized void finishRead(Optional<StoredRecord> ignored, Throwable failure) {
+    reading = false;
+    if (failure != null) failed = true;
+    if (failed || closed) {
+      try { releaseHeads(); }
+      catch (RuntimeException | Error cleanup) {
+        if (failure == null) throw cleanup;
+        if (cleanup != failure) failure.addSuppressed(cleanup);
       }
-    }).copy();
+    }
+    if (failure == null && closed) throw new java.util.concurrent.CompletionException(inactive());
   }
 
   private CompletableFuture<Void> initialize() {
@@ -119,21 +107,23 @@ final class OrderedViewCursor implements AsyncCursor<StoredRecord>, AutoCloseabl
     requireActive();
     return Objects.requireNonNull(sources.get(source).next(), "ordered source future").thenAccept(found -> {
       requireActive();
-      Objects.requireNonNull(found, "ordered source result").ifPresent(record -> {
-        try {
-          BudgetManager.Lease lease = account.tryRetain(BudgetManager.Memory.HEAD, record.retainedBytes())
-              .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-          try { heads.add(new Head(source, record, lease)); }
-          catch (RuntimeException | Error failure) {
-            try { lease.close(); }
-            catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-            throw failure;
-          }
-        } catch (BackendFailure failure) {
-          throw new java.util.concurrent.CompletionException(failure);
-        }
-      });
+      Objects.requireNonNull(found, "ordered source result").ifPresent(record -> retainHead(source, record));
     });
+  }
+
+  private void retainHead(int source, StoredRecord record) {
+    try {
+      BudgetManager.Lease lease = account.tryRetain(BudgetManager.Memory.HEAD, record.retainedBytes())
+          .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+      try { heads.add(new Head(source, record, lease)); }
+      catch (RuntimeException | Error failure) {
+        try { lease.close(); }
+        catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+        throw failure;
+      }
+    } catch (BackendFailure failure) {
+      throw new java.util.concurrent.CompletionException(failure);
+    }
   }
 
   private synchronized Optional<StoredRecord> take() {

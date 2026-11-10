@@ -53,6 +53,25 @@ func RunM3Delete(ctx context.Context, client *clientv3.Client, scope, prefix str
 
 func (runner *runner) m3DeleteScenario(ctx context.Context, prefix string) error {
 	kv := etcdserverpb.NewKVClient(runner.client.ActiveConnection())
+	if err := runner.m3DeletePointAndRecreate(ctx, kv, prefix); err != nil {
+		return err
+	}
+	if err := runner.m3DeletePrefix(ctx, kv, prefix); err != nil {
+		return err
+	}
+	if err := runner.m3DeleteOverlap(ctx, kv, prefix); err != nil {
+		return err
+	}
+	if err := runner.m3DeleteZeroEnd(ctx, kv, prefix); err != nil {
+		return err
+	}
+	if err := runner.m3ClientDelete(ctx, kv, prefix); err != nil {
+		return err
+	}
+	return runner.m3DeleteWithoutPreviousAndInvalid(ctx, kv, prefix)
+}
+
+func (runner *runner) m3DeletePointAndRecreate(ctx context.Context, kv etcdserverpb.KVClient, prefix string) error {
 	point := []byte(prefix + "point")
 	baseline, err := runner.m3Put(ctx, kv, "native-baseline", &etcdserverpb.PutRequest{Key: point, Value: []byte("old")})
 	if err != nil || baseline.Header == nil {
@@ -60,12 +79,14 @@ func (runner *runner) m3DeleteScenario(ctx context.Context, prefix string) error
 	}
 	base := baseline.Header.Revision
 	deleted, err := runner.m3Delete(ctx, kv, "J33-point", &etcdserverpb.DeleteRangeRequest{Key: point, PrevKv: true})
-	if err != nil || deleted.Header == nil || deleted.Header.Revision != base+1 || deleted.Deleted != 1 ||
-		len(deleted.PrevKvs) != 1 || !bytes.Equal(deleted.PrevKvs[0].Value, []byte("old")) {
+	invalidPoint := err != nil || deleted.Header == nil || deleted.Header.Revision != base+1 || deleted.Deleted != 1 ||
+		len(deleted.PrevKvs) != 1 || !bytes.Equal(deleted.PrevKvs[0].Value, []byte("old"))
+	if invalidPoint {
 		return errors.New("point delete returned the wrong revision or previous value")
 	}
 	empty, err := runner.m3Delete(ctx, kv, "J33-empty", &etcdserverpb.DeleteRangeRequest{Key: point, PrevKv: true})
-	if err != nil || empty.Header == nil || empty.Header.Revision != base+1 || empty.Deleted != 0 || len(empty.PrevKvs) != 0 {
+	invalidEmpty := err != nil || empty.Header == nil || empty.Header.Revision != base+1 || empty.Deleted != 0 || len(empty.PrevKvs) != 0
+	if invalidEmpty {
 		return errors.New("empty delete changed revision or returned a previous value")
 	}
 	if _, err = runner.m3Put(ctx, kv, "J33-recreate", &etcdserverpb.PutRequest{Key: point, Value: []byte("new"), PrevKv: true}); err != nil {
@@ -76,10 +97,15 @@ func (runner *runner) m3DeleteScenario(ctx context.Context, prefix string) error
 		return errors.New("recreated key could not be read")
 	}
 	read := recreated.Responses[0].GetResponseRange()
-	if read == nil || len(read.Kvs) != 1 || read.Kvs[0].CreateRevision != base+2 || read.Kvs[0].Version != 1 ||
-		!bytes.Equal(read.Kvs[0].Value, []byte("new")) {
+	invalidRecreated := read == nil || len(read.Kvs) != 1 || read.Kvs[0].CreateRevision != base+2 || read.Kvs[0].Version != 1 ||
+		!bytes.Equal(read.Kvs[0].Value, []byte("new"))
+	if invalidRecreated {
 		return errors.New("delete then recreate did not reset key metadata")
 	}
+	return nil
+}
+
+func (runner *runner) m3DeletePrefix(ctx context.Context, kv etcdserverpb.KVClient, prefix string) error {
 	group := []byte(prefix + "group/")
 	keys := [][]byte{append(bytes.Clone(group), 'a'), append(bytes.Clone(group), 'a', 0), append(bytes.Clone(group), 0xff)}
 	other := []byte(prefix + "other")
@@ -88,7 +114,7 @@ func (runner *runner) m3DeleteScenario(ctx context.Context, prefix string) error
 		ops = append(ops, m3PutOp(key, []byte("range"), false))
 	}
 	ops = append(ops, m3PutOp(other, []byte("other"), false))
-	if _, err = runner.m3Txn(ctx, kv, "J33-seed-range", &etcdserverpb.TxnRequest{Success: ops}); err != nil {
+	if _, err := runner.m3Txn(ctx, kv, "J33-seed-range", &etcdserverpb.TxnRequest{Success: ops}); err != nil {
 		return err
 	}
 	ranged, err := runner.m3Delete(ctx, kv, "J33-prefix", &etcdserverpb.DeleteRangeRequest{
@@ -101,15 +127,11 @@ func (runner *runner) m3DeleteScenario(ctx context.Context, prefix string) error
 			return errors.New("prefix delete previous values are not in key order")
 		}
 	}
-	if err := runner.m3DeleteOverlap(ctx, kv, prefix); err != nil {
-		return err
-	}
-	if err := runner.m3DeleteZeroEnd(ctx, kv, prefix); err != nil {
-		return err
-	}
-	if err := runner.m3ClientDelete(ctx, kv, prefix); err != nil {
-		return err
-	}
+	return nil
+}
+
+func (runner *runner) m3DeleteWithoutPreviousAndInvalid(ctx context.Context, kv etcdserverpb.KVClient, prefix string) error {
+	other := []byte(prefix + "other")
 	withoutPrevious, err := runner.m3Delete(ctx, kv, "J33-no-prev", &etcdserverpb.DeleteRangeRequest{Key: other})
 	if err != nil || withoutPrevious.Deleted != 1 || len(withoutPrevious.PrevKvs) != 0 {
 		return errors.New("delete without PrevKV returned an incorrect result")
@@ -145,11 +167,13 @@ func (runner *runner) m3DeleteOverlap(ctx context.Context, kv etcdserverpb.KVCli
 	first := response.Responses[1].GetResponseDeleteRange()
 	after := response.Responses[2].GetResponseRange()
 	nested := response.Responses[3].GetResponseTxn()
-	if first == nil || first.Deleted != 2 || after == nil || len(after.Kvs) != 0 || nested == nil || len(nested.Responses) != 2 {
+	invalidWorkingView := first == nil || first.Deleted != 2 || after == nil || len(after.Kvs) != 0 || nested == nil || len(nested.Responses) != 2
+	if invalidWorkingView {
 		return errors.New("overlapping deletes did not use the completed working view")
 	}
 	second, empty := nested.Responses[0].GetResponseDeleteRange(), nested.Responses[1].GetResponseDeleteRange()
-	if second == nil || second.Deleted != 1 || empty == nil || empty.Deleted != 0 {
+	invalidNestedDeletes := second == nil || second.Deleted != 1 || empty == nil || empty.Deleted != 0
+	if invalidNestedDeletes {
 		return errors.New("nested overlapping deletes did not use the completed working view")
 	}
 	return nil
@@ -168,11 +192,8 @@ func (runner *runner) m3DeleteZeroEnd(ctx context.Context, kv etcdserverpb.KVCli
 	if err != nil || len(first.Responses) != 3 {
 		return errors.New("zero-end delete then Put transaction failed")
 	}
-	firstDelete, firstPut, firstRead := first.Responses[0].GetResponseDeleteRange(),
-		first.Responses[1].GetResponsePut(), first.Responses[2].GetResponseRange()
-	if firstDelete == nil || firstDelete.Deleted != 1 || firstPut == nil || firstPut.PrevKv != nil ||
-		firstRead == nil || len(firstRead.Kvs) != 1 || firstRead.Kvs[0].Version != 1 {
-		return errors.New("zero-end delete then Put did not recreate the key")
+	if err := validateZeroDeleteThenPut(first); err != nil {
+		return err
 	}
 	second, err := runner.m3Txn(ctx, kv, "J33-zero-put-delete", &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
 		m3PutOp(key, []byte("next"), true), del, m3Range(key),
@@ -180,9 +201,25 @@ func (runner *runner) m3DeleteZeroEnd(ctx context.Context, kv etcdserverpb.KVCli
 	if err != nil || len(second.Responses) != 3 {
 		return errors.New("zero-end Put then delete transaction failed")
 	}
+	return validateZeroPutThenDelete(second)
+}
+
+func validateZeroDeleteThenPut(first *etcdserverpb.TxnResponse) error {
+	firstDelete, firstPut, firstRead := first.Responses[0].GetResponseDeleteRange(),
+		first.Responses[1].GetResponsePut(), first.Responses[2].GetResponseRange()
+	invalid := firstDelete == nil || firstDelete.Deleted != 1 || firstPut == nil || firstPut.PrevKv != nil ||
+		firstRead == nil || len(firstRead.Kvs) != 1 || firstRead.Kvs[0].Version != 1
+	if invalid {
+		return errors.New("zero-end delete then Put did not recreate the key")
+	}
+	return nil
+}
+
+func validateZeroPutThenDelete(second *etcdserverpb.TxnResponse) error {
 	secondDelete, secondRead := second.Responses[1].GetResponseDeleteRange(), second.Responses[2].GetResponseRange()
-	if secondDelete == nil || secondDelete.Deleted != 1 || len(secondDelete.PrevKvs) != 1 ||
-		!bytes.Equal(secondDelete.PrevKvs[0].Value, []byte("next")) || secondRead == nil || len(secondRead.Kvs) != 0 {
+	invalid := secondDelete == nil || secondDelete.Deleted != 1 || len(secondDelete.PrevKvs) != 1 ||
+		!bytes.Equal(secondDelete.PrevKvs[0].Value, []byte("next")) || secondRead == nil || len(secondRead.Kvs) != 0
+	if invalid {
 		return errors.New("zero-end Put then delete did not use the prior working value")
 	}
 	return nil

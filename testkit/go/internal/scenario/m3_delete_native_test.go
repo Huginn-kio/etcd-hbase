@@ -35,21 +35,24 @@ func TestM3NativeDeleteOrderingAndEmptyRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Header.Revision != 3 || response.Responses[1].GetResponseDeleteRange().Deleted != 2 ||
+	invalidDeleteOrder := response.Header.Revision != 3 || response.Responses[1].GetResponseDeleteRange().Deleted != 2 ||
 		response.Responses[3].GetResponseDeleteRange().Deleted != 1 ||
-		response.Responses[4].GetResponseDeleteRange().Deleted != 0 {
+		response.Responses[4].GetResponseDeleteRange().Deleted != 0
+	if invalidDeleteOrder {
 		t.Fatal("native delete operations did not share one revision and one live working view")
 	}
 	before, first, after := response.Responses[0].GetResponseRange(),
 		response.Responses[1].GetResponseDeleteRange(), response.Responses[2].GetResponseRange()
 	second, empty := response.Responses[3].GetResponseDeleteRange(), response.Responses[4].GetResponseDeleteRange()
-	if before.Header.Revision != 2 || first.Header.Revision != 3 || after.Header.Revision != 3 ||
-		second.Header.Revision != 3 || empty.Header.Revision != 3 || len(before.Kvs) != 1 || len(after.Kvs) != 0 {
+	invalidHeadersOrReads := before.Header.Revision != 2 || first.Header.Revision != 3 || after.Header.Revision != 3 ||
+		second.Header.Revision != 3 || empty.Header.Revision != 3 || len(before.Kvs) != 1 || len(after.Kvs) != 0
+	if invalidHeadersOrReads {
 		t.Fatal("native per-operation headers or reads do not match execution order")
 	}
-	if len(first.PrevKvs) != 2 || !bytes.Equal(first.PrevKvs[0].Key, []byte("a")) ||
+	invalidPreviousOrder := len(first.PrevKvs) != 2 || !bytes.Equal(first.PrevKvs[0].Key, []byte("a")) ||
 		!bytes.Equal(first.PrevKvs[1].Key, []byte("b")) || len(second.PrevKvs) != 1 ||
-		!bytes.Equal(second.PrevKvs[0].Key, []byte("c")) || len(empty.PrevKvs) != 0 {
+		!bytes.Equal(second.PrevKvs[0].Key, []byte("c")) || len(empty.PrevKvs) != 0
+	if invalidPreviousOrder {
 		t.Fatal("native previous values are not the ordered live records before each delete")
 	}
 	standalone, err := kv.DeleteRange(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte("a"), RangeEnd: []byte("z")})
@@ -80,9 +83,10 @@ func TestM3NativeZeroEndAllowsDeleteAndPutOfSameKey(t *testing.T) {
 		t.Fatalf("native rejected zero-end delete then Put: %v", err)
 	}
 	read := first.Responses[2].GetResponseRange().Kvs[0]
-	if first.Header.Revision != 3 || first.Responses[0].GetResponseDeleteRange().Deleted != 1 ||
+	invalidRecreation := first.Header.Revision != 3 || first.Responses[0].GetResponseDeleteRange().Deleted != 1 ||
 		first.Responses[1].GetResponsePut().PrevKv != nil || read.CreateRevision != 3 ||
-		read.ModRevision != 3 || read.Version != 1 || !bytes.Equal(read.Value, []byte("new")) {
+		read.ModRevision != 3 || read.Version != 1 || !bytes.Equal(read.Value, []byte("new"))
+	if invalidRecreation {
 		t.Fatal("native delete then Put did not recreate the key in the same revision")
 	}
 	second, err := kv.Txn(ctx, &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
@@ -92,9 +96,10 @@ func TestM3NativeZeroEndAllowsDeleteAndPutOfSameKey(t *testing.T) {
 		t.Fatalf("native rejected Put then zero-end delete: %v", err)
 	}
 	previous := second.Responses[1].GetResponseDeleteRange().PrevKvs[0]
-	if second.Header.Revision != 4 || second.Responses[1].GetResponseDeleteRange().Deleted != 1 ||
+	invalidPriorWrite := second.Header.Revision != 4 || second.Responses[1].GetResponseDeleteRange().Deleted != 1 ||
 		previous.CreateRevision != 3 || previous.ModRevision != 4 || previous.Version != 2 ||
-		!bytes.Equal(previous.Value, []byte("next")) || len(second.Responses[2].GetResponseRange().Kvs) != 0 {
+		!bytes.Equal(previous.Value, []byte("next")) || len(second.Responses[2].GetResponseRange().Kvs) != 0
+	if invalidPriorWrite {
 		t.Fatal("native Put then delete did not use the previously written working value")
 	}
 }

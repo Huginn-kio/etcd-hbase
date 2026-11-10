@@ -41,36 +41,41 @@ final class BucketViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable
       if (cursor.state() == BucketCursor.State.EXHAUSTED) return CompletableFuture.completedFuture(Optional.empty());
       reading = true;
     }
-    CompletableFuture<Optional<StoredRecord>> operation = cursor.fetch().thenApply(page -> {
-      try (page) {
-        Optional<StoredRecord> next = page.next();
-        if (next.isEmpty() && !page.exhausted()) throw new IllegalStateException("bucket page made no progress");
-        if (next.isEmpty()) return Optional.empty();
-        StoredRecord record = next.orElseThrow();
-        BudgetManager.Lease lease;
-        try {
-          lease = account.tryRetain(BudgetManager.Memory.HEAD, record.retainedBytes())
-              .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-        } catch (BackendFailure failure) {
-          throw new java.util.concurrent.CompletionException(failure);
-        }
-        synchronized (BucketViewCursor.this) {
-          if (closed || scope.isClosed() || scope.isDeadlineExceeded()) {
-            lease.close();
-            throw new java.util.concurrent.CompletionException(inactive());
-          }
-          delivered = lease;
-        }
-        return next;
+    CompletableFuture<Optional<StoredRecord>> operation = cursor.fetch().thenApply(this::receivePage);
+    return operation.whenComplete(this::finishRead).copy();
+  }
+
+  private Optional<StoredRecord> receivePage(BucketCursor.Page page) {
+    try (page) {
+      Optional<StoredRecord> next = page.next();
+      if (next.isEmpty() && !page.exhausted()) throw new IllegalStateException("bucket page made no progress");
+      if (next.isEmpty()) return Optional.empty();
+      retainHead(next.orElseThrow());
+      return next;
+    }
+  }
+
+  private void retainHead(StoredRecord record) {
+    BudgetManager.Lease lease;
+    try {
+      lease = account.tryRetain(BudgetManager.Memory.HEAD, record.retainedBytes())
+          .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+    } catch (BackendFailure failure) {
+      throw new java.util.concurrent.CompletionException(failure);
+    }
+    synchronized (this) {
+      if (closed || scope.isClosed() || scope.isDeadlineExceeded()) {
+        lease.close();
+        throw new java.util.concurrent.CompletionException(inactive());
       }
-    });
-    return operation.whenComplete((ignored, failure) -> {
-      synchronized (BucketViewCursor.this) {
-        reading = false;
-        if (failure != null || closed) release();
-        if (failure == null && closed) throw new java.util.concurrent.CompletionException(inactive());
-      }
-    }).copy();
+      delivered = lease;
+    }
+  }
+
+  private synchronized void finishRead(Optional<StoredRecord> ignored, Throwable failure) {
+    reading = false;
+    if (failure != null || closed) release();
+    if (failure == null && closed) throw new java.util.concurrent.CompletionException(inactive());
   }
 
   @Override public synchronized void close() {
