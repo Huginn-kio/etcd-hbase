@@ -93,16 +93,7 @@ public final class PutGateway implements BiConsumer<Rpc.PutRequest, StreamObserv
     var dispatchState = new AtomicInteger();
     if (!scope.startIfOpen(() -> scope.trackPhysicalProducer(gatewayDrained))) return;
     try {
-      BudgetManager.Account account = budgets.admit(tableGroup, scope, reservation);
-      long inputBytes = Math.addExact(1024L, Math.multiplyExact(4L, request.getSerializedSize()));
-      var inputLease = account.tryRetain(BudgetManager.Memory.CANDIDATE, inputBytes)
-          .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-      PutCommitPreparation.retainUntilDrain(scope, inputLease);
-      worker.execute(() -> {
-        if (dispatchState.compareAndSet(0, 1)) {
-          begin(request, observer, scope, account, terminal, gatewayDrained);
-        }
-      });
+      scheduleRequest(request, observer, scope, terminal, gatewayDrained, dispatchState);
     } catch (BackendFailure | RuntimeException failure) {
       if (dispatchState.compareAndSet(0, 2)) {
         gatewayDrained.complete(null);
@@ -115,6 +106,21 @@ public final class PutGateway implements BiConsumer<Rpc.PutRequest, StreamObserv
       }
       throw fatal;
     }
+  }
+
+  private void scheduleRequest(Rpc.PutRequest request, StreamObserver<Rpc.PutResponse> observer,
+      RequestScope scope, AtomicBoolean terminal, CompletableFuture<Void> gatewayDrained,
+      AtomicInteger dispatchState) throws BackendFailure {
+    BudgetManager.Account account = budgets.admit(tableGroup, scope, reservation);
+    long inputBytes = Math.addExact(1024L, Math.multiplyExact(4L, request.getSerializedSize()));
+    var inputLease = account.tryRetain(BudgetManager.Memory.CANDIDATE, inputBytes)
+        .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+    PutCommitPreparation.retainUntilDrain(scope, inputLease);
+    worker.execute(() -> {
+      if (dispatchState.compareAndSet(0, 1)) {
+        begin(request, observer, scope, account, terminal, gatewayDrained);
+      }
+    });
   }
 
   private void begin(Rpc.PutRequest request, StreamObserver<Rpc.PutResponse> observer,
@@ -203,26 +209,22 @@ public final class PutGateway implements BiConsumer<Rpc.PutRequest, StreamObserv
     }
     var dispatchState = new AtomicInteger();
     try {
+      scheduleResponse(command, observer, scope, account, terminal, responseDrained,
+          resolved, failure, dispatchState);
+    } finally {
+      gatewayDrained.complete(null);
+    }
+  }
+
+  private void scheduleResponse(PutCommand command, StreamObserver<Rpc.PutResponse> observer,
+      RequestScope scope, BudgetManager.Account account, AtomicBoolean terminal,
+      CompletableFuture<Void> responseDrained,
+      InvocationResultResolver.ResolvedResult resolved, Throwable failure,
+      AtomicInteger dispatchState) {
+    try {
       worker.execute(() -> {
         if (!dispatchState.compareAndSet(0, 1)) return;
-        try {
-          if (failure != null) {
-            signalError(scope, observer, terminal, failure);
-          } else if (terminal.compareAndSet(false, true)) {
-            long started = System.nanoTime();
-            try {
-              PutResponseEmitter.send(command, resolved, ResultMessages::decodePut,
-                  clusterId, memberId, scope, account, countOutput(observer));
-            } finally {
-              metrics.recordPutStage(RequestMetrics.PutStage.RESPONSE,
-                  Math.max(0, System.nanoTime() - started));
-            }
-          } else if (resolved != null) {
-            resolved.close();
-          }
-        } finally {
-          responseDrained.complete(null);
-        }
+        deliverResponse(command, observer, scope, account, terminal, responseDrained, resolved, failure);
       });
     } catch (RuntimeException rejected) {
       if (dispatchState.compareAndSet(0, 2)) {
@@ -237,8 +239,30 @@ public final class PutGateway implements BiConsumer<Rpc.PutRequest, StreamObserv
         signalError(scope, observer, terminal, fatal);
       }
       throw fatal;
+    }
+  }
+
+  private void deliverResponse(PutCommand command, StreamObserver<Rpc.PutResponse> observer,
+      RequestScope scope, BudgetManager.Account account, AtomicBoolean terminal,
+      CompletableFuture<Void> responseDrained,
+      InvocationResultResolver.ResolvedResult resolved, Throwable failure) {
+    try {
+      if (failure != null) {
+        signalError(scope, observer, terminal, failure);
+      } else if (terminal.compareAndSet(false, true)) {
+        long started = System.nanoTime();
+        try {
+          PutResponseEmitter.send(command, resolved, ResultMessages::decodePut,
+              clusterId, memberId, scope, account, countOutput(observer));
+        } finally {
+          metrics.recordPutStage(RequestMetrics.PutStage.RESPONSE,
+              Math.max(0, System.nanoTime() - started));
+        }
+      } else if (resolved != null) {
+        resolved.close();
+      }
     } finally {
-      gatewayDrained.complete(null);
+      responseDrained.complete(null);
     }
   }
 

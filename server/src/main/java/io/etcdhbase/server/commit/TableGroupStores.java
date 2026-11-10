@@ -150,21 +150,42 @@ public final class TableGroupStores {
           "table-group identity, salt, or physical bindings differ"));
     }
     return HBaseSystemRecordStore.open(factory, identity, system, scope).thenCompose(records ->
-        HBaseCommitControlStore.open(factory, identity, system, scope).thenCompose(control ->
-            control.read(scope).thenCompose(found -> {
-              var state = found.orElseThrow(() ->
-                  new IllegalStateException("table-group control state is not initialized")).state();
-              if (!state.profileFingerprint().equals(system.profileFingerprint())) {
-                return CompletableFuture.failedFuture(
-                    new IllegalStateException("table-group control profile differs"));
-              }
-              return SnapshotPinManager.open(records, pinConfiguration, scope).thenCompose(pins ->
-                  HBaseMaterializationStore.openForTableGroup(
-                          factory, identity, system, primary, current, scope)
-                      .thenCompose(materialization -> new TableGroupIdentityService(records)
-                          .readExisting(scope).thenApply(clusterId -> assemble(records, control,
-                              materialization, pins, system, clusterId))));
-            })));
+        openControlAndVerifyReadiness(factory, identity, system, primary, current,
+            pinConfiguration, scope, records));
+  }
+
+  private static CompletableFuture<TableGroupStores> openControlAndVerifyReadiness(
+      HBaseConnectionFactory factory, AuthorizedBackendIdentity identity, SystemTableBinding system,
+      StorageTableBinding primary, Optional<StorageTableBinding> current,
+      SnapshotPinConfiguration pinConfiguration, RequestScope scope, HBaseSystemRecordStore records) {
+    return HBaseCommitControlStore.open(factory, identity, system, scope).thenCompose(control ->
+        control.read(scope).thenCompose(found -> {
+          var state = found.orElseThrow(() ->
+              new IllegalStateException("table-group control state is not initialized")).state();
+          if (!state.profileFingerprint().equals(system.profileFingerprint())) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("table-group control profile differs"));
+          }
+          return openReadyStores(factory, identity, system, primary, current,
+              pinConfiguration, scope, records, control);
+        }));
+  }
+
+  private static CompletableFuture<TableGroupStores> openReadyStores(
+      HBaseConnectionFactory factory, AuthorizedBackendIdentity identity, SystemTableBinding system,
+      StorageTableBinding primary, Optional<StorageTableBinding> current,
+      SnapshotPinConfiguration pinConfiguration, RequestScope scope,
+      HBaseSystemRecordStore records, HBaseCommitControlStore control) {
+    return SnapshotPinManager.open(records, pinConfiguration, scope).thenCompose(pins ->
+        HBaseMaterializationStore.openForTableGroup(
+            factory, identity, system, primary, current, scope).thenCompose(materialization ->
+                readClusterIdentity(records, scope).thenApply(clusterId -> assemble(records, control,
+                    materialization, pins, system, clusterId))));
+  }
+
+  private static CompletableFuture<Long> readClusterIdentity(
+      HBaseSystemRecordStore records, RequestScope scope) {
+    return new TableGroupIdentityService(records).readExisting(scope);
   }
 
   private static TableGroupStores assemble(HBaseSystemRecordStore records,

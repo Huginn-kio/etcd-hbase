@@ -48,6 +48,15 @@ public final class InvocationResultResolver {
     if (requestDigest.length() != 32 || authorizationDigest.length() != 32 || !account.belongsTo(scope)) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid result query identity or budget"));
     }
+    return readBinding(id, requestDigest, authorizationDigest, scope)
+        .thenCompose(binding -> resolveSelectedInvocation(binding, scope))
+        .thenCompose(selected -> readVerifiedResult(selected, scope))
+        .thenCompose(verified -> loadAndMark(verified.binding(), verified.decision(),
+            verified.reference(), scope, account));
+  }
+
+  private CompletableFuture<InvocationBinding> readBinding(InvocationId id, ByteKey requestDigest,
+      ByteKey authorizationDigest, RequestScope scope) {
     return repository.read(id, scope).thenCompose(found -> {
       InvocationBinding binding = found.orElseThrow(() -> new IllegalStateException("invocation is missing"));
       if (!binding.invocationId().equals(id) || !binding.requestDigest().equals(requestDigest)
@@ -58,29 +67,41 @@ public final class InvocationResultResolver {
           && binding.state() != InvocationBinding.State.SELECTED) {
         return CompletableFuture.failedFuture(new IllegalStateException("invocation result is not queryable"));
       }
-      return outcomes.resolve(binding, scope).thenCompose(outcome -> {
-        if (outcome.state() != CommitOutcomeResolver.State.SELECTED_FINALIZED) {
-          return CompletableFuture.failedFuture(new IllegalStateException("invocation is not finalized"));
-        }
-        CommitDecision decision = outcome.decision().orElseThrow();
-        return manifests.readRoot(decision.manifestRoot(), scope).thenCompose(root -> {
-          ManifestRoot manifest = root.orElseThrow(() -> new IllegalStateException("result manifest is missing"));
-          if (!manifest.systemIdentity().equals(decision.manifestRoot())
-              || !manifest.digest().equals(decision.manifestDigest())
-              || !manifest.transactionId().equals(binding.transactionId())
-              || manifest.ownerEpoch() != binding.preparedOwnerEpoch()
-              || manifest.baseSequence() != binding.baseSequence()
-              || manifest.baseRevision() != binding.baseRevision()) {
-            return CompletableFuture.failedFuture(new IllegalStateException("result manifest differs from the decision"));
-          }
-          ResultReference reference = manifest.resultReference().orElseThrow(() ->
-              new IllegalStateException("finalized business manifest has no result"));
-          if (!reference.identity().matches(binding)) {
-            return CompletableFuture.failedFuture(new IllegalStateException("result belongs to another invocation"));
-          }
-          return loadAndMark(binding, decision, reference, scope, account);
-        });
-      });
+      return CompletableFuture.completedFuture(binding);
+    });
+  }
+
+  private CompletableFuture<SelectedInvocation> resolveSelectedInvocation(
+      InvocationBinding binding, RequestScope scope) {
+    return outcomes.resolve(binding, scope).thenCompose(outcome -> {
+      if (outcome.state() != CommitOutcomeResolver.State.SELECTED_FINALIZED) {
+        return CompletableFuture.failedFuture(new IllegalStateException("invocation is not finalized"));
+      }
+      return CompletableFuture.completedFuture(new SelectedInvocation(
+          binding, outcome.decision().orElseThrow()));
+    });
+  }
+
+  private CompletableFuture<VerifiedResult> readVerifiedResult(
+      SelectedInvocation selected, RequestScope scope) {
+    InvocationBinding binding = selected.binding();
+    CommitDecision decision = selected.decision();
+    return manifests.readRoot(decision.manifestRoot(), scope).thenCompose(root -> {
+      ManifestRoot manifest = root.orElseThrow(() -> new IllegalStateException("result manifest is missing"));
+      if (!manifest.systemIdentity().equals(decision.manifestRoot())
+          || !manifest.digest().equals(decision.manifestDigest())
+          || !manifest.transactionId().equals(binding.transactionId())
+          || manifest.ownerEpoch() != binding.preparedOwnerEpoch()
+          || manifest.baseSequence() != binding.baseSequence()
+          || manifest.baseRevision() != binding.baseRevision()) {
+        return CompletableFuture.failedFuture(new IllegalStateException("result manifest differs from the decision"));
+      }
+      ResultReference reference = manifest.resultReference().orElseThrow(() ->
+          new IllegalStateException("finalized business manifest has no result"));
+      if (!reference.identity().matches(binding)) {
+        return CompletableFuture.failedFuture(new IllegalStateException("result belongs to another invocation"));
+      }
+      return CompletableFuture.completedFuture(new VerifiedResult(binding, decision, reference));
     });
   }
 
@@ -112,4 +133,9 @@ public final class InvocationResultResolver {
       }
     });
   }
+
+  private record SelectedInvocation(InvocationBinding binding, CommitDecision decision) {}
+
+  private record VerifiedResult(
+      InvocationBinding binding, CommitDecision decision, ResultReference reference) {}
 }

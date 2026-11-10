@@ -48,21 +48,9 @@ public final class M3InitializeTablesCommand {
     Objects.requireNonNull(output, "output");
     Objects.requireNonNull(error, "error");
     Objects.requireNonNull(operation, "operation");
-    CommandOptions command;
-    M3TableGroupPlan plan;
-    String fingerprint;
+    PreparedPlan prepared;
     try {
-      command = parse(args);
-      try (var input = Files.newInputStream(command.options().config())) {
-        var configuration = new InitializationConfigurationLoader().load(input);
-        plan = M3TableGroupPlan.from(TableGroupPlanFactory.create(configuration,
-            command.options().group(), command.options().historyLayout()));
-      }
-      fingerprint = fingerprint(plan, command.pins());
-      if (command.options().action() == InitializationOptions.Action.APPLY
-          && !fingerprint.equals(command.options().confirmation())) {
-        throw new IllegalArgumentException("confirmation does not match the M3 plan and pin registry");
-      }
+      prepared = loadAndConfirmPlan(args);
     } catch (IOException unreadable) {
       error.println("m3-admin error: configuration cannot be read");
       return 2;
@@ -70,29 +58,59 @@ public final class M3InitializeTablesCommand {
       error.println("m3-admin error: " + invalid.getMessage());
       return 2;
     }
-    if (command.options().action() == InitializationOptions.Action.PLAN) {
-      output.println("M3 fresh table-group initialization");
-      output.println("table_group_id: " + plan.source().tableGroupId());
-      output.println("identity_provider_id: " + plan.source().identityProviderId());
-      output.println("hbase_profile_id: " + plan.source().hbaseProfile().id());
-      output.println("namespace: " + plan.source().namespace());
-      output.println("authentication_mode: " + plan.source().hbaseProfile().authenticationMode());
-      output.println("schema_version: " + plan.source().schemaVersion());
-      output.println("salt_profile_id: " + plan.source().saltProfile().id());
-      output.println("salt_strategy_id: " + plan.source().saltProfile().strategyId());
-      output.println("history_layout: " + plan.source().historyLayout());
-      output.println("configured_namespace_tables: " + plan.source().configuredNamespaceTableNames());
-      for (var table : plan.source().tables()) {
-        InitializeTablesCommand.printTable(plan.source().namespace(), table, output);
-      }
-      output.printf("pin_registry: %d:%d:%d%n", command.pins().shardCount(),
-          command.pins().slotsPerShard(), command.pins().leaseMillis());
-      output.println("confirmation_fingerprint: " + fingerprint);
-      output.println("backend_contacted: false");
+    if (prepared.command().options().action() == InitializationOptions.Action.PLAN) {
+      renderPlan(prepared, output);
       return 0;
     }
+    return applyPlan(prepared, operation, output, error);
+  }
+
+  private static PreparedPlan loadAndConfirmPlan(String[] args) throws IOException {
+    CommandOptions command;
+    M3TableGroupPlan plan;
+    command = parse(args);
+    try (var input = Files.newInputStream(command.options().config())) {
+      var configuration = new InitializationConfigurationLoader().load(input);
+      plan = M3TableGroupPlan.from(TableGroupPlanFactory.create(configuration,
+          command.options().group(), command.options().historyLayout()));
+    }
+    String fingerprint = fingerprint(plan, command.pins());
+    if (command.options().action() == InitializationOptions.Action.APPLY
+        && !fingerprint.equals(command.options().confirmation())) {
+      throw new IllegalArgumentException("confirmation does not match the M3 plan and pin registry");
+    }
+    return new PreparedPlan(command, plan, fingerprint);
+  }
+
+  private static void renderPlan(PreparedPlan prepared, PrintStream output) {
+    var plan = prepared.plan();
+    var pins = prepared.command().pins();
+    output.println("M3 fresh table-group initialization");
+    output.println("table_group_id: " + plan.source().tableGroupId());
+    output.println("identity_provider_id: " + plan.source().identityProviderId());
+    output.println("hbase_profile_id: " + plan.source().hbaseProfile().id());
+    output.println("namespace: " + plan.source().namespace());
+    output.println("authentication_mode: " + plan.source().hbaseProfile().authenticationMode());
+    output.println("schema_version: " + plan.source().schemaVersion());
+    output.println("salt_profile_id: " + plan.source().saltProfile().id());
+    output.println("salt_strategy_id: " + plan.source().saltProfile().strategyId());
+    output.println("history_layout: " + plan.source().historyLayout());
+    output.println("configured_namespace_tables: " + plan.source().configuredNamespaceTableNames());
+    for (var table : plan.source().tables()) {
+      InitializeTablesCommand.printTable(plan.source().namespace(), table, output);
+    }
+    output.printf("pin_registry: %d:%d:%d%n", pins.shardCount(),
+        pins.slotsPerShard(), pins.leaseMillis());
+    output.println("confirmation_fingerprint: " + prepared.fingerprint());
+    output.println("backend_contacted: false");
+  }
+
+  private static int applyPlan(PreparedPlan prepared, ApplyOperation operation,
+      PrintStream output, PrintStream error) {
+    var plan = prepared.plan();
+    var pins = prepared.command().pins();
     try {
-      var result = operation.apply(plan, command.pins());
+      var result = operation.apply(plan, pins);
       output.printf("m3-admin created table_group=%s tables=%s cluster_id=%s%n",
           plan.source().tableGroupId(), result.tables(), Long.toUnsignedString(result.clusterId()));
       return 0;
@@ -177,6 +195,8 @@ public final class M3InitializeTablesCommand {
   }
 
   private record CommandOptions(InitializationOptions options, SnapshotPinConfiguration pins) {}
+
+  private record PreparedPlan(CommandOptions command, M3TableGroupPlan plan, String fingerprint) {}
 
   private static final class MissingIdentityInputException extends Exception {
     private static final long serialVersionUID = 1L;

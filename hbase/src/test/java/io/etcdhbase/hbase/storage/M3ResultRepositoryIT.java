@@ -6,8 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
-import io.etcdhbase.core.commit.InvocationBinding;
-import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.CommitDecision;
 import io.etcdhbase.core.commit.CommitFinalizationService;
 import io.etcdhbase.core.commit.CommitOutcomeResolver;
@@ -15,6 +13,8 @@ import io.etcdhbase.core.commit.CommitOwnerService;
 import io.etcdhbase.core.commit.CommitPlanVerifier;
 import io.etcdhbase.core.commit.CommitPublisher;
 import io.etcdhbase.core.commit.CommitState;
+import io.etcdhbase.core.commit.InvocationBinding;
+import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.InvocationResultResolver;
 import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.ManifestCatalog;
@@ -41,8 +41,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
@@ -64,101 +64,173 @@ class M3ResultRepositoryIT {
     try (var environment = M1TestEnvironment.start(1);
          var scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
       environment.create(table, tableDescriptor(table, GROUP, true), SALT.splitKeys().toArray(byte[][]::new));
-      SystemRecordStore records = HBaseSystemRecordStore.open(
-          environment.factory(), environment.identity(), binding, scope).join();
+      SystemRecordStore records = openInitializedGroup(environment, binding, scope);
+      verifyClusterIdentityIsolation(environment, scope, records);
       HBaseResultRepository first = new HBaseResultRepository(records);
       HBaseResultRepository reopened = new HBaseResultRepository(records);
-      long clusterId = new TableGroupIdentityService(records).initialize(scope).join();
-      assertNotEquals(0, clusterId);
-      assertEquals(clusterId, new TableGroupIdentityService(records).readExisting(scope).join());
-      TableName otherTable = TableName.valueOf("m3_other_" + UUID.randomUUID().toString().replace("-", ""));
-      String otherGroup = GROUP + "-other";
-      environment.create(otherTable, tableDescriptor(otherTable, otherGroup, true),
-          SALT.splitKeys().toArray(byte[][]::new));
-      var otherBinding = new SystemTableBinding(otherTable, FAMILY, otherGroup, PROFILE, SALT);
-      var otherRecords = HBaseSystemRecordStore.open(
-          environment.factory(), environment.identity(), otherBinding, scope).join();
-      assertNotEquals(clusterId, new TableGroupIdentityService(otherRecords).initialize(scope).join());
-      InvocationBinding invocation = InvocationBinding.begin(InvocationId.create(),
-          ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]), TransactionId.create(), 1, 0, 1);
-      ResultIdentity identity = ResultIdentity.from(invocation);
+      InvocationBinding invocation = beginInvocation();
       ByteKey logicalKey = ByteKey.copyOf(new byte[] {0, (byte) 0xff});
-      ResultPage page = new ResultPage(identity, 0,
-          ResultMessages.encode(new PutResult(logicalKey, 1, Optional.empty())));
-      TableName legacyTable = TableName.valueOf("m3_legacy_" + UUID.randomUUID().toString().replace("-", ""));
-      environment.create(legacyTable, tableDescriptor(legacyTable, GROUP, false), SALT.splitKeys().toArray(byte[][]::new));
-      var legacyBinding = new SystemTableBinding(legacyTable, FAMILY, GROUP, PROFILE, SALT);
-      var legacyRecords = HBaseSystemRecordStore.open(
-          environment.factory(), environment.identity(), legacyBinding, scope).join();
-      assertTrue(legacyRecords.read(SystemRecordType.CONTROL, ByteKey.copyOf(new byte[] {1}), scope).join().isEmpty());
-      assertThrows(IllegalStateException.class, () -> new HBaseResultRepository(legacyRecords).createPage(page, scope));
-      var reference = new ResultPreparation(first).prepare(identity, List.of(page), scope).join();
-      var manifestStore = new HBaseManifestRepository(records);
-      var manifests = new ManifestCatalog(manifestStore);
-      var resultCatalog = new ResultCatalog(reopened);
-      var root = new ManifestPreparation(manifestStore, new ManifestPreparation.Limits(0, 0, 0, 0))
-          .prepareWithResult(invocation, List.<PreparedCandidate>of().iterator(),
-              List.<PreparedEvent>of().iterator(), reference, resultCatalog,
-              () -> CompletableFuture.completedFuture(null), scope).join();
-      var sealed = invocation.seal(root.systemIdentity());
-      MaterializationStore materialization = new MaterializationStore() {
-        @Override public CompletableFuture<ApplyResult> applySelected(
-            CommitDecision decision, PreparedCandidate candidate, RequestScope ignored) {
-          return CompletableFuture.completedFuture(ApplyResult.APPLIED);
-        }
-        @Override public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope ignored) {
-          return CompletableFuture.completedFuture(null);
-        }
-      };
-      var verifier = new CommitPlanVerifier(manifests, materialization, resultCatalog);
-
-      assertEquals(reference, new ResultCatalog(reopened).verify(reference, scope).join().reference());
-      assertEquals(reference, new HBaseManifestRepository(records).readRoot(root.systemIdentity(), scope)
-          .join().orElseThrow().resultReference().orElseThrow());
-      assertEquals(root.digest(), verifier.verify(sealed, root, scope).join().digest());
+      ResultPage page = resultPage(invocation, logicalKey);
+      verifyLegacySchemaRejected(environment, scope, page);
+      PersistedResult persisted = persistAndVerifyResult(records, first, reopened, invocation, page, scope);
       verifyRecoveryThroughRealControlAndInvocationRows(
-          environment, binding, records, invocation, sealed, root, manifests, resultCatalog,
-          materialization, verifier, logicalKey, scope);
-      assertEquals(SystemRecordStore.CreateResult.CONFLICT,
-          reopened.createPage(new ResultPage(identity, 0, new byte[] {7}), scope).join());
-      assertEquals(identity, reopened.readPage(identity, 0, scope).join().orElseThrow().identity());
-
-      // Fault injection after successful verification: a later reader must not trust the directory alone.
-      ByteKey oldBytes = ByteKey.copyOf(ResultMessages.encode(page));
-      ByteKey replacement = ByteKey.copyOf(new byte[] {1});
-      assertTrue(records.compareAndSet(SystemRecordType.RESULT, page.systemIdentity(),
-          Optional.of(oldBytes), replacement, scope).join());
-      assertThrows(CompletionException.class, () -> new ResultCatalog(reopened).verify(reference, scope).join());
-      assertThrows(CompletionException.class, () -> verifier.verify(sealed, root, scope).join());
+          environment, binding, records, persisted, logicalKey, scope);
+      verifyIdempotencyAndDamagedResult(records, reopened, persisted, page, scope);
     }
   }
 
+  private static SystemRecordStore openInitializedGroup(
+      M1TestEnvironment environment, SystemTableBinding binding, RequestScope scope) {
+    var records = HBaseSystemRecordStore.open(
+        environment.factory(), environment.identity(), binding, scope).join();
+    long clusterId = new TableGroupIdentityService(records).initialize(scope).join();
+    assertNotEquals(0, clusterId);
+    assertEquals(clusterId, new TableGroupIdentityService(records).readExisting(scope).join());
+    return records;
+  }
+
+  private static void verifyClusterIdentityIsolation(
+      M1TestEnvironment environment, RequestScope scope, SystemRecordStore records) throws Exception {
+    long clusterId = new TableGroupIdentityService(records).readExisting(scope).join();
+    TableName otherTable = TableName.valueOf("m3_other_" + UUID.randomUUID().toString().replace("-", ""));
+    String otherGroup = GROUP + "-other";
+    environment.create(otherTable, tableDescriptor(otherTable, otherGroup, true),
+        SALT.splitKeys().toArray(byte[][]::new));
+    var otherBinding = new SystemTableBinding(otherTable, FAMILY, otherGroup, PROFILE, SALT);
+    var otherRecords = HBaseSystemRecordStore.open(
+        environment.factory(), environment.identity(), otherBinding, scope).join();
+    assertNotEquals(clusterId, new TableGroupIdentityService(otherRecords).initialize(scope).join());
+  }
+
+  private static InvocationBinding beginInvocation() {
+    return InvocationBinding.begin(InvocationId.create(), ByteKey.copyOf(new byte[32]),
+        ByteKey.copyOf(new byte[32]), TransactionId.create(), 1, 0, 1);
+  }
+
+  private static ResultPage resultPage(InvocationBinding invocation, ByteKey logicalKey) {
+    return new ResultPage(ResultIdentity.from(invocation), 0,
+        ResultMessages.encode(new PutResult(logicalKey, 1, Optional.empty())));
+  }
+
+  private static void verifyLegacySchemaRejected(
+      M1TestEnvironment environment, RequestScope scope, ResultPage page) throws Exception {
+    TableName legacyTable = TableName.valueOf("m3_legacy_" + UUID.randomUUID().toString().replace("-", ""));
+    environment.create(legacyTable, tableDescriptor(legacyTable, GROUP, false),
+        SALT.splitKeys().toArray(byte[][]::new));
+    var legacyBinding = new SystemTableBinding(legacyTable, FAMILY, GROUP, PROFILE, SALT);
+    var legacyRecords = HBaseSystemRecordStore.open(
+        environment.factory(), environment.identity(), legacyBinding, scope).join();
+    assertTrue(legacyRecords.read(SystemRecordType.CONTROL, ByteKey.copyOf(new byte[] {1}), scope)
+        .join().isEmpty());
+    assertThrows(IllegalStateException.class,
+        () -> new HBaseResultRepository(legacyRecords).createPage(page, scope));
+  }
+
+  private static PersistedResult persistAndVerifyResult(SystemRecordStore records,
+      HBaseResultRepository first, HBaseResultRepository reopened,
+      InvocationBinding invocation, ResultPage page, RequestScope scope) {
+    ResultIdentity identity = ResultIdentity.from(invocation);
+    var reference = new ResultPreparation(first).prepare(identity, List.of(page), scope).join();
+    var manifestStore = new HBaseManifestRepository(records);
+    var manifests = new ManifestCatalog(manifestStore);
+    var results = new ResultCatalog(reopened);
+    var root = new ManifestPreparation(manifestStore, new ManifestPreparation.Limits(0, 0, 0, 0))
+        .prepareWithResult(invocation, List.<PreparedCandidate>of().iterator(),
+            List.<PreparedEvent>of().iterator(), reference, results,
+            () -> CompletableFuture.completedFuture(null), scope).join();
+    var sealed = invocation.seal(root.systemIdentity());
+    MaterializationStore materialization = noOpMaterialization();
+    var verifier = new CommitPlanVerifier(manifests, materialization, results);
+    var persisted = new PersistedResult(invocation, identity, page, reference, root, sealed,
+        manifests, results, materialization, verifier);
+
+    assertEquals(reference, results.verify(reference, scope).join().reference());
+    assertEquals(reference, manifestStore.readRoot(root.systemIdentity(), scope)
+        .join().orElseThrow().resultReference().orElseThrow());
+    assertEquals(root.digest(), verifier.verify(sealed, root, scope).join().digest());
+    return persisted;
+  }
+
+  private static MaterializationStore noOpMaterialization() {
+    return new MaterializationStore() {
+      @Override public CompletableFuture<ApplyResult> applySelected(
+          CommitDecision decision, PreparedCandidate candidate, RequestScope ignored) {
+        return CompletableFuture.completedFuture(ApplyResult.APPLIED);
+      }
+      @Override public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope ignored) {
+        return CompletableFuture.completedFuture(null);
+      }
+    };
+  }
+
+  private static void verifyIdempotencyAndDamagedResult(SystemRecordStore records,
+      HBaseResultRepository repository, PersistedResult persisted, ResultPage page, RequestScope scope) {
+    assertEquals(SystemRecordStore.CreateResult.CONFLICT,
+        repository.createPage(new ResultPage(persisted.identity(), 0, new byte[] {7}), scope).join());
+    assertEquals(persisted.identity(), repository.readPage(persisted.identity(), 0, scope)
+        .join().orElseThrow().identity());
+
+    // Fault injection after successful verification: later readers must not trust the directory alone.
+    ByteKey oldBytes = ByteKey.copyOf(ResultMessages.encode(page));
+    ByteKey replacement = ByteKey.copyOf(new byte[] {1});
+    assertTrue(records.compareAndSet(SystemRecordType.RESULT, page.systemIdentity(),
+        Optional.of(oldBytes), replacement, scope).join());
+    assertThrows(CompletionException.class,
+        () -> persisted.results().verify(persisted.reference(), scope).join());
+    assertThrows(CompletionException.class,
+        () -> persisted.verifier().verify(persisted.sealed(), persisted.root(), scope).join());
+  }
+
+  private record PersistedResult(InvocationBinding invocation, ResultIdentity identity, ResultPage page,
+      io.etcdhbase.core.commit.ResultReference reference,
+      io.etcdhbase.core.commit.ManifestRoot root, InvocationBinding sealed,
+      ManifestCatalog manifests, ResultCatalog results, MaterializationStore materialization,
+      CommitPlanVerifier verifier) {}
+
   private static void verifyRecoveryThroughRealControlAndInvocationRows(
       M1TestEnvironment environment, SystemTableBinding binding, SystemRecordStore records,
-      InvocationBinding preparing, InvocationBinding sealed, io.etcdhbase.core.commit.ManifestRoot root,
-      ManifestCatalog manifests, ResultCatalog results, MaterializationStore materialization,
-      CommitPlanVerifier verifier, ByteKey logicalKey, RequestScope scope) {
-    var control = HBaseCommitControlStore.open(environment.factory(), environment.identity(), binding, scope).join();
-    assertTrue(control.initializeIfAbsent(CommitState.initial(binding.profileFingerprint(), 1), scope).join());
-    var initial = control.read(scope).join().orElseThrow();
-    assertTrue(control.compareAndSet(initial, initial.state().claimOwner("fixture-owner", 0, Long.MAX_VALUE), scope).join());
+      PersistedResult persisted, ByteKey logicalKey, RequestScope scope) {
+    var control = initializeControl(environment, binding, scope);
+    var preparing = persisted.invocation();
     var invocationRepository = new HBaseInvocationRepository(records);
     var invocations = new InvocationService(invocationRepository);
     invocations.bindOrJoin(preparing, scope).join();
-    invocations.transition(preparing, sealed, scope).join();
+    invocations.transition(preparing, persisted.sealed(), scope).join();
+    publishPreparedResult(records, control, persisted, scope);
+    verifyRecoveredInvocation(records, control, invocationRepository, preparing, logicalKey, scope);
+  }
+
+  private static HBaseCommitControlStore initializeControl(
+      M1TestEnvironment environment, SystemTableBinding binding, RequestScope scope) {
+    var control = HBaseCommitControlStore.open(
+        environment.factory(), environment.identity(), binding, scope).join();
+    assertTrue(control.initializeIfAbsent(CommitState.initial(binding.profileFingerprint(), 1), scope).join());
+    var initial = control.read(scope).join().orElseThrow();
+    assertTrue(control.compareAndSet(initial, initial.state().claimOwner("fixture-owner", 0, Long.MAX_VALUE), scope).join());
+    return control;
+  }
+
+  private static void publishPreparedResult(SystemRecordStore records,
+      HBaseCommitControlStore control, PersistedResult persisted, RequestScope scope) {
     var decisions = new HBaseCommitDecisionRepository(records);
     var outcomes = new CommitOutcomeResolver(control, decisions);
-    var finalizer = new CommitFinalizationService(control, outcomes, decisions, manifests, materialization, results);
+    var finalizer = new CommitFinalizationService(control, outcomes, decisions,
+        persisted.manifests(), persisted.materialization(), persisted.results());
     PublicationHandoff handoff = new PublicationHandoff() {
       @Override public <T> CompletableFuture<T> transfer(InvocationBinding invocation,
           RequestScope requestScope, java.util.function.Function<RequestScope, CompletableFuture<T>> work) {
         return work.apply(requestScope);
       }
     };
-    var published = new CommitPublisher(control, outcomes, verifier, handoff, finalizer)
-        .publish(sealed, new CommitOwnerService.OwnerToken("fixture-owner", 1), root, scope).join();
+    var published = new CommitPublisher(control, outcomes, persisted.verifier(), handoff, finalizer)
+        .publish(persisted.sealed(), new CommitOwnerService.OwnerToken("fixture-owner", 1),
+            persisted.root(), scope).join();
     assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED, published.state());
+  }
 
+  private static void verifyRecoveredInvocation(SystemRecordStore records,
+      HBaseCommitControlStore control, HBaseInvocationRepository invocationRepository,
+      InvocationBinding preparing, ByteKey logicalKey, RequestScope scope) {
     var reopenedResults = new ResultCatalog(new HBaseResultRepository(records));
     var reopened = new InvocationResultResolver(new HBaseInvocationRepository(records),
         new CommitOutcomeResolver(control, new HBaseCommitDecisionRepository(records)),

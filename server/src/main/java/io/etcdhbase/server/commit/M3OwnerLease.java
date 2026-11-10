@@ -13,9 +13,12 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Recovers a group before enabling its owner lane and fences it on uncertain renewal. */
 final class M3OwnerLease implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(M3OwnerLease.class);
   private static final Executor CLEANUP = task ->
       Thread.ofVirtual().name("m3-owner-cleanup").start(task);
 
@@ -129,19 +132,20 @@ final class M3OwnerLease implements AutoCloseable {
       scope = expired ? null : RequestScope.withTimeout(Duration.ofMillis(heartbeatTimeoutMillis));
       if (!expired) inFlight = scope;
     }
-    if (expired) { stop(true); return; }
+    if (expired) { stop(LossReason.LEASE_EXPIRED_BEFORE_RENEWAL); return; }
     ScheduledFuture<?> timeout;
     try {
       timeout = timer.schedule(() -> {
-        stop(true);
+        stop(LossReason.HEARTBEAT_TIMEOUT);
         scope.cancelAsync(CLEANUP);
       }, heartbeatTimeoutMillis, TimeUnit.MILLISECONDS);
       long deadline = Math.addExact(clock.millis(), leaseMillis);
       owners.heartbeat(token, deadline, scope).whenComplete((renewed, failure) -> {
         timeout.cancel(false);
+        long now = clock.millis();
         if (failure != null || !Boolean.TRUE.equals(renewed)
-            || clock.millis() >= previousDeadline || clock.millis() >= deadline) {
-          stop(true);
+            || now >= previousDeadline || now >= deadline) {
+          stop(renewalFailure(failure, renewed, now, previousDeadline, deadline));
         } else {
           synchronized (lock) {
             if (!stopping) verifiedDeadlineMillis = Math.max(verifiedDeadlineMillis, deadline);
@@ -150,10 +154,10 @@ final class M3OwnerLease implements AutoCloseable {
         finishHeartbeat(scope);
       });
     } catch (RuntimeException failure) {
-      stop(true);
+      stop(LossReason.HEARTBEAT_SCHEDULING_FAILED);
       finishHeartbeat(scope);
     } catch (Error fatal) {
-      stop(true);
+      stop(LossReason.HEARTBEAT_SCHEDULING_FAILED);
       finishHeartbeat(scope);
       throw fatal;
     }
@@ -164,13 +168,13 @@ final class M3OwnerLease implements AutoCloseable {
       scope.closeAsync(CLEANUP);
     } catch (RuntimeException | Error failure) {
       recordFailure(failure);
-      stop(true);
+      stop(LossReason.HEARTBEAT_CLEANUP_FAILED);
     } finally {
       CompletableFuture.allOf(scope.cleanupCompletion().toCompletableFuture(),
           scope.physicalProducersCompletion().toCompletableFuture()).whenComplete((ignored, failure) -> {
             if (failure != null) {
               recordFailure(failure);
-              stop(true);
+              stop(LossReason.HEARTBEAT_CLEANUP_FAILED);
             }
             DrainStatus status;
             synchronized (lock) {
@@ -183,6 +187,14 @@ final class M3OwnerLease implements AutoCloseable {
   }
 
   private void stop(boolean lost) {
+    stop(lost, null);
+  }
+
+  private void stop(LossReason reason) {
+    stop(true, Objects.requireNonNull(reason, "reason"));
+  }
+
+  private void stop(boolean lost, LossReason reason) {
     RequestScope cancel;
     synchronized (lock) {
       if (stopping) return;
@@ -190,6 +202,7 @@ final class M3OwnerLease implements AutoCloseable {
       ready = false;
       cancel = inFlight;
     }
+    if (lost) LOGGER.warn("M3 table-group owner lease lost; reason={}", reason);
     timer.shutdown();
     try {
       if (lost) onLost.run();
@@ -230,6 +243,26 @@ final class M3OwnerLease implements AutoCloseable {
   }
 
   private record DrainStatus(Throwable failure) {}
+
+  private static LossReason renewalFailure(Throwable failure, Boolean renewed, long now,
+      long previousDeadline, long deadline) {
+    if (failure != null) return LossReason.HEARTBEAT_FAILED;
+    if (!Boolean.TRUE.equals(renewed)) return LossReason.HEARTBEAT_REJECTED;
+    if (now >= previousDeadline || now >= deadline) {
+      return LossReason.LEASE_WINDOW_EXPIRED;
+    }
+    return LossReason.HEARTBEAT_FAILED;
+  }
+
+  private enum LossReason {
+    LEASE_EXPIRED_BEFORE_RENEWAL,
+    HEARTBEAT_TIMEOUT,
+    HEARTBEAT_FAILED,
+    HEARTBEAT_REJECTED,
+    LEASE_WINDOW_EXPIRED,
+    HEARTBEAT_SCHEDULING_FAILED,
+    HEARTBEAT_CLEANUP_FAILED
+  }
 
   private static long millis(Duration value) {
     Objects.requireNonNull(value, "duration");

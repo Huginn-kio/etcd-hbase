@@ -3,6 +3,7 @@ package io.etcdhbase.server;
 import static io.etcdhbase.spi.identity.BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID;
 
 import io.etcdhbase.admin.M3TableGroupPlan;
+import io.etcdhbase.admin.TableGroupInitializationPlan;
 import io.etcdhbase.admin.TableGroupPlanFactory;
 import io.etcdhbase.admin.config.DevelopmentHBaseConfiguration;
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
@@ -15,6 +16,7 @@ import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.observability.RequestMetrics;
 import io.etcdhbase.spi.identity.AuthenticationScope;
+import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.etcdhbase.spi.identity.BackendCredentials;
 import java.io.IOException;
 import java.time.Duration;
@@ -78,54 +80,84 @@ final class M3RuntimeGroups implements AutoCloseable {
   private static ManagedGroup openGroup(M3TableGroupPlan plan, RuntimeConfiguration configuration,
       M3RuntimeConfiguration activation, io.etcdhbase.core.scan.BudgetManager budgets) throws Exception {
     var source = plan.source();
-    var scope = new AuthenticationScope(source.tableGroupId(), source.hbaseProfile().id());
-    var timeout = Duration.ofMillis(Math.min(activation.startupTimeoutMs(), 300_000));
-    var provider = new HBaseBackendIdentityProvider(source.identityProviderId(), scope,
-        DevelopmentHBaseConfiguration.create(source.hbaseProfile()), HBaseAuthenticators.simpleDevelopment(),
-        (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
-        1, 1, timeout);
-    boolean deferred = false;
+    var provider = createProvider(source, activation);
+    boolean providerCloseDeferred = false;
     try {
-      String principal = UserGroupInformation.getCurrentUser().getShortUserName();
-      try (var credentials = new BackendCredentials(principal, new char[0]);
-           var startup = RequestScope.withTimeout(Duration.ofMillis(activation.startupTimeoutMs()))) {
-        var identity = provider.authenticate(credentials, scope).toCompletableFuture()
-            .get(activation.startupTimeoutMs(), TimeUnit.MILLISECONDS);
-        try {
-          var runtime = M3TableGroupRuntime.open(plan, activation, configuration.resources(),
-              provider, identity, budgets, startup);
-          try {
-            return new ManagedGroup(runtime, provider);
-          } catch (RuntimeException | Error failure) {
-            deferred = true;
-            try { runtime.close(); }
-            catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-            awaitCleanup(closeAfter(runtime.drained(), provider), activation.shutdownTimeoutMs(), failure);
-            throw failure;
-          }
-        } catch (M3TableGroupRuntime.StartupException failure) {
-          deferred = true;
-          awaitCleanup(closeAfter(failure.cleanup(), provider), activation.shutdownTimeoutMs(), failure);
-          throw failure;
-        } catch (Error fatal) {
-          for (Throwable suppressed : fatal.getSuppressed()) {
-            if (suppressed instanceof M3TableGroupRuntime.StartupCleanup cleanup) {
-              deferred = true;
-              awaitCleanup(closeAfter(cleanup.cleanup(), provider), activation.shutdownTimeoutMs(), fatal);
-              break;
-            }
-          }
-          throw fatal;
-        }
+      M3TableGroupRuntime runtime;
+      try (var startup = RequestScope.withTimeout(Duration.ofMillis(activation.startupTimeoutMs()))) {
+        AuthorizedBackendIdentity identity = authenticate(provider, source, activation);
+        runtime = startRuntime(plan, configuration, activation, budgets, provider, identity, startup);
+      } catch (M3TableGroupRuntime.StartupException failure) {
+        providerCloseDeferred = true;
+        awaitCleanup(closeAfter(failure.cleanup(), provider), activation.shutdownTimeoutMs(), failure);
+        throw failure;
+      } catch (Error fatal) {
+        providerCloseDeferred = awaitFatalStartupCleanup(fatal, provider, activation.shutdownTimeoutMs());
+        throw fatal;
+      }
+      try {
+        return new ManagedGroup(runtime, provider);
+      } catch (RuntimeException | Error failure) {
+        providerCloseDeferred = true;
+        closeRuntimeAfterDrain(runtime, provider, activation.shutdownTimeoutMs(), failure);
+        throw failure;
       }
     } catch (Exception | Error failure) {
-      if (!deferred) {
-        try { provider.close(); }
-        catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-      }
+      if (!providerCloseDeferred) closeProvider(provider, failure);
       if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
       throw failure;
     }
+  }
+
+  private static HBaseBackendIdentityProvider createProvider(
+      TableGroupInitializationPlan source, M3RuntimeConfiguration activation) {
+    var scope = new AuthenticationScope(source.tableGroupId(), source.hbaseProfile().id());
+    var timeout = Duration.ofMillis(Math.min(activation.startupTimeoutMs(), 300_000));
+    return new HBaseBackendIdentityProvider(source.identityProviderId(), scope,
+        DevelopmentHBaseConfiguration.create(source.hbaseProfile()), HBaseAuthenticators.simpleDevelopment(),
+        (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+        1, 1, timeout);
+  }
+
+  private static AuthorizedBackendIdentity authenticate(HBaseBackendIdentityProvider provider,
+      TableGroupInitializationPlan source, M3RuntimeConfiguration activation) throws Exception {
+    var scope = new AuthenticationScope(source.tableGroupId(), source.hbaseProfile().id());
+    String principal = UserGroupInformation.getCurrentUser().getShortUserName();
+    try (var credentials = new BackendCredentials(principal, new char[0])) {
+      return provider.authenticate(credentials, scope).toCompletableFuture()
+          .get(activation.startupTimeoutMs(), TimeUnit.MILLISECONDS);
+    }
+  }
+
+  private static M3TableGroupRuntime startRuntime(M3TableGroupPlan plan,
+      RuntimeConfiguration configuration, M3RuntimeConfiguration activation,
+      io.etcdhbase.core.scan.BudgetManager budgets, HBaseBackendIdentityProvider provider,
+      AuthorizedBackendIdentity identity, RequestScope startup) throws Exception {
+    return M3TableGroupRuntime.open(plan, activation, configuration.resources(),
+        provider, identity, budgets, startup);
+  }
+
+  private static boolean awaitFatalStartupCleanup(Error fatal, HBaseBackendIdentityProvider provider,
+      int timeoutMs) {
+    for (Throwable suppressed : fatal.getSuppressed()) {
+      if (suppressed instanceof M3TableGroupRuntime.StartupCleanup cleanup) {
+        awaitCleanup(closeAfter(cleanup.cleanup(), provider), timeoutMs, fatal);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static void closeRuntimeAfterDrain(M3TableGroupRuntime runtime,
+      HBaseBackendIdentityProvider provider, int timeoutMs, Throwable failure) {
+    try { runtime.close(); }
+    catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+    awaitCleanup(closeAfter(runtime.drained(), provider), timeoutMs, failure);
+  }
+
+  private static void closeProvider(HBaseBackendIdentityProvider provider, Throwable failure) {
+    try { provider.close(); }
+    catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
   }
 
   KvService service(String group) {

@@ -59,18 +59,19 @@ GO_REQUIRED_CASES = {
 }
 
 
+def unique_pairs(pairs):
+    """Reject duplicate object keys wherever M3 metadata is parsed."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate metadata key")
+        result[key] = value
+    return result
+
+
 def read_json(path: Path) -> dict:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 1 << 20:
         raise ValueError("missing, linked or oversized M3 metadata")
-
-    def unique_pairs(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate metadata key")
-            result[key] = value
-        return result
-
     with path.open(encoding="utf-8") as stream:
         data = json.load(stream, object_pairs_hook=unique_pairs)
     if not isinstance(data, dict):

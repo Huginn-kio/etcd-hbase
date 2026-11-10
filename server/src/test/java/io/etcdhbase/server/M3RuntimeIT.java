@@ -21,6 +21,7 @@ import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.observability.RequestMetrics;
 import io.etcdhbase.spi.identity.AuthenticationScope;
+import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.etcdhbase.spi.identity.BackendCredentials;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import java.io.ByteArrayInputStream;
@@ -62,62 +63,87 @@ class M3RuntimeIT {
             List.of(new RuntimeConfiguration.Listener("m3-local", "127.0.0.1", 0, "local")),
             initialization.hbaseProfiles(), initialization.saltProfiles(), initialization.tableGroups(),
             new RuntimeConfiguration.ResourceBudgets(65_536, 2, 30_000, 4 << 20, 4 << 20, 4, 0));
-        Rpc.PutResponse first;
-        var server = RuntimeServer.startM3(config, firstActivation);
-        var metrics = server.metrics().getFirst();
-        try {
-          assertTrue(server.dataReady());
-          first = put(server, "before");
-          assertEquals(initialized.clusterId(), first.getHeader().getClusterId());
-          assertEquals(Long.MIN_VALUE, first.getHeader().getMemberId());
-          assertEquals(2, first.getHeader().getRevision());
-        } finally {
-          server.close();
-        }
-        assertFalse(server.dataReady());
-        for (var stage : RequestMetrics.PutStage.values()) {
-          assertTrue(metrics.putStages().get(stage).count() > 0, "missing observed stage " + stage);
-        }
-        assertTrue(metrics.putOutputBytes() > 0);
+        RuntimeObservation firstRun = startConfiguredRuntime(config, firstActivation, initialized.clusterId());
+        verifyPutMetrics(firstRun.metrics());
+        verifyEmbeddedRestart(plan, initializer, identity, config, firstRun.response());
         M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
-        try (var restarted = RuntimeServer.startM3(config, activation("2"))) {
-          var second = put(restarted, "after");
-          assertEquals(first.getHeader().getClusterId(), second.getHeader().getClusterId());
-          assertEquals(2, second.getHeader().getMemberId());
-          assertEquals(3, second.getHeader().getRevision());
-          assertTrue(second.hasPrevKv());
-          assertEquals(ByteString.copyFromUtf8("before"), second.getPrevKv().getValue());
-        }
-        M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
-        int port;
-        try (var reservation = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
-          port = reservation.getLocalPort();
-        }
-        Path runtimeFile = writeRuntimeConfiguration(initialization, port);
-        Process child = startRuntimeProcess(runtimeFile, writeActivation("3"), "first");
-        try {
-          var third = put(port, "child-one");
-          assertEquals(first.getHeader().getClusterId(), third.getHeader().getClusterId());
-          assertEquals(3, third.getHeader().getMemberId());
-          assertEquals(4, third.getHeader().getRevision());
-          assertEquals(ByteString.copyFromUtf8("after"), third.getPrevKv().getValue());
-        } finally {
-          stopRuntimeProcess(child);
-        }
-        M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
-        child = startRuntimeProcess(runtimeFile, writeActivation("4"), "second");
-        try {
-          var fourth = put(port, "child-two");
-          assertEquals(first.getHeader().getClusterId(), fourth.getHeader().getClusterId());
-          assertEquals(4, fourth.getHeader().getMemberId());
-          assertEquals(5, fourth.getHeader().getRevision());
-          assertEquals(ByteString.copyFromUtf8("child-one"), fourth.getPrevKv().getValue());
-        } finally {
-          stopRuntimeProcess(child);
-        }
+        verifyChildProcessRestarts(initialization, plan, initializer, identity,
+            firstRun.response().getHeader().getClusterId());
       }
     }
   }
+
+  private RuntimeObservation startConfiguredRuntime(
+      RuntimeConfiguration configuration, M3RuntimeConfiguration activation, long clusterId) throws Exception {
+    var server = RuntimeServer.startM3(configuration, activation);
+    var metrics = server.metrics().getFirst();
+    Rpc.PutResponse first;
+    try {
+      assertTrue(server.dataReady());
+      first = put(server, "before");
+      assertEquals(clusterId, first.getHeader().getClusterId());
+      assertEquals(Long.MIN_VALUE, first.getHeader().getMemberId());
+      assertEquals(2, first.getHeader().getRevision());
+    } finally {
+      server.close();
+    }
+    assertFalse(server.dataReady());
+    return new RuntimeObservation(first, metrics);
+  }
+
+  private static void verifyPutMetrics(RequestMetrics metrics) {
+    for (var stage : RequestMetrics.PutStage.values()) {
+      assertTrue(metrics.putStages().get(stage).count() > 0, "missing observed stage " + stage);
+    }
+    assertTrue(metrics.putOutputBytes() > 0);
+  }
+
+  private static void verifyEmbeddedRestart(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer, AuthorizedBackendIdentity identity,
+      RuntimeConfiguration configuration, Rpc.PutResponse first) throws Exception {
+    M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
+    try (var restarted = RuntimeServer.startM3(configuration, activation("2"))) {
+      var second = put(restarted, "after");
+      assertEquals(first.getHeader().getClusterId(), second.getHeader().getClusterId());
+      assertEquals(2, second.getHeader().getMemberId());
+      assertEquals(3, second.getHeader().getRevision());
+      assertTrue(second.hasPrevKv());
+      assertEquals(ByteString.copyFromUtf8("before"), second.getPrevKv().getValue());
+    }
+  }
+
+  private void verifyChildProcessRestarts(InitializationConfiguration initialization,
+      M3TableGroupPlan plan, HBaseBackendIdentityProvider initializer,
+      AuthorizedBackendIdentity identity, long clusterId) throws Exception {
+    int port;
+    try (var reservation = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+      port = reservation.getLocalPort();
+    }
+    Path runtimeFile = writeRuntimeConfiguration(initialization, port);
+    Process firstChild = startRuntimeProcess(runtimeFile, writeActivation("3"), "first");
+    try {
+      var third = put(port, "child-one");
+      assertEquals(clusterId, third.getHeader().getClusterId());
+      assertEquals(3, third.getHeader().getMemberId());
+      assertEquals(4, third.getHeader().getRevision());
+      assertEquals(ByteString.copyFromUtf8("after"), third.getPrevKv().getValue());
+    } finally {
+      stopRuntimeProcess(firstChild);
+    }
+    M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
+    Process secondChild = startRuntimeProcess(runtimeFile, writeActivation("4"), "second");
+    try {
+      var fourth = put(port, "child-two");
+      assertEquals(clusterId, fourth.getHeader().getClusterId());
+      assertEquals(4, fourth.getHeader().getMemberId());
+      assertEquals(5, fourth.getHeader().getRevision());
+      assertEquals(ByteString.copyFromUtf8("child-one"), fourth.getPrevKv().getValue());
+    } finally {
+      stopRuntimeProcess(secondChild);
+    }
+  }
+
+  private record RuntimeObservation(Rpc.PutResponse response, RequestMetrics metrics) {}
 
   private static Rpc.PutResponse put(RuntimeServer server, String value) throws Exception {
     return put(server.boundListeners().getFirst().port(), value);

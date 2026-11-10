@@ -117,89 +117,101 @@ class M3ReportTest(unittest.TestCase):
 
     def test_report_requires_real_named_java_cases_and_zero_skips(self):
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory)
-            root = parent / "run-1"
-            root.mkdir()
-            repo = parent / "repo"
-            suite = repo / "testkit/scenarios/m3-put.yaml"
-            suite.parent.mkdir(parents=True)
-            suite.write_text("synthetic-validator-test-suite")
-            registry = repo / "testkit/cases/m3-cases.json"
-            registry.parent.mkdir(parents=True)
-            registry.write_text((M3.REPO / "testkit/cases/m3-cases.json").read_text())
-            source = "a" * 40
-            (root / "run.json").write_text(json.dumps({
-                "schema": "etcd-hbase-m3-run/v1", "scope": "public-local-minicluster",
-                "run_id": root.name, "tasks": ["J30"], "source_commit": source,
-                "commands_passed": True,
-            }))
-            suite_sha = M3.file_digest(suite)
-            prefix_sha = hashlib.sha256(b"etcd-hbase-m3-test/run-1/").hexdigest()
-            for name, scope, layout in (("native", "native-etcd", ""), ("target-history", "target-hbase", "HISTORY"),
-                                        ("target-native", "target-hbase", "NATIVE")):
-                trace = root / f"{name}-trace.jsonl"
-                trace.write_text("".join(json.dumps({"schema": "etcd-hbase-trace/v1", "case_id": case,
-                    "evidence_scope": scope, "method": "etcdserverpb.KV/Put"}) + "\n"
-                    for case in M3.PUT_CASES))
-                observed = metadata(scope, layout)
-                observed.update(suite_sha256=suite_sha, prefix_sha256=prefix_sha,
-                                trace_sha256=M3.file_digest(trace))
-                (root / f"{name}-metadata.json").write_text(json.dumps(observed))
-            (root / "target-fixture.json").write_text(json.dumps({
-                "kind": "java-grpc-hbase-minicluster", "run_id": root.name,
-                "source_commit": source, "authentication": "dev-no-auth", "layouts": ["HISTORY", "NATIVE"],
-            }))
-            events = []
-            for package, cases in M3.GO_REQUIRED_CASES.items():
-                name = M3.GO_MODULE + package
-                events.extend({"Action": "pass", "Package": name, "Test": case} for case in cases)
-                events.append({"Action": "pass", "Package": name})
-            (root / "go-test.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
-            for name in M3.REQUIRED_CASES:
-                module = "hbase" if name == M3.HBASE_SUITE else "admin" if name == M3.INIT_SUITE else "server"
-                path = root / module / "target/failsafe-reports" / f"TEST-{name}.xml"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                cases = "".join(f'<testcase name="{case}"/>' for case in sorted(M3.REQUIRED_CASES[name]))
-                path.write_text(f'<testsuite name="{name}" tests="{len(M3.REQUIRED_CASES[name])}" '
-                                f'failures="0" errors="0" skipped="0">{cases}</testsuite>')
-            with mock.patch.object(M3.subprocess, "check_output", side_effect=[source + "\n", ""]), \
-                    mock.patch.object(M3.subprocess, "run"):
-                self.assertEqual(["J30"], M3.validate_run(root, repo)["tasks"])
-            init_report = root / "admin/target/failsafe-reports" / f"TEST-{M3.INIT_SUITE}.xml"
-            saved_init = init_report.read_text()
-            init_report.unlink()
-            with mock.patch.object(M3.subprocess, "check_output", side_effect=[source + "\n", ""]), \
-                    mock.patch.object(M3.subprocess, "run"):
-                with self.assertRaises(ValueError):
-                    M3.validate_run(root, repo)
-            init_report.write_text(saved_init)
-            group_runtime = root / "server/target/failsafe-reports" / f"TEST-{M3.GROUP_RUNTIME_SUITE}.xml"
-            saved_group_runtime = group_runtime.read_text()
-            group_runtime.unlink()
-            with mock.patch.object(M3.subprocess, "check_output", side_effect=[source + "\n", ""]), \
-                    mock.patch.object(M3.subprocess, "run"):
-                with self.assertRaises(ValueError):
-                    M3.validate_run(root, repo)
-            group_runtime.write_text(saved_group_runtime)
-            runtime_report = root / "server/target/failsafe-reports" / f"TEST-{M3.RUNTIME_SUITE}.xml"
-            saved_runtime = runtime_report.read_text()
-            runtime_report.unlink()
-            with mock.patch.object(M3.subprocess, "check_output", side_effect=[source + "\n", ""]), \
-                    mock.patch.object(M3.subprocess, "run"):
-                with self.assertRaises(ValueError):
-                    M3.validate_run(root, repo)
-            runtime_report.write_text(saved_runtime)
-            server_report = root / "server/target/failsafe-reports" / f"TEST-{M3.SERVER_SUITE}.xml"
+            fixture = create_report_fixture(Path(directory))
+            self.assertEqual(["J30"], validate_report(fixture)["tasks"])
+            for suite in (M3.INIT_SUITE, M3.GROUP_RUNTIME_SUITE, M3.RUNTIME_SUITE):
+                report = fixture.report(suite)
+                saved = report.read_text()
+                report.unlink()
+                self.assert_report_rejected(fixture)
+                report.write_text(saved)
+            server_report = fixture.report(M3.SERVER_SUITE)
             server_report.write_text(server_report.read_text().replace('skipped="0"', 'skipped="1"'))
-            with mock.patch.object(M3.subprocess, "check_output", side_effect=[source + "\n", ""]), \
-                    mock.patch.object(M3.subprocess, "run"):
-                with self.assertRaises(ValueError):
-                    M3.validate_run(root, repo)
+            self.assert_report_rejected(fixture)
             server_report.unlink()
-            with mock.patch.object(M3.subprocess, "check_output", side_effect=[source + "\n", ""]), \
-                    mock.patch.object(M3.subprocess, "run"):
-                with self.assertRaises(ValueError):
-                    M3.validate_run(root, repo)
+            self.assert_report_rejected(fixture)
+
+    def assert_report_rejected(self, fixture):
+        with self.assertRaises(ValueError):
+            validate_report(fixture)
+
+
+def create_report_fixture(parent):
+    root = parent / "run-1"
+    root.mkdir()
+    repo = parent / "repo"
+    suite = repo / "testkit/scenarios/m3-put.yaml"
+    suite.parent.mkdir(parents=True)
+    suite.write_text("synthetic-validator-test-suite")
+    registry = repo / "testkit/cases/m3-cases.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text((M3.REPO / "testkit/cases/m3-cases.json").read_text())
+    source = "a" * 40
+    (root / "run.json").write_text(json.dumps({
+        "schema": "etcd-hbase-m3-run/v1", "scope": "public-local-minicluster",
+        "run_id": root.name, "tasks": ["J30"], "source_commit": source,
+        "commands_passed": True,
+    }))
+    suite_sha = M3.file_digest(suite)
+    prefix_sha = hashlib.sha256(b"etcd-hbase-m3-test/run-1/").hexdigest()
+    write_trace_metadata(root, suite_sha, prefix_sha)
+    (root / "target-fixture.json").write_text(json.dumps({
+        "kind": "java-grpc-hbase-minicluster", "run_id": root.name,
+        "source_commit": source, "authentication": "dev-no-auth", "layouts": ["HISTORY", "NATIVE"],
+    }))
+    write_go_report(root)
+    write_java_reports(root)
+    return ReportFixture(root, repo, source)
+
+
+def write_trace_metadata(root, suite_sha, prefix_sha):
+    for name, scope, layout in (("native", "native-etcd", ""),
+                                ("target-history", "target-hbase", "HISTORY"),
+                                ("target-native", "target-hbase", "NATIVE")):
+        trace = root / f"{name}-trace.jsonl"
+        trace.write_text("".join(json.dumps({"schema": "etcd-hbase-trace/v1", "case_id": case,
+            "evidence_scope": scope, "method": "etcdserverpb.KV/Put"}) + "\n"
+            for case in M3.PUT_CASES))
+        observed = metadata(scope, layout)
+        observed.update(suite_sha256=suite_sha, prefix_sha256=prefix_sha,
+                        trace_sha256=M3.file_digest(trace))
+        (root / f"{name}-metadata.json").write_text(json.dumps(observed))
+
+
+def write_go_report(root):
+    events = []
+    for package, cases in M3.GO_REQUIRED_CASES.items():
+        name = M3.GO_MODULE + package
+        events.extend({"Action": "pass", "Package": name, "Test": case} for case in cases)
+        events.append({"Action": "pass", "Package": name})
+    (root / "go-test.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+
+
+def write_java_reports(root):
+    for name in M3.REQUIRED_CASES:
+        module = "hbase" if name == M3.HBASE_SUITE else "admin" if name == M3.INIT_SUITE else "server"
+        path = root / module / "target/failsafe-reports" / f"TEST-{name}.xml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cases = "".join(f'<testcase name="{case}"/>' for case in sorted(M3.REQUIRED_CASES[name]))
+        path.write_text(f'<testsuite name="{name}" tests="{len(M3.REQUIRED_CASES[name])}" '
+                        f'failures="0" errors="0" skipped="0">{cases}</testsuite>')
+
+
+def validate_report(fixture):
+    with mock.patch.object(M3.subprocess, "check_output", side_effect=[fixture.source + "\n", ""]), \
+            mock.patch.object(M3.subprocess, "run"):
+        return M3.validate_run(fixture.root, fixture.repo)
+
+
+class ReportFixture:
+    def __init__(self, root, repo, source):
+        self.root = root
+        self.repo = repo
+        self.source = source
+
+    def report(self, suite):
+        module = "hbase" if suite == M3.HBASE_SUITE else "admin" if suite == M3.INIT_SUITE else "server"
+        return self.root / module / "target/failsafe-reports" / f"TEST-{suite}.xml"
 
 
 if __name__ == "__main__":
