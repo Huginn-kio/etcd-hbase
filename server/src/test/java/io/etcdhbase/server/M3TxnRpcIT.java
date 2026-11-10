@@ -68,47 +68,7 @@ class M3TxnRpcIT {
         "--trace", nativeTrace.toString(), "--metadata", artifacts.resolve("j31-native-metadata.json").toString());
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
       for (String file : List.of("history-table.json", "native-cell-versions.json")) {
-        var plan = M3TableGroupRuntimeIT.plan(file, cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
-        String layout = file.startsWith("history") ? "HISTORY" : "NATIVE";
-        String suffix = layout.toLowerCase(Locale.ROOT);
-        var auth = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
-        try (var provider = new HBaseBackendIdentityProvider(plan.source().identityProviderId(), auth,
-                cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
-                (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
-                1, 1, Duration.ofSeconds(30));
-             var credentials = new BackendCredentials("m3-txn-fixture", new char[0])) {
-          var identity = provider.authenticate(credentials, auth).toCompletableFuture().get(30, TimeUnit.SECONDS);
-          M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider, PINS);
-          var limits = new BudgetManager.Limits(10, 10, 16, 8, 16, 4L << 20, 512L << 20);
-          var budgets = new BudgetManager(limits, Map.of(plan.source().tableGroupId(), limits), limits);
-          try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
-            M3TableGroupRuntime runtime;
-            try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
-              runtime = M3TableGroupRuntime.open(plan, M3TableGroupRuntimeIT.activation("1"),
-                  RESOURCES, provider, identity, budgets, scans, startup);
-            }
-            try {
-              try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
-                  "m3-txn", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
-                runDriver(root, artifacts.resolve("j31-target-" + suffix + ".log"),
-                    "--endpoint", "127.0.0.1:" + server.boundListener().port(), "--scope", "target-hbase",
-                    "--layout", layout, "--prefix", prefix,
-                    "--trace", artifacts.resolve("j31-target-" + suffix + "-trace.jsonl").toString(),
-                    "--metadata", artifacts.resolve("j31-target-" + suffix + "-metadata.json").toString());
-                assertPhysicalRowLimits(server, provider, identity, plan);
-              }
-            } finally {
-              runtime.close();
-              runtime.drained().get(30, TimeUnit.SECONDS);
-            }
-          }
-          assertEquals(0, budgets.snapshot().reservedBytes());
-          assertEquals(0, budgets.snapshot().allocatedBytes());
-        }
-        run(root, artifacts.resolve("j31-compare-" + suffix + ".log"), List.of(
-            root.resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare", "--m3-txn",
-            "--left", nativeTrace.toString(), "--right",
-            artifacts.resolve("j31-target-" + suffix + "-trace.jsonl").toString()));
+        runTargetLayout(cluster, file, root, artifacts, prefix, nativeTrace);
       }
     }
     String source = System.getenv("M3_SOURCE_COMMIT");
@@ -119,6 +79,63 @@ class M3TxnRpcIT {
           + "\",\"authentication\":\"dev-no-auth\",\"layouts\":[\"HISTORY\",\"NATIVE\"]}\n";
       Files.writeString(artifacts.resolve("j31-target-fixture.json"), metadata,
           java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE);
+    }
+  }
+
+  private static void runTargetLayout(TemporaryHBaseClusterProcess cluster, String file,
+      Path root, Path artifacts, String prefix, Path nativeTrace) throws Exception {
+    var plan = M3TableGroupRuntimeIT.plan(file, cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
+    String layout = file.startsWith("history") ? "HISTORY" : "NATIVE";
+    String suffix = layout.toLowerCase(Locale.ROOT);
+    var auth = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
+    try (var provider = new HBaseBackendIdentityProvider(plan.source().identityProviderId(), auth,
+            cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+            (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+            1, 1, Duration.ofSeconds(30));
+         var credentials = new BackendCredentials("m3-txn-fixture", new char[0])) {
+      var identity = provider.authenticate(credentials, auth).toCompletableFuture().get(30, TimeUnit.SECONDS);
+      M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider, PINS);
+      var limits = new BudgetManager.Limits(10, 10, 16, 8, 16, 4L << 20, 512L << 20);
+      var budgets = new BudgetManager(limits, Map.of(plan.source().tableGroupId(), limits), limits);
+      runTargetRuntime(plan, provider, identity, budgets, root, artifacts, prefix, layout, suffix);
+      assertEquals(0, budgets.snapshot().reservedBytes());
+      assertEquals(0, budgets.snapshot().allocatedBytes());
+    }
+    run(root, artifacts.resolve("j31-compare-" + suffix + ".log"), List.of(
+        root.resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare", "--m3-txn",
+        "--left", nativeTrace.toString(), "--right",
+        artifacts.resolve("j31-target-" + suffix + "-trace.jsonl").toString()));
+  }
+
+  private static void runTargetRuntime(M3TableGroupPlan plan, HBaseBackendIdentityProvider provider,
+      AuthorizedBackendIdentity identity, BudgetManager budgets, Path root, Path artifacts,
+      String prefix, String layout, String suffix) throws Exception {
+    try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
+      M3TableGroupRuntime runtime;
+      try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+        runtime = M3TableGroupRuntime.open(plan, M3TableGroupRuntimeIT.activation("1"),
+            RESOURCES, provider, identity, budgets, scans, startup);
+      }
+      try {
+        runTargetServer(runtime, plan, provider, identity, root, artifacts, prefix, layout, suffix);
+      } finally {
+        runtime.close();
+        runtime.drained().get(30, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  private static void runTargetServer(M3TableGroupRuntime runtime, M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider, AuthorizedBackendIdentity identity, Path root,
+      Path artifacts, String prefix, String layout, String suffix) throws Exception {
+    try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
+        "m3-txn", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
+      runDriver(root, artifacts.resolve("j31-target-" + suffix + ".log"),
+          "--endpoint", "127.0.0.1:" + server.boundListener().port(), "--scope", "target-hbase",
+          "--layout", layout, "--prefix", prefix,
+          "--trace", artifacts.resolve("j31-target-" + suffix + "-trace.jsonl").toString(),
+          "--metadata", artifacts.resolve("j31-target-" + suffix + "-metadata.json").toString());
+      assertPhysicalRowLimits(server, provider, identity, plan);
     }
   }
 

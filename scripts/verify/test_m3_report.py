@@ -111,50 +111,7 @@ class M3ReportTest(unittest.TestCase):
 
     def test_txn_run_requires_named_unit_and_real_integration_cases(self):
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory)
-            root, repo = parent / "run-1", parent / "repo"
-            root.mkdir()
-            suite = repo / "testkit/scenarios/m3-txn.yaml"
-            suite.parent.mkdir(parents=True)
-            suite.write_text("synthetic-validator-test-suite")
-            registry = repo / "testkit/cases/m3-cases.json"
-            registry.parent.mkdir(parents=True)
-            registry.write_text((M3.REPO / "testkit/cases/m3-cases.json").read_text())
-            source = "a" * 40
-            (root / "run.json").write_text(json.dumps({
-                "schema": "etcd-hbase-m3-run/v1", "scope": "public-local-minicluster",
-                "run_id": root.name, "tasks": ["J31"], "source_commit": source, "commands_passed": True,
-            }))
-            suite_sha = M3.file_digest(suite)
-            prefix_sha = hashlib.sha256(b"etcd-hbase-m3-test/run-1/").hexdigest()
-            for name, scope, layout in (("native", "native-etcd", ""), ("target-history", "target-hbase", "HISTORY"),
-                                        ("target-native", "target-hbase", "NATIVE")):
-                trace = root / f"j31-{name}-trace.jsonl"
-                trace.write_text("".join(json.dumps({"schema": "etcd-hbase-trace/v1", "case_id": case,
-                    "evidence_scope": scope, "method": "etcdserverpb.KV/Put" if index == 0 else "etcdserverpb.KV/Txn"}) + "\n"
-                    for index, case in enumerate(M3.TXN_CASES)))
-                observed = metadata(scope, layout)
-                observed["build"]["scenario_id"] = "m3-txn-v1"
-                observed.update(suite_sha256=suite_sha, prefix_sha256=prefix_sha, trace_sha256=M3.file_digest(trace))
-                (root / f"j31-{name}-metadata.json").write_text(json.dumps(observed))
-            (root / "j31-target-fixture.json").write_text(json.dumps({
-                "kind": "java-grpc-hbase-minicluster", "run_id": root.name, "source_commit": source,
-                "authentication": "dev-no-auth", "layouts": ["HISTORY", "NATIVE"],
-            }))
-            events = []
-            for package, cases in M3.J31_GO_REQUIRED_CASES.items():
-                name = M3.GO_MODULE + package
-                events.extend({"Action": "pass", "Package": name, "Test": case} for case in cases)
-                events.append({"Action": "pass", "Package": name})
-            (root / "go-test.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
-            for suites, kind in ((M3.J31_INTEGRATION_CASES, "failsafe-reports"),
-                                 (M3.J31_UNIT_CASES, "surefire-reports")):
-                for name, names in suites.items():
-                    module = "hbase" if ".hbase." in name else "core" if ".core." in name else "grpc" if ".grpc." in name else "server"
-                    path = root / module / "target" / kind / f"TEST-{name}.xml"
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    cases = "".join(f'<testcase name="{case}"/>' for case in sorted(names))
-                    path.write_text(f'<testsuite name="{name}" tests="{len(names)}" failures="0" errors="0" skipped="0">{cases}</testsuite>')
+            root, repo, source = create_txn_report_fixture(Path(directory))
             with mock.patch.object(M3.subprocess, "check_output", side_effect=[source + "\n", ""]), \
                     mock.patch.object(M3.subprocess, "run"):
                 self.assertEqual(["J31"], M3.validate_run(root, repo)["tasks"])
@@ -210,6 +167,65 @@ class M3ReportTest(unittest.TestCase):
     def assert_report_rejected(self, fixture):
         with self.assertRaises(ValueError):
             validate_report(fixture)
+
+
+def create_txn_report_fixture(parent):
+    root, repo = parent / "run-1", parent / "repo"
+    root.mkdir()
+    suite = repo / "testkit/scenarios/m3-txn.yaml"
+    suite.parent.mkdir(parents=True)
+    suite.write_text("synthetic-validator-test-suite")
+    registry = repo / "testkit/cases/m3-cases.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text((M3.REPO / "testkit/cases/m3-cases.json").read_text())
+    source = "a" * 40
+    (root / "run.json").write_text(json.dumps({
+        "schema": "etcd-hbase-m3-run/v1", "scope": "public-local-minicluster",
+        "run_id": root.name, "tasks": ["J31"], "source_commit": source, "commands_passed": True,
+    }))
+    write_txn_trace_metadata(root, suite, source)
+    write_txn_go_report(root)
+    write_txn_java_reports(root)
+    return root, repo, source
+
+
+def write_txn_trace_metadata(root, suite, source):
+    suite_sha = M3.file_digest(suite)
+    prefix_sha = hashlib.sha256(b"etcd-hbase-m3-test/run-1/").hexdigest()
+    for name, scope, layout in (("native", "native-etcd", ""), ("target-history", "target-hbase", "HISTORY"),
+                                ("target-native", "target-hbase", "NATIVE")):
+        trace = root / f"j31-{name}-trace.jsonl"
+        trace.write_text("".join(json.dumps({"schema": "etcd-hbase-trace/v1", "case_id": case,
+            "evidence_scope": scope, "method": "etcdserverpb.KV/Put" if index == 0 else "etcdserverpb.KV/Txn"}) + "\n"
+            for index, case in enumerate(M3.TXN_CASES)))
+        observed = metadata(scope, layout)
+        observed["build"]["scenario_id"] = "m3-txn-v1"
+        observed.update(suite_sha256=suite_sha, prefix_sha256=prefix_sha, trace_sha256=M3.file_digest(trace))
+        (root / f"j31-{name}-metadata.json").write_text(json.dumps(observed))
+    (root / "j31-target-fixture.json").write_text(json.dumps({
+        "kind": "java-grpc-hbase-minicluster", "run_id": root.name, "source_commit": source,
+        "authentication": "dev-no-auth", "layouts": ["HISTORY", "NATIVE"],
+    }))
+
+
+def write_txn_go_report(root):
+    events = []
+    for package, cases in M3.J31_GO_REQUIRED_CASES.items():
+        name = M3.GO_MODULE + package
+        events.extend({"Action": "pass", "Package": name, "Test": case} for case in cases)
+        events.append({"Action": "pass", "Package": name})
+    (root / "go-test.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+
+
+def write_txn_java_reports(root):
+    for suites, kind in ((M3.J31_INTEGRATION_CASES, "failsafe-reports"),
+                         (M3.J31_UNIT_CASES, "surefire-reports")):
+        for name, names in suites.items():
+            module = "hbase" if ".hbase." in name else "core" if ".core." in name else "grpc" if ".grpc." in name else "server"
+            path = root / module / "target" / kind / f"TEST-{name}.xml"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            cases = "".join(f'<testcase name="{case}"/>' for case in sorted(names))
+            path.write_text(f'<testsuite name="{name}" tests="{len(names)}" failures="0" errors="0" skipped="0">{cases}</testsuite>')
 
 
 def create_report_fixture(parent):

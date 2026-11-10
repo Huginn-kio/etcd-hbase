@@ -92,6 +92,7 @@ J31_UNIT_CASES = {
     "io.etcdhbase.core.commit.ReadViewRecordStoreTest": {"transactionComparesPointAndRangeAgainstOneProtectedBase",
         "transactionComparePropagatesBackendFailureInsteadOfChoosingElse",
         "flatTransactionReadsItsPriorWriteAndUsesOneCommitRevision",
+        "flatTransactionCanWriteInElse", "readOnlyTransactionNeedsNoInvocation",
         "cancellationDuringFinalPinValidationRejectsTheTransaction"},
     "io.etcdhbase.grpc.protocol.TxnRequestMapperTest": {"matchesPinnedGoEtcdInternalTxnEnvelopeSizeAcrossVarintBoundaries"},
     "io.etcdhbase.grpc.protocol.TxnResponseMapperTest": {"projectsOuterIdentityAndPerOperationRevisionsWithoutInventingChildIdentities"},
@@ -241,6 +242,18 @@ def validate_go_report(path: Path, required_cases: dict = GO_REQUIRED_CASES) -> 
 
 
 def validate_run(root: Path, repository: Path = REPO) -> dict:
+    run, source, task = validate_run_identity(root, repository)
+    prefix, txn = validate_run_traces(root, repository, run, source, task)
+    suites = validate_run_reports(root, txn)
+    compare_run_traces(root, repository, prefix, txn)
+    return {"phase": "M3", "tasks": [task], "scope": run["scope"], "run_id": run["run_id"],
+            "source_commit": source, "suites": suites, "trace_cases": list(TXN_CASES if txn else PUT_CASES),
+            "limitations": ["raft_term=0 is a disclosed non-Raft projection",
+                            "public MiniCluster is not target HBase or target identity acceptance",
+                            "an unconfirmed scanner close retires local capacity; remote lifetime across restarts is unverified"]}
+
+
+def validate_run_identity(root: Path, repository: Path) -> tuple[dict, str, str]:
     run = read_json(root / "run.json")
     run_id = run.get("run_id")
     tasks = run.get("tasks")
@@ -257,8 +270,12 @@ def validate_run(root: Path, repository: Path = REPO) -> dict:
     if current != source or dirty:
         raise ValueError("M3 source changed or is uncommitted")
 
+    return run, source, tasks[0]
+
+
+def validate_run_traces(root: Path, repository: Path, run: dict, source: str, task: str) -> tuple[str, bool]:
+    run_id = run["run_id"]
     validate_case_registry(read_json(repository / "testkit/cases/m3-cases.json"))
-    task = tasks[0]
     txn = task == "J31"
     prefix = "j31-" if txn else ""
     scenario = "m3-txn-v1" if txn else "m3-put-v1"
@@ -276,6 +293,10 @@ def validate_run(root: Path, repository: Path = REPO) -> dict:
             or fixture.get("source_commit") != source or fixture.get("authentication") != "dev-no-auth"
             or fixture.get("layouts") != ["HISTORY", "NATIVE"]):
         raise ValueError("M3 target fixture provenance is incomplete or mismatched")
+    return prefix, txn
+
+
+def validate_run_reports(root: Path, txn: bool) -> dict:
     validate_go_report(root / "go-test.jsonl", J31_GO_REQUIRED_CASES if txn else GO_REQUIRED_CASES)
     integration = J31_INTEGRATION_CASES if txn else REQUIRED_CASES
     _, suites = java_reports(root, set(integration), modules=("hbase", "admin", "server"),
@@ -284,16 +305,15 @@ def validate_run(root: Path, repository: Path = REPO) -> dict:
         _, units = java_reports(root, set(J31_UNIT_CASES), modules=("core", "grpc", "server"),
                                 required_cases=J31_UNIT_CASES, report_kinds=("surefire-reports",))
         suites.update(units)
+    return suites
+
+
+def compare_run_traces(root: Path, repository: Path, prefix: str, txn: bool) -> None:
     for layout in ("history", "native"):
         command = [str(repository / "scripts/dev/go-program.sh"), "native-etcd", "compare",
                    "--m3-txn" if txn else "--m3-put", "--left", str(root / f"{prefix}native-trace.jsonl"),
                    "--right", str(root / f"{prefix}target-{layout}-trace.jsonl")]
         subprocess.run(command, cwd=repository, check=True, stdout=subprocess.DEVNULL)
-    return {"phase": "M3", "tasks": [task], "scope": run["scope"], "run_id": run_id,
-            "source_commit": source, "suites": suites, "trace_cases": list(TXN_CASES if txn else PUT_CASES),
-            "limitations": ["raft_term=0 is a disclosed non-Raft projection",
-                            "public MiniCluster is not target HBase or target identity acceptance",
-                            "an unconfirmed scanner close retires local capacity; remote lifetime across restarts is unverified"]}
 
 
 def main() -> int:

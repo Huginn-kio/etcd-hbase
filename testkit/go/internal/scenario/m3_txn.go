@@ -65,6 +65,16 @@ func (runner *runner) m3TxnScenario(ctx context.Context, prefix string) error {
 		return errors.New("M3 Txn baseline did not create a fresh key")
 	}
 	base := baseline.Header.Revision
+	if err := runner.m3TxnCompareMatrix(ctx, kv, key, value, base); err != nil {
+		return err
+	}
+	if err := runner.m3TxnCompareEdges(ctx, kv, prefix, key, base); err != nil {
+		return err
+	}
+	return runner.m3TxnWrites(ctx, kv, prefix, key, value, base)
+}
+
+func (runner *runner) m3TxnCompareMatrix(ctx context.Context, kv etcdserverpb.KVClient, key, value []byte, base int64) error {
 	for _, target := range []string{"version", "create", "mod", "value", "lease"} {
 		for _, relation := range []string{"equal", "not-equal", "greater", "less"} {
 			comparison := m3Comparison(key, value, base, target, relation)
@@ -80,6 +90,10 @@ func (runner *runner) m3TxnScenario(ctx context.Context, prefix string) error {
 			}
 		}
 	}
+	return nil
+}
+
+func (runner *runner) m3TxnCompareEdges(ctx context.Context, kv etcdserverpb.KVClient, prefix string, key []byte, base int64) error {
 	missing := []byte(prefix + "missing")
 	for _, test := range []struct {
 		id       string
@@ -104,7 +118,7 @@ func (runner *runner) m3TxnScenario(ctx context.Context, prefix string) error {
 			return fmt.Errorf("%s: incorrect missing-key or range comparison", test.id)
 		}
 	}
-	return runner.m3TxnWrites(ctx, kv, prefix, key, value, base)
+	return nil
 }
 
 func m3Comparison(key, value []byte, base int64, target, relation string) *etcdserverpb.Compare {
@@ -142,29 +156,57 @@ func m3Comparison(key, value []byte, base int64, target, relation string) *etcds
 	return compare
 }
 
+func m3TxnVersion(key []byte, expected int64) *etcdserverpb.Compare {
+	return &etcdserverpb.Compare{Key: key, Target: etcdserverpb.Compare_VERSION,
+		Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: expected}}
+}
+
 func (runner *runner) m3TxnWrites(ctx context.Context, kv etcdserverpb.KVClient,
 	prefix string, key, value []byte, base int64) error {
-	version := func(key []byte, expected int64) *etcdserverpb.Compare {
-		return &etcdserverpb.Compare{Key: key, Target: etcdserverpb.Compare_VERSION,
-			Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: expected}}
+	if err := runner.m3TxnThenWrite(ctx, kv, key, value, base); err != nil {
+		return err
 	}
+	if err := runner.m3TxnElseAndNoChange(ctx, kv, prefix, key, value, base); err != nil {
+		return err
+	}
+	if err := runner.m3ClientTxn(ctx, kv, key, base+2); err != nil {
+		return err
+	}
+	return runner.m3TxnErrors(ctx, kv, key, value)
+}
+
+func (runner *runner) m3TxnThenWrite(ctx context.Context, kv etcdserverpb.KVClient, key, value []byte, base int64) error {
 	replacement := []byte{'n', 0, 0x80}
 	first, err := runner.m3Txn(ctx, kv, "J31-then-write", &etcdserverpb.TxnRequest{
-		Compare: []*etcdserverpb.Compare{version(key, 1)},
+		Compare: []*etcdserverpb.Compare{m3TxnVersion(key, 1)},
 		Success: []*etcdserverpb.RequestOp{m3Range(key), m3PutOp(key, replacement, true), m3Range(key)},
 	})
 	if err != nil {
 		return err
 	}
-	if first.Header == nil || first.Header.Revision != base+1 || !first.Succeeded || len(first.Responses) != 3 ||
-		len(first.Responses[0].GetResponseRange().Kvs) != 1 || len(first.Responses[2].GetResponseRange().Kvs) != 1 ||
-		!bytes.Equal(first.Responses[0].GetResponseRange().Kvs[0].Value, value) ||
-		!bytes.Equal(first.Responses[2].GetResponseRange().Kvs[0].Value, replacement) {
+	if !validOrderedTxnResponse(first, base+1, value, replacement) {
 		return errors.New("M3 Txn ordered read/write result is incorrect")
 	}
+	return nil
+}
+
+func validOrderedTxnResponse(response *etcdserverpb.TxnResponse, revision int64, before, after []byte) bool {
+	if response.Header == nil || response.Header.Revision != revision || !response.Succeeded || len(response.Responses) != 3 {
+		return false
+	}
+	first := response.Responses[0].GetResponseRange()
+	if len(first.Kvs) != 1 {
+		return false
+	}
+	last := response.Responses[2].GetResponseRange()
+	return len(last.Kvs) == 1 && bytes.Equal(first.Kvs[0].Value, before) &&
+		bytes.Equal(last.Kvs[0].Value, after)
+}
+
+func (runner *runner) m3TxnElseAndNoChange(ctx context.Context, kv etcdserverpb.KVClient, prefix string, key, value []byte, base int64) error {
 	other := []byte(prefix + "other")
 	second, err := runner.m3Txn(ctx, kv, "J31-else-write", &etcdserverpb.TxnRequest{
-		Compare: []*etcdserverpb.Compare{version(key, 0)}, Success: []*etcdserverpb.RequestOp{m3PutOp(key, value, false)},
+		Compare: []*etcdserverpb.Compare{m3TxnVersion(key, 0)}, Success: []*etcdserverpb.RequestOp{m3PutOp(key, value, false)},
 		Failure: []*etcdserverpb.RequestOp{m3PutOp(other, value, false)},
 	})
 	if err != nil {
@@ -174,7 +216,7 @@ func (runner *runner) m3TxnWrites(ctx context.Context, kv etcdserverpb.KVClient,
 		return errors.New("M3 Txn Else write did not commit exactly once")
 	}
 	unchanged, err := runner.m3Txn(ctx, kv, "J31-no-change", &etcdserverpb.TxnRequest{
-		Compare: []*etcdserverpb.Compare{version(other, 0)}, Success: []*etcdserverpb.RequestOp{m3PutOp(other, value, false)},
+		Compare: []*etcdserverpb.Compare{m3TxnVersion(other, 0)}, Success: []*etcdserverpb.RequestOp{m3PutOp(other, value, false)},
 		Failure: []*etcdserverpb.RequestOp{m3Range(other)},
 	})
 	if err != nil {
@@ -183,9 +225,10 @@ func (runner *runner) m3TxnWrites(ctx context.Context, kv etcdserverpb.KVClient,
 	if unchanged.Header == nil || unchanged.Header.Revision != base+2 || unchanged.Succeeded || len(unchanged.Responses) != 1 {
 		return errors.New("M3 Txn no-change branch altered the revision")
 	}
-	if err := runner.m3ClientTxn(ctx, kv, key, base+2); err != nil {
-		return err
-	}
+	return nil
+}
+
+func (runner *runner) m3TxnErrors(ctx context.Context, kv etcdserverpb.KVClient, key, value []byte) error {
 	for _, test := range []struct {
 		id, semantic string
 		request      *etcdserverpb.TxnRequest

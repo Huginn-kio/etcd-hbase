@@ -214,16 +214,14 @@ class ReadViewRecordStoreTest {
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.physical.add(live("alpha", 1, 1, 1, 0, "x"));
     fixture.physical.add(live("beta", 1, 1, 1, 0, "x"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 32768, 8192);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
       var conditions = List.of(
           CompareCondition.numeric(KeyRange.point(key("delta")), CompareCondition.Target.VERSION,
               CompareCondition.Relation.EQUAL, 2),
@@ -242,16 +240,14 @@ class ReadViewRecordStoreTest {
   void transactionComparePropagatesBackendFailureInsteadOfChoosingElse() throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 32768, 8192);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
       fixture.physical.blockNextGet(key("broken"));
       var result = comparisons.evaluate(List.of(CompareCondition.numeric(KeyRange.point(key("broken")),
           CompareCondition.Target.VERSION, CompareCondition.Relation.EQUAL, 0)));
@@ -266,16 +262,14 @@ class ReadViewRecordStoreTest {
   void transactionCompareAndShortCircuitsBeforeReadingLaterConditions() throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 32768, 8192);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
       var conditions = List.of(
           CompareCondition.value(KeyRange.point(key("missing")), CompareCondition.Relation.NOT_EQUAL, bytes("x")),
           CompareCondition.numeric(KeyRange.point(key("later")), CompareCondition.Target.VERSION,
@@ -292,17 +286,15 @@ class ReadViewRecordStoreTest {
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.physical.add(live("alpha", 1, 1, 1, 0, "x"));
     fixture.physical.add(live("beta", 1, 1, 1, 0, "x"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 32768, 8192);
     var reads = new BudgetManager.ReadLimits(100, 100_000, 100, 1, 100);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation, reads);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+    try (var resources = transactionResources(budget, reservation, reads)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
       var result = comparisons.evaluate(List.of(CompareCondition.numeric(
           KeyRange.between(key("a"), key("z")), CompareCondition.Target.VERSION,
           CompareCondition.Relation.GREATER, 0)));
@@ -316,8 +308,7 @@ class ReadViewRecordStoreTest {
   void transactionCompareRejectsAnAccountFromAnotherRequestScope() throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 32768, 8192);
     try (RequestScope owner = RequestScope.withTimeout(Duration.ofSeconds(10));
          RequestScope other = RequestScope.withTimeout(Duration.ofSeconds(10));
@@ -337,18 +328,15 @@ class ReadViewRecordStoreTest {
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
     fixture.physical.add(live("alpha", 1, 1, 1, 0, "old"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0);
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
       var put = new PutCommand(key("alpha"), bytes("new"), 0, true, false, false);
       var command = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key("alpha")),
           CompareCondition.Target.VERSION, CompareCondition.Relation.EQUAL, 1)),
@@ -385,18 +373,15 @@ class ReadViewRecordStoreTest {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0);
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key("missing")),
           CompareCondition.Target.VERSION, CompareCondition.Relation.GREATER, 0)),
           List.of(new TxnCommand.Put(new PutCommand(key("a"), new byte[0], 0, false, true, false)),
@@ -416,22 +401,19 @@ class ReadViewRecordStoreTest {
   }
 
   @Test
-  void flatTransactionCanWriteInElseAndReadOnlyRequestsNeedNoInvocation() throws Exception {
+  void flatTransactionCanWriteInElse() throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0);
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(CompareCondition.numeric(KeyRange.point(key("missing")),
           CompareCondition.Target.VERSION, CompareCondition.Relation.GREATER, 0)), List.of(),
           List.of(new TxnCommand.Put(new PutCommand(key("a"), bytes("else"), 0, false, false, false))));
@@ -444,15 +426,22 @@ class ReadViewRecordStoreTest {
       assertEquals(1, evaluated.candidates().size());
       session.finish().join();
     }
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0);
+  }
+
+  @Test
+  void readOnlyTransactionNeedsNoInvocation() throws Exception {
+    Fixture fixture = new Fixture(1, List.of(
+        candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
+    fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
+    var budget = transactionBudget();
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
       var evaluated = evaluator.evaluate(new TxnCommand(List.of(),
           List.of(new TxnCommand.PointRange(key("missing"))), List.of()), Optional.empty()).join();
       var result = assertInstanceOf(ResultNode.Txn.class, evaluated.result().root());
@@ -471,18 +460,14 @@ class ReadViewRecordStoreTest {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.physical.add(live("alpha", 1, 1, 1, 0, "old"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
     RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
     try (BudgetManager.Account account = budget.admit("public", scope, reservation);
          var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 256, 65536), ignored -> 0);
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(session, comparisons, account, scope, 256);
       var result = evaluator.evaluate(new TxnCommand(List.of(),
           List.of(new TxnCommand.PointRange(key("alpha"))), List.of()), Optional.empty());
       var failure = assertInstanceOf(BackendFailure.class, completionFailure(result::join));
@@ -498,18 +483,15 @@ class ReadViewRecordStoreTest {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0);
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(), List.of(new TxnCommand.Put(
           new PutCommand(key("a"), bytes("x"), 0, false, false, false))), List.of());
       InvocationBinding foreign = InvocationBinding.begin(InvocationId.create(), digest(7), digest(8),
@@ -525,18 +507,15 @@ class ReadViewRecordStoreTest {
   void potentiallyWritingTransactionRejectsAnUnfinalizedPublication() throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0);
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(), List.of(new TxnCommand.Put(
           new PutCommand(key("a"), bytes("x"), 0, false, false, false))), List.of());
       InvocationBinding binding = InvocationBinding.begin(InvocationId.create(), digest(7), digest(9),
@@ -553,18 +532,15 @@ class ReadViewRecordStoreTest {
   void selectedUnsupportedTransactionOperationFailsExplicitly() throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0);
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
       var command = new TxnCommand(List.of(), List.of(new TxnCommand.Unsupported(false)), List.of());
       var failure = assertInstanceOf(KvFailure.class,
           completionFailure(() -> evaluator.evaluate(command, Optional.empty()).join()));
@@ -577,18 +553,14 @@ class ReadViewRecordStoreTest {
   void flatTransactionCancellationKeepsBudgetUntilItsPhysicalReadStops() throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var budget = transactionBudget();
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
     RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
     try (BudgetManager.Account account = budget.admit("public", scope, reservation);
          var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0);
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(session, comparisons, account, scope, 16384);
       fixture.physical.blockNextGet(key("blocked"));
       var result = evaluator.evaluate(new TxnCommand(List.of(),
           List.of(new TxnCommand.PointRange(key("blocked"))), List.of()), Optional.empty());
@@ -1124,6 +1096,76 @@ class ReadViewRecordStoreTest {
     scope.cleanupCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
     assertEquals(0, budgets.snapshot().allocatedBytes(),
         "candidate lease releases only after the physical producer and scope cleanup finish");
+  }
+
+  private record TransactionResources(RequestScope scope, BudgetManager.Account account,
+      ScanScheduler scheduler) implements AutoCloseable {
+    @Override public void close() {
+      try (scope; account; scheduler) {
+        // Close in the same scheduler, account, scope order as the individual resources.
+      }
+    }
+  }
+
+  @FunctionalInterface
+  private interface TransactionAdmission {
+    BudgetManager.Account admit(RequestScope scope) throws BackendFailure;
+  }
+
+  private static TransactionResources transactionResources(BudgetManager budget,
+      BudgetManager.Reservation reservation) throws BackendFailure {
+    return transactionResources(budget, scope -> budget.admit("public", scope, reservation));
+  }
+
+  private static TransactionResources transactionResources(BudgetManager budget,
+      BudgetManager.Reservation reservation, BudgetManager.ReadLimits reads) throws BackendFailure {
+    return transactionResources(budget, scope -> budget.admit("public", scope, reservation, reads));
+  }
+
+  private static TransactionResources transactionResources(BudgetManager budget,
+      TransactionAdmission admission) throws BackendFailure {
+    RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+    try {
+      BudgetManager.Account account = admission.admit(scope);
+      try {
+        var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5));
+        try {
+          return new TransactionResources(scope, account, scheduler);
+        } catch (RuntimeException | Error failure) {
+          try { scheduler.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+          throw failure;
+        }
+      } catch (RuntimeException | Error failure) {
+        try { account.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+        throw failure;
+      }
+    } catch (BackendFailure | RuntimeException | Error failure) {
+      try { scope.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+      throw failure;
+    }
+  }
+
+  private static BudgetManager transactionBudget() {
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    return new BudgetManager(limits, Map.of("public", limits), limits);
+  }
+
+  private static TxnReadSession openTransaction(Fixture fixture, RequestScope scope) {
+    return TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+        new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+  }
+
+  private static CompareReadExecutor transactionComparisons(TxnReadSession session,
+      ScanScheduler scheduler, BudgetManager.Account account, RequestScope scope) {
+    return new CompareReadExecutor(session, scheduler, account, scope,
+        new CompareReadExecutor.Limits(1, 4096, 64, 4096));
+  }
+
+  private static TxnEvaluator transactionEvaluator(TxnReadSession session,
+      CompareReadExecutor comparisons, BudgetManager.Account account, RequestScope scope,
+      long maxResultBytes) {
+    return new TxnEvaluator(session, comparisons, account, scope,
+        new TxnEvaluator.Limits(4096, maxResultBytes, 65536), ignored -> 0);
   }
 
   private static List<String> pageRecords(BucketCursor.Page page) {

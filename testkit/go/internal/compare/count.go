@@ -132,87 +132,20 @@ func countPolicyForRange(fields map[string]any) countPolicy {
 
 // Apply a Count allowance only to the selected, matching flat Range operation.
 // Nested operations and all other response fields remain strict.
+type countPair struct{ left, right map[string]any }
+
+type selectedTxn struct {
+	operations, leftOps, rightOps []any
+}
+
 func equalFlatTxnWithCountAllowance(left, right map[string]any, leftScope string) (bool, bool) {
-	if left["method"] != "etcdserverpb.KV/Txn" || !reflect.DeepEqual(withoutResponse(left), withoutResponse(right)) {
-		return false, false
-	}
-	request, ok := left["request"].(map[string]any)
+	selected, ok := selectFlatTxn(left, right)
 	if !ok {
 		return false, false
 	}
-	requestFields, ok := request["fields"].(map[string]any)
-	if !ok {
-		return false, false
-	}
-	leftResponse, ok := left["response"].(map[string]any)
-	if !ok {
-		return false, false
-	}
-	rightResponse, ok := right["response"].(map[string]any)
-	if !ok {
-		return false, false
-	}
-	leftFields, leftOK := leftResponse["fields"].(map[string]any)
-	rightFields, rightOK := rightResponse["fields"].(map[string]any)
-	if !leftOK || !rightOK {
-		return false, false
-	}
-	succeeded, ok := leftFields["succeeded"].(bool)
-	if !ok || rightFields["succeeded"] != succeeded {
-		return false, false
-	}
-	branch := "failure"
-	if succeeded {
-		branch = "success"
-	}
-	operations, ok := requestFields[branch].([]any)
-	if !ok {
-		return false, false
-	}
-	leftOps, leftOK := leftFields["responses"].([]any)
-	rightOps, rightOK := rightFields["responses"].([]any)
-	if !leftOK || !rightOK || len(operations) != len(leftOps) || len(operations) != len(rightOps) {
-		return false, false
-	}
-	type pair struct{ left, right map[string]any }
-	var matches []pair
-	for index, raw := range operations {
-		op, ok := raw.(map[string]any)
-		if !ok {
-			return false, false
-		}
-		fields, ok := op["fields"].(map[string]any)
-		if !ok {
-			return false, false
-		}
-		rangeRequest, ok := fields["requestRange"].(map[string]any)
-		if !ok {
-			continue
-		}
-		rangeFields, ok := rangeRequest["fields"].(map[string]any)
-		if !ok {
-			return false, false
-		}
-		policy := countPolicyForRange(rangeFields)
-		if policy == strictCount {
-			continue
-		}
-		if !hasTxnOneof(op, "request", "request_range") {
-			return true, false
-		}
-		leftRange, leftOK := txnRangeResponse(leftOps[index])
-		rightRange, rightOK := txnRangeResponse(rightOps[index])
-		if !leftOK || !rightOK {
-			return true, false
-		}
-		native, target := leftRange, rightRange
-		if leftScope == "target-hbase" {
-			native, target = rightRange, leftRange
-		}
-		if !validTargetCount(native, target, policy) {
-			return true, false
-		}
-		matches = append(matches, pair{leftRange, rightRange})
+	matches, handled, valid := matchCountAllowances(selected, leftScope)
+	if !valid {
+		return handled, false
 	}
 	if len(matches) == 0 {
 		return false, false
@@ -222,6 +155,95 @@ func equalFlatTxnWithCountAllowance(left, right map[string]any, leftScope string
 		delete(match.right, "count")
 	}
 	return true, reflect.DeepEqual(left, right)
+}
+
+func selectFlatTxn(left, right map[string]any) (selectedTxn, bool) {
+	if left["method"] != "etcdserverpb.KV/Txn" || !reflect.DeepEqual(withoutResponse(left), withoutResponse(right)) {
+		return selectedTxn{}, false
+	}
+	request, ok := left["request"].(map[string]any)
+	if !ok {
+		return selectedTxn{}, false
+	}
+	requestFields, ok := request["fields"].(map[string]any)
+	if !ok {
+		return selectedTxn{}, false
+	}
+	leftResponse, ok := left["response"].(map[string]any)
+	if !ok {
+		return selectedTxn{}, false
+	}
+	rightResponse, ok := right["response"].(map[string]any)
+	if !ok {
+		return selectedTxn{}, false
+	}
+	leftFields, leftOK := leftResponse["fields"].(map[string]any)
+	rightFields, rightOK := rightResponse["fields"].(map[string]any)
+	if !leftOK || !rightOK {
+		return selectedTxn{}, false
+	}
+	succeeded, ok := leftFields["succeeded"].(bool)
+	if !ok || rightFields["succeeded"] != succeeded {
+		return selectedTxn{}, false
+	}
+	branch := "failure"
+	if succeeded {
+		branch = "success"
+	}
+	operations, ok := requestFields[branch].([]any)
+	if !ok {
+		return selectedTxn{}, false
+	}
+	leftOps, leftOK := leftFields["responses"].([]any)
+	rightOps, rightOK := rightFields["responses"].([]any)
+	if !leftOK || !rightOK || len(operations) != len(leftOps) || len(operations) != len(rightOps) {
+		return selectedTxn{}, false
+	}
+	return selectedTxn{operations, leftOps, rightOps}, true
+}
+
+// Validate every pair before modifying either response.
+func matchCountAllowances(selected selectedTxn, leftScope string) ([]countPair, bool, bool) {
+	var matches []countPair
+	for index, raw := range selected.operations {
+		op, ok := raw.(map[string]any)
+		if !ok {
+			return nil, false, false
+		}
+		fields, ok := op["fields"].(map[string]any)
+		if !ok {
+			return nil, false, false
+		}
+		rangeRequest, ok := fields["requestRange"].(map[string]any)
+		if !ok {
+			continue
+		}
+		rangeFields, ok := rangeRequest["fields"].(map[string]any)
+		if !ok {
+			return nil, false, false
+		}
+		policy := countPolicyForRange(rangeFields)
+		if policy == strictCount {
+			continue
+		}
+		if !hasTxnOneof(op, "request", "request_range") {
+			return nil, true, false
+		}
+		leftRange, leftOK := txnRangeResponse(selected.leftOps[index])
+		rightRange, rightOK := txnRangeResponse(selected.rightOps[index])
+		if !leftOK || !rightOK {
+			return nil, true, false
+		}
+		native, target := leftRange, rightRange
+		if leftScope == "target-hbase" {
+			native, target = rightRange, leftRange
+		}
+		if !validTargetCount(native, target, policy) {
+			return nil, true, false
+		}
+		matches = append(matches, countPair{leftRange, rightRange})
+	}
+	return matches, len(matches) > 0, true
 }
 
 func txnRangeResponse(value any) (map[string]any, bool) {

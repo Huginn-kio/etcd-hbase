@@ -85,45 +85,8 @@ class M3TxnCommitIT {
     for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
       try (M3TestEnvironment environment = M3TestEnvironment.start(layout, 1);
            Engine engine = new Engine(environment)) {
-        var firstCommand = new TxnCommand(List.of(), List.of(put("a", "one"), put("b", "two")), List.of());
-        Receipt first = engine.run(firstCommand, 1);
-        assertTrue(first.changed());
-        assertEquals(2, first.revision());
-        engine.assertValue("a", 2, "one");
-        engine.assertValue("b", 2, "two");
-        engine.assertResolvedResponse(first, firstCommand, true);
-        engine.assertNettyCancellationWaitsForSerialization(first, firstCommand);
-
-        var noChangeCommand = new TxnCommand(List.of(CompareCondition.numeric(
-            KeyRange.point(key("a")), CompareCondition.Target.VERSION,
-            CompareCondition.Relation.EQUAL, 0)), List.of(put("c", "unused")), List.of());
-        Receipt unchanged = engine.run(noChangeCommand, 2);
-        assertFalse(unchanged.changed());
-        assertEquals(2, unchanged.revision());
-        assertEquals(2, engine.currentRevision());
-        assertEquals(1, engine.currentSequence());
-
-        Receipt later = engine.run(new TxnCommand(List.of(), List.of(put("a", "new")), List.of()), 3);
-        assertTrue(later.changed());
-        assertEquals(3, later.revision());
-        ResultNode.Txn replayed = engine.replayNoChanges(unchanged);
-        assertFalse(replayed.succeeded());
-        assertEquals(2, replayed.header().revision());
-        assertTrue(replayed.responses().isEmpty());
-        engine.assertResolvedResponse(unchanged, noChangeCommand, false);
-        assertEquals(3, engine.currentRevision());
-        assertEquals(2, engine.currentSequence());
-
-        Receipt ownerWrite = engine.runViaExecutor(new TxnCommand(List.of(), List.of(put("d", "owner")),
-            List.of()), 4);
-        assertTrue(ownerWrite.changed());
-        assertEquals(4, ownerWrite.revision());
-        engine.assertValue("d", 4, "owner");
-        Receipt ownerNoChange = engine.runViaExecutor(new TxnCommand(List.of(CompareCondition.numeric(
-            KeyRange.point(key("d")), CompareCondition.Target.VERSION,
-            CompareCondition.Relation.EQUAL, 0)), List.of(put("e", "unused")), List.of()), 5);
-        assertFalse(ownerNoChange.changed());
-        assertEquals(4, engine.replayNoChanges(ownerNoChange).header().revision());
+        assertPublishedAndReplayed(engine);
+        assertOwnerTransactions(engine);
         engine.assertFinalizationCapacityIsReservedBeforePreparing();
         engine.assertTaggedOwnerRequest();
         engine.assertValue("tagged", 5, "value");
@@ -131,6 +94,50 @@ class M3TxnCommitIT {
         engine.assertLostOwnerRepliesAndNoChangeTakeover();
       }
     }
+  }
+
+  private static void assertPublishedAndReplayed(Engine engine) throws Exception {
+    var firstCommand = new TxnCommand(List.of(), List.of(put("a", "one"), put("b", "two")), List.of());
+    Receipt first = engine.run(firstCommand, 1);
+    assertTrue(first.changed());
+    assertEquals(2, first.revision());
+    engine.assertValue("a", 2, "one");
+    engine.assertValue("b", 2, "two");
+    engine.assertResolvedResponse(first, firstCommand, true);
+    engine.assertNettyCancellationWaitsForSerialization(first, firstCommand);
+
+    var noChangeCommand = new TxnCommand(List.of(CompareCondition.numeric(
+        KeyRange.point(key("a")), CompareCondition.Target.VERSION,
+        CompareCondition.Relation.EQUAL, 0)), List.of(put("c", "unused")), List.of());
+    Receipt unchanged = engine.run(noChangeCommand, 2);
+    assertFalse(unchanged.changed());
+    assertEquals(2, unchanged.revision());
+    assertEquals(2, engine.currentRevision());
+    assertEquals(1, engine.currentSequence());
+
+    Receipt later = engine.run(new TxnCommand(List.of(), List.of(put("a", "new")), List.of()), 3);
+    assertTrue(later.changed());
+    assertEquals(3, later.revision());
+    ResultNode.Txn replayed = engine.replayNoChanges(unchanged);
+    assertFalse(replayed.succeeded());
+    assertEquals(2, replayed.header().revision());
+    assertTrue(replayed.responses().isEmpty());
+    engine.assertResolvedResponse(unchanged, noChangeCommand, false);
+    assertEquals(3, engine.currentRevision());
+    assertEquals(2, engine.currentSequence());
+  }
+
+  private static void assertOwnerTransactions(Engine engine) throws Exception {
+    Receipt ownerWrite = engine.runViaExecutor(new TxnCommand(List.of(), List.of(put("d", "owner")),
+        List.of()), 4);
+    assertTrue(ownerWrite.changed());
+    assertEquals(4, ownerWrite.revision());
+    engine.assertValue("d", 4, "owner");
+    Receipt ownerNoChange = engine.runViaExecutor(new TxnCommand(List.of(CompareCondition.numeric(
+        KeyRange.point(key("d")), CompareCondition.Target.VERSION,
+        CompareCondition.Relation.EQUAL, 0)), List.of(put("e", "unused")), List.of()), 5);
+    assertFalse(ownerNoChange.changed());
+    assertEquals(4, engine.replayNoChanges(ownerNoChange).header().revision());
   }
 
   private record Receipt(InvocationId id, ByteKey requestDigest, long revision, boolean changed) {}
@@ -361,7 +368,24 @@ class M3TxnCommitIT {
       var route = new OwnerForwarding.Route(owner.instance(), owner.epoch(), "fixture", "fixture-peer");
       var dropReply = new AtomicBoolean();
       var lastRequest = new AtomicReference<MutationForwardRequest>();
-      var relay = new MutationRelay(stores.control(), (group, instance, epoch) ->
+      var relay = droppedReplyRelay(lane, route, dropReply, lastRequest);
+      var gateway = new TxnGateway(environment.system().tableGroupId(), environment.identity(), AUTHORIZATION,
+          stores.clusterId(), 1, 1_572_864, stores.control(), relay, stores.invocationResults(),
+          readOnly, budgets, reservation(), worker, new RequestMetrics());
+      var service = new KvService((request, observer) -> observer.onError(Status.UNIMPLEMENTED.asRuntimeException()), gateway);
+      var resources = new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000, 4 << 20, 4 << 20, 4, 0);
+      try {
+        runDroppedReplyServer(service, resources, dropReply, lastRequest);
+      } finally {
+        queue.close();
+        queue.drained().get(30, TimeUnit.SECONDS);
+        assertTrue(queue.awaitTermination(Duration.ofSeconds(30)));
+      }
+    }
+
+    private MutationRelay droppedReplyRelay(MutationOwnerLane lane, OwnerForwarding.Route route,
+        AtomicBoolean dropReply, AtomicReference<MutationForwardRequest> lastRequest) {
+      return new MutationRelay(stores.control(), (group, instance, epoch) ->
           CompletableFuture.completedFuture(route), (selected, request, scope) -> {
             lastRequest.set(request);
             return lane.receive("fixture-peer", request, scope).thenApply(reply -> {
@@ -371,51 +395,49 @@ class M3TxnCommitIT {
               return reply;
             });
           });
-      var gateway = new TxnGateway(environment.system().tableGroupId(), environment.identity(), AUTHORIZATION,
-          stores.clusterId(), 1, 1_572_864, stores.control(), relay, stores.invocationResults(),
-          readOnly, budgets, reservation(), worker, new RequestMetrics());
-      var service = new KvService((request, observer) -> observer.onError(Status.UNIMPLEMENTED.asRuntimeException()), gateway);
-      var resources = new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000, 4 << 20, 4 << 20, 4, 0);
-      try {
-        try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
-            "m3-txn-fault", "127.0.0.1", 0, environment.system().tableGroupId()), resources, service)) {
-          var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port()).usePlaintext().build();
-          try {
-            var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS);
-            var key = ByteString.copyFromUtf8("lost-reply");
-            var put = Rpc.RequestOp.newBuilder().setRequestPut(Rpc.PutRequest.newBuilder().setKey(key)
-                .setValue(ByteString.copyFromUtf8("value"))).build();
-            var range = Rpc.RequestOp.newBuilder().setRequestRange(Rpc.RangeRequest.newBuilder().setKey(key)).build();
-            var absent = Rpc.Compare.newBuilder().setKey(key).setTarget(Rpc.Compare.CompareTarget.VERSION)
-                .setResult(Rpc.Compare.CompareResult.EQUAL).setVersion(0).build();
-            dropReply.set(true);
-            var changed = stub.txn(Rpc.TxnRequest.newBuilder().addSuccess(put).build());
-            assertFalse(dropReply.get());
-            assertEquals(6, changed.getHeader().getRevision());
-            dropReply.set(true);
-            var unchanged = stub.txn(Rpc.TxnRequest.newBuilder().addCompare(absent)
-                .addSuccess(put).addFailure(range).build());
-            assertFalse(dropReply.get());
-            assertFalse(unchanged.getSucceeded());
-            assertEquals(6, unchanged.getHeader().getRevision());
-            var originalRequest = lastRequest.get();
-            assertEquals(ByteString.copyFromUtf8("value"),
-                unchanged.getResponses(0).getResponseRange().getKvs(0).getValue());
-            var later = stub.txn(Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder()
-                .setRequestPut(Rpc.PutRequest.newBuilder().setKey(ByteString.copyFromUtf8("after-no-change"))
-                    .setValue(ByteString.copyFromUtf8("later")))).build());
-            assertEquals(7, later.getHeader().getRevision());
-            assertNoChangeReplayAfterOwnerSwitch(originalRequest, unchanged);
-          } finally {
-            channel.shutdownNow();
-            assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
-          }
+    }
+
+    private void runDroppedReplyServer(KvService service, RuntimeConfiguration.ResourceBudgets resources,
+        AtomicBoolean dropReply, AtomicReference<MutationForwardRequest> lastRequest) throws Exception {
+      try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
+          "m3-txn-fault", "127.0.0.1", 0, environment.system().tableGroupId()), resources, service)) {
+        var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port()).usePlaintext().build();
+        try {
+          assertDroppedRepliesAndTakeover(channel, dropReply, lastRequest);
+        } finally {
+          channel.shutdownNow();
+          assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
         }
-      } finally {
-        queue.close();
-        queue.drained().get(30, TimeUnit.SECONDS);
-        assertTrue(queue.awaitTermination(Duration.ofSeconds(30)));
       }
+    }
+
+    private void assertDroppedRepliesAndTakeover(io.grpc.ManagedChannel channel,
+        AtomicBoolean dropReply, AtomicReference<MutationForwardRequest> lastRequest) throws Exception {
+      var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS);
+      var key = ByteString.copyFromUtf8("lost-reply");
+      var put = Rpc.RequestOp.newBuilder().setRequestPut(Rpc.PutRequest.newBuilder().setKey(key)
+          .setValue(ByteString.copyFromUtf8("value"))).build();
+      var range = Rpc.RequestOp.newBuilder().setRequestRange(Rpc.RangeRequest.newBuilder().setKey(key)).build();
+      var absent = Rpc.Compare.newBuilder().setKey(key).setTarget(Rpc.Compare.CompareTarget.VERSION)
+          .setResult(Rpc.Compare.CompareResult.EQUAL).setVersion(0).build();
+      dropReply.set(true);
+      var changed = stub.txn(Rpc.TxnRequest.newBuilder().addSuccess(put).build());
+      assertFalse(dropReply.get());
+      assertEquals(6, changed.getHeader().getRevision());
+      dropReply.set(true);
+      var unchanged = stub.txn(Rpc.TxnRequest.newBuilder().addCompare(absent)
+          .addSuccess(put).addFailure(range).build());
+      assertFalse(dropReply.get());
+      assertFalse(unchanged.getSucceeded());
+      assertEquals(6, unchanged.getHeader().getRevision());
+      var originalRequest = lastRequest.get();
+      assertEquals(ByteString.copyFromUtf8("value"),
+          unchanged.getResponses(0).getResponseRange().getKvs(0).getValue());
+      var later = stub.txn(Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder()
+          .setRequestPut(Rpc.PutRequest.newBuilder().setKey(ByteString.copyFromUtf8("after-no-change"))
+              .setValue(ByteString.copyFromUtf8("later")))).build());
+      assertEquals(7, later.getHeader().getRevision());
+      assertNoChangeReplayAfterOwnerSwitch(originalRequest, unchanged);
     }
 
     private void assertNettyCancellationWaitsForSerialization(Receipt receipt, TxnCommand command) throws Exception {
@@ -470,44 +492,47 @@ class M3TxnCommitIT {
 
     private void assertReadResponseRetainedUntilConsumerDrains(TxnCommand command,
         TxnEvaluator.ValidatedRead result, RequestScope scope, BudgetManager.Account account) throws Exception {
-      var entered = new CountDownLatch(1);
-      var release = new CountDownLatch(1);
-      var completed = new AtomicBoolean();
-      var failure = new AtomicReference<Throwable>();
+      var observer = new BlockingResponseObserver();
       Thread sender = Thread.ofVirtual().start(() -> {
         try {
-          TxnResponseEmitter.sendReadOnly(command, result, stores.clusterId(), 1, scope, account,
-              new StreamObserver<>() {
-                @Override public void onNext(Rpc.TxnResponse value) {
-                  entered.countDown();
-                  try {
-                    if (!release.await(30, TimeUnit.SECONDS)) throw new IllegalStateException("consumer did not drain");
-                  } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw new IllegalStateException(interrupted);
-                  }
-                }
-                @Override public void onError(Throwable error) { failure.set(error); }
-                @Override public void onCompleted() { completed.set(true); }
-              });
+          TxnResponseEmitter.sendReadOnly(command, result, stores.clusterId(), 1, scope, account, observer);
         } catch (RuntimeException | Error error) {
-          failure.set(error);
+          observer.failure.set(error);
         }
       });
       try {
-        assertTrue(entered.await(30, TimeUnit.SECONDS));
+        assertTrue(observer.entered.await(30, TimeUnit.SECONDS));
         scope.cancelAsync(task -> Thread.ofVirtual().start(task));
         assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
         assertTrue(budgets.snapshot().allocatedBytes() > 0);
       } finally {
-        release.countDown();
+        observer.release.countDown();
         sender.join(30_000);
       }
       assertFalse(sender.isAlive());
-      assertFalse(completed.get());
-      assertTrue(failure.get() == null);
+      assertFalse(observer.completed.get());
+      assertTrue(observer.failure.get() == null);
       scope.cleanupCompletion().toCompletableFuture().get(30, TimeUnit.SECONDS);
       assertEquals(0, budgets.snapshot().allocatedBytes());
+    }
+
+    private static final class BlockingResponseObserver implements StreamObserver<Rpc.TxnResponse> {
+      private final CountDownLatch entered = new CountDownLatch(1);
+      private final CountDownLatch release = new CountDownLatch(1);
+      private final AtomicBoolean completed = new AtomicBoolean();
+      private final AtomicReference<Throwable> failure = new AtomicReference<>();
+
+      @Override public void onNext(Rpc.TxnResponse value) {
+        entered.countDown();
+        try {
+          if (!release.await(30, TimeUnit.SECONDS)) throw new IllegalStateException("consumer did not drain");
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException(interrupted);
+        }
+      }
+      @Override public void onError(Throwable error) { failure.set(error); }
+      @Override public void onCompleted() { completed.set(true); }
     }
 
     private void assertValue(String key, long revision, String value) throws Exception {

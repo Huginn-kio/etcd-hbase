@@ -87,82 +87,94 @@ class M3TableGroupRuntimeIT {
   void realRuntimeExecutesFlatTransactionsOnBothLayouts() throws Exception {
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
       for (String file : List.of("history-table.json", "native-cell-versions.json")) {
-        var plan = plan(file, cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
-        var authentication = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
-        try (var provider = new HBaseBackendIdentityProvider(plan.source().identityProviderId(), authentication,
-                cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
-                (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
-                1, 1, Duration.ofSeconds(30));
-             var credentials = new BackendCredentials("m3-runtime-fixture", new char[0])) {
-          var identity = provider.authenticate(credentials, authentication).toCompletableFuture().get(30, TimeUnit.SECONDS);
-          M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider, PINS);
-          var limits = new BudgetManager.Limits(6, 6, 8, 4, 8, 1L << 20, 512L << 20);
-          var budgets = new BudgetManager(limits, Map.of(plan.source().tableGroupId(), limits), limits);
-          try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
-            M3TableGroupRuntime runtime;
-            try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
-              runtime = M3TableGroupRuntime.open(plan, activation("1"), RESOURCES, provider, identity, budgets, scans, startup);
-            }
-            try {
-              try (Bootstrap server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
-                  "m3-txn", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
-                var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port())
-                    .usePlaintext().build();
-                try {
-                  var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS);
-                  var key = ByteString.copyFromUtf8("txn-key");
-                  var range = Rpc.RequestOp.newBuilder().setRequestRange(Rpc.RangeRequest.newBuilder().setKey(key)).build();
-                  var put = Rpc.RequestOp.newBuilder().setRequestPut(Rpc.PutRequest.newBuilder().setKey(key)
-                      .setValue(ByteString.copyFromUtf8("value"))).build();
-                  var absent = Rpc.Compare.newBuilder().setKey(key).setTarget(Rpc.Compare.CompareTarget.VERSION)
-                      .setResult(Rpc.Compare.CompareResult.EQUAL).setVersion(0).build();
-                  var first = stub.txn(Rpc.TxnRequest.newBuilder().addCompare(absent)
-                      .addSuccess(range).addSuccess(put).addSuccess(range).build());
-                  assertTrue(first.getSucceeded());
-                  assertEquals(2, first.getHeader().getRevision());
-                  assertEquals(0, first.getResponses(0).getResponseRange().getKvsCount());
-                  assertEquals(ByteString.copyFromUtf8("value"),
-                      first.getResponses(2).getResponseRange().getKvs(0).getValue());
-                  var unchanged = stub.txn(Rpc.TxnRequest.newBuilder().addCompare(absent)
-                      .addSuccess(put).addFailure(range).build());
-                  assertFalse(unchanged.getSucceeded());
-                  assertEquals(2, unchanged.getHeader().getRevision());
-                  assertEquals(ByteString.copyFromUtf8("value"),
-                      unchanged.getResponses(0).getResponseRange().getKvs(0).getValue());
-                  var readOnly = stub.txn(Rpc.TxnRequest.newBuilder().addSuccess(range).build());
-                  assertEquals(2, readOnly.getHeader().getRevision());
-                  assertEquals(ByteString.copyFromUtf8("value"),
-                      readOnly.getResponses(0).getResponseRange().getKvs(0).getValue());
-                  var rangeCompare = Rpc.Compare.newBuilder().setKey(ByteString.copyFromUtf8("txn"))
-                      .setRangeEnd(ByteString.copyFromUtf8("txo")).setTarget(Rpc.Compare.CompareTarget.VERSION)
-                      .setResult(Rpc.Compare.CompareResult.GREATER).setVersion(0).build();
-                  assertTrue(stub.txn(Rpc.TxnRequest.newBuilder().addCompare(rangeCompare)
-                      .addSuccess(range).build()).getSucceeded());
-                  assertEquals(3, stub.put(Rpc.PutRequest.newBuilder().setKey(key)
-                      .setValue(ByteString.copyFromUtf8("next")).build()).getHeader().getRevision());
-                } finally {
-                  channel.shutdownNow();
-                  assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
-                }
-              }
-            } finally {
-              runtime.close();
-              runtime.drained().get(30, TimeUnit.SECONDS);
-            }
-            var metrics = runtime.metrics();
-            assertEquals(2, metrics.txnStages().get(RequestMetrics.TxnStage.QUEUE).count());
-            assertEquals(4, metrics.txnStages().get(RequestMetrics.TxnStage.COMPARE_AND_PREPARE).count());
-            assertEquals(1, metrics.txnStages().get(RequestMetrics.TxnStage.PUBLISH_AND_FINALIZE).count());
-            assertEquals(2, metrics.txnStages().get(RequestMetrics.TxnStage.RESULT_RESOLUTION).count());
-            assertEquals(4, metrics.txnStages().get(RequestMetrics.TxnStage.RESPONSE).count());
-            assertTrue(metrics.txnOutputBytes() > 0);
-            assertEquals(1, metrics.putStages().get(RequestMetrics.PutStage.QUEUE).count());
-          }
-          assertEquals(0, budgets.snapshot().reservedBytes());
-          assertEquals(0, budgets.snapshot().allocatedBytes());
-        }
+        runTransactionLayout(cluster, file);
       }
     }
+  }
+
+  private static void runTransactionLayout(TemporaryHBaseClusterProcess cluster, String file) throws Exception {
+    var plan = plan(file, cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
+    var authentication = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
+    try (var provider = new HBaseBackendIdentityProvider(plan.source().identityProviderId(), authentication,
+            cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+            (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+            1, 1, Duration.ofSeconds(30));
+         var credentials = new BackendCredentials("m3-runtime-fixture", new char[0])) {
+      var identity = provider.authenticate(credentials, authentication).toCompletableFuture().get(30, TimeUnit.SECONDS);
+      M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider, PINS);
+      var limits = new BudgetManager.Limits(6, 6, 8, 4, 8, 1L << 20, 512L << 20);
+      var budgets = new BudgetManager(limits, Map.of(plan.source().tableGroupId(), limits), limits);
+      try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
+        M3TableGroupRuntime runtime;
+        try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+          runtime = M3TableGroupRuntime.open(plan, activation("1"), RESOURCES, provider, identity, budgets, scans, startup);
+        }
+        try {
+          runTransactionProbe(runtime, plan);
+        } finally {
+          runtime.close();
+          runtime.drained().get(30, TimeUnit.SECONDS);
+        }
+        var metrics = runtime.metrics();
+        assertEquals(2, metrics.txnStages().get(RequestMetrics.TxnStage.QUEUE).count());
+        assertEquals(4, metrics.txnStages().get(RequestMetrics.TxnStage.COMPARE_AND_PREPARE).count());
+        assertEquals(1, metrics.txnStages().get(RequestMetrics.TxnStage.PUBLISH_AND_FINALIZE).count());
+        assertEquals(2, metrics.txnStages().get(RequestMetrics.TxnStage.RESULT_RESOLUTION).count());
+        assertEquals(4, metrics.txnStages().get(RequestMetrics.TxnStage.RESPONSE).count());
+        assertTrue(metrics.txnOutputBytes() > 0);
+        assertEquals(1, metrics.putStages().get(RequestMetrics.PutStage.QUEUE).count());
+      }
+      assertEquals(0, budgets.snapshot().reservedBytes());
+      assertEquals(0, budgets.snapshot().allocatedBytes());
+    }
+  }
+
+  private static void runTransactionProbe(M3TableGroupRuntime runtime, M3TableGroupPlan plan) throws Exception {
+    try (Bootstrap server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
+        "m3-txn", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
+      var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port())
+          .usePlaintext().build();
+      try {
+        assertFlatTransactionScenarios(channel);
+      } finally {
+        channel.shutdownNow();
+        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+      }
+    }
+  }
+
+  private static void assertFlatTransactionScenarios(io.grpc.ManagedChannel channel) {
+    var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS);
+    var key = ByteString.copyFromUtf8("txn-key");
+    var range = Rpc.RequestOp.newBuilder().setRequestRange(Rpc.RangeRequest.newBuilder().setKey(key)).build();
+    var put = Rpc.RequestOp.newBuilder().setRequestPut(Rpc.PutRequest.newBuilder().setKey(key)
+        .setValue(ByteString.copyFromUtf8("value"))).build();
+    var absent = Rpc.Compare.newBuilder().setKey(key).setTarget(Rpc.Compare.CompareTarget.VERSION)
+        .setResult(Rpc.Compare.CompareResult.EQUAL).setVersion(0).build();
+    var first = stub.txn(Rpc.TxnRequest.newBuilder().addCompare(absent)
+        .addSuccess(range).addSuccess(put).addSuccess(range).build());
+    assertTrue(first.getSucceeded());
+    assertEquals(2, first.getHeader().getRevision());
+    assertEquals(0, first.getResponses(0).getResponseRange().getKvsCount());
+    assertEquals(ByteString.copyFromUtf8("value"),
+        first.getResponses(2).getResponseRange().getKvs(0).getValue());
+    var unchanged = stub.txn(Rpc.TxnRequest.newBuilder().addCompare(absent)
+        .addSuccess(put).addFailure(range).build());
+    assertFalse(unchanged.getSucceeded());
+    assertEquals(2, unchanged.getHeader().getRevision());
+    assertEquals(ByteString.copyFromUtf8("value"),
+        unchanged.getResponses(0).getResponseRange().getKvs(0).getValue());
+    var readOnly = stub.txn(Rpc.TxnRequest.newBuilder().addSuccess(range).build());
+    assertEquals(2, readOnly.getHeader().getRevision());
+    assertEquals(ByteString.copyFromUtf8("value"),
+        readOnly.getResponses(0).getResponseRange().getKvs(0).getValue());
+    var rangeCompare = Rpc.Compare.newBuilder().setKey(ByteString.copyFromUtf8("txn"))
+        .setRangeEnd(ByteString.copyFromUtf8("txo")).setTarget(Rpc.Compare.CompareTarget.VERSION)
+        .setResult(Rpc.Compare.CompareResult.GREATER).setVersion(0).build();
+    assertTrue(stub.txn(Rpc.TxnRequest.newBuilder().addCompare(rangeCompare)
+        .addSuccess(range).build()).getSucceeded());
+    assertEquals(3, stub.put(Rpc.PutRequest.newBuilder().setKey(key)
+        .setValue(ByteString.copyFromUtf8("next")).build()).getHeader().getRevision());
   }
 
   private static void assertInsufficientRecoveryBudgetRollsBack(M3TableGroupPlan plan,

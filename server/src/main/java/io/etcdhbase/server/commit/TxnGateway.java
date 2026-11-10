@@ -195,39 +195,56 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
     }
     var dispatchState = new AtomicInteger();
     try {
+      scheduleResponse(observer, scope, terminal, responseDrained, value, failure, send, discard, dispatchState);
+    } finally {
+      gatewayDrained.complete(null);
+    }
+  }
+
+  private <T> void scheduleResponse(StreamObserver<Rpc.TxnResponse> observer, RequestScope scope,
+      AtomicBoolean terminal, CompletableFuture<Void> responseDrained, T value, Throwable failure,
+      Consumer<T> send, Consumer<T> discard, AtomicInteger dispatchState) {
+    try {
       worker.execute(() -> {
-        if (!dispatchState.compareAndSet(0, 1)) return;
-        try {
-          if (failure != null) signalError(scope, observer, terminal, failure);
-          else if (terminal.compareAndSet(false, true)) {
-            long started = System.nanoTime();
-            try { send.accept(value); }
-            finally { metrics.recordTxnStage(RequestMetrics.TxnStage.RESPONSE, Math.max(0, System.nanoTime() - started)); }
-          }
-          else discard.accept(value);
-        } finally {
-          responseDrained.complete(null);
+        if (dispatchState.compareAndSet(0, 1)) {
+          deliverResponse(observer, scope, terminal, responseDrained, value, failure, send, discard);
         }
       });
     } catch (RuntimeException rejected) {
       if (dispatchState.compareAndSet(0, 2)) {
-        try { discard.accept(value); }
-        finally {
-          responseDrained.complete(null);
-          signalError(scope, observer, terminal, new BackendFailure(BackendFailure.Category.UNKNOWN, rejected));
-        }
+        rejectResponse(observer, scope, terminal, responseDrained, value, discard, rejected, true);
       }
     } catch (Error fatal) {
       if (dispatchState.compareAndSet(0, 2)) {
-        try { discard.accept(value); }
-        finally {
-          responseDrained.complete(null);
-          signalError(scope, observer, terminal, fatal);
-        }
+        rejectResponse(observer, scope, terminal, responseDrained, value, discard, fatal, false);
       }
       throw fatal;
+    }
+  }
+
+  private <T> void deliverResponse(StreamObserver<Rpc.TxnResponse> observer, RequestScope scope,
+      AtomicBoolean terminal, CompletableFuture<Void> responseDrained, T value, Throwable failure,
+      Consumer<T> send, Consumer<T> discard) {
+    try {
+      if (failure != null) signalError(scope, observer, terminal, failure);
+      else if (terminal.compareAndSet(false, true)) {
+        long started = System.nanoTime();
+        try { send.accept(value); }
+        finally { metrics.recordTxnStage(RequestMetrics.TxnStage.RESPONSE, Math.max(0, System.nanoTime() - started)); }
+      } else discard.accept(value);
     } finally {
-      gatewayDrained.complete(null);
+      responseDrained.complete(null);
+    }
+  }
+
+  private static <T> void rejectResponse(StreamObserver<Rpc.TxnResponse> observer, RequestScope scope,
+      AtomicBoolean terminal, CompletableFuture<Void> responseDrained, T value, Consumer<T> discard,
+      Throwable failure, boolean rejected) {
+    try { discard.accept(value); }
+    finally {
+      responseDrained.complete(null);
+      signalError(scope, observer, terminal, rejected
+          ? new BackendFailure(BackendFailure.Category.UNKNOWN, failure) : failure);
     }
   }
 

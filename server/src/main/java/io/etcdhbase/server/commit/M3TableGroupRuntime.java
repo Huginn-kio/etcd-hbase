@@ -102,67 +102,85 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       pending.trackOwner(ownerFuture);
       var owner = await(ownerFuture, startup);
       ByteKey authorization = authorizationDigest(identity);
-      var preparation = new PutCommitPreparation(new ResultPreparation(stores.resultRepository()),
-          stores.results(), new ManifestPreparation(stores.manifestRepository(),
-              new ManifestPreparation.Limits(1, 4L << 20, 1, 8L << 20)), invocations);
-      var publisher = new CommitPublisher(stores.control(), stores.outcomes(),
-          new CommitPlanVerifier(stores.manifests(), stores.materialization(), stores.results()),
-          stores.invocations(), pending.handoff, stores.finalizer());
-      var metrics = new RequestMetrics();
-      var executor = new PutMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
-          stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
-          preparation, publisher, 5L << 20, 8L << 20, metrics);
-      var putProcessor = new PutOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
-          REQUEST_MEMORY, executor, stores.outcomes());
-      var txnLimits = new TxnExecutionLimits(5L << 20, 8L << 20, 32L << 20, 4096, 4096);
-      var txnPreparation = new TxnCommitPreparation(new ResultPreparation(stores.resultRepository()),
-          stores.results(), new ManifestPreparation(stores.manifestRepository(),
-              new ManifestPreparation.Limits(128, 4L << 20, 128, 8L << 20)), invocations, 8L << 20);
-      var txnExecutor = new TxnMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
-          stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
-          scans, txnPreparation, publisher, txnLimits, metrics);
-      var txnProcessor = new TxnOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
-          REQUEST_MEMORY, txnExecutor, stores.outcomes(), activation.maxEtcdRequestBytes());
-      var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),
-          connections, plan.primary(), pending.worker, scans, txnLimits, metrics);
-      var receiver = new MutationForwardReceiver(stores.control(), invocations,
-          (peer, request, scope) -> peer.equals(owner.token().instance())
-              ? CompletableFuture.completedFuture(new MutationForwardReceiver.VerifiedAuthorization(identity, authorization))
-              : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION)),
-          (request, binding, principal, scope) -> MutationOperationEnvelope.isTransaction(request.operationBytes())
-              ? txnProcessor.process(request, binding, principal, scope)
-              : putProcessor.process(request, binding, principal, scope));
-      var lane = new MutationOwnerLane(plan.source().tableGroupId(), pending.queue, receiver, metrics);
-      var route = new OwnerForwarding.Route(owner.token().instance(), owner.token().epoch(),
-          owner.token().instance(), owner.token().instance());
-      // A direct same-process call has no network peer. Unknown or remote owners are rejected;
-      // authenticated cross-process forwarding remains a separate deployment capability.
-      var relay = new MutationRelay(stores.control(),
-          (group, instanceId, epoch) -> group.equals(plan.source().tableGroupId())
-              && instanceId.equals(owner.token().instance()) && epoch == owner.token().epoch()
-                  ? CompletableFuture.completedFuture(route)
-                  : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE)),
-          (selected, request, scope) -> selected.equals(route)
-              ? lane.receive(owner.token().instance(), request, scope)
-              : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION)));
-      var gateway = new PutGateway(plan.source().tableGroupId(), identity, authorization,
-          stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
-          stores.control(), relay, stores.invocationResults(), budgets, REQUEST_MEMORY, pending.worker, metrics);
-      var txnGateway = new TxnGateway(plan.source().tableGroupId(), identity, authorization,
-          stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
-          stores.control(), relay, stores.invocationResults(), txnReads, budgets, REQUEST_MEMORY, pending.worker, metrics);
+      var business = assembleBusiness(plan, activation, connections, budgets, scans, pending, stores, invocations, owner);
+      var service = assembleService(plan, activation, identity, authorization, budgets, pending, stores,
+          invocations, owner, business);
       startup.closeAsync(CLEANUP);
       await(CompletableFuture.allOf(startup.cleanupCompletion().toCompletableFuture(),
           startup.physicalProducersCompletion().toCompletableFuture()), startup);
       if (!owner.isReady()) throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
-      return new M3TableGroupRuntime(pending, new KvService(gateway, txnGateway),
-          stores.clusterId(), activation.memberIdBits(), metrics);
+      return new M3TableGroupRuntime(pending, service,
+          stores.clusterId(), activation.memberIdBits(), business.metrics());
     } catch (Exception failure) {
       throw new StartupException(failure, abort(startup, pending, failure));
     } catch (Error fatal) {
       fatal.addSuppressed(new StartupCleanup(abort(startup, pending, fatal)));
       throw fatal;
     }
+  }
+
+  private record BusinessComponents(PutOwnerProcessor putProcessor, TxnOwnerProcessor txnProcessor,
+      TxnReadExecutor txnReads, RequestMetrics metrics) {}
+
+  private static BusinessComponents assembleBusiness(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
+      HBaseConnectionFactory connections, BudgetManager budgets, ScanScheduler scans, Pending pending,
+      TableGroupStores stores, InvocationService invocations, M3OwnerLease owner) {
+    var preparation = new PutCommitPreparation(new ResultPreparation(stores.resultRepository()),
+        stores.results(), new ManifestPreparation(stores.manifestRepository(),
+            new ManifestPreparation.Limits(1, 4L << 20, 1, 8L << 20)), invocations);
+    var publisher = new CommitPublisher(stores.control(), stores.outcomes(),
+        new CommitPlanVerifier(stores.manifests(), stores.materialization(), stores.results()),
+        stores.invocations(), pending.handoff, stores.finalizer());
+    var metrics = new RequestMetrics();
+    var executor = new PutMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
+        stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
+        preparation, publisher, 5L << 20, 8L << 20, metrics);
+    var putProcessor = new PutOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
+        REQUEST_MEMORY, executor, stores.outcomes());
+    var txnLimits = new TxnExecutionLimits(5L << 20, 8L << 20, 32L << 20, 4096, 4096);
+    var txnPreparation = new TxnCommitPreparation(new ResultPreparation(stores.resultRepository()),
+        stores.results(), new ManifestPreparation(stores.manifestRepository(),
+            new ManifestPreparation.Limits(128, 4L << 20, 128, 8L << 20)), invocations, 8L << 20);
+    var txnExecutor = new TxnMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
+        stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
+        scans, txnPreparation, publisher, txnLimits, metrics);
+    var txnProcessor = new TxnOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
+        REQUEST_MEMORY, txnExecutor, stores.outcomes(), activation.maxEtcdRequestBytes());
+    var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),
+        connections, plan.primary(), pending.worker, scans, txnLimits, metrics);
+    return new BusinessComponents(putProcessor, txnProcessor, txnReads, metrics);
+  }
+
+  private static KvService assembleService(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
+      AuthorizedBackendIdentity identity, ByteKey authorization, BudgetManager budgets, Pending pending,
+      TableGroupStores stores, InvocationService invocations, M3OwnerLease owner, BusinessComponents business) {
+    var receiver = new MutationForwardReceiver(stores.control(), invocations,
+        (peer, request, scope) -> peer.equals(owner.token().instance())
+            ? CompletableFuture.completedFuture(new MutationForwardReceiver.VerifiedAuthorization(identity, authorization))
+            : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION)),
+        (request, binding, principal, scope) -> MutationOperationEnvelope.isTransaction(request.operationBytes())
+            ? business.txnProcessor().process(request, binding, principal, scope)
+            : business.putProcessor().process(request, binding, principal, scope));
+    var lane = new MutationOwnerLane(plan.source().tableGroupId(), pending.queue, receiver, business.metrics());
+    var route = new OwnerForwarding.Route(owner.token().instance(), owner.token().epoch(),
+        owner.token().instance(), owner.token().instance());
+    // A direct same-process call has no network peer. Unknown or remote owners are rejected;
+    // authenticated cross-process forwarding remains a separate deployment capability.
+    var relay = new MutationRelay(stores.control(),
+        (group, instanceId, epoch) -> group.equals(plan.source().tableGroupId())
+            && instanceId.equals(owner.token().instance()) && epoch == owner.token().epoch()
+                ? CompletableFuture.completedFuture(route)
+                : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE)),
+        (selected, request, scope) -> selected.equals(route)
+            ? lane.receive(owner.token().instance(), request, scope)
+            : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION)));
+    var gateway = new PutGateway(plan.source().tableGroupId(), identity, authorization,
+        stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
+        stores.control(), relay, stores.invocationResults(), budgets, REQUEST_MEMORY, pending.worker, business.metrics());
+    var txnGateway = new TxnGateway(plan.source().tableGroupId(), identity, authorization,
+        stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
+        stores.control(), relay, stores.invocationResults(), business.txnReads(), budgets, REQUEST_MEMORY, pending.worker, business.metrics());
+    return new KvService(gateway, txnGateway);
   }
 
   public KvService kvService() { return kvService; }

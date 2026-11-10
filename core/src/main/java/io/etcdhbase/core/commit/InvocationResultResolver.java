@@ -128,34 +128,46 @@ public final class InvocationResultResolver {
   public CompletableFuture<ResolvedNoChanges> resolveNoChanges(
       InvocationId id, ByteKey requestDigest, ByteKey authorizationDigest,
       RequestScope scope, BudgetManager.Account account) {
-    return readMatching(id, requestDigest, authorizationDigest, scope, account).thenCompose(binding -> {
-      if (binding.state() != InvocationBinding.State.NO_CHANGES) {
-        return CompletableFuture.failedFuture(new IllegalStateException("no-change result is not queryable"));
-      }
-      ResultReference reference = ResultReference.fromToken(ResultIdentity.from(binding),
-          binding.resultReference().orElseThrow());
-      return results.load(reference, scope, account).thenCompose(payload -> {
-        try {
-          return repository.read(binding.invocationId(), scope).thenApply(current -> {
-            InvocationBinding latest = current.orElseThrow(() -> new IllegalStateException("invocation disappeared"));
-            if (!latest.sameAttempt(binding) || latest.state() != InvocationBinding.State.NO_CHANGES
-                || latest.resultReference().filter(reference.token()::equals).isEmpty()) {
-              throw new IllegalStateException("no-change result window changed during query");
-            }
-            if (scope.isClosed() || scope.isDeadlineExceeded()) {
-              throw new java.util.concurrent.CompletionException(new BackendFailure(scope.isDeadlineExceeded()
-                  ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
-            }
-            return new ResolvedNoChanges(binding.baseRevision(), payload);
-          }).whenComplete((ignored, failure) -> {
-            if (failure != null) payload.close();
-          });
-        } catch (RuntimeException | Error failure) {
-          try { payload.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
-          throw failure;
-        }
-      });
-    });
+    return readMatching(id, requestDigest, authorizationDigest, scope, account)
+        .thenCompose(binding -> loadNoChanges(binding, scope, account));
+  }
+
+  private CompletableFuture<ResolvedNoChanges> loadNoChanges(
+      InvocationBinding binding, RequestScope scope, BudgetManager.Account account) {
+    if (binding.state() != InvocationBinding.State.NO_CHANGES) {
+      return CompletableFuture.failedFuture(new IllegalStateException("no-change result is not queryable"));
+    }
+    ResultReference reference = ResultReference.fromToken(ResultIdentity.from(binding),
+        binding.resultReference().orElseThrow());
+    return results.load(reference, scope, account)
+        .thenCompose(payload -> verifyNoChangesWindow(binding, reference, payload, scope));
+  }
+
+  private CompletableFuture<ResolvedNoChanges> verifyNoChangesWindow(InvocationBinding binding,
+      ResultReference reference, ResultCatalog.RetainedResult payload, RequestScope scope) {
+    try {
+      return repository.read(binding.invocationId(), scope)
+          .thenApply(current -> deliverNoChanges(current, binding, reference, payload, scope))
+          .whenComplete((ignored, failure) -> { if (failure != null) payload.close(); });
+    } catch (RuntimeException | Error failure) {
+      try { payload.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+      throw failure;
+    }
+  }
+
+  private ResolvedNoChanges deliverNoChanges(java.util.Optional<InvocationBinding> current,
+      InvocationBinding binding, ResultReference reference, ResultCatalog.RetainedResult payload,
+      RequestScope scope) {
+    InvocationBinding latest = current.orElseThrow(() -> new IllegalStateException("invocation disappeared"));
+    if (!latest.sameAttempt(binding) || latest.state() != InvocationBinding.State.NO_CHANGES
+        || latest.resultReference().filter(reference.token()::equals).isEmpty()) {
+      throw new IllegalStateException("no-change result window changed during query");
+    }
+    if (scope.isClosed() || scope.isDeadlineExceeded()) {
+      throw new java.util.concurrent.CompletionException(new BackendFailure(scope.isDeadlineExceeded()
+          ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
+    }
+    return new ResolvedNoChanges(binding.baseRevision(), payload);
   }
 
   /** Resolves the original Txn outcome without recomputing a branch on newer data. */
