@@ -110,6 +110,26 @@ RANGE_METHODS = tuple("etcdserverpb.KV/" + {
     "J34-txn-negative": "Txn", "J34-txn-count-after-delete": "Txn",
     "J34-delete": "DeleteRange", "J34-recreate": "Put",
 }.get(case, "Range") for case in RANGE_CASES)
+SORT_CASES = (
+    "native-baseline",
+    "J35-seed",
+    "J35-update",
+    "J35-none",
+    "J35-asc",
+    "J35-desc",
+    "J35-desc-first",
+    "J35-desc-next",
+    "J35-desc-filter",
+    "J35-desc-history",
+    "J35-desc-point",
+    "J35-desc-keys",
+    "J35-desc-count",
+    "J35-client-asc",
+    "J35-txn-desc",
+)
+SORT_METHODS = tuple("etcdserverpb.KV/" + {
+    "native-baseline": "Put", "J35-seed": "Txn", "J35-update": "Put", "J35-txn-desc": "Txn",
+}.get(case, "Range") for case in SORT_CASES)
 HBASE_SUITE = "io.etcdhbase.hbase.storage.M3ResultRepositoryIT"
 INIT_SUITE = "io.etcdhbase.admin.M3InitializeTablesIT"
 SERVER_SUITE = "io.etcdhbase.server.M3PutRpcIT"
@@ -327,6 +347,47 @@ J34_UNIT_CASES = {
 }
 
 
+J35_GO_REQUIRED_CASES = {
+    **{package: set(cases) for package, cases in J34_GO_REQUIRED_CASES.items()},
+    "internal/scenario": J34_GO_REQUIRED_CASES["internal/scenario"] | {
+        "TestM3SortScenarioMatchesIndependentNativeServers", "TestM3SortSuiteRejectsMissingCoverage"},
+    "internal/compare": J34_GO_REQUIRED_CASES["internal/compare"] | {
+        "TestM3RangeComparisonRejectsDescendingReordering"},
+}
+J35_INTEGRATION_CASES = {
+    **{suite: set(cases) for suite, cases in J34_INTEGRATION_CASES.items()},
+    "io.etcdhbase.hbase.storage.M3ReverseStorageIT": {"reversePagesAreBoundedAndResumeAcrossVersionsOnBothLayouts"},
+    "io.etcdhbase.hbase.storage.M2ReadViewIT": J34_INTEGRATION_CASES.get("io.etcdhbase.hbase.storage.M2ReadViewIT", set()) | {"readsSelectedPendingVersionsAndHistoricalRowsInBothLayouts"},
+    "io.etcdhbase.server.M3SortComparisonIT": {"goSortedRangesMatchNativeOnBothLayouts"},
+}
+J35_UNIT_CASES = {
+    **{suite: set(cases) for suite, cases in J34_UNIT_CASES.items()},
+    "io.etcdhbase.core.commit.ReadViewRecordStoreTest": J34_UNIT_CASES[
+        "io.etcdhbase.core.commit.ReadViewRecordStoreTest"] | {
+            "descendingGlobalLimitUsesTheNextFilteredLiveKeyAcrossBuckets",
+            "descendingSelectedViewResumesPhysicalProgressAtItsStableRevision",
+            "descendingReadViewMergesSelectedCandidatesAndRejectsAnotherViewCheckpoint",
+            "descendingManifestTraversalResumesWithoutSkippingCandidates"},
+    "io.etcdhbase.core.commit.ManifestPreparationTest": J34_UNIT_CASES.get("io.etcdhbase.core.commit.ManifestPreparationTest", set()) | {"preparesLargeLazyCandidatePlanWithoutRecursiveStackGrowth"},
+    "io.etcdhbase.core.commit.PagedWorksetIndexTest": J34_UNIT_CASES.get("io.etcdhbase.core.commit.PagedWorksetIndexTest", set()) | {"pagesLargeOperationAndReadsOnlyCompletedBucketKeyOrder"},
+    "io.etcdhbase.core.kv.TxnWorkingSetTest": J34_UNIT_CASES["io.etcdhbase.core.kv.TxnWorkingSetTest"] | {
+        "mergesCompletedOverlayAndFixedBaseInBucketKeyOrder"},
+    "io.etcdhbase.core.kv.OrderedViewCursorTest": J34_UNIT_CASES["io.etcdhbase.core.kv.OrderedViewCursorTest"] | {
+        "mergesDescendingBucketHeadsAndRejectsDuplicates"},
+    "io.etcdhbase.core.kv.LogicalViewCursorTest": J34_UNIT_CASES.get("io.etcdhbase.core.kv.LogicalViewCursorTest", set()) | {"mergesDescendingMetadataAcrossBuckets",
+        "closeCancelsAnInFlightPageAndReleasesItsBudgetAfterCompletion"},
+    "io.etcdhbase.core.scan.BucketCursorTest": J34_UNIT_CASES.get("io.etcdhbase.core.scan.BucketCursorTest", set()) | {"descendingPagesResumeAfterTheLastConsumedLogicalKey",
+        "physicalProgressResumesWithoutExposingAnEmptyLogicalPageAndRejectsRepetition",
+        "cancelledPhysicalContinuationKeepsItsMemoryUntilTheProducerFinishes",
+        "logicalContinuationRemainsChargedUntilTheCancelledProducerFinishes",
+        "logicalContinuationFailsClosedWhenItsHeadBudgetIsExhausted"},
+    "io.etcdhbase.core.storage.ScanRequestDirectionTest": {"legacyConstructionRemainsAscendingAndExcludesTheConsumedKey",
+        "checkpointIsBoundToDirectionRevisionBucketAndLogicalBounds"},
+    "io.etcdhbase.grpc.protocol.TxnResponseMapperTest": J34_UNIT_CASES[
+        "io.etcdhbase.grpc.protocol.TxnResponseMapperTest"] | {"projectsDescendingRangeAndRejectsIncorrectOrdering"},
+}
+
+
 # One registry supplies the evidence contract to every validation stage.
 ALL_UNIT_MODULES = ("protocol", "spi", "core", "hbase", "grpc", "admin", "server")
 RUN_TASKS = {
@@ -348,6 +409,10 @@ RUN_TASKS = {
     "J34": {"cases": RANGE_CASES, "methods": RANGE_METHODS, "prefix": "j34-",
             "scenario": "m3-range-v1", "suite": "m3-range.yaml", "compare": "--m3-range",
             "go": J34_GO_REQUIRED_CASES, "integration": J34_INTEGRATION_CASES, "units": J34_UNIT_CASES,
+            "unit_modules": ALL_UNIT_MODULES},
+    "J35": {"cases": SORT_CASES, "methods": SORT_METHODS, "prefix": "j35-",
+            "scenario": "m3-sort-v1", "suite": "m3-sort.yaml", "compare": "--m3-range",
+            "go": J35_GO_REQUIRED_CASES, "integration": J35_INTEGRATION_CASES, "units": J35_UNIT_CASES,
             "unit_modules": ALL_UNIT_MODULES},
 }
 
@@ -500,17 +565,17 @@ def validate_run(root: Path, repository: Path = REPO) -> dict:
     limitations = ["raft_term=0 is a disclosed non-Raft projection",
                    "public MiniCluster is not target HBase or target identity acceptance",
                    "an unconfirmed scanner close retires local capacity; remote lifetime across restarts is unverified"]
-    if task in {"J32", "J33", "J34"}:
+    if task in {"J32", "J33", "J34", "J35"}:
         limitations.extend([
             "private workset pages are non-expiring until long-term collection is implemented in J53",
             "a started invocation with an unknown outcome requires a durable decision or fencing proof; "
             "automatic recovery is not yet integrated",
         ])
-    if task in {"J33", "J34"}:
+    if task in {"J33", "J34", "J35"}:
         limitations.append("mixed-version recovery and rollback of same-revision previous-value events are unverified")
         limitations.append("zero-end delete followed by an ignore-value Put of the same key is rejected before publication; "
                            "native fault behavior is not compared")
-    if task == "J34":
+    if task in {"J34", "J35"}:
         limitations.append("filtered ordinary Range Count follows returned Kvs and may differ from native prefilter Count")
     return {"phase": "M3", "tasks": [task], "scope": run["scope"], "run_id": run["run_id"],
             "source_commit": source, "suites": suites,

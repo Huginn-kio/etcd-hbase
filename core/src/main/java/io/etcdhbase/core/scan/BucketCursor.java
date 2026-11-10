@@ -1,6 +1,7 @@
 package io.etcdhbase.core.scan;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ScanRequest;
@@ -8,21 +9,26 @@ import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.ScanSource;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
+import io.etcdhbase.core.storage.ScanDirection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /** One logical bucket cursor; physical page scanners belong to the request-bound store. */
 public final class BucketCursor implements AutoCloseable {
+  private static final ContinuationExecutor CONTINUE = new ContinuationExecutor();
   public enum State { IDLE, FETCHING, PAGE_READY, PAUSED, EXHAUSTED, FAILED, CLOSED }
 
   private final ScanSource store;
   private final ScanRequest template;
   private final RequestScope scope;
+  private final BudgetManager.Account account;
   private final RequestScope.ScopedCleanup registration;
   private Optional<ByteKey> checkpoint;
+  private BudgetManager.Lease checkpointLease;
   private State state = State.IDLE;
   private boolean pauseRequested;
   private ScanOperation activeRead;
@@ -31,9 +37,15 @@ public final class BucketCursor implements AutoCloseable {
   private Page outstanding;
 
   public BucketCursor(ScanSource store, ScanRequest template, RequestScope scope) {
+    this(store, template, scope, null);
+  }
+
+  public BucketCursor(ScanSource store, ScanRequest template, RequestScope scope, BudgetManager.Account account) {
     this.store = Objects.requireNonNull(store, "store");
     this.template = Objects.requireNonNull(template, "template");
     this.scope = Objects.requireNonNull(scope, "scope");
+    if (account != null && !account.belongsTo(scope)) throw new IllegalArgumentException("scan account belongs to another scope");
+    this.account = account;
     this.checkpoint = template.after();
     this.registration = scope.registerScopedCleanup(this);
   }
@@ -51,31 +63,102 @@ public final class BucketCursor implements AutoCloseable {
       state = State.FETCHING;
       result = new CompletableFuture<>();
       pending = result;
-      request = new ScanRequest(template.bucket(), template.range(), checkpoint,
-          template.revisionUpperBound(), template.projection(), template.maximumRows(),
-          template.maximumBytes(), template.maximumPhysicalRows());
+      request = template.resumeAfter(checkpoint);
     }
+    startRead(result, request, null, new StoragePage.Cost(0, 0, 0));
+    return result.copy();
+  }
+
+  private void startRead(CompletableFuture<Page> result, ScanRequest request, BudgetManager.Lease progressLease,
+      StoragePage.Cost priorCost) {
     try {
+      if (!acceptRead(result, progressLease)) return;
       ScanOperation read = Objects.requireNonNull(store.startScan(request), "page operation");
-      boolean stop;
-      synchronized (this) {
-        activeRead = read;
-        stop = state == State.CLOSED || scope.isClosed();
-      }
-      read.completion().whenComplete((page, problem) -> {
-        synchronized (this) {
-          if (activeRead == read) activeRead = null;
-        }
-        receive(result, request, read, page, problem);
-      });
+      boolean stop = installRead(read);
+      read.completion().whenComplete((page, problem) ->
+          completeRead(result, request, read, progressLease, priorCost, page, problem));
       if (stop) read.close();
     } catch (RuntimeException problem) {
+      if (progressLease != null) progressLease.close();
       fail(result, problem);
     } catch (Error fatal) {
+      if (progressLease != null) progressLease.close();
       fail(result, fatal);
       throw fatal;
     }
-    return result.copy();
+  }
+
+  private synchronized boolean acceptRead(CompletableFuture<Page> result, BudgetManager.Lease progressLease) {
+    if (state == State.FETCHING && !scope.isClosed()) return true;
+    if (progressLease != null) progressLease.close();
+    releaseCheckpoint();
+    result.completeExceptionally(cancelled());
+    return false;
+  }
+
+  private synchronized boolean installRead(ScanOperation read) {
+    activeRead = read;
+    return state == State.CLOSED || scope.isClosed();
+  }
+
+  private void completeRead(CompletableFuture<Page> result, ScanRequest request, ScanOperation read,
+      BudgetManager.Lease progressLease, StoragePage.Cost priorCost, StoragePage page, Throwable problem) {
+    try {
+      if (progressLease != null) progressLease.close();
+      synchronized (this) {
+        if (activeRead == read) activeRead = null;
+        if (state == State.CLOSED || scope.isClosed()) releaseCheckpoint();
+      }
+      if (problem == null && page != null && page.physicalProgress().isPresent()) {
+        continuePhysical(result, request, read, page, priorCost);
+      } else if (problem == null && page != null) {
+        receive(result, request, read, new StoragePage(page.records(), page.exhausted(),
+            priorCost.plus(page.cost())), null);
+      } else {
+        receive(result, request, read, page, problem);
+      }
+    } catch (RuntimeException failure) {
+      failRead(result, read, failure);
+    } catch (Error fatal) {
+      failRead(result, read, fatal);
+      throw fatal;
+    }
+  }
+
+  private void continuePhysical(CompletableFuture<Page> result, ScanRequest request, ScanOperation read,
+      StoragePage page, StoragePage.Cost priorCost) {
+    BudgetManager.Lease retained = null;
+    try {
+      var progress = page.physicalProgress().orElseThrow();
+      var next = request.resumePhysical(progress);
+      if (request.direction() != ScanDirection.DESCENDING
+          || request.physicalProgress().map(previous -> request.direction().compare(
+              previous.lastPhysicalRow(), progress.lastPhysicalRow()) >= 0).orElse(false)) {
+        throw new IllegalStateException("physical scan did not advance");
+      }
+      long bytes = Math.addExact(128L, progress.lastPhysicalRow().length());
+      if (account == null || bytes > request.maximumBytes()) throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+      retained = account.tryRetain(BudgetManager.Memory.HEAD, bytes)
+          .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+      StoragePage.Cost cost = priorCost.plus(page.cost());
+      read.close();
+      synchronized (this) {
+        if (state == State.CLOSED || scope.isClosed()) {
+          retained.close();
+          releaseCheckpoint();
+          return;
+        }
+      }
+      BudgetManager.Lease lease = retained;
+      CONTINUE.execute(() -> startRead(result, next, lease, cost));
+    } catch (BackendFailure | RuntimeException failure) {
+      if (retained != null) retained.close();
+      failRead(result, read, failure);
+    } catch (Error fatal) {
+      if (retained != null) retained.close();
+      failRead(result, read, fatal);
+      throw fatal;
+    }
   }
 
   public synchronized void pause() {
@@ -141,7 +224,8 @@ public final class BucketCursor implements AutoCloseable {
     long retained = 0;
     Optional<ByteKey> previous = request.after();
     for (StoredRecord record : page.records()) {
-      if (!request.range().contains(record.key()) || previous.map(key -> key.compareTo(record.key()) >= 0).orElse(false)) {
+      if (!request.range().contains(record.key())
+          || previous.map(key -> request.direction().compare(key, record.key()) >= 0).orElse(false)) {
         throw new IllegalStateException("page violates its ordered logical range");
       }
       retained = Math.addExact(retained, record.retainedBytes());
@@ -152,9 +236,13 @@ public final class BucketCursor implements AutoCloseable {
 
   private void fail(CompletableFuture<Page> result, Throwable problem) {
     synchronized (this) {
-      if (state == State.CLOSED) return;
+      if (state == State.CLOSED) {
+        releaseCheckpoint();
+        return;
+      }
       failure = problem;
       state = State.FAILED;
+      releaseCheckpoint();
       if (pending == result) pending = null;
     }
     result.completeExceptionally(problem);
@@ -162,16 +250,46 @@ public final class BucketCursor implements AutoCloseable {
   }
 
   private void release(Page page, Optional<ByteKey> consumed, boolean exhausted) {
+    BackendFailure limit = null;
     synchronized (this) {
       if (outstanding != page) return;
       outstanding = null;
       if (state == State.CLOSED || state == State.FAILED) return;
-      if (consumed.isPresent()) checkpoint = consumed;
-      if (exhausted) state = State.EXHAUSTED;
-      else state = pauseRequested ? State.PAUSED : State.IDLE;
+      if (!exhausted && consumed.isPresent() && account != null) {
+        try {
+          long bytes = Math.addExact(128L, consumed.orElseThrow().length());
+          BudgetManager.Lease next = account.tryRetain(BudgetManager.Memory.HEAD, bytes)
+              .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+          releaseCheckpoint();
+          checkpointLease = next;
+        } catch (BackendFailure problem) {
+          limit = problem;
+          failure = problem;
+          state = State.FAILED;
+          releaseCheckpoint();
+        }
+      }
+      if (limit == null) {
+        if (consumed.isPresent()) checkpoint = consumed;
+        if (exhausted) {
+          state = State.EXHAUSTED;
+          releaseCheckpoint();
+        } else state = pauseRequested ? State.PAUSED : State.IDLE;
+      }
       if (pending != null && pending.isDone()) pending = null;
     }
-    if (exhausted) releaseRegistration();
+    if (exhausted || limit != null) releaseRegistration();
+    if (limit != null) throw new CompletionException(limit);
+  }
+
+  private void releaseCheckpoint() {
+    if (checkpointLease != null) {
+      checkpointLease.close();
+      checkpointLease = null;
+    }
+    if (state == State.CLOSED || state == State.EXHAUSTED || state == State.FAILED || scope.isClosed()) {
+      checkpoint = Optional.empty();
+    }
   }
 
   @Override
@@ -181,7 +299,9 @@ public final class BucketCursor implements AutoCloseable {
     ScanOperation read;
     synchronized (this) {
       if (state == State.CLOSED) return;
+      boolean fetching = state == State.FETCHING;
       if (state != State.EXHAUSTED && state != State.FAILED) state = State.CLOSED;
+      if (!fetching) releaseCheckpoint();
       page = outstanding;
       outstanding = null;
       operation = pending;
@@ -258,9 +378,9 @@ public final class BucketCursor implements AutoCloseable {
         read = null;
       }
       try {
-        ownedRead.close();
-      } finally {
         release(this, consumed, exhausted);
+      } finally {
+        ownedRead.close();
       }
     }
 

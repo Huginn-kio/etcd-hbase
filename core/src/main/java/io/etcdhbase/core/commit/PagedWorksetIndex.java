@@ -6,6 +6,7 @@ import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.storage.ScanDirection;
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -244,34 +245,40 @@ public final class PagedWorksetIndex {
 
   /** Returns one ordered reference per call, with no materialized list of modified keys. */
   public AsyncCursor<EventRef> scan(int bucket, KeyRange range) {
+    return scan(bucket, range, ScanDirection.ASCENDING);
+  }
+
+  public AsyncCursor<EventRef> scan(int bucket, KeyRange range, ScanDirection direction) {
     if (bucket < 0 || bucket >= 4096) throw new IllegalArgumentException("invalid workset bucket");
-    return cursor(bucket, Objects.requireNonNull(range, "range"));
+    return cursor(bucket, Objects.requireNonNull(range, "range"), Objects.requireNonNull(direction, "direction"));
   }
 
   /** Traverses all buckets in bucket/key order for final candidate preparation. */
-  public AsyncCursor<EventRef> scanAll() { return cursor(-1, KeyRange.all()); }
+  public AsyncCursor<EventRef> scanAll() { return cursor(-1, KeyRange.all(), ScanDirection.ASCENDING); }
 
-  private AsyncCursor<EventRef> cursor(int bucket, KeyRange range) {
+  private AsyncCursor<EventRef> cursor(int bucket, KeyRange range, ScanDirection direction) {
     PageRef snapshot;
     synchronized (this) {
       if (!started || failed || inactive()) throw new IllegalStateException("workset is not active");
       snapshot = root;
     }
-    return new IndexCursor(bucket, range, snapshot);
+    return new IndexCursor(bucket, range, snapshot, direction);
   }
 
   private final class IndexCursor implements AsyncCursor<EventRef> {
     private final int bucket;
     private final KeyRange range;
     private final PageRef snapshot;
+    private final ScanDirection direction;
     private final AtomicBoolean reading = new AtomicBoolean();
     private SortKey after;
     private boolean ended;
 
-    private IndexCursor(int bucket, KeyRange range, PageRef snapshot) {
+    private IndexCursor(int bucket, KeyRange range, PageRef snapshot, ScanDirection direction) {
       this.bucket = bucket;
       this.range = range;
       this.snapshot = snapshot;
+      this.direction = direction;
     }
 
     @Override public CompletableFuture<Optional<EventRef>> next() {
@@ -286,7 +293,7 @@ public final class PagedWorksetIndex {
             return CompletableFuture.failedFuture(unavailable());
           }
           next = ended || snapshot == null || range.isEmpty()
-              ? CompletableFuture.completedFuture(Optional.empty()) : seek(snapshot, after, bucket, range);
+              ? CompletableFuture.completedFuture(Optional.empty()) : seek(snapshot, after, bucket, range, direction);
         }
         return fenceOnFailure(next.thenApply(this::advance)).whenComplete((ignored, failure) ->
             reading.set(false)).copy();
@@ -327,26 +334,65 @@ public final class PagedWorksetIndex {
   }
 
   private CompletableFuture<Optional<EventRef>> seek(PageRef reference, SortKey after,
-      int bucket, KeyRange range) {
-    if (after != null && reference.last().compareTo(after) <= 0
-        || bucket >= 0 && (reference.last().bucket() < bucket || reference.first().bucket() > bucket)) {
+      int bucket, KeyRange range, ScanDirection direction) {
+    if (pageBeforeResume(reference, after, direction) || !intersects(reference, bucket, range)) {
       return CompletableFuture.completedFuture(Optional.empty());
     }
     return readPage(reference).thenCompose(page -> {
       if (page.level() == 0) {
-        return CompletableFuture.completedFuture(page.entries().stream().filter(entry ->
-            (after == null || entry.sortKey().compareTo(after) > 0)
-                && (bucket < 0 || entry.bucket() == bucket && range.contains(entry.key()))).findFirst());
+        return CompletableFuture.completedFuture(selectLeaf(page.entries(), after, bucket, range, direction));
       }
-      return seekChildren(page.children(), 0, after, bucket, range);
+      int first = direction == ScanDirection.ASCENDING ? 0 : page.children().size() - 1;
+      return seekChildren(page.children(), first, after, bucket, range, direction);
     });
   }
 
+  private static boolean pageBeforeResume(PageRef reference, SortKey after, ScanDirection direction) {
+    if (after == null) return false;
+    return direction == ScanDirection.ASCENDING
+        ? reference.last().compareTo(after) <= 0 : reference.first().compareTo(after) >= 0;
+  }
+
+  private static Optional<EventRef> selectLeaf(List<EventRef> entries, SortKey after, int bucket,
+      KeyRange range, ScanDirection direction) {
+    int step = direction == ScanDirection.ASCENDING ? 1 : -1;
+    for (int index = step > 0 ? 0 : entries.size() - 1; index >= 0 && index < entries.size(); index += step) {
+      EventRef entry = entries.get(index);
+      if (entryAfterResume(entry, after, direction) && entryInRange(entry, bucket, range)) return Optional.of(entry);
+    }
+    return Optional.empty();
+  }
+
+  private static boolean entryAfterResume(EventRef entry, SortKey after, ScanDirection direction) {
+    if (after == null) return true;
+    return direction == ScanDirection.ASCENDING
+        ? entry.sortKey().compareTo(after) > 0 : after.compareTo(entry.sortKey()) > 0;
+  }
+
+  private static boolean entryInRange(EventRef entry, int bucket, KeyRange range) {
+    return bucket < 0 || entry.bucket() == bucket && range.contains(entry.key());
+  }
+
+  private static boolean intersects(PageRef reference, int bucket, KeyRange range) {
+    if (bucket < 0) return true;
+    if (reference.last().bucket() < bucket || reference.first().bucket() > bucket) return false;
+    if (range.lowerInclusive().isPresent() && reference.last().bucket() == bucket
+        && reference.last().key().compareTo(range.lowerInclusive().orElseThrow()) < 0) return false;
+    if (reference.first().bucket() == bucket) {
+      if (range.kind() == KeyRange.Kind.POINT
+          && reference.first().key().compareTo(range.lowerInclusive().orElseThrow()) > 0) return false;
+      if (range.upperExclusive().isPresent()
+          && reference.first().key().compareTo(range.upperExclusive().orElseThrow()) >= 0) return false;
+    }
+    return true;
+  }
+
   private CompletableFuture<Optional<EventRef>> seekChildren(List<PageRef> children, int index,
-      SortKey after, int bucket, KeyRange range) {
-    if (index == children.size()) return CompletableFuture.completedFuture(Optional.empty());
-    return seek(children.get(index), after, bucket, range).thenComposeAsync(found -> found.isPresent()
-        ? CompletableFuture.completedFuture(found) : seekChildren(children, index + 1, after, bucket, range),
+      SortKey after, int bucket, KeyRange range, ScanDirection direction) {
+    if (index < 0 || index >= children.size()) return CompletableFuture.completedFuture(Optional.empty());
+    int next = index + (direction == ScanDirection.ASCENDING ? 1 : -1);
+    return seek(children.get(index), after, bucket, range, direction).thenComposeAsync(found -> found.isPresent()
+        ? CompletableFuture.completedFuture(found) : seekChildren(children, next, after, bucket, range, direction),
         CONTINUE);
   }
 

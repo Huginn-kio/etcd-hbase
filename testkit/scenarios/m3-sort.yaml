@@ -1,0 +1,19 @@
+schema_version: 1
+id: m3-sort-v1
+protocol: etcd-v3.5.23
+steps:
+  - {case_id: C03, id: native-baseline}
+  - {case_id: C03, id: J35-seed}
+  - {case_id: C03, id: J35-update}
+  - {case_id: C03, id: J35-none}
+  - {case_id: C03, id: J35-asc}
+  - {case_id: C03, id: J35-desc}
+  - {case_id: C03, id: J35-desc-first}
+  - {case_id: C03, id: J35-desc-next}
+  - {case_id: C03, id: J35-desc-filter}
+  - {case_id: C03, id: J35-desc-history}
+  - {case_id: C03, id: J35-desc-point}
+  - {case_id: C03, id: J35-desc-keys}
+  - {case_id: C03, id: J35-desc-count}
+  - {case_id: C03, id: J35-client-asc}
+  - {case_id: C03, id: J35-txn-desc}

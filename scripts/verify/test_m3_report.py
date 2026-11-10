@@ -137,8 +137,23 @@ class M3ReportTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     M3.validate_trace_cases(path, "native-etcd", "J34")
 
+    def test_sort_trace_requires_each_registered_method(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.jsonl"
+            records = [{"schema": "etcd-hbase-trace/v1", "case_id": case,
+                        "evidence_scope": "native-etcd", "method": M3.SORT_METHODS[index]}
+                       for index, case in enumerate(M3.SORT_CASES)]
+            path.write_text("".join(json.dumps(record) + "\n" for record in records))
+            M3.validate_trace_cases(path, "native-etcd", "J35")
+            for index in (1, 2, 3, len(records) - 1):
+                bad = copy.deepcopy(records)
+                bad[index]["method"] = "etcdserverpb.KV/Unknown"
+                path.write_text("".join(json.dumps(record) + "\n" for record in bad))
+                with self.assertRaises(ValueError):
+                    M3.validate_trace_cases(path, "native-etcd", "J35")
+
     def test_txn_run_requires_named_unit_and_real_integration_cases(self):
-        for task in ("J31", "J32", "J33", "J34"):
+        for task in ("J31", "J32", "J33", "J34", "J35"):
             with self.subTest(task=task):
                 self.assert_txn_run_requires_cases(task)
 
@@ -162,21 +177,35 @@ class M3ReportTest(unittest.TestCase):
             readview = root / "core/target/surefire-reports/TEST-io.etcdhbase.core.commit.ReadViewRecordStoreTest.xml"
             for case in ("flatTransactionCanWriteInElse", "readOnlyTransactionNeedsNoInvocation"):
                 self.assert_missing_txn_case_rejected(root, repo, source, readview, case)
-            if task in {"J32", "J33", "J34"}:
+            if task in {"J32", "J33", "J34", "J35"}:
                 workset = root / "server/target/failsafe-reports/TEST-io.etcdhbase.server.M3TxnCommitIT.xml"
                 self.assert_missing_txn_case_rejected(root, repo, source, workset,
                     "nestedWorksetExceedsMemoryAndDoesNotReplayAnUncertainPageOnBothLayouts")
                 hbase = root / f"hbase/target/failsafe-reports/TEST-{M3.HBASE_SUITE}.xml"
                 self.assert_missing_txn_case_rejected(root, repo, source, hbase,
                     "noChangeResultSurvivesLostCasAcknowledgementAndRejectsLateSeal")
-            if task in {"J33", "J34"}:
+            if task in {"J33", "J34", "J35"}:
                 self.assert_missing_txn_case_rejected(root, repo, source, workset,
                     "largeDeleteIsAtomicBudgetedAndReplayableOnBothLayouts")
                 self.assert_missing_txn_case_rejected(root, repo, source, go_report,
                     "TestM3DeleteComparisonKeepsTxnCountOneofsStrict")
-            if task == "J34":
+            if task in {"J34", "J35"}:
                 self.assert_missing_txn_case_rejected(root, repo, source, go_report,
                     "TestM3RangeComparisonKeepsTxnCountOneofsStrict")
+
+    def test_j35_inherits_j34_evidence_and_rejects_missing_cases(self):
+        for category in ("go", "integration", "units"):
+            for suite, required in M3.RUN_TASKS["J34"][category].items():
+                with self.subTest(category=category, suite=suite):
+                    self.assertLessEqual(required, M3.RUN_TASKS["J35"][category][suite])
+        with tempfile.TemporaryDirectory() as directory:
+            root, repo, source = create_txn_report_fixture(Path(directory), "J35")
+            report = root / "core/target/surefire-reports/TEST-io.etcdhbase.core.commit.ManifestPreparationTest.xml"
+            self.assert_missing_txn_case_rejected(root, repo, source, report,
+                next(iter(M3.J34_UNIT_CASES["io.etcdhbase.core.commit.ManifestPreparationTest"])))
+            report = root / "core/target/surefire-reports/TEST-io.etcdhbase.core.kv.OrderedViewCursorTest.xml"
+            self.assert_missing_txn_case_rejected(root, repo, source, report,
+                "mergesDescendingBucketHeadsAndRejectsDuplicates")
 
     def assert_missing_txn_case_rejected(self, root, repo, source, report, case):
         original = report.read_text()
@@ -240,7 +269,7 @@ class M3ReportTest(unittest.TestCase):
 def create_txn_report_fixture(parent, task):
     root, repo = parent / "run-1", parent / "repo"
     root.mkdir()
-    suite_name = {"J31": "m3-txn.yaml", "J32": "m3-nested-txn.yaml", "J33": "m3-delete.yaml", "J34": "m3-range.yaml"}[task]
+    suite_name = M3.RUN_TASKS[task]["suite"]
     suite = repo / "testkit/scenarios" / suite_name
     suite.parent.mkdir(parents=True)
     suite.write_text("synthetic-validator-test-suite")
@@ -259,17 +288,16 @@ def create_txn_report_fixture(parent, task):
 
 
 def write_txn_trace_metadata(root, suite, source, task):
-    prefix = {"J31": "j31", "J32": "j32", "J33": "j33", "J34": "j34"}[task]
-    scenario_id = {"J31": "m3-txn-v1", "J32": "m3-nested-txn-v1", "J33": "m3-delete-v1", "J34": "m3-range-v1"}[task]
+    prefix = M3.RUN_TASKS[task]["prefix"].removesuffix("-")
+    scenario_id = M3.RUN_TASKS[task]["scenario"]
     suite_sha = M3.file_digest(suite)
     prefix_sha = hashlib.sha256(b"etcd-hbase-m3-test/run-1/").hexdigest()
     for name, scope, layout in (("native", "native-etcd", ""), ("target-history", "target-hbase", "HISTORY"),
                                 ("target-native", "target-hbase", "NATIVE")):
         trace = root / f"{prefix}-{name}-trace.jsonl"
         trace.write_text("".join(json.dumps({"schema": "etcd-hbase-trace/v1", "case_id": case,
-            "evidence_scope": scope, "method": M3.RANGE_METHODS[index] if task == "J34" else M3.DELETE_METHODS[index] if task == "J33" else
-            "etcdserverpb.KV/Put" if index == 0 else "etcdserverpb.KV/Txn"}) + "\n"
-            for index, case in enumerate({"J31": M3.TXN_CASES, "J32": M3.NESTED_CASES, "J33": M3.DELETE_CASES, "J34": M3.RANGE_CASES}[task])))
+            "evidence_scope": scope, "method": M3.RUN_TASKS[task]["methods"][index]}) + "\n"
+            for index, case in enumerate(M3.RUN_TASKS[task]["cases"])))
         observed = metadata(scope, layout)
         observed["build"]["scenario_id"] = scenario_id
         observed.update(suite_sha256=suite_sha, prefix_sha256=prefix_sha, trace_sha256=M3.file_digest(trace))
@@ -282,7 +310,7 @@ def write_txn_trace_metadata(root, suite, source, task):
 
 def write_txn_go_report(root, task):
     events = []
-    required = {"J31": M3.J31_GO_REQUIRED_CASES, "J32": M3.J32_GO_REQUIRED_CASES, "J33": M3.J33_GO_REQUIRED_CASES, "J34": M3.J34_GO_REQUIRED_CASES}[task]
+    required = M3.RUN_TASKS[task]["go"]
     for package, cases in required.items():
         name = M3.GO_MODULE + package
         events.extend({"Action": "pass", "Package": name, "Test": case} for case in cases)
@@ -291,9 +319,8 @@ def write_txn_go_report(root, task):
 
 
 def write_txn_java_reports(root, task):
-    integration = {"J31": M3.J31_INTEGRATION_CASES, "J32": M3.J32_INTEGRATION_CASES,
-                   "J33": M3.J33_INTEGRATION_CASES, "J34": M3.J34_INTEGRATION_CASES}[task]
-    units = {"J31": M3.J31_UNIT_CASES, "J32": M3.J32_UNIT_CASES, "J33": M3.J33_UNIT_CASES, "J34": M3.J34_UNIT_CASES}[task]
+    integration = M3.RUN_TASKS[task]["integration"]
+    units = M3.RUN_TASKS[task]["units"]
     for suites, kind in ((integration, "failsafe-reports"), (units, "surefire-reports")):
         for name, names in suites.items():
             module = "hbase" if ".hbase." in name else "core" if ".core." in name else "grpc" if ".grpc." in name else "server"

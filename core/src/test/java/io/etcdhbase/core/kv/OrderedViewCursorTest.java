@@ -10,6 +10,7 @@ import io.etcdhbase.core.commit.AsyncCursor;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -29,6 +30,27 @@ class OrderedViewCursorTest {
           assertEquals(key(key), cursor.next().join().orElseThrow().key());
         }
         assertTrue(cursor.next().join().isEmpty());
+      }
+      assertEquals(0, fixture.manager.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void mergesDescendingBucketHeadsAndRejectsDuplicates() throws Exception {
+    try (var fixture = new Fixture()) {
+      try (var cursor = new OrderedViewCursor(List.of(source("d", "b"), source("c", "a")),
+          fixture.account, fixture.scope, ScanDirection.DESCENDING)) {
+        for (String key : List.of("d", "c", "b", "a")) {
+          assertEquals(key(key), cursor.next().join().orElseThrow().key());
+        }
+        assertTrue(cursor.next().join().isEmpty());
+      }
+      try (var cursor = new OrderedViewCursor(List.of(source("c", "a"), source("b", "a")),
+          fixture.account, fixture.scope, ScanDirection.DESCENDING)) {
+        assertEquals(key("c"), cursor.next().join().orElseThrow().key());
+        assertEquals(key("b"), cursor.next().join().orElseThrow().key());
+        assertEquals(key("a"), cursor.next().join().orElseThrow().key());
+        assertThrows(CompletionException.class, () -> cursor.next().join());
       }
       assertEquals(0, fixture.manager.snapshot().allocatedBytes());
     }

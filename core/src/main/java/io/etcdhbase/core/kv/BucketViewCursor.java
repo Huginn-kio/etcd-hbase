@@ -27,7 +27,7 @@ final class BucketViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable
     if (!account.belongsTo(scope) || request.maximumRows() != 1) {
       throw new IllegalArgumentException("bucket view requires one-row pages and the same request budget");
     }
-    cursor = new BucketCursor(source, request, scope);
+    cursor = new BucketCursor(source, request, scope, account);
   }
 
   @Override public CompletableFuture<Optional<StoredRecord>> next() {

@@ -20,11 +20,13 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.codec.StorageMessages;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import java.util.ArrayDeque;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -43,6 +45,7 @@ import org.apache.hadoop.hbase.client.metrics.ScanMetrics;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 
 class HBasePageReaderTest {
   private final HBaseRecordStore store = mock(HBaseRecordStore.class);
@@ -53,6 +56,51 @@ class HBasePageReaderTest {
 
   private static ScanRequest request(KeyRange range, Optional<ByteKey> after) {
     return new ScanRequest(0, range, after, Long.MAX_VALUE, ReadProjection.METADATA, 1, 1024, 16);
+  }
+
+  @Test
+  void reversedHistorySelectsNewestVisibleVersionForEachLogicalKey() throws Exception {
+    var history = new StorageTableBinding(TableName.valueOf("synthetic"), new byte[] {'d'},
+        StorageTableBinding.Layout.HISTORY, new HashSaltStrategy());
+    ByteKey a = ByteKey.copyOf(new byte[] {1});
+    ByteKey b = null;
+    int bucket = history.codec().bucket(a);
+    for (int value = 2; value < 256; value++) {
+      ByteKey candidate = ByteKey.copyOf(new byte[] {(byte) value});
+      if (history.codec().bucket(candidate) == bucket) { b = candidate; break; }
+    }
+    if (b == null) throw new AssertionError("fixture did not find two keys in one bucket");
+    var a1 = StoredRecord.metadataOnly(a, new StorageMetadata(1, 1, 1, 0, StorageMetadata.State.LIVE, 0));
+    var b2 = StoredRecord.metadataOnly(b, new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, 0));
+    Result b3 = historyRow(history, b, 3);
+    Result b2row = historyRow(history, b, 2);
+    Result b1row = historyRow(history, b, 1);
+    Result a4 = historyRow(history, a, 4);
+    Result a1row = historyRow(history, a, 1);
+    doReturn(table).when(store).table();
+    doReturn(scanner).when(table).getScanner(any(Scan.class));
+    doReturn(b3, b2row, b1row, a4, a1row, null).when(scanner).next();
+    doReturn(new ScanMetrics()).when(scanner).getScanMetrics();
+    doReturn(b2).when(store).decode(b2row, ReadProjection.METADATA);
+    doReturn(StoredRecord.metadataOnly(b, new StorageMetadata(1, 1, 1, 0, StorageMetadata.State.LIVE, 0)))
+        .when(store).decode(b1row, ReadProjection.METADATA);
+    doReturn(a1).when(store).decode(a1row, ReadProjection.METADATA);
+    try (var scope = RequestScope.withoutDeadline()) {
+      var request = new ScanRequest(bucket, KeyRange.all(), Optional.empty(), 2,
+          ReadProjection.METADATA, 4, 4096, 16, ScanDirection.DESCENDING);
+      var page = new HBasePageReader(store, history, scope, Runnable::run).read(request).join();
+      assertEquals(List.of(b2, a1), page.records());
+      assertTrue(page.exhausted());
+      var captured = ArgumentCaptor.forClass(Scan.class);
+      verify(table).getScanner(captured.capture());
+      assertTrue(captured.getValue().isReversed());
+    }
+  }
+
+  private static Result historyRow(StorageTableBinding binding, ByteKey key, long revision) {
+    var metadata = new StorageMetadata(1, revision, revision, 0, StorageMetadata.State.LIVE, 0);
+    return Result.create(List.of(new KeyValue(binding.codec().encode(key, revision), binding.family(),
+        HBaseRecordStore.METADATA, 0, StorageMessages.metadata(metadata))));
   }
 
   @Test

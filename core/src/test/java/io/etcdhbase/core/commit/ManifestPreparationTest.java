@@ -7,7 +7,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.time.Duration;
@@ -76,7 +79,7 @@ class ManifestPreparationTest {
   }
 
   @Test
-  void preparesLargeLazyCandidatePlanWithoutRecursiveStackGrowth() {
+  void preparesLargeLazyCandidatePlanWithoutRecursiveStackGrowth() throws Exception {
     int candidateCount = 5_000;
     TransactionId transactionId = TransactionId.create();
     MemoryRepository repository = new MemoryRepository();
@@ -94,6 +97,25 @@ class ManifestPreparationTest {
       assertTrue(root.candidateDirectory().orElseThrow().level() >= 2);
       assertTrue(repository.directories.size() >= 2);
       assertEquals(0, root.eventCount());
+      var limits = new BudgetManager.Limits(2, 2, 2, 2, 2, 1_000_000, 16L << 20);
+      var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+      var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 8192, 8192);
+      try (var account = budget.admit("public", scope, reservation)) {
+        var catalog = new ManifestCatalog(repository);
+        try (var first = catalog.candidatesInRange(root, 0, KeyRange.all(), Optional.empty(), 3,
+            8192, scope, () -> false, account, ScanDirection.DESCENDING).join()) {
+          assertEquals(List.of(ByteKey.copyOf(sequenceKey(4999)), ByteKey.copyOf(sequenceKey(4998)),
+              ByteKey.copyOf(sequenceKey(4997))), first.candidates().stream().map(c -> c.record().key()).toList());
+          assertFalse(first.exhausted());
+        }
+        try (var second = catalog.candidatesInRange(root, 0, KeyRange.all(),
+            Optional.of(ByteKey.copyOf(sequenceKey(4997))), 2, 8192, scope, () -> false, account,
+            ScanDirection.DESCENDING).join()) {
+          assertEquals(List.of(ByteKey.copyOf(sequenceKey(4996)), ByteKey.copyOf(sequenceKey(4995))),
+              second.candidates().stream().map(c -> c.record().key()).toList());
+        }
+      }
+      assertEquals(0, budget.snapshot().allocatedBytes());
     }
   }
 

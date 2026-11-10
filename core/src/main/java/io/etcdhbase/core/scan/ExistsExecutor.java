@@ -10,6 +10,7 @@ import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.ScanSource;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoragePage;
+import io.etcdhbase.core.storage.ScanDirection;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -50,6 +51,9 @@ public final class ExistsExecutor implements AutoCloseable {
   /** Supplies the pinned view whose unary result must be fenced before it is returned. */
   public ExistsExecutor(ScanSource source, ScanRequest template, int bucketCount,
       RequestScope scope, RecordStore completionStore) {
+    if (template.direction() != ScanDirection.ASCENDING) {
+      throw new UnsupportedOperationException("descending existence scans are not implemented");
+    }
     if (bucketCount < 1 || bucketCount > 4096) throw new IllegalArgumentException("invalid bucket count");
     this.source = source;
     this.template = template;

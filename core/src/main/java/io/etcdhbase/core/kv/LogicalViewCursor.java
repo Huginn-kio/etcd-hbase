@@ -7,6 +7,7 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.ScanSource;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.util.ArrayList;
@@ -18,7 +19,7 @@ import java.util.function.ToIntFunction;
 
 /** Merges metadata from one fixed read view and an optional completed transaction workset. */
 final class LogicalViewCursor implements AsyncCursor<StoredRecord>, AutoCloseable {
-  enum Traversal { KEY_ASCENDING, ANY }
+  enum Traversal { KEY_ASCENDING, KEY_DESCENDING, ANY }
 
   private final List<BucketViewCursor> bases;
   private final OrderedViewCursor ordered;
@@ -41,6 +42,10 @@ final class LogicalViewCursor implements AsyncCursor<StoredRecord>, AutoCloseabl
     Objects.requireNonNull(account, "account");
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(traversal, "traversal");
+    if (traversal != Traversal.ANY && (traversal == Traversal.KEY_DESCENDING)
+        != (template.direction() == ScanDirection.DESCENDING)) {
+      throw new IllegalArgumentException("logical traversal direction differs from the scan");
+    }
     if (bucketCount < 1 || bucketCount > 4096 || !account.belongsTo(scope)
         || template.projection() != ReadProjection.METADATA || template.maximumRows() != 1
         || template.after().isPresent()) {
@@ -58,14 +63,14 @@ final class LogicalViewCursor implements AsyncCursor<StoredRecord>, AutoCloseabl
         end = first + 1;
       }
       for (int bucket = first; bucket < end; bucket++) {
-        var request = new ScanRequest(bucket, template.range(), template.after(), template.revisionUpperBound(),
-            ReadProjection.METADATA, 1, template.maximumBytes(), template.maximumPhysicalRows());
+        var request = new ScanRequest(bucket, template.range(), Optional.empty(), template.revisionUpperBound(),
+            ReadProjection.METADATA, 1, template.maximumBytes(), template.maximumPhysicalRows(), template.direction());
         var base = new BucketViewCursor(source, request, account, scope);
         opened.add(base);
-        merged.add(working.isPresent() ? working.orElseThrow().merge(bucket, template.range(), base) : base);
+        merged.add(working.isPresent() ? working.orElseThrow().merge(bucket, template.range(), base, template.direction()) : base);
       }
       if (merged.isEmpty()) merged.add(AsyncCursor.fromIterator(List.<StoredRecord>of().iterator()));
-      this.ordered = traversal == Traversal.KEY_ASCENDING ? new OrderedViewCursor(merged, account, scope) : null;
+      this.ordered = traversal != Traversal.ANY ? new OrderedViewCursor(merged, account, scope, template.direction()) : null;
       this.sequential = traversal == Traversal.ANY ? new SequentialViewCursor(merged, scope) : null;
       this.bases = List.copyOf(opened);
     } catch (RuntimeException | Error failure) {

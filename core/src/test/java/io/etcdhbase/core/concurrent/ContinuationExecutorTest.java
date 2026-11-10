@@ -23,6 +23,20 @@ class ContinuationExecutorTest {
   }
 
   @Test
+  void drainsLongSynchronousContinuationChainsWithoutGrowingTheStack() {
+    var executor = new ContinuationExecutor();
+    class Repeated implements Runnable {
+      int count;
+      @Override public void run() {
+        if (++count < 10_000) executor.execute(this);
+      }
+    }
+    var repeated = new Repeated();
+    executor.execute(repeated);
+    assertEquals(10_000, repeated.count);
+  }
+
+  @Test
   void failureClearsQueuedTasksAndAllowsNextDrain() {
     var executor = new ContinuationExecutor();
     var observed = new ArrayList<String>();

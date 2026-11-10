@@ -9,6 +9,9 @@ import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.BudgetedRecordStore;
 import io.etcdhbase.core.storage.BatchWriteResult;
 import io.etcdhbase.core.storage.ReadProjection;
+import io.etcdhbase.core.storage.PhysicalScanProgress;
+import io.etcdhbase.core.storage.ScanCheckpoint;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.ScanRequest;
@@ -19,10 +22,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.IdentityHashMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
@@ -40,6 +45,8 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
   private final PinnedReadView.ReaderLease readerLease;
   private final CompletableFuture<Void> termination = new CompletableFuture<>();
   private final Set<ScanOperation> activeScans = Collections.newSetFromMap(new IdentityHashMap<>());
+  private record ReverseScanOwner(BudgetManager.Account account, BudgetManager.Lease lease) {}
+  private final java.util.Map<UUID, ReverseScanOwner> reverseScanOwners = new HashMap<>();
   private CompletableFuture<Void> finishFuture;
   private boolean closed;
   private boolean readerReleased;
@@ -136,11 +143,15 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       return failedOperation(new IllegalArgumentException("scan budget belongs to another request scope"));
     }
     if (!beginOperation()) return failedOperation(inactiveFailure());
-    return track(new DeferredScanOperation(request, account));
+    return track(new DeferredScanOperation(request, account), request);
   }
 
   private ScanOperation startScanAfterRenew(ScanRequest request, BudgetManager.Account account) {
     if (!isActive()) return failedOperation(inactiveFailure());
+    if (request.direction() == ScanDirection.DESCENDING) {
+      try { registerReverseScan(request, account); }
+      catch (BackendFailure | RuntimeException failure) { return failedOperation(failure); }
+    }
     if (request.bucket() >= bucketCount) {
       return failedOperation(new IllegalArgumentException("scan bucket exceeds the configured bucket count"));
     }
@@ -162,8 +173,15 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       base = physical.startScan(baseRequest);
       int maximumCandidates = Math.min(request.maximumRows(), 1024);
       var stopped = new AtomicBoolean();
-      var candidates = manifests.candidatesInRange(root, bucket, request.range(), request.after(),
-          maximumCandidates, ManifestCatalog.MAX_RANGE_CANDIDATE_BYTES, scope, stopped::get, account);
+      java.util.function.Supplier<CompletableFuture<ManifestCatalog.CandidateSlice>> loadCandidates = () ->
+          manifests.candidatesInRange(root, bucket, request.range(), request.after(), maximumCandidates,
+              ManifestCatalog.MAX_RANGE_CANDIDATE_BYTES, scope, stopped::get, account, request.direction());
+      var candidates = request.direction() == ScanDirection.DESCENDING
+          ? base.completion().toCompletableFuture().thenCompose(page -> {
+            if (stopped.get() || !isActive()) return CompletableFuture.failedFuture(inactiveFailure());
+            return page.physicalProgress().isPresent()
+                ? CompletableFuture.completedFuture(ManifestCatalog.CandidateSlice.empty()) : loadCandidates.get();
+          }) : loadCandidates.get();
       return new OverlayScanOperation(base, candidates, request, stopped);
     } catch (RuntimeException | Error failure) {
       // Close the already-open physical producer before preserving a setup Error as fatal.
@@ -310,13 +328,13 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     }
   }
 
-  private ScanOperation track(ScanOperation operation) {
+  private ScanOperation track(ScanOperation operation, ScanRequest request) {
     synchronized (this) {
       activeScans.add(operation);
     }
     // A consumer may immediately finish the view from its scan callback. Publish completion
     // only after this store has retired the scan and its operation lease.
-    var completion = operation.completion().whenComplete((ignored, failure) -> {
+    var completion = operation.completion().thenApply(page -> logicalProgress(page, request)).whenComplete((ignored, failure) -> {
       synchronized (ReadViewRecordStore.this) {
         activeScans.remove(operation);
       }
@@ -339,6 +357,55 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       }
       @Override public void close() { operation.close(); }
     };
+  }
+
+  private void registerReverseScan(ScanRequest request, BudgetManager.Account account) throws BackendFailure {
+    synchronized (this) {
+      var existing = reverseScanOwners.get(request.viewId());
+      if (existing != null) {
+        if (existing.account() != account) throw new IllegalArgumentException("scan account changed during a read view");
+        if (closed || !pinned.isOpen() || scope.isClosed() || scope.isDeadlineExceeded()) throw inactiveFailure();
+        return;
+      }
+      if (request.checkpoint().isPresent() || request.physicalProgress().isPresent()) {
+        throw new IllegalArgumentException("scan checkpoint belongs to another read view");
+      }
+    }
+    if (account == null) throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    var lease = account.tryRetain(BudgetManager.Memory.HEAD, 192)
+        .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+    boolean keep = false;
+    boolean wrongAccount = false;
+    synchronized (this) {
+      if (!closed) {
+        var existing = reverseScanOwners.get(request.viewId());
+        if (existing == null) {
+          reverseScanOwners.put(request.viewId(), new ReverseScanOwner(account, lease));
+          keep = true;
+        } else if (existing.account() != account) {
+          wrongAccount = true;
+        }
+      }
+    }
+    if (!keep) lease.close();
+    if (wrongAccount) throw new IllegalArgumentException("scan account changed during a read view");
+    if (!isActive()) throw inactiveFailure();
+  }
+
+  private StoragePage logicalProgress(StoragePage page, ScanRequest request) {
+    if (page.physicalProgress().isEmpty()) return page;
+    var progress = page.physicalProgress().orElseThrow();
+    long stableUpper = Math.min(Math.min(request.revisionUpperBound(), pinned.view().targetRevision()),
+        pinned.view().stableRevision());
+    var expected = withUpperBound(request, stableUpper);
+    if (!progress.viewId().equals(expected.viewId()) || progress.bucket() != expected.bucket()
+        || progress.revision() != stableUpper || progress.direction() != expected.direction()
+        || !progress.logicalCheckpoint().equals(expected.checkpoint())) {
+      throw new IllegalStateException("physical progress differs from the pinned read view");
+    }
+    var logical = new PhysicalScanProgress(request.viewId(), request.bucket(), request.revisionUpperBound(),
+        request.direction(), request.checkpoint(), progress.lastPhysicalRow(), progress.physicalSourceId());
+    return new StoragePage(page.records(), page.exhausted(), page.cost(), Optional.of(logical));
   }
 
   private void completeOperation() {
@@ -379,6 +446,15 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
   }
 
   private void releaseReader(PinnedReadView.ReaderLease release) {
+    List<BudgetManager.Lease> owners;
+    synchronized (this) {
+      owners = reverseScanOwners.values().stream().map(ReverseScanOwner::lease).toList();
+      reverseScanOwners.clear();
+    }
+    for (var owner : owners) {
+      try { owner.close(); }
+      catch (RuntimeException | Error failure) { recordCloseFailure(failure); }
+    }
     try {
       release.close();
     } catch (RuntimeException | Error closeError) {
@@ -401,9 +477,13 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
   }
 
   private static ScanRequest withUpperBound(ScanRequest request, long upper) {
-    return new ScanRequest(request.bucket(), request.range(), request.after(), upper,
-        request.projection(), request.maximumRows(), request.maximumBytes(),
-        request.maximumPhysicalRows());
+    var checkpoint = request.checkpoint().map(previous -> new ScanCheckpoint(previous.bucket(), previous.kind(),
+        previous.lower(), previous.upper(), upper, previous.direction(), previous.viewId(), previous.key()));
+    var progress = request.physicalProgress().map(previous -> new PhysicalScanProgress(previous.viewId(),
+        previous.bucket(), upper, previous.direction(), checkpoint, previous.lastPhysicalRow(), previous.physicalSourceId()));
+    return new ScanRequest(request.bucket(), request.range(), checkpoint, upper, request.projection(),
+        request.maximumRows(), request.maximumBytes(), request.maximumPhysicalRows(), request.direction(),
+        request.viewId(), progress);
   }
 
   private static StoredRecord project(StoredRecord record, ReadProjection projection) {
@@ -593,8 +673,11 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
 
   private static StoragePage merge(StoragePage base,
       ManifestCatalog.CandidateSlice candidates, ScanRequest request) {
+    if (base.physicalProgress().isPresent()) {
+      return new StoragePage(List.of(), false, mergeCost(base.cost(), candidates), base.physicalProgress());
+    }
     List<StoredRecord> records = new ArrayList<>(request.maximumRows());
-    ByteKey safeBoundary = commonPrefixBoundary(base, candidates);
+    ByteKey safeBoundary = commonPrefixBoundary(base, candidates, request.direction());
     int baseIndex = 0;
     int candidateIndex = 0;
     long bytes = 0;
@@ -608,7 +691,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
       } else {
         StoredRecord baseRecord = base.records().get(baseIndex);
         StoredRecord candidateRecord = candidates.candidates().get(candidateIndex).record();
-        int order = baseRecord.key().compareTo(candidateRecord.key());
+        int order = request.direction().compare(baseRecord.key(), candidateRecord.key());
         if (order == 0) {
           baseIndex++;
           next = candidateRecord;
@@ -621,7 +704,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
           candidateIndex++;
         }
       }
-      if (safeBoundary != null && next.key().compareTo(safeBoundary) > 0) {
+      if (safeBoundary != null && request.direction().compare(next.key(), safeBoundary) > 0) {
         truncated = true;
         break;
       }
@@ -647,7 +730,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
   }
 
   private static ByteKey commonPrefixBoundary(StoragePage base,
-      ManifestCatalog.CandidateSlice candidates) {
+      ManifestCatalog.CandidateSlice candidates, ScanDirection direction) {
     ByteKey boundary = null;
     if (!base.exhausted()) {
       if (base.records().isEmpty()) {
@@ -657,7 +740,7 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     }
     if (!candidates.exhausted()) {
       ByteKey candidateBoundary = candidates.candidates().getLast().record().key();
-      if (boundary == null || candidateBoundary.compareTo(boundary) < 0) {
+      if (boundary == null || direction.compare(candidateBoundary, boundary) < 0) {
         boundary = candidateBoundary;
       }
     }

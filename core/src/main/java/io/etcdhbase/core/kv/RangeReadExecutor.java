@@ -12,6 +12,7 @@ import io.etcdhbase.core.scan.DirectRecordReader;
 import io.etcdhbase.core.scan.PointResult;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.util.Objects;
 import java.util.Optional;
@@ -58,7 +59,7 @@ final class RangeReadExecutor {
             || targetRevision != session.currentRevision())) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid range view target"));
     }
-    if (command.sort().target() != 0 || command.sort().order() < 0 || command.sort().order() > 1) {
+    if (command.sort().target() != 0 || command.sort().order() < 0 || command.sort().order() > 2) {
       return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.UNSUPPORTED_OPERATION));
     }
     LogicalViewCursor cursor = null;
@@ -70,11 +71,13 @@ final class RangeReadExecutor {
         return readPoint(command, targetRevision, selector, reader, output);
       }
       var limits = comparisons.limits();
+      var direction = command.sort().order() == 2 ? ScanDirection.DESCENDING : ScanDirection.ASCENDING;
       var request = new ScanRequest(0, command.range(), Optional.empty(), targetRevision,
-          ReadProjection.METADATA, 1, limits.pageBytes(), limits.physicalRowsPerPage());
+          ReadProjection.METADATA, 1, limits.pageBytes(), limits.physicalRowsPerPage(), direction);
       cursor = new LogicalViewCursor(comparisons.scanSource(targetRevision), working,
           request, limits.buckets(), bucket, account, scope, command.countOnly()
-              ? LogicalViewCursor.Traversal.ANY : LogicalViewCursor.Traversal.KEY_ASCENDING);
+              ? LogicalViewCursor.Traversal.ANY : direction == ScanDirection.DESCENDING
+                  ? LogicalViewCursor.Traversal.KEY_DESCENDING : LogicalViewCursor.Traversal.KEY_ASCENDING);
       var scan = new Scan(command, targetRevision, selector, reader, cursor, output);
       scan.advance();
       return scan.result.copy();

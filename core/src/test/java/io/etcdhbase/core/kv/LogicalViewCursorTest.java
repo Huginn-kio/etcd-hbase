@@ -12,6 +12,7 @@ import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.ScanOperation;
 import io.etcdhbase.core.storage.ScanRequest;
+import io.etcdhbase.core.storage.ScanDirection;
 import io.etcdhbase.core.storage.ScanSource;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoragePage;
@@ -43,6 +44,18 @@ class LogicalViewCursorTest {
           && request.projection() == ReadProjection.METADATA));
       assertEquals(fixture.requests.size(), fixture.closedOperations);
       assertEquals(0, fixture.budgets.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void mergesDescendingMetadataAcrossBuckets() throws Exception {
+    try (var fixture = new Fixture();
+         var cursor = fixture.cursor(fixture::scan, KeyRange.all(), 2, LogicalViewCursor.Traversal.KEY_DESCENDING)) {
+      for (String expected : List.of("d", "c", "b", "a")) {
+        assertEquals(key(expected), cursor.next().join().orElseThrow().key());
+      }
+      assertTrue(cursor.next().join().isEmpty());
+      assertTrue(fixture.requests.stream().allMatch(request -> request.direction() == ScanDirection.DESCENDING));
     }
   }
 
@@ -133,7 +146,9 @@ class LogicalViewCursorTest {
 
     private LogicalViewCursor cursor(ScanSource source, KeyRange range, long revision,
         LogicalViewCursor.Traversal traversal) {
-      var request = new ScanRequest(0, range, Optional.empty(), revision, ReadProjection.METADATA, 1, 2048, 16);
+      var direction = traversal == LogicalViewCursor.Traversal.KEY_DESCENDING
+          ? ScanDirection.DESCENDING : ScanDirection.ASCENDING;
+      var request = new ScanRequest(0, range, Optional.empty(), revision, ReadProjection.METADATA, 1, 2048, 16, direction);
       return new LogicalViewCursor(source, Optional.empty(), request, 2,
           value -> value.equals(key("b")) || value.equals(key("d")) ? 1 : 0, account, scope, traversal);
     }
@@ -143,7 +158,8 @@ class LogicalViewCursorTest {
       List<String> bucket = request.bucket() == 0 ? List.of("a", "c") : List.of("b", "d");
       var remaining = bucket.stream().map(LogicalViewCursorTest::record)
           .filter(value -> request.range().contains(value.key()))
-          .filter(value -> request.after().map(after -> value.key().compareTo(after) > 0).orElse(true)).toList();
+          .filter(value -> request.after().map(after -> request.direction().compare(value.key(), after) > 0).orElse(true))
+          .sorted((left, right) -> request.direction().compare(left.key(), right.key())).toList();
       var page = new StoragePage(remaining.stream().limit(1).toList(), remaining.size() <= 1,
           new StoragePage.Cost(remaining.isEmpty() ? 0 : 1, 1, 1));
       return new Operation(CompletableFuture.completedFuture(page), () -> closedOperations++);

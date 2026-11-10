@@ -39,7 +39,7 @@
 | T03 Txn | nested Txn、重复或重叠操作接受/拒绝组合 | 不因某组合实现困难静默改操作顺序或丢弃操作；原生拒绝的组合返回对应错误，接受的组合保持原子可见性 | 需求承诺；本轮未观察生产路径直接 OpTxn/Else | J32；C13 |
 | K01 `/etcdserverpb.KV/Compact` | revision、logical/physical 请求边界 | 真实逻辑压缩水位；活跃读、当前值和 Watch 保留规则成立；physical 不冒充完成未实现的回收 | 需求承诺，非业务直接调用 | J52；C14 |
 
-Range 的非 KEY 排序属于 J35 要逐项说明支持或明确拒绝的边界；首版不能静默用 key 排序代替 VERSION/CREATE/MOD/VALUE。Put 的 ignore_value/ignore_lease 非默认组合不属于已确定的调用组合，J30 必须明确支持或返回 UNIMPLEMENTED，不得忽略标志并普通写入。这些边界的最终选择在对应实现评审记录，不据此削减上表已承诺能力。
+Range 首版支持 KEY 的升序和降序；VERSION/CREATE/MOD/VALUE 排序明确返回 UNIMPLEMENTED，不能静默用 key 排序代替。Put 的 ignore_value/ignore_lease 非默认组合不属于已确定的调用组合，J30 必须明确支持或返回 UNIMPLEMENTED，不得忽略标志并普通写入。这些边界的最终选择在对应实现评审记录，不据此削减上表已承诺能力。
 
 ## 3 Count 已接受差异
 
