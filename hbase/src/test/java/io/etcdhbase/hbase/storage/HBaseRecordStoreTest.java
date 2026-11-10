@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -26,6 +27,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.BatchWriteResult;
 import io.etcdhbase.core.storage.ReadProjection;
+import io.etcdhbase.core.storage.ScanCleanupFailure;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.hbase.codec.StorageMessages;
@@ -91,6 +93,51 @@ class HBaseRecordStoreTest {
       backend.complete(Result.EMPTY_RESULT);
       var failure = assertThrows(CompletionException.class, result::join);
       assertEquals(BackendFailure.Category.CANCELLED, ((BackendFailure) failure.getCause()).category());
+    }
+  }
+
+  @Test
+  void failedHistoryPointReadReportsUnknownScannerCleanup() {
+    var binding = binding(StorageTableBinding.Layout.HISTORY);
+    try (var scope = RequestScope.withoutDeadline()) {
+      var store = decoder(binding, scope);
+      var backend = new CompletableFuture<List<Result>>();
+      var table = store.table();
+      doReturn(backend).when(table).scanAll(any(Scan.class));
+      var result = store.get(ByteKey.empty(), 1, ReadProjection.METADATA);
+      backend.completeExceptionally(new TimeoutException("scanner response lost"));
+      var failure = assertThrows(CompletionException.class, result::join);
+      var classified = assertInstanceOf(BackendFailure.class, failure.getCause());
+      assertEquals(BackendFailure.Category.TIMEOUT, classified.category());
+      assertTrue(Arrays.stream(classified.getSuppressed())
+          .anyMatch(ScanCleanupFailure.class::isInstance));
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(StorageTableBinding.Layout.class)
+  void historyPointReadUsesOneAttemptWhileOtherPointReadsKeepTheirRetryPolicy(
+      StorageTableBinding.Layout layout) {
+    var binding = binding(layout);
+    var connection = mock(AsyncConnection.class);
+    var admin = mock(AsyncAdmin.class);
+    var factory = mock(HBaseConnectionFactory.class);
+    var identity = mock(AuthorizedBackendIdentity.class);
+    AsyncTableBuilder<?> builder = mock(AsyncTableBuilder.class, RETURNS_SELF);
+    AsyncTable<?> table = mock(AsyncTable.class);
+    doReturn(CompletableFuture.completedFuture(connection)).when(factory).connectionFor(identity);
+    doReturn(admin).when(connection).getAdmin();
+    doReturn(CompletableFuture.completedFuture(binding.descriptor())).when(admin).getDescriptor(binding.table());
+    doReturn(builder).when(connection).getTableBuilder(binding.table());
+    doReturn(table).when(builder).build();
+    try (var scope = RequestScope.withoutDeadline()) {
+      var store = HBaseRecordStore.open(factory, identity, binding, scope, Runnable::run).join();
+      Runnable finish = pendingPointRead(table, layout, Result.EMPTY_RESULT);
+      var result = store.get(ByteKey.empty(), 1, ReadProjection.METADATA);
+      finish.run();
+      assertTrue(result.join().isEmpty());
+      if (layout == StorageTableBinding.Layout.HISTORY) verify(builder).setMaxAttempts(1);
+      else verify(builder, never()).setMaxAttempts(anyInt());
     }
   }
 
@@ -203,6 +250,7 @@ class HBaseRecordStoreTest {
         metadata(StorageMessages.MAX_VALUE_BYTES, StorageMetadata.State.LIVE), 0), decodedOn);
     try (var scope = RequestScope.withoutDeadline()) {
       var store = decoder(binding, scope, tasks::add);
+      assertEquals(layout == StorageTableBinding.Layout.HISTORY, store.pointReadUsesScanner());
       Runnable complete = pendingPointRead(store.table(), layout, row);
       var result = store.get(ByteKey.empty(), 1, ReadProjection.FULL);
       CompletableFuture.runAsync(() -> {

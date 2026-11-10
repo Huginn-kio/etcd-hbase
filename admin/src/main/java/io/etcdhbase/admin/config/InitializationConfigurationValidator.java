@@ -131,8 +131,11 @@ public final class InitializationConfigurationValidator {
 
   private static Set<String> validateGroupTables(TableGroup group, SaltProfile salt) {
     validateTable(group.systemTable(), salt);
+    Set<RecordCategory> categories = categorySet(group.systemTable().recordCategories());
+    Set<RecordCategory> withResults = EnumSet.copyOf(SYSTEM_CATEGORIES);
+    withResults.add(RecordCategory.RESULT);
     require(
-        categorySet(group.systemTable().recordCategories()).equals(SYSTEM_CATEGORIES),
+        categories.equals(SYSTEM_CATEGORIES) || categories.equals(withResults),
         "system table must cover the system record categories");
     require(group.historyCandidates().size() == 2, "both history layout candidates are required");
     Set<HistoryLayout> layouts = EnumSet.noneOf(HistoryLayout.class);

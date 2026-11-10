@@ -1,6 +1,7 @@
 package io.etcdhbase.hbase.error;
 
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.hbase.codec.PhysicalRowLimitException;
 import io.etcdhbase.spi.identity.BackendIdentityException;
 import java.io.IOException;
 import java.net.SocketTimeoutException;
@@ -48,6 +49,9 @@ public final class HBaseFailures {
       }
       if (current instanceof BackendFailure known) {
         return known;
+      }
+      if (current instanceof PhysicalRowLimitException) {
+        return new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT, root);
       }
       if (current instanceof BackendIdentityException identityFailure) {
         return new BackendFailure(

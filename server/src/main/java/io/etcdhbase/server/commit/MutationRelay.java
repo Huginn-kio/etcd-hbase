@@ -7,6 +7,7 @@ import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
+import io.etcdhbase.core.kv.KvFailure;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.Optional;
@@ -15,13 +16,16 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** Reads the authoritative owner and forwards at most once; a post-send failure remains unknown. */
 public final class MutationRelay {
-  public sealed interface Result permits KnownResult, KnownRejection, ResultUnknown {}
+  public sealed interface Result permits KnownResult, KnownRejection, SemanticRejection, ResultUnknown {}
   public record KnownResult(byte[] responseBytes) implements Result {
     public KnownResult { responseBytes = responseBytes.clone(); }
     @Override public byte[] responseBytes() { return responseBytes.clone(); }
   }
   public record KnownRejection(BackendFailure.Category category) implements Result {
     public KnownRejection { Objects.requireNonNull(category, "category"); }
+  }
+  public record SemanticRejection(KvFailure.Reason reason) implements Result {
+    public SemanticRejection { Objects.requireNonNull(reason, "reason"); }
   }
   public record ResultUnknown(BackendFailure.Category category) implements Result {
     public ResultUnknown {
@@ -122,6 +126,9 @@ public final class MutationRelay {
     }
     if (reply instanceof OwnerForwarding.Rejected rejected) {
       return new KnownRejection(rejected.category());
+    }
+    if (reply instanceof OwnerForwarding.SemanticRejected rejected) {
+      return new SemanticRejection(rejected.reason());
     }
     return new ResultUnknown(((OwnerForwarding.Unknown) reply).category());
   }

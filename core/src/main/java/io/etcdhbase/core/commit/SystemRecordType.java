@@ -11,7 +11,9 @@ public enum SystemRecordType {
   MATERIALIZATION(7),
   ROW_FENCE(8),
   SNAPSHOT_PIN(9),
-  RECOVERY_CHECKPOINT(10);
+  RECOVERY_CHECKPOINT(10),
+  RESULT(11),
+  TABLE_GROUP_IDENTITY(12);
 
   private final int id;
 

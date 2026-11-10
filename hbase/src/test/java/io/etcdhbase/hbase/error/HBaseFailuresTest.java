@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.hbase.codec.PhysicalRowLimitException;
 import java.io.IOException;
 import java.net.SocketTimeoutException;
 import java.util.concurrent.CompletionException;
@@ -44,6 +45,10 @@ class HBaseFailuresTest {
     assertEquals(
         BackendFailure.Category.UNKNOWN,
         HBaseFailures.classify(new IllegalStateException("private")).category());
+    assertEquals(BackendFailure.Category.UNKNOWN,
+        HBaseFailures.classify(new IllegalArgumentException("private")).category());
+    assertEquals(BackendFailure.Category.RESOURCE_LIMIT,
+        HBaseFailures.classify(new PhysicalRowLimitException()).category());
     assertFalse(
         HBaseFailures.classify(new SaslException("private")).getMessage().contains("private"));
   }

@@ -362,6 +362,63 @@ class ManifestPreparationTest {
   }
 
   @Test
+  void businessRootRequiresDurableMatchingResultBeforeSealAndBeforePublication() {
+    MemoryRepository repository = new MemoryRepository();
+    SingleResultRepository resultRepository = new SingleResultRepository();
+    ResultCatalog results = new ResultCatalog(resultRepository);
+    InvocationBinding invocation = InvocationBinding.begin(InvocationId.create(),
+        ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]), TransactionId.create(), 1, 0, 1);
+    ResultIdentity identity = ResultIdentity.from(invocation);
+    ResultPage page = new ResultPage(identity, 0, new byte[] {1});
+    ResultDirectory directory = ResultDirectory.create(identity, List.of(ResultPageReference.from(page)));
+    var preparation = new ManifestPreparation(repository, new ManifestPreparation.Limits(0, 0, 0, 0));
+
+    try (RequestScope scope = scope()) {
+      InvocationBinding other = InvocationBinding.begin(InvocationId.create(),
+          ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]), invocation.transactionId(), 1, 0, 1);
+      assertThrows(CompletionException.class, () -> preparation.prepareWithResult(other,
+          List.<PreparedCandidate>of().iterator(), List.<PreparedEvent>of().iterator(),
+          directory.reference(), results, () -> CompletableFuture.completedFuture(null), scope).join());
+      assertEquals(0, repository.writeCount);
+      assertThrows(CompletionException.class, () -> preparation.prepareWithResult(invocation,
+          List.<PreparedCandidate>of().iterator(), List.<PreparedEvent>of().iterator(),
+          directory.reference(), results, () -> CompletableFuture.completedFuture(null), scope).join());
+      assertEquals(0, repository.sealCalls);
+      resultRepository.directory = directory;
+      resultRepository.page = page;
+      var pinValidation = new CompletableFuture<Void>();
+      var pending = preparation.prepareWithResult(invocation,
+          List.<PreparedCandidate>of().iterator(), List.<PreparedEvent>of().iterator(),
+          directory.reference(), results, () -> pinValidation, scope);
+      assertFalse(pending.isDone());
+      assertEquals(0, repository.sealCalls);
+      pinValidation.completeExceptionally(new IllegalStateException("pin was revoked"));
+      assertThrows(CompletionException.class, pending::join);
+      assertEquals(0, repository.sealCalls, "a failed final pin validation cannot seal a root");
+      ManifestRoot root = preparation.prepareWithResult(invocation,
+          List.<PreparedCandidate>of().iterator(), List.<PreparedEvent>of().iterator(),
+          directory.reference(), results, () -> CompletableFuture.completedFuture(null), scope).join();
+      InvocationBinding sealed = invocation.seal(root.systemIdentity());
+      MaterializationStore materialization = new MaterializationStore() {
+        @Override public CompletableFuture<ApplyResult> applySelected(
+            CommitDecision decision, PreparedCandidate candidate, RequestScope ignored) {
+          return CompletableFuture.completedFuture(ApplyResult.APPLIED);
+        }
+        @Override public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope ignored) {
+          return CompletableFuture.completedFuture(null);
+        }
+      };
+      ManifestCatalog manifests = new ManifestCatalog(repository);
+      assertThrows(CompletionException.class,
+          () -> new CommitPlanVerifier(manifests, materialization).verify(sealed, root, scope).join());
+      CommitPlanVerifier verifier = new CommitPlanVerifier(manifests, materialization, results);
+      assertEquals(root, verifier.verify(sealed, root, scope).join());
+      resultRepository.page = null;
+      assertThrows(CompletionException.class, () -> verifier.verify(sealed, root, scope).join());
+    }
+  }
+
+  @Test
   void catalogRejectsMissingOrMismatchedPagesAndRestoreRejectsBadDigest() {
     TransactionId transactionId = TransactionId.create();
     MemoryRepository repository = new MemoryRepository();
@@ -599,6 +656,24 @@ class ManifestPreparationTest {
 
     private static <T> CompletableFuture<Optional<T>> completed(T value) {
       return CompletableFuture.completedFuture(Optional.ofNullable(value));
+    }
+  }
+
+  private static final class SingleResultRepository implements ResultRepository {
+    private ResultPage page;
+    private ResultDirectory directory;
+
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createPage(
+        ResultPage value, RequestScope scope) { throw new UnsupportedOperationException(); }
+    @Override public CompletableFuture<SystemRecordStore.CreateResult> createDirectory(
+        ResultDirectory value, RequestScope scope) { throw new UnsupportedOperationException(); }
+    @Override public CompletableFuture<Optional<ResultPage>> readPage(
+        ResultIdentity identity, int index, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.ofNullable(page));
+    }
+    @Override public CompletableFuture<Optional<ResultDirectory>> readDirectory(
+        ResultIdentity identity, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.ofNullable(directory));
     }
   }
 }

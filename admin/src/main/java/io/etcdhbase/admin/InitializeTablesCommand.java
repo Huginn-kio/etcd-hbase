@@ -4,7 +4,7 @@ import static io.etcdhbase.admin.HBaseOperationAwaiter.OPERATION_TIMEOUT;
 import static io.etcdhbase.admin.HBaseOperationAwaiter.await;
 import static io.etcdhbase.spi.identity.BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID;
 
-import io.etcdhbase.admin.config.HBaseQuorum;
+import io.etcdhbase.admin.config.DevelopmentHBaseConfiguration;
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
 import io.etcdhbase.admin.config.InitializationConfiguration.TableSchemaCandidate;
 import io.etcdhbase.admin.config.InitializationConfigurationLoader;
@@ -18,7 +18,6 @@ import java.io.PrintStream;
 import java.nio.file.Files;
 import java.util.List;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.TableName;
 
 /** Offline plan and explicitly confirmed table provisioning; not etcd runtime bootstrap. */
@@ -135,19 +134,7 @@ public final class InitializeTablesCommand {
   }
 
   static Configuration localDevelopmentConfiguration(TableGroupInitializationPlan plan) {
-    var configuration = HBaseConfiguration.create();
-    String quorum = HBaseQuorum.connectionString(plan.hbaseProfile());
-    configuration.set("hbase.zookeeper.quorum", quorum);
-    configuration.set("hbase.client.zookeeper.quorum", quorum);
-    configuration.setInt("hbase.zookeeper.property.clientPort", plan.hbaseProfile().clientPort());
-    configuration.setInt(
-        "hbase.client.zookeeper.property.clientPort", plan.hbaseProfile().clientPort());
-    configuration.set(
-        "hbase.client.registry.impl", "org.apache.hadoop.hbase.client.ZKConnectionRegistry");
-    configuration.set("hbase.security.authentication", "simple");
-    configuration.set("hadoop.security.authentication", "simple");
-    configuration.setBoolean("hbase.security.authorization", false);
-    return configuration;
+    return DevelopmentHBaseConfiguration.create(plan.hbaseProfile());
   }
 
   private static void printPlan(TableGroupInitializationPlan plan, PrintStream output) {
@@ -169,7 +156,7 @@ public final class InitializeTablesCommand {
     output.println("backend_contacted: false");
   }
 
-  private static void printTable(String namespace, TableSchemaCandidate table, PrintStream output) {
+  static void printTable(String namespace, TableSchemaCandidate table, PrintStream output) {
     output.println("table: " + namespace + ":" + table.tableName());
     output.println("  record_categories: " + table.recordCategories());
     for (var family : table.columnFamilies()) {

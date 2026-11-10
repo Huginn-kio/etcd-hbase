@@ -13,6 +13,7 @@ import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ReadProjection;
+import io.etcdhbase.core.storage.ScanCleanupFailure;
 import io.etcdhbase.core.storage.ScanRequest;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.time.Duration;
@@ -61,6 +62,93 @@ class DirectRecordReaderTest {
         assertEquals(0, budget.snapshot().allocatedBytes());
       }
       assertEquals(2, store.gets.size(), "neither caching nor request coalescing is enabled");
+    }
+  }
+
+  @Test
+  void preparationKeepsTheReadOpenUntilItsExplicitFinalValidation() throws Exception {
+    var record = ExistsExecutorTest.live(1, 16);
+    var store = new FrozenRecordStore(List.of(List.of(record)));
+    var budget = SortedMergeCursorTest.budget();
+    try (var scope = RequestScope.withoutDeadline();
+        var account = budget.admit("public", scope, SortedMergeCursorTest.memory(1, 1024))) {
+      var reader = new DirectRecordReader(store, account, 1024);
+      try (var result = reader.readForPreparation(record.key(), 7, ReadProjection.FULL).join()) {
+        assertTrue(result.record().orElseThrow().hasValue());
+        assertEquals(0, store.finishReadCalls, "preparation must keep the pin active");
+        store.finishReadFuture = CompletableFuture.failedFuture(new IllegalStateException("pin revoked"));
+        assertThrows(CompletionException.class, () -> store.finishRead().join());
+        assertEquals(1, store.finishReadCalls);
+      }
+    }
+  }
+
+  @Test
+  void scannerBackedPointReadKeepsItsScannerBudgetUntilTheProducerStops() throws Exception {
+    var record = ExistsExecutorTest.live(1, 16);
+    var store = new FrozenRecordStore(List.of(List.of(record)));
+    store.pointUsesScanner = true;
+    store.pending = new CompletableFuture<>();
+    var limits = new BudgetManager.Limits(2, 0, 2, 1, 1, 0, 8192);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(0, 1, 1024, 1024);
+    try (var firstScope = RequestScope.withoutDeadline();
+         var firstAccount = budget.admit("public", firstScope, reservation);
+         var secondScope = RequestScope.withoutDeadline();
+         var secondAccount = budget.admit("public", secondScope, reservation)) {
+      var first = new DirectRecordReader(store, firstAccount, 1024)
+          .readForPreparation(record.key(), 7, ReadProjection.FULL);
+      assertEquals(1, budget.snapshot().scanners());
+      var secondReader = new DirectRecordReader(store, secondAccount, 1024);
+      var rejected = assertThrows(CompletionException.class,
+          () -> secondReader.readForPreparation(record.key(), 7, ReadProjection.FULL).join());
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT,
+          assertInstanceOf(BackendFailure.class, rejected.getCause()).category());
+      firstScope.cancel();
+      assertEquals(1, budget.snapshot().scanners(), "cancelling a waiter cannot release its scanner");
+      store.pending.complete(Optional.of(record));
+      assertThrows(CompletionException.class, first::join);
+      assertEquals(0, budget.snapshot().scanners());
+      try (var accepted = secondReader.readForPreparation(record.key(), 7, ReadProjection.FULL).join()) {
+        assertTrue(accepted.record().isPresent());
+      }
+    }
+  }
+
+  @Test
+  void scannerBackedPointReadRetiresCapacityWhenCleanupIsUnknown() throws Exception {
+    var store = new FrozenRecordStore(List.of(List.of()));
+    store.pointUsesScanner = true;
+    var failure = new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    failure.addSuppressed(new ScanCleanupFailure(new IllegalStateException("scanner close is unknown")));
+    store.pending = CompletableFuture.failedFuture(failure);
+    var limits = new BudgetManager.Limits(2, 0, 2, 1, 1, 0, 8192);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var reservation = new BudgetManager.Reservation(0, 1, 1024, 1024);
+    try (var scope = RequestScope.withoutDeadline();
+         var account = budget.admit("public", scope, reservation)) {
+      var reader = new DirectRecordReader(store, account, 1024);
+      assertThrows(CompletionException.class,
+          () -> reader.readForPreparation(ByteKey.empty(), 1, ReadProjection.METADATA).join());
+      assertEquals(1, budget.snapshot().retiredScanners());
+      assertEquals(1, budget.snapshot().scanners());
+    }
+  }
+
+  @Test
+  void scannerBackedPointReadReleasesCapacityAfterOperationFailureWithConfirmedCleanup() throws Exception {
+    var store = new FrozenRecordStore(List.of(List.of()));
+    store.pointUsesScanner = true;
+    store.pending = CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    var limits = new BudgetManager.Limits(2, 0, 2, 1, 1, 0, 8192);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    try (var scope = RequestScope.withoutDeadline();
+         var account = budget.admit("public", scope, new BudgetManager.Reservation(0, 1, 1024, 1024))) {
+      var reader = new DirectRecordReader(store, account, 1024);
+      assertThrows(CompletionException.class,
+          () -> reader.readForPreparation(ByteKey.empty(), 1, ReadProjection.METADATA).join());
+      assertEquals(0, budget.snapshot().retiredScanners());
+      assertEquals(0, budget.snapshot().scanners());
     }
   }
 

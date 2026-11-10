@@ -1,0 +1,24 @@
+{
+  "schema": "etcd-hbase-m3-case-registry/v1",
+  "protocol": "etcd-v3.5.23",
+  "tasks": [
+    {"id": "J30", "case_ids": ["C01", "C07"]},
+    {"id": "J31", "case_ids": ["C11", "C12"]},
+    {"id": "J32", "case_ids": ["C13"]},
+    {"id": "J33", "case_ids": ["C09", "C10"]},
+    {"id": "J34", "case_ids": ["C02", "C04", "C05", "C06"]},
+    {"id": "J35", "case_ids": ["C03"]},
+    {"id": "J36", "case_ids": ["C23"]},
+    {"id": "J28.2", "case_ids": ["C02", "C03", "C07", "C09", "C10", "C11", "C12", "C13"]}
+  ],
+  "pending_native_probes": [
+    {
+      "id": "J34-filtered-ordinary-range-count",
+      "task": "J34",
+      "case_id": "C06",
+      "shapes": ["exact-key", "range-without-limit"],
+      "filters": ["min_mod_revision", "max_mod_revision", "min_create_revision", "max_create_revision"],
+      "purpose": "compare native Count and Kvs after revision filtering; resolve any conflict with the approved Count policy before J34 completion"
+    }
+  ]
+}

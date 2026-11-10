@@ -12,6 +12,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
+import java.util.function.Supplier;
 
 /** Sequential, bounded writer for private candidates, ordered events, and Merkle directories. */
 public final class ManifestPreparation {
@@ -86,7 +87,29 @@ public final class ManifestPreparation {
     if (ownerEpoch <= 0 || baseSequence < 0 || baseRevision <= 0) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid manifest base"));
     }
-    return new Writer(transactionId, ownerEpoch, baseSequence, baseRevision, candidates, events, scope).next();
+    return new Writer(transactionId, ownerEpoch, baseSequence, baseRevision, candidates, events,
+        Optional.empty(), null, () -> CompletableFuture.completedFuture(null), scope).next();
+  }
+
+  /** Prepares a business manifest only after its result belongs to this invocation. */
+  public CompletableFuture<ManifestRoot> prepareWithResult(InvocationBinding invocation,
+      Iterator<PreparedCandidate> candidates, Iterator<PreparedEvent> events,
+      ResultReference result, ResultCatalog results,
+      Supplier<CompletableFuture<Void>> beforeSeal, RequestScope scope) {
+    Objects.requireNonNull(invocation, "invocation");
+    Objects.requireNonNull(candidates, "candidates");
+    Objects.requireNonNull(events, "events");
+    Objects.requireNonNull(result, "result");
+    Objects.requireNonNull(results, "results");
+    Objects.requireNonNull(beforeSeal, "beforeSeal");
+    if (invocation.state() != InvocationBinding.State.PREPARING
+        || !result.identity().matches(invocation)) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException(
+          "result does not belong to the preparing invocation"));
+    }
+    return new Writer(invocation.transactionId(), invocation.preparedOwnerEpoch(),
+        invocation.baseSequence(), invocation.baseRevision(), candidates, events,
+        Optional.of(result), results, beforeSeal, scope).next();
   }
 
   private final class Writer {
@@ -97,6 +120,9 @@ public final class ManifestPreparation {
     private final Iterator<PreparedCandidate> input;
     private final Iterator<PreparedEvent> eventInput;
     private final RequestScope scope;
+    private final Optional<ResultReference> result;
+    private final ResultCatalog results;
+    private final Supplier<CompletableFuture<Void>> beforeSeal;
     private final List<ManifestCandidateReference> leaf = new ArrayList<>(ManifestPage.MAX_ENTRIES);
     private final List<List<ManifestChildReference>> levels = new ArrayList<>(ManifestDirectoryPage.MAX_DEPTH + 1);
     private long count;
@@ -109,13 +135,18 @@ public final class ManifestPreparation {
     private ByteKey previousKey;
 
     private Writer(TransactionId transactionId, long ownerEpoch, long baseSequence, long baseRevision,
-        Iterator<PreparedCandidate> input, Iterator<PreparedEvent> eventInput, RequestScope scope) {
+        Iterator<PreparedCandidate> input, Iterator<PreparedEvent> eventInput,
+        Optional<ResultReference> result, ResultCatalog results,
+        Supplier<CompletableFuture<Void>> beforeSeal, RequestScope scope) {
       this.transactionId = Objects.requireNonNull(transactionId, "transactionId");
       this.ownerEpoch = ownerEpoch;
       this.baseSequence = baseSequence;
       this.baseRevision = baseRevision;
       this.input = input;
       this.eventInput = eventInput;
+      this.result = result;
+      this.results = results;
+      this.beforeSeal = beforeSeal;
       this.scope = Objects.requireNonNull(scope, "scope");
       for (int level = 0; level <= ManifestDirectoryPage.MAX_DEPTH; level++) {
         levels.add(new ArrayList<>(ManifestDirectoryPage.MAX_CHILDREN));
@@ -200,14 +231,37 @@ public final class ManifestPreparation {
       return finishLevel(0).thenCompose(candidateRoot ->
           new EventWriter(transactionId, ownerEpoch, baseSequence, baseRevision, eventInput, scope)
               .write().thenCompose(events -> {
-        ManifestRoot root = ManifestRoot.create(transactionId, ownerEpoch, baseSequence, baseRevision,
-            count, valueBytes, Optional.ofNullable(candidateRoot), events.count(), events.bytes(),
-            Optional.ofNullable(events.root()));
-        return repository.seal(root, scope).thenApply(result -> {
-          requireCreatedOrIdentical(result, "sealed manifest root");
+        ManifestRoot root = result.isPresent()
+            ? ManifestRoot.createWithResult(transactionId, ownerEpoch, baseSequence, baseRevision,
+                count, valueBytes, Optional.ofNullable(candidateRoot), events.count(), events.bytes(),
+                Optional.ofNullable(events.root()), result.orElseThrow())
+            : ManifestRoot.create(transactionId, ownerEpoch, baseSequence, baseRevision,
+                count, valueBytes, Optional.ofNullable(candidateRoot), events.count(), events.bytes(),
+                Optional.ofNullable(events.root()));
+        CompletableFuture<?> verified = result.isPresent()
+            ? results.verify(result.orElseThrow(), scope) : CompletableFuture.completedFuture(null);
+        return verified.thenCompose(ignored -> validateBeforeSeal())
+            .thenCompose(ignored -> repository.seal(root, scope)).thenApply(outcome -> {
+          requireCreatedOrIdentical(outcome, "sealed manifest root");
           return root;
         });
       }));
+    }
+
+    private CompletableFuture<Void> validateBeforeSeal() {
+      var started = new java.util.concurrent.atomic.AtomicReference<CompletableFuture<Void>>();
+      if (!scope.startIfOpen(() -> started.set(
+          Objects.requireNonNull(beforeSeal.get(), "pre-seal validation future")))) {
+        return failed(new BackendFailure(scope.isDeadlineExceeded()
+            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
+      }
+      return started.get().thenCompose(ignored -> {
+        if (scope.isClosed() || scope.isDeadlineExceeded()) {
+          return failed(new BackendFailure(scope.isDeadlineExceeded()
+              ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
+        }
+        return CompletableFuture.completedFuture(null);
+      });
     }
 
     private CompletableFuture<ManifestChildReference> finishLevel(int level) {

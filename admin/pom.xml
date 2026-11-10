@@ -74,6 +74,30 @@
   </build>
   <profiles>
     <profile>
+      <id>m3-init-local</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <failIfNoTests>true</failIfNoTests>
+              <includes combine.self="override">
+                <include>**/M3InitializeTablesIT.java</include>
+              </includes>
+              <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
+            </configuration>
+            <executions>
+              <execution>
+                <id>m3-real-initialization</id>
+                <goals><goal>integration-test</goal><goal>verify</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
       <id>j05-hbase-local</id>
       <build>
         <plugins>

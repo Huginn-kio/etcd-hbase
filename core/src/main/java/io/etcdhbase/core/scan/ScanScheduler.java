@@ -287,7 +287,7 @@ public final class ScanScheduler implements AutoCloseable {
         if (failure == null) failure = cleanupMarker;
         else failure.addSuppressed(cleanupMarker);
       }
-      boolean retire = hasCleanupFailure(failure);
+      boolean retire = ScanCleanupFailure.isPresent(failure);
       if (retire) synchronized (ScanScheduler.this) { cleanupFailure = failure; }
       if (owned != null) owned.finishIo(retire);
       if (failure == null && stopped) failure = cancelled();
@@ -392,16 +392,6 @@ public final class ScanScheduler implements AutoCloseable {
       if (retire) { work.retire(); io.retire(); }
       else { work.close(); io.close(); }
     }
-  }
-
-  private static boolean hasCleanupFailure(Throwable failure) {
-    for (int depth = 0; failure != null && depth < 16; depth++, failure = failure.getCause()) {
-      if (failure instanceof ScanCleanupFailure) return true;
-      for (Throwable suppressed : failure.getSuppressed()) {
-        if (suppressed instanceof ScanCleanupFailure) return true;
-      }
-    }
-    return false;
   }
 
   private static BackendFailure resourceLimit() { return new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT); }

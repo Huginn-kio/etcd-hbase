@@ -84,6 +84,24 @@ class EvidenceTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 go_report(path)
 
+    def test_go_requires_m3_driver_without_weakening_package_or_skip_checks(self):
+        self.assertIn("cmd/m3driver", GO_PACKAGES)
+        path = self.root / "go.jsonl"
+        events = []
+        for package in sorted(GO_PACKAGES - {"cmd/m3driver"}):
+            events.extend([{"Action": "pass", "Package": GO_MODULE + package, "Test": "TestContract"},
+                           {"Action": "pass", "Package": GO_MODULE + package}])
+        path.write_text("".join(json.dumps(item) + "\n" for item in events))
+        with self.assertRaises(ValueError):
+            go_report(path)
+        events.extend([{"Action": "pass", "Package": GO_MODULE + "cmd/m3driver", "Test": "TestContract"},
+                       {"Action": "pass", "Package": GO_MODULE + "cmd/m3driver"},
+                       {"Action": "pass", "Package": GO_MODULE + "cmd/unexpected", "Test": "TestContract"},
+                       {"Action": "pass", "Package": GO_MODULE + "cmd/unexpected"}])
+        path.write_text("".join(json.dumps(item) + "\n" for item in events))
+        with self.assertRaises(ValueError):
+            go_report(path)
+
 
     def test_source_changes_and_untracked_code_invalidate_evidence(self):
         def git(*arguments):

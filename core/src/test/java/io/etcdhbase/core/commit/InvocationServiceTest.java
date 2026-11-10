@@ -109,6 +109,31 @@ class InvocationServiceTest {
         repository.bindings.get(INVOCATION).state());
   }
 
+  @Test
+  void nullCasOutcomeIsResolvedFromDurableProgress() {
+    var repository = new InMemoryInvocationRepository();
+    var service = new InvocationService(repository);
+    var preparing = service.bindOrJoin(binding(1, 0, transaction(8)), RequestScope.withoutDeadline()).join();
+    repository.nullFirstCasReply.set(true);
+    var sealed = preparing.seal(ByteKey.copyOf(new byte[] {11}));
+    assertEquals(InvocationBinding.State.SEALED,
+        service.transition(preparing, sealed, RequestScope.withoutDeadline()).join().state());
+  }
+
+  @Test
+  void definitePermissionErrorIsNotHiddenByAlreadyMatchingProgress() {
+    var repository = new InMemoryInvocationRepository();
+    var service = new InvocationService(repository);
+    var preparing = binding(1, 0, transaction(9));
+    var sealed = preparing.seal(ByteKey.copyOf(new byte[] {11}));
+    repository.bindings.put(INVOCATION, sealed);
+    repository.failCasPermission.set(true);
+    var failure = assertThrows(CompletionException.class,
+        () -> service.transition(preparing, sealed, RequestScope.withoutDeadline()).join());
+    assertEquals(BackendFailure.Category.PERMISSION, ((BackendFailure) failure.getCause()).category());
+    assertEquals(0, repository.readCount.get());
+  }
+
   private static InvocationBinding binding(long epoch, long base, TransactionId transaction) {
     return InvocationBinding.begin(INVOCATION, REQUEST_DIGEST, AUTH_DIGEST,
         transaction, epoch, base, 1);
@@ -123,6 +148,8 @@ class InvocationServiceTest {
     private final CyclicBarrier createBarrier;
     private final AtomicBoolean loseFirstCreateReply = new AtomicBoolean();
     private final AtomicBoolean loseFirstCasReply = new AtomicBoolean();
+    private final AtomicBoolean nullFirstCasReply = new AtomicBoolean();
+    private final AtomicBoolean failCasPermission = new AtomicBoolean();
     private final AtomicInteger createCount = new AtomicInteger();
     private final AtomicInteger readCount = new AtomicInteger();
 
@@ -164,7 +191,13 @@ class InvocationServiceTest {
     @Override
     public CompletableFuture<Boolean> compareAndSet(
         InvocationBinding expected, InvocationBinding replacement, RequestScope scope) {
+      if (failCasPermission.get()) {
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION));
+      }
       boolean replaced = bindings.replace(expected.invocationId(), expected, replacement);
+      if (replaced && nullFirstCasReply.compareAndSet(true, false)) {
+        return CompletableFuture.completedFuture(null);
+      }
       if (replaced && loseFirstCasReply.compareAndSet(true, false)) {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
       }

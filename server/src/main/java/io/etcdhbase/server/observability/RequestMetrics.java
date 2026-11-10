@@ -6,6 +6,7 @@ import static io.etcdhbase.grpc.RequestCompletionRecorder.Outcome;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.grpc.RequestCompletionRecorder;
 import java.time.Duration;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -24,6 +25,8 @@ public final class RequestMetrics implements RequestCompletionRecorder {
       Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
   static final long WARNING_INTERVAL_NANOS = Duration.ofSeconds(30).toNanos();
   private final Map<Series, Counter> counters;
+  private final Map<PutStage, StageCounter> putStages;
+  private final LongAdder putOutputBytes = new LongAdder();
   private final LongSupplier nanoTime;
   private final Consumer<FailureSummary> warnings;
   private final AtomicLong lastWarningNanos;
@@ -42,6 +45,35 @@ public final class RequestMetrics implements RequestCompletionRecorder {
         initialized.put(new Series(methodClass, outcome), new Counter());
     }
     counters = Map.copyOf(initialized);
+    Map<PutStage, StageCounter> stages = new EnumMap<>(PutStage.class);
+    for (PutStage stage : PutStage.values()) stages.put(stage, new StageCounter());
+    putStages = Map.copyOf(stages);
+  }
+
+  /** Bounded stages that J30 actually observes; publication includes M2 finalization. */
+  public enum PutStage { QUEUE, PREPARE, PUBLISH_AND_FINALIZE, RESULT_RESOLUTION, RESPONSE }
+
+  public void recordPutStage(PutStage stage, long elapsedNanos) {
+    Objects.requireNonNull(stage, "stage");
+    if (elapsedNanos < 0) throw new IllegalArgumentException("elapsedNanos must not be negative");
+    var counter = putStages.get(stage);
+    counter.count.increment();
+    counter.totalNanos.add(elapsedNanos);
+  }
+
+  /** Counts protobuf response bytes accepted by onNext, excluding transport framing. */
+  public void recordPutOutputBytes(long bytes) {
+    if (bytes < 0) throw new IllegalArgumentException("output bytes must not be negative");
+    putOutputBytes.add(bytes);
+  }
+
+  public long putOutputBytes() { return putOutputBytes.sum(); }
+
+  public Map<PutStage, StageSnapshot> putStages() {
+    Map<PutStage, StageSnapshot> snapshot = new EnumMap<>(PutStage.class);
+    putStages.forEach((stage, counter) -> snapshot.put(stage,
+        new StageSnapshot(counter.count.sum(), counter.totalNanos.sum())));
+    return Map.copyOf(snapshot);
   }
 
   @Override
@@ -128,6 +160,8 @@ public final class RequestMetrics implements RequestCompletionRecorder {
 
   public record Snapshot(long completed, long totalElapsedNanos, long cleanupFailures) {}
 
+  public record StageSnapshot(long count, long totalNanos) {}
+
   record FailureSummary(
       MethodClass methodClass,
       Outcome outcome,
@@ -142,5 +176,10 @@ public final class RequestMetrics implements RequestCompletionRecorder {
     private final LongAdder cleanupFailures = new LongAdder();
     private final LongAdder completed = new LongAdder();
     private final LongAdder totalElapsedNanos = new LongAdder();
+  }
+
+  private static final class StageCounter {
+    private final LongAdder count = new LongAdder();
+    private final LongAdder totalNanos = new LongAdder();
   }
 }

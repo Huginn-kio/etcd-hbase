@@ -83,6 +83,42 @@ class CommitFinalizationServiceTest {
     }
   }
 
+  @Test
+  void businessResultMustBeSupportedAndDurableBeforeFinalization() throws Exception {
+    for (boolean equipped : List.of(false, true)) {
+      Fixture fixture = new Fixture(SystemRecordStore.CreateResult.ALREADY_PRESENT,
+          true, false, true, false, equipped);
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+        var pending = new CommitOutcomeResolver.Resolution(
+            CommitOutcomeResolver.State.SELECTED_PENDING, Optional.of(fixture.decision), Optional.empty());
+        assertThrows(ExecutionException.class, () -> fixture.service.finish(fixture.invocation, pending, scope).get());
+        assertEquals(0, fixture.materializationCalls.get());
+        assertEquals(0, fixture.control.state.finalizedSequence());
+      }
+    }
+    Fixture complete = new Fixture(SystemRecordStore.CreateResult.ALREADY_PRESENT,
+        true, false, true, true, true);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pending = new CommitOutcomeResolver.Resolution(
+          CommitOutcomeResolver.State.SELECTED_PENDING, Optional.of(complete.decision), Optional.empty());
+      assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED,
+          complete.service.finish(complete.invocation, pending, scope).get().state());
+      assertEquals(1, complete.materializationCalls.get());
+    }
+  }
+
+  @Test
+  void upgradedFinalizerStillRecoversLegacyRoots() throws Exception {
+    Fixture fixture = new Fixture(SystemRecordStore.CreateResult.ALREADY_PRESENT,
+        false, false, false, false, true);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pending = new CommitOutcomeResolver.Resolution(
+          CommitOutcomeResolver.State.SELECTED_PENDING, Optional.of(fixture.decision), Optional.empty());
+      assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED,
+          fixture.service.finish(fixture.invocation, pending, scope).get().state());
+    }
+  }
+
   private static final class Fixture {
     private final TransactionId transactionId = TransactionId.create();
     private final InvocationId invocationId = InvocationId.create();
@@ -101,6 +137,17 @@ class CommitFinalizationServiceTest {
 
     private Fixture(SystemRecordStore.CreateResult archiveResult,
         boolean withCandidate, boolean failMaterialization) {
+      this(archiveResult, withCandidate, failMaterialization, false, false, false);
+    }
+
+    private Fixture(SystemRecordStore.CreateResult archiveResult, boolean withCandidate,
+        boolean failMaterialization, boolean withResult, boolean resultAvailable, boolean equipped) {
+      InvocationBinding preparing = InvocationBinding.begin(invocationId,
+          repeatedDigest(), repeatedDigest(), transactionId, 1, 0, 1);
+      ResultIdentity resultIdentity = ResultIdentity.from(preparing);
+      ResultPage resultPage = new ResultPage(resultIdentity, 0, new byte[] {1});
+      ResultDirectory resultDirectory = ResultDirectory.create(resultIdentity,
+          List.of(ResultPageReference.from(resultPage)));
       if (withCandidate) {
         byte[] value = {7};
         candidate = new PreparedCandidate(transactionId, 1, 0, 1,
@@ -108,17 +155,20 @@ class CommitFinalizationServiceTest {
                 new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length), value));
         ManifestPage page = ManifestPage.create(transactionId, 0,
             List.of(ManifestCandidateReference.from(candidate, 0)));
-        root = ManifestRoot.create(transactionId, 1, 0, 1, 1, value.length,
-            Optional.of(page.reference()));
-        invocation = InvocationBinding.begin(invocationId,
-            repeatedDigest(), repeatedDigest(), transactionId, 1, 0, 1).seal(root.systemIdentity());
+        root = withResult
+            ? ManifestRoot.createWithResult(transactionId, 1, 0, 1, 1, value.length,
+                Optional.of(page.reference()), 0, 0, Optional.empty(), resultDirectory.reference())
+            : ManifestRoot.create(transactionId, 1, 0, 1, 1, value.length, Optional.of(page.reference()));
+        invocation = preparing.seal(root.systemIdentity());
         decision = new CommitDecision(transactionId, invocationId,
             1, 1, 2, root.systemIdentity(), root.digest(), true);
       } else {
         candidate = null;
-        root = ManifestRoot.create(transactionId, 1, 0, 1, 0, 0, Optional.empty());
-        invocation = InvocationBinding.begin(invocationId,
-            repeatedDigest(), repeatedDigest(), transactionId, 1, 0, 1).seal(root.systemIdentity());
+        root = withResult
+            ? ManifestRoot.createWithResult(transactionId, 1, 0, 1, 0, 0, Optional.empty(),
+                0, 0, Optional.empty(), resultDirectory.reference())
+            : ManifestRoot.create(transactionId, 1, 0, 1, 0, 0, Optional.empty());
+        invocation = preparing.seal(root.systemIdentity());
         decision = new CommitDecision(transactionId, invocationId,
             1, 1, 1, root.systemIdentity(), root.digest(), false);
       }
@@ -147,8 +197,25 @@ class CommitFinalizationServiceTest {
           return CompletableFuture.completedFuture(null);
         }
       };
-      service = new CommitFinalizationService(control,
-          new CommitOutcomeResolver(control, decisions), decisions, catalog, materialization);
+      ResultRepository resultRepository = new ResultRepository() {
+        @Override public CompletableFuture<SystemRecordStore.CreateResult> createPage(
+            ResultPage page, RequestScope scope) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<SystemRecordStore.CreateResult> createDirectory(
+            ResultDirectory directory, RequestScope scope) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<Optional<ResultPage>> readPage(
+            ResultIdentity identity, int index, RequestScope scope) {
+          return CompletableFuture.completedFuture(resultAvailable ? Optional.of(resultPage) : Optional.empty());
+        }
+        @Override public CompletableFuture<Optional<ResultDirectory>> readDirectory(
+            ResultIdentity identity, RequestScope scope) {
+          return CompletableFuture.completedFuture(resultAvailable ? Optional.of(resultDirectory) : Optional.empty());
+        }
+      };
+      service = equipped
+          ? new CommitFinalizationService(control, new CommitOutcomeResolver(control, decisions),
+              decisions, catalog, materialization, new ResultCatalog(resultRepository))
+          : new CommitFinalizationService(control, new CommitOutcomeResolver(control, decisions),
+              decisions, catalog, materialization);
     }
   }
 

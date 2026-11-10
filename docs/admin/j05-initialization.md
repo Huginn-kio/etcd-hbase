@@ -30,6 +30,8 @@ J05 提供可重复验证的公开盐候选、两种历史布局配置，以及�
 
 当前值、历史和系统类别分别完整声明；系统表覆盖 DECISION、EVENT、LEASE、AUTH、CONTROL、INVOCATION、CANDIDATE、MANIFEST、SNAPSHOT_PIN。M2 的调用绑定、私有候选和封存目录使用 INVOCATION、CANDIDATE、MANIFEST；J23 使用 DECISION 按 commit sequence 保存不可变发布决定；J26 使用 SNAPSHOT_PIN 保存有界跨副本读保护槽与注册下界。示例中的 history 单版本和 kv 多版本数值是原型参数。迟到写、删除重建、TTL/compaction、历史保留与容量对照仍归 J11/J24/J25/J52，尚未据此选择生产布局。
 
+系统表的 `record_categories` 可额外声明 `RESULT`，用于启用 M3 的调用结果和表组身份记录。未声明时旧 M2 访问仍可使用，但这些新记录的访问会被拒绝。给已有表组的配置增加该类别会改变方案指纹；初始化器不会自动修改已有表或迁移数据，已有表的升级和回退需要单独制定并验证方案。
+
 ## 2. 配置与确认边界
 
 初始化配置使用有界、严格的 JSON：最多 64 KiB，拒绝重复键、未知字段、缺失必填属性、null 必填值、浮点到整数或字符串到数字强制转换、数字枚举和尾随内容。内部 DTO 的集合不可变。表组引用、列族版本/TTL、权限集合、盐编码和 split keys 在接触 HBase 前校验。

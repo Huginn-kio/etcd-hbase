@@ -196,6 +196,7 @@ func compareTraces(args []string, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	leftPath := flags.String("left", "", "left complete trace JSONL")
 	rightPath := flags.String("right", "", "right complete trace JSONL")
+	m3Put := flags.Bool("m3-put", false, "apply the M3 Put non-Raft header projection")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -212,7 +213,11 @@ func compareTraces(args []string, stderr io.Writer) error {
 		return fmt.Errorf("open right trace: %w", err)
 	}
 	defer right.Close()
-	if err := compare.CompareTraces(left, right); err != nil {
+	compareTraces := compare.CompareTraces
+	if *m3Put {
+		compareTraces = compare.CompareM3PutTraces
+	}
+	if err := compareTraces(left, right); err != nil {
 		return err
 	}
 	return nil

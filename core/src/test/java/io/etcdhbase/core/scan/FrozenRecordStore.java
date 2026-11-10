@@ -19,6 +19,7 @@ final class FrozenRecordStore implements RecordStore {
   private final List<StoredRecord> records;
   boolean mismatch;
   boolean fatal;
+  boolean pointUsesScanner;
   CompletableFuture<Optional<StoredRecord>> pending;
   int finishReadCalls;
   CompletableFuture<Void> finishReadFuture = CompletableFuture.completedFuture(null);
@@ -46,5 +47,6 @@ final class FrozenRecordStore implements RecordStore {
     if (synchronousFinishReadError != null) throw synchronousFinishReadError;
     return finishReadFuture;
   }
+  @Override public boolean pointReadUsesScanner() { return pointUsesScanner; }
   record Get(ByteKey key, long upper, ReadProjection projection) {}
 }

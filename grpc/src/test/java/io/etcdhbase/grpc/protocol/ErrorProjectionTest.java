@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.kv.KvFailure;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import java.util.concurrent.CancellationException;
@@ -16,6 +17,30 @@ import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.Test;
 
 class ErrorProjectionTest {
+  @Test
+  void projectsKvSemanticsUsingNativeErrorIdentity() {
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.EMPTY_KEY)),
+        Status.Code.INVALID_ARGUMENT, "etcdserver: key is not provided");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.KEY_NOT_FOUND)),
+        Status.Code.INVALID_ARGUMENT, "etcdserver: key not found");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.VALUE_PROVIDED)),
+        Status.Code.INVALID_ARGUMENT, "etcdserver: value is provided");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.LEASE_PROVIDED)),
+        Status.Code.INVALID_ARGUMENT, "etcdserver: lease is provided");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.TOO_MANY_OPS)),
+        Status.Code.INVALID_ARGUMENT, "etcdserver: too many operations in txn request");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.DUPLICATE_KEY)),
+        Status.Code.INVALID_ARGUMENT, "etcdserver: duplicate key given in txn request");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.COMPACTED)),
+        Status.Code.OUT_OF_RANGE, "etcdserver: mvcc: required revision has been compacted");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.FUTURE_REVISION)),
+        Status.Code.OUT_OF_RANGE, "etcdserver: mvcc: required revision is a future revision");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.REQUEST_TOO_LARGE)),
+        Status.Code.INVALID_ARGUMENT, "etcdserver: request is too large");
+    assertStatus(ErrorProjection.project(new KvFailure(KvFailure.Reason.LEASE_UNAVAILABLE)),
+        Status.Code.UNIMPLEMENTED, "etcd-hbase: lease binding is not available");
+  }
+
   @Test
   void keepsAuthenticationFailureDistinctFromPermissionDenied() {
     StatusRuntimeException authentication =

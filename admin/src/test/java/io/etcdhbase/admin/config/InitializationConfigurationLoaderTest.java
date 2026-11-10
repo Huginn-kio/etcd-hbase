@@ -147,6 +147,17 @@ class InitializationConfigurationLoaderTest {
   }
 
   @Test
+  void systemTableCanExplicitlyDeclareResultCapability() throws Exception {
+    ObjectNode tree = exampleTree();
+    var categories = ((ObjectNode) tree.at("/table_groups/0/system_table"))
+        .withArray("record_categories");
+    categories.add("RESULT");
+    assertEquals(10, load(tree).tableGroups().getFirst().systemTable().recordCategories().size());
+    categories.add("RESULT");
+    assertThrows(IllegalArgumentException.class, () -> load(tree));
+  }
+
+  @Test
   void detectsSiblingTableOverlapAcrossEquivalentLoopbackProfiles() throws Exception {
     ObjectNode tree = exampleTree();
     ObjectNode profile = tree.withArray("hbase_profiles").get(0).deepCopy();

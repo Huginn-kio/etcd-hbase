@@ -1,0 +1,32 @@
+schema_version: 1
+id: m3-put-v1
+protocol: etcd-v3.5.23
+steps:
+  - case_id: C01
+    id: native-baseline
+  - case_id: C07
+    id: J30-update
+  - case_id: C07
+    id: J30-same-value
+  - case_id: C07
+    id: J30-ignore-value
+  - case_id: C07
+    id: J30-ignore-lease
+  - case_id: C07
+    id: J30-ignore-both
+  - case_id: C07
+    id: J30-client-ignore-value
+  - case_id: C07
+    id: J30-client-ignore-lease
+  - case_id: C01
+    id: J30-long-key
+  - case_id: C01
+    id: J30-empty-key
+  - case_id: C07
+    id: J30-value-provided
+  - case_id: C07
+    id: J30-lease-provided
+  - case_id: C07
+    id: J30-missing-ignore
+  - case_id: C07
+    id: J30-request-too-large

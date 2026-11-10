@@ -3,25 +3,27 @@ package scenario
 import (
 	"context"
 	"fmt"
-	"github.com/Reidddddd/etcd-hbase/testkit/go/internal/trace"
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc/status"
 	"io"
 	"reflect"
 	"strconv"
 	"time"
+
+	"github.com/Reidddddd/etcd-hbase/testkit/go/internal/trace"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc/status"
 )
 
 type runner struct {
-	client   *clientv3.Client
-	writer   io.Writer
-	ordinals map[string]uint64
+	client        *clientv3.Client
+	writer        io.Writer
+	ordinals      map[string]uint64
+	evidenceScope string
 }
 
 func (runner *runner) call(ctx context.Context, caseID, method string, request protoMessage, operation func(context.Context) (protoMessage, error)) (protoMessage, error) {
 	response, err := runner.callWithError(ctx, caseID, method, request, operation)
 	if err != nil {
-		return nil, fmt.Errorf("native %s failed with grpc_code=%s", method, status.Code(err))
+		return nil, fmt.Errorf("scenario %s failed with grpc_code=%s", method, status.Code(err))
 	}
 	return response, nil
 }
@@ -54,7 +56,7 @@ func (runner *runner) record(caseID, method string, request, response protoMessa
 	record := trace.Record{
 		Schema: trace.SchemaVersion, CaseID: caseID, Ordinal: runner.ordinals[caseID], Method: method,
 		Request: requestSnapshot, Response: responseSnapshot, Error: trace.ClassifyError(callErr),
-		StreamTerminal: terminal, EvidenceScope: "native-etcd", ElapsedNS: strconv.FormatInt(elapsed.Nanoseconds(), 10),
+		StreamTerminal: terminal, EvidenceScope: runner.evidenceScope, ElapsedNS: strconv.FormatInt(elapsed.Nanoseconds(), 10),
 	}
 	if err := trace.WriteJSONL(runner.writer, record); err != nil {
 		return fmt.Errorf("write %s trace: %w", method, err)

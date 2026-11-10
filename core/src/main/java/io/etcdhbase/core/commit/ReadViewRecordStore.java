@@ -69,6 +69,11 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
   }
 
   @Override
+  public boolean pointReadUsesScanner() {
+    return physical.pointReadUsesScanner();
+  }
+
+  @Override
   public CompletableFuture<Optional<StoredRecord>> get(ByteKey key, long revisionUpperBound,
       ReadProjection projection, BudgetManager.Account account) {
     Objects.requireNonNull(key, "key");

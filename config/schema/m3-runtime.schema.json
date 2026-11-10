@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "etcd-hbase M3 local runtime activation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "member_id", "owner_lease_ms", "heartbeat_ms", "startup_timeout_ms",
+    "shutdown_timeout_ms", "memory_bytes", "max_etcd_request_bytes",
+    "pin_shards", "pin_slots_per_shard", "pin_lease_ms"
+  ],
+  "properties": {
+    "member_id": {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
+    "owner_lease_ms": {"type": "integer", "minimum": 1000, "maximum": 600000},
+    "heartbeat_ms": {"type": "integer", "minimum": 100, "maximum": 200000},
+    "startup_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 600000},
+    "shutdown_timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 600000},
+    "memory_bytes": {"type": "integer", "minimum": 268435456, "maximum": 1099511627776},
+    "max_etcd_request_bytes": {"type": "integer", "minimum": 1, "maximum": 4194304},
+    "pin_shards": {"type": "integer", "minimum": 1, "maximum": 256},
+    "pin_slots_per_shard": {"type": "integer", "minimum": 1, "maximum": 512},
+    "pin_lease_ms": {"type": "integer", "minimum": 10, "maximum": 300000}
+  }
+}

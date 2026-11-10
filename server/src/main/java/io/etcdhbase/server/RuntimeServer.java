@@ -1,23 +1,63 @@
 package io.etcdhbase.server;
 
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
+import io.etcdhbase.server.config.M3RuntimeConfiguration;
+import io.etcdhbase.server.config.M3RuntimeConfigurationLoader;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfigurationLoader;
 import io.etcdhbase.server.config.RuntimeConfigurationValidator;
+import io.etcdhbase.server.observability.RequestMetrics;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Owns all configured listeners and rolls back earlier binds when startup partially fails. */
 public final class RuntimeServer implements AutoCloseable {
   private final List<Bootstrap> listeners;
+  private final M3RuntimeGroups groups;
+  private final int shutdownTimeoutMs;
   private final AtomicBoolean closed = new AtomicBoolean();
 
   private RuntimeServer(List<Bootstrap> listeners) {
+    this(listeners, null, 0);
+  }
+
+  private RuntimeServer(List<Bootstrap> listeners, M3RuntimeGroups groups, int shutdownTimeoutMs) {
     this.listeners = List.copyOf(listeners);
+    this.groups = groups;
+    this.shutdownTimeoutMs = shutdownTimeoutMs;
+  }
+
+  /** Activates the configured local-development groups only after recovery and resource checks. */
+  public static RuntimeServer startM3(RuntimeConfiguration configuration,
+      M3RuntimeConfiguration activation) throws IOException {
+    RuntimeConfigurationValidator.validate(configuration, 1);
+    requireDevelopmentActivation(configuration);
+    var groups = M3RuntimeGroups.open(configuration, activation);
+    List<Bootstrap> opened = new ArrayList<>();
+    try {
+      for (var listener : configuration.listeners()) {
+        opened.add(Bootstrap.startConfigured(listener, configuration.resources(),
+            groups.service(listener.tableGroupId()), groups.metrics(listener.tableGroupId())));
+      }
+      if (!groups.isReady()) throw new IllegalStateException("M3 table group lost readiness during startup");
+      return new RuntimeServer(opened, groups, activation.shutdownTimeoutMs());
+    } catch (IOException | RuntimeException | Error failure) {
+      try { closeAll(opened); }
+      catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+      try { groups.close(); }
+      catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+      try { groups.drained().get(activation.shutdownTimeoutMs(), TimeUnit.MILLISECONDS); }
+      catch (Exception cleanup) {
+        if (cleanup instanceof InterruptedException) Thread.currentThread().interrupt();
+        if (cleanup != failure) failure.addSuppressed(cleanup);
+      }
+      throw failure;
+    }
   }
 
   public static RuntimeServer start(RuntimeConfiguration configuration) throws IOException {
@@ -53,7 +93,7 @@ public final class RuntimeServer implements AutoCloseable {
               .orElseThrow();
       if (backend.authenticationMode() != AuthenticationMode.DEV_NO_AUTH) {
         throw new IllegalArgumentException(
-            "target identity and TLS activation are not configured in this skeleton");
+            "target identity and TLS activation are not configured");
       }
     }
   }
@@ -62,13 +102,37 @@ public final class RuntimeServer implements AutoCloseable {
     return listeners.stream().map(Bootstrap::boundListener).toList();
   }
 
+  /** Listeners for the same table group share one bounded metric set. */
+  public List<RequestMetrics> metrics() {
+    return listeners.stream().map(Bootstrap::metrics).toList();
+  }
+
+  /** Current local activation state; a bound protocol skeleton alone is never data-ready. */
+  public boolean dataReady() { return !closed.get() && groups != null && groups.isReady(); }
+
   public void awaitTermination() throws InterruptedException {
     listeners.getFirst().awaitTermination();
   }
 
   @Override
   public void close() {
-    if (closed.compareAndSet(false, true)) closeAll(listeners);
+    if (!closed.compareAndSet(false, true)) return;
+    Throwable failure = null;
+    try { closeAll(listeners); }
+    catch (RuntimeException | Error cleanup) { failure = cleanup; }
+    if (groups != null) {
+      try {
+        groups.close();
+        groups.drained().get(shutdownTimeoutMs, TimeUnit.MILLISECONDS);
+      } catch (Exception | Error cleanup) {
+        if (cleanup instanceof InterruptedException) Thread.currentThread().interrupt();
+        if (failure == null) failure = cleanup;
+        else if (failure != cleanup) failure.addSuppressed(cleanup);
+      }
+    }
+    if (failure instanceof Error fatal) throw fatal;
+    if (failure instanceof RuntimeException problem) throw problem;
+    if (failure != null) throw new IllegalStateException("runtime cleanup did not complete", failure);
   }
 
   private static void closeAll(List<Bootstrap> opened) {
@@ -86,24 +150,36 @@ public final class RuntimeServer implements AutoCloseable {
   }
 
   static int run(String[] arguments) {
-    if (arguments.length != 2 || !arguments[0].equals("--config")) {
-      System.err.println("usage: runtime-server --config <json-file>");
+    if ((arguments.length != 2 && arguments.length != 4) || !arguments[0].equals("--config")
+        || arguments.length == 4 && !arguments[2].equals("--m3-config")) {
+      System.err.println("usage: runtime-server --config <json-file> [--m3-config <json-file>]");
       return 2;
     }
-    try (var input = Files.newInputStream(Path.of(arguments[1]));
-        RuntimeServer server = start(new RuntimeConfigurationLoader().load(input))) {
-      Thread hook = new Thread(server::close, "runtime-server-shutdown");
-      Runtime.getRuntime().addShutdownHook(hook);
-      try {
-        System.out.println(
-            "listeners=" + server.boundListeners().size() + " data_readiness=UNIMPLEMENTED");
-        server.awaitTermination();
-        return 0;
-      } finally {
+    try (var input = Files.newInputStream(Path.of(arguments[1]))) {
+      var configuration = new RuntimeConfigurationLoader().load(input);
+      RuntimeServer activated;
+      if (arguments.length == 4) {
+        try (var activationInput = Files.newInputStream(Path.of(arguments[3]))) {
+          activated = startM3(configuration, new M3RuntimeConfigurationLoader().load(activationInput));
+        }
+      } else {
+        activated = start(configuration);
+      }
+      try (RuntimeServer server = activated) {
+        Thread hook = new Thread(server::close, "runtime-server-shutdown");
+        Runtime.getRuntime().addShutdownHook(hook);
         try {
-          Runtime.getRuntime().removeShutdownHook(hook);
-        } catch (IllegalStateException shuttingDown) {
-          /* The shutdown hook owns cleanup. */
+          System.out.println(
+              "listeners=" + server.boundListeners().size()
+                  + " data_readiness=" + (server.dataReady() ? "READY" : "UNIMPLEMENTED"));
+          server.awaitTermination();
+          return 0;
+        } finally {
+          try {
+            Runtime.getRuntime().removeShutdownHook(hook);
+          } catch (IllegalStateException shuttingDown) {
+            /* The shutdown hook owns cleanup. */
+          }
         }
       }
     } catch (IllegalArgumentException failure) {

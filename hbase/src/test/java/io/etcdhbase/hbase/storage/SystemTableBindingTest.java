@@ -2,6 +2,7 @@ package io.etcdhbase.hbase.storage;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
@@ -29,6 +30,16 @@ class SystemTableBindingTest {
   void acceptsTheExactDurableSingleVersionSystemTable() {
     BINDING.validate(descriptor(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
         Durability.SYNC_WAL, HConstants.FOREVER, 1));
+  }
+
+  @Test
+  void resultCapabilityIsExplicitAndDoesNotChangeLegacyValidation() {
+    var legacy = descriptor(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES,
+        Durability.SYNC_WAL, HConstants.FOREVER, 1);
+    var withResult = descriptor(TABLE, FAMILY, TABLE_GROUP, SALT_PROFILE, REQUIRED_CATEGORIES + ",RESULT",
+        Durability.SYNC_WAL, HConstants.FOREVER, 1);
+    assertFalse(BINDING.supportsResults(legacy));
+    assertTrue(BINDING.supportsResults(withResult));
   }
 
   @Test
