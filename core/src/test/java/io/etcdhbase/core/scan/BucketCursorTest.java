@@ -39,9 +39,8 @@ class BucketCursorTest {
   void physicalProgressResumesWithoutExposingAnEmptyLogicalPageAndRejectsRepetition() throws Exception {
     var descending = new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
         ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    var budget = progressBudget();
+    var reservation = progressReservation(8192);
     try (var scope = RequestScope.withoutDeadline();
          var account = budget.admit("public", scope, reservation);
          var cursor = new BucketCursor(store, descending, scope, account)) {
@@ -62,9 +61,8 @@ class BucketCursorTest {
   void cancelledPhysicalContinuationKeepsItsMemoryUntilTheProducerFinishes() throws Exception {
     var descending = new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
         ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    var budget = progressBudget();
+    var reservation = progressReservation(8192);
     try (var scope = RequestScope.withoutDeadline(); var account = budget.admit("public", scope, reservation)) {
       var cursor = new BucketCursor(store, descending, scope, account);
       var pending = cursor.fetch();
@@ -83,9 +81,8 @@ class BucketCursorTest {
   void logicalContinuationRemainsChargedUntilTheCancelledProducerFinishes() throws Exception {
     var descending = new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
         ReadProjection.METADATA, 2, 4096, 16, ScanDirection.DESCENDING);
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    var budget = progressBudget();
+    var reservation = progressReservation(8192);
     try (var scope = RequestScope.withoutDeadline(); var account = budget.admit("public", scope, reservation)) {
       var cursor = new BucketCursor(store, descending, scope, account);
       var first = cursor.fetch();
@@ -105,9 +102,8 @@ class BucketCursorTest {
   void logicalContinuationFailsClosedWhenItsHeadBudgetIsExhausted() throws Exception {
     var descending = new ScanRequest(0, KeyRange.all(), Optional.empty(), 7,
         ReadProjection.METADATA, 2, 4096, 16, ScanDirection.DESCENDING);
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(1, 8192, 8192, 65536, 131072);
+    var budget = progressBudget();
+    var reservation = progressReservation(1);
     try (var scope = RequestScope.withoutDeadline();
          var account = budget.admit("public", scope, reservation);
          var cursor = new BucketCursor(store, descending, scope, account)) {
@@ -122,6 +118,15 @@ class BucketCursorTest {
       assertThrows(CompletionException.class, () -> cursor.fetch().join());
       assertEquals(0, budget.snapshot().allocatedBytes());
     }
+  }
+
+  private static BudgetManager progressBudget() {
+    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
+    return new BudgetManager(limits, Map.of("public", limits), limits);
+  }
+
+  private static BudgetManager.Reservation progressReservation(long headBytes) {
+    return new BudgetManager.Reservation(headBytes, 8192, 8192, 65536, 131072);
   }
 
   private static ByteKey key(int value) { return ByteKey.copyOf(new byte[] {(byte) value}); }

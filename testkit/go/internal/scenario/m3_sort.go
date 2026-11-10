@@ -50,6 +50,11 @@ func RunM3Sort(ctx context.Context, client *clientv3.Client, scope, prefix strin
 	return runner.m3SortScenario(ctx, prefix)
 }
 
+type sortFixture struct {
+	group, end, a, zero, last []byte
+	base                      int64
+}
+
 func (runner *runner) m3SortScenario(ctx context.Context, prefix string) error {
 	kv := etcdserverpb.NewKVClient(runner.client.ActiveConnection())
 	group := []byte(prefix + "sort/")
@@ -57,27 +62,54 @@ func (runner *runner) m3SortScenario(ctx context.Context, prefix string) error {
 	a := append(bytes.Clone(group), 'a')
 	zero := append(bytes.Clone(a), 0)
 	last := append(bytes.Clone(a), 0xff)
+	fixture := sortFixture{group: group, end: end, a: a, zero: zero, last: last}
+	base, err := runner.prepareSort(ctx, kv, fixture)
+	if err != nil {
+		return err
+	}
+	fixture.base = base
+	if err := runner.checkSortPages(ctx, kv, fixture); err != nil {
+		return err
+	}
+	if err := runner.checkSortCount(ctx, kv, fixture); err != nil {
+		return err
+	}
+	if err := runner.checkSortClient(ctx, kv, fixture); err != nil {
+		return err
+	}
+	return runner.checkSortTxn(ctx, kv, fixture)
+}
+
+func (runner *runner) prepareSort(ctx context.Context, kv etcdserverpb.KVClient, fixture sortFixture) (int64, error) {
+	a, zero, last := fixture.a, fixture.zero, fixture.last
 	baseline, err := runner.m3Put(ctx, kv, "native-baseline", &etcdserverpb.PutRequest{Key: a, Value: []byte("old")})
 	if err != nil || baseline.Header == nil || baseline.Header.Revision < 1 {
-		return errors.New("sort baseline did not create a key")
+		return 0, errors.New("sort baseline did not create a key")
 	}
 	base := baseline.Header.Revision
 	seed, err := runner.m3Txn(ctx, kv, "J35-seed", &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
 		m3PutOp(zero, []byte("zero"), false), m3PutOp(last, []byte("last"), false),
 	}})
 	if err != nil || seed.Header == nil || seed.Header.Revision != base+1 {
-		return errors.New("sort seed did not commit once")
+		return 0, errors.New("sort seed did not commit once")
 	}
 	updated, err := runner.m3Put(ctx, kv, "J35-update", &etcdserverpb.PutRequest{Key: a, Value: []byte("new")})
 	if err != nil || updated.Header == nil || updated.Header.Revision != base+2 {
-		return errors.New("sort update did not commit once")
+		return 0, errors.New("sort update did not commit once")
 	}
-	for _, test := range []struct {
-		id      string
-		request *etcdserverpb.RangeRequest
-		keys    [][]byte
-		more    bool
-	}{
+	return base, nil
+}
+
+type sortPageCase struct {
+	id      string
+	request *etcdserverpb.RangeRequest
+	keys    [][]byte
+	more    bool
+}
+
+func sortPageCases(fixture sortFixture) []sortPageCase {
+	group, end, a, zero, last, base := fixture.group, fixture.end, fixture.a, fixture.zero, fixture.last, fixture.base
+	return []sortPageCase{
 		{"J35-none", &etcdserverpb.RangeRequest{Key: group, RangeEnd: end}, [][]byte{a, zero, last}, false},
 		{"J35-asc", &etcdserverpb.RangeRequest{Key: group, RangeEnd: end, SortOrder: etcdserverpb.RangeRequest_ASCEND}, [][]byte{a, zero, last}, false},
 		{"J35-desc", &etcdserverpb.RangeRequest{Key: group, RangeEnd: end, SortOrder: etcdserverpb.RangeRequest_DESCEND}, [][]byte{last, zero, a}, false},
@@ -87,17 +119,37 @@ func (runner *runner) m3SortScenario(ctx context.Context, prefix string) error {
 		{"J35-desc-history", &etcdserverpb.RangeRequest{Key: group, RangeEnd: end, Revision: base, SortOrder: etcdserverpb.RangeRequest_DESCEND}, [][]byte{a}, false},
 		{"J35-desc-point", &etcdserverpb.RangeRequest{Key: a, SortOrder: etcdserverpb.RangeRequest_DESCEND}, [][]byte{a}, false},
 		{"J35-desc-keys", &etcdserverpb.RangeRequest{Key: group, RangeEnd: end, SortOrder: etcdserverpb.RangeRequest_DESCEND, KeysOnly: true, Limit: 2}, [][]byte{last, zero}, true},
-	} {
-		response, err := runner.m3Range(ctx, kv, test.id, test.request)
-		if err != nil || response.Header == nil || response.Header.Revision != base+2 || response.More != test.more || len(response.Kvs) != len(test.keys) {
-			return fmt.Errorf("%s returned an incomplete sorted Range", test.id)
-		}
-		for index, key := range test.keys {
-			if !bytes.Equal(response.Kvs[index].Key, key) || test.request.KeysOnly && len(response.Kvs[index].Value) != 0 {
-				return fmt.Errorf("%s returned incorrect order or projection", test.id)
-			}
+	}
+}
+
+func (runner *runner) checkSortPages(ctx context.Context, kv etcdserverpb.KVClient, fixture sortFixture) error {
+	for _, test := range sortPageCases(fixture) {
+		if err := runner.checkSortPage(ctx, kv, fixture.base, test); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+func (runner *runner) checkSortPage(ctx context.Context, kv etcdserverpb.KVClient, base int64, test sortPageCase) error {
+	response, err := runner.m3Range(ctx, kv, test.id, test.request)
+	if err != nil || !completeSortPage(response, base, test) {
+		return fmt.Errorf("%s returned an incomplete sorted Range", test.id)
+	}
+	for index, key := range test.keys {
+		if !bytes.Equal(response.Kvs[index].Key, key) || test.request.KeysOnly && len(response.Kvs[index].Value) != 0 {
+			return fmt.Errorf("%s returned incorrect order or projection", test.id)
+		}
+	}
+	return nil
+}
+
+func completeSortPage(response *etcdserverpb.RangeResponse, base int64, test sortPageCase) bool {
+	return response.Header != nil && response.Header.Revision == base+2 && response.More == test.more && len(response.Kvs) == len(test.keys)
+}
+
+func (runner *runner) checkSortCount(ctx context.Context, kv etcdserverpb.KVClient, fixture sortFixture) error {
+	group, end := fixture.group, fixture.end
 	count, err := runner.m3Range(ctx, kv, "J35-desc-count", &etcdserverpb.RangeRequest{
 		Key: group, RangeEnd: end, SortOrder: etcdserverpb.RangeRequest_DESCEND, Limit: 1, CountOnly: true,
 	})
@@ -108,6 +160,11 @@ func (runner *runner) m3SortScenario(ctx context.Context, prefix string) error {
 	if err != nil || count.Count != wantCount || len(count.Kvs) != 0 || count.More {
 		return errors.New("descending CountOnly did not preserve its approved existence semantics")
 	}
+	return nil
+}
+
+func (runner *runner) checkSortClient(ctx context.Context, kv etcdserverpb.KVClient, fixture sortFixture) error {
+	group, a := fixture.group, fixture.a
 	capture := &capturingRangeClient{KVClient: kv}
 	client := clientv3.NewKVFromKVClient(capture, nil)
 	callContext, cancel := context.WithTimeout(ctx, requestTimeout)
@@ -125,9 +182,18 @@ func (runner *runner) m3SortScenario(ctx context.Context, prefix string) error {
 	if err := runner.record("J35-client-asc", "etcdserverpb.KV/Range", capture.request, wire, callErr, nil, elapsed); err != nil {
 		return err
 	}
-	if callErr != nil || wire == nil || capture.request.SortOrder != etcdserverpb.RangeRequest_NONE || len(wire.Kvs) != 3 || !bytes.Equal(wire.Kvs[0].Key, a) {
+	if callErr != nil || !validClientSort(capture.request, wire, a) {
 		return errors.New("clientv3 ascending sort did not preserve its native request semantics")
 	}
+	return nil
+}
+
+func validClientSort(request *etcdserverpb.RangeRequest, response *etcdserverpb.RangeResponse, first []byte) bool {
+	return response != nil && request.SortOrder == etcdserverpb.RangeRequest_NONE && len(response.Kvs) == 3 && bytes.Equal(response.Kvs[0].Key, first)
+}
+
+func (runner *runner) checkSortTxn(ctx context.Context, kv etcdserverpb.KVClient, fixture sortFixture) error {
+	group, end, last := fixture.group, fixture.end, fixture.last
 	newKey := append(bytes.Clone(group), 'b')
 	transaction, err := runner.m3Txn(ctx, kv, "J35-txn-desc", &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
 		m3PutOp(newKey, []byte("txn"), false),
@@ -139,8 +205,12 @@ func (runner *runner) m3SortScenario(ctx context.Context, prefix string) error {
 		return errors.New("sorted transaction returned an incomplete response")
 	}
 	child := transaction.Responses[1].GetResponseRange()
-	if len(child.Kvs) != 2 || !bytes.Equal(child.Kvs[0].Key, newKey) || !bytes.Equal(child.Kvs[1].Key, last) || !child.More {
+	if !validSortTransactionPage(child, newKey, last) {
 		return errors.New("sorted transaction did not merge its working set")
 	}
 	return nil
+}
+
+func validSortTransactionPage(response *etcdserverpb.RangeResponse, first, second []byte) bool {
+	return len(response.Kvs) == 2 && bytes.Equal(response.Kvs[0].Key, first) && bytes.Equal(response.Kvs[1].Key, second) && response.More
 }

@@ -39,37 +39,49 @@ class PagedWorksetIndexTest {
       assertTrue(records.rows.size() > 2, "the index must be paged");
       assertEquals(42, index.find(1, key("key-0257")).join().orElseThrow().ordinal());
       assertTrue(index.find(0, key("absent")).join().isEmpty());
-      var cursor = index.scan(1, KeyRange.between(key("key-0100"), key("key-0120")));
-      var found = new ArrayList<String>();
-      for (var next = cursor.next().join(); next.isPresent(); next = cursor.next().join()) {
-        found.add(text(next.orElseThrow().key()));
-      }
-      assertEquals(List.of("key-0101", "key-0105", "key-0109", "key-0113", "key-0117"), found);
-      var reverse = index.scan(1, KeyRange.between(key("key-0100"), key("key-0120")), ScanDirection.DESCENDING);
-      var descending = new ArrayList<String>();
-      for (var next = reverse.next().join(); next.isPresent(); next = reverse.next().join()) {
-        descending.add(text(next.orElseThrow().key()));
-      }
-      assertEquals(List.of("key-0117", "key-0113", "key-0109", "key-0105", "key-0101"), descending);
-      int beforeNarrowSeek = records.readCalls;
-      var absent = index.scan(1, KeyRange.between(key("z"), key("zz")), ScanDirection.DESCENDING);
-      assertTrue(absent.next().join().isEmpty());
-      assertTrue(records.readCalls - beforeNarrowSeek <= 16,
-          "a range beyond the indexed keys should prune directory pages; reads=" + (records.readCalls - beforeNarrowSeek));
-      var all = index.scanAll();
-      int count = 0;
-      PagedWorksetIndex.EventRef previous = null;
-      for (var next = all.next().join(); next.isPresent(); next = all.next().join()) {
-        var current = next.orElseThrow();
-        if (previous != null) {
-          assertTrue(previous.bucket() < current.bucket() || previous.bucket() == current.bucket()
-              && previous.key().compareTo(current.key()) < 0);
-        }
-        previous = current;
-        count++;
-      }
-      assertEquals(300, count);
+      assertBucketOrder(index);
+      assertRangePruning(index, records);
+      assertAllBucketOrder(index);
     }
+  }
+
+  private static void assertBucketOrder(PagedWorksetIndex index) {
+    var cursor = index.scan(1, KeyRange.between(key("key-0100"), key("key-0120")));
+    var found = new ArrayList<String>();
+    for (var next = cursor.next().join(); next.isPresent(); next = cursor.next().join()) {
+      found.add(text(next.orElseThrow().key()));
+    }
+    assertEquals(List.of("key-0101", "key-0105", "key-0109", "key-0113", "key-0117"), found);
+    var reverse = index.scan(1, KeyRange.between(key("key-0100"), key("key-0120")), ScanDirection.DESCENDING);
+    var descending = new ArrayList<String>();
+    for (var next = reverse.next().join(); next.isPresent(); next = reverse.next().join()) {
+      descending.add(text(next.orElseThrow().key()));
+    }
+    assertEquals(List.of("key-0117", "key-0113", "key-0109", "key-0105", "key-0101"), descending);
+  }
+
+  private static void assertRangePruning(PagedWorksetIndex index, MemoryRecords records) {
+    int beforeNarrowSeek = records.readCalls;
+    var absent = index.scan(1, KeyRange.between(key("z"), key("zz")), ScanDirection.DESCENDING);
+    assertTrue(absent.next().join().isEmpty());
+    assertTrue(records.readCalls - beforeNarrowSeek <= 16,
+        "a range beyond the indexed keys should prune directory pages; reads=" + (records.readCalls - beforeNarrowSeek));
+  }
+
+  private static void assertAllBucketOrder(PagedWorksetIndex index) {
+    var all = index.scanAll();
+    int count = 0;
+    PagedWorksetIndex.EventRef previous = null;
+    for (var next = all.next().join(); next.isPresent(); next = all.next().join()) {
+      var current = next.orElseThrow();
+      if (previous != null) {
+        assertTrue(previous.bucket() < current.bucket() || previous.bucket() == current.bucket()
+            && previous.key().compareTo(current.key()) < 0);
+      }
+      previous = current;
+      count++;
+    }
+    assertEquals(300, count);
   }
 
   @Test

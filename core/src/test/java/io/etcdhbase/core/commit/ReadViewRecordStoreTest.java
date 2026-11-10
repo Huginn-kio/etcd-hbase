@@ -1907,16 +1907,7 @@ class ReadViewRecordStoreTest {
       var request = new ScanRequest(0, KeyRange.all(), Optional.empty(), 2,
           ReadProjection.METADATA, 1, 4096, 16, ScanDirection.DESCENDING);
       try {
-        for (String expected : List.of("d", "c", "b", "a")) {
-          var operation = firstView.startScan(request, account);
-          var page = operation.completion().toCompletableFuture().join();
-          operation.close();
-          assertEquals(expected, text(page.records().getFirst().key()));
-          if (expected.equals("b")) {
-            assertEquals(StorageMetadata.State.TOMBSTONE, page.records().getFirst().metadata().state());
-          }
-          request = request.resumeAfter(Optional.of(page.records().getFirst().key()));
-        }
+        request = assertDescendingRecords(firstView, request, account);
         var foreign = otherView.startScan(request, account);
         assertThrows(CompletionException.class, () -> foreign.completion().toCompletableFuture().join());
         foreign.close();
@@ -1930,6 +1921,21 @@ class ReadViewRecordStoreTest {
         otherView.close();
       }
     }
+  }
+
+  private static ScanRequest assertDescendingRecords(ReadViewRecordStore view, ScanRequest request,
+      BudgetManager.Account account) {
+    for (String expected : List.of("d", "c", "b", "a")) {
+      var operation = view.startScan(request, account);
+      var page = operation.completion().toCompletableFuture().join();
+      operation.close();
+      assertEquals(expected, text(page.records().getFirst().key()));
+      if (expected.equals("b")) {
+        assertEquals(StorageMetadata.State.TOMBSTONE, page.records().getFirst().metadata().state());
+      }
+      request = request.resumeAfter(Optional.of(page.records().getFirst().key()));
+    }
+    return request;
   }
 
   @Test

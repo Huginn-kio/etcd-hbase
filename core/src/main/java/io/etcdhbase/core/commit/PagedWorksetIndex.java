@@ -335,27 +335,42 @@ public final class PagedWorksetIndex {
 
   private CompletableFuture<Optional<EventRef>> seek(PageRef reference, SortKey after,
       int bucket, KeyRange range, ScanDirection direction) {
-    if (after != null && (direction == ScanDirection.ASCENDING
-            ? reference.last().compareTo(after) <= 0 : reference.first().compareTo(after) >= 0)
-        || !intersects(reference, bucket, range)) {
+    if (pageBeforeResume(reference, after, direction) || !intersects(reference, bucket, range)) {
       return CompletableFuture.completedFuture(Optional.empty());
     }
     return readPage(reference).thenCompose(page -> {
       if (page.level() == 0) {
-        var entries = page.entries();
-        int step = direction == ScanDirection.ASCENDING ? 1 : -1;
-        for (int index = step > 0 ? 0 : entries.size() - 1; index >= 0 && index < entries.size(); index += step) {
-          EventRef entry = entries.get(index);
-          int order = after == null ? 1 : step > 0 ? entry.sortKey().compareTo(after) : after.compareTo(entry.sortKey());
-          if (order > 0 && (bucket < 0 || entry.bucket() == bucket && range.contains(entry.key()))) {
-            return CompletableFuture.completedFuture(Optional.of(entry));
-          }
-        }
-        return CompletableFuture.completedFuture(Optional.empty());
+        return CompletableFuture.completedFuture(selectLeaf(page.entries(), after, bucket, range, direction));
       }
       int first = direction == ScanDirection.ASCENDING ? 0 : page.children().size() - 1;
       return seekChildren(page.children(), first, after, bucket, range, direction);
     });
+  }
+
+  private static boolean pageBeforeResume(PageRef reference, SortKey after, ScanDirection direction) {
+    if (after == null) return false;
+    return direction == ScanDirection.ASCENDING
+        ? reference.last().compareTo(after) <= 0 : reference.first().compareTo(after) >= 0;
+  }
+
+  private static Optional<EventRef> selectLeaf(List<EventRef> entries, SortKey after, int bucket,
+      KeyRange range, ScanDirection direction) {
+    int step = direction == ScanDirection.ASCENDING ? 1 : -1;
+    for (int index = step > 0 ? 0 : entries.size() - 1; index >= 0 && index < entries.size(); index += step) {
+      EventRef entry = entries.get(index);
+      if (entryAfterResume(entry, after, direction) && entryInRange(entry, bucket, range)) return Optional.of(entry);
+    }
+    return Optional.empty();
+  }
+
+  private static boolean entryAfterResume(EventRef entry, SortKey after, ScanDirection direction) {
+    if (after == null) return true;
+    return direction == ScanDirection.ASCENDING
+        ? entry.sortKey().compareTo(after) > 0 : after.compareTo(entry.sortKey()) > 0;
+  }
+
+  private static boolean entryInRange(EventRef entry, int bucket, KeyRange range) {
+    return bucket < 0 || entry.bucket() == bucket && range.contains(entry.key());
   }
 
   private static boolean intersects(PageRef reference, int bucket, KeyRange range) {

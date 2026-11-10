@@ -141,6 +141,18 @@ final class HBasePageReader {
       var scan = new Scan().setCaching(1).setMaxResultSize(request.maximumBytes())
           .setAllowPartialResults(false).setScanMetricsEnabled(true)
           .setLimit(request.maximumPhysicalRows() + 1).addColumn(binding.family(), HBaseRecordStore.METADATA);
+      configureDirection(scan, physical);
+      if (request.physicalProgress().isPresent()) {
+        var progress = request.physicalProgress().orElseThrow();
+        validatePhysicalProgress(progress, physical);
+        scan.withStartRow(progress.lastPhysicalRow().bytes(), false);
+      }
+      if (binding.layout() != StorageTableBinding.Layout.HISTORY) scan.setTimeRange(0, request.revisionUpperBound());
+      if (request.projection() == ReadProjection.FULL) scan.addColumn(binding.family(), HBaseRecordStore.VALUE);
+      return scan;
+    }
+
+    private void configureDirection(Scan scan, KeyRange physical) {
       if (request.direction() == ScanDirection.DESCENDING) {
         scan.setReversed(true);
         physical.upperExclusive().ifPresent(upper -> scan.withStartRow(upper.bytes(), false));
@@ -149,33 +161,50 @@ final class HBasePageReader {
         physical.lowerInclusive().ifPresent(lower -> scan.withStartRow(lower.bytes(), true));
         physical.upperExclusive().ifPresent(upper -> scan.withStopRow(upper.bytes(), false));
       }
-      if (request.physicalProgress().isPresent()) {
-        var progress = request.physicalProgress().orElseThrow();
-        ByteKey row = progress.lastPhysicalRow();
-        var decoded = binding.codec().decode(row.bytes());
-        if (request.direction() != ScanDirection.DESCENDING || binding.layout() != StorageTableBinding.Layout.HISTORY
-            || !physical.contains(row) || binding.codec().bucket(decoded.key()) != request.bucket()
-            || !progress.physicalSourceId().equals(Optional.of(store.scanSourceId()))
-            || decoded.revision().isEmpty() || decoded.revision().getAsLong() <= request.revisionUpperBound()) {
-          throw new IllegalArgumentException("invalid history physical progress");
-        }
-        scan.withStartRow(row.bytes(), false);
+    }
+
+    private void validatePhysicalProgress(PhysicalScanProgress progress, KeyRange physical) {
+      ByteKey row = progress.lastPhysicalRow();
+      var decoded = binding.codec().decode(row.bytes());
+      boolean wrongSource = request.direction() != ScanDirection.DESCENDING
+          || binding.layout() != StorageTableBinding.Layout.HISTORY || !physical.contains(row)
+          || binding.codec().bucket(decoded.key()) != request.bucket()
+          || !progress.physicalSourceId().equals(Optional.of(store.scanSourceId()));
+      if (wrongSource || decoded.revision().isEmpty()
+          || decoded.revision().getAsLong() <= request.revisionUpperBound()) {
+        throw new IllegalArgumentException("invalid history physical progress");
       }
-      if (binding.layout() != StorageTableBinding.Layout.HISTORY) scan.setTimeRange(0, request.revisionUpperBound());
-      if (request.projection() == ReadProjection.FULL) scan.addColumn(binding.family(), HBaseRecordStore.VALUE);
-      return scan;
     }
 
     private StoragePage collect(ResultScanner opened) throws Exception {
-      List<StoredRecord> records = new ArrayList<>();
-      StoredRecord candidate = null;
-      ByteKey group = null;
-      long retained = 0;
-      long physicalRows = 0;
-      long cellBytes = 0;
-      Result row;
-      while ((row = opened.next()) != null) {
+      return new PageCollector(opened).collect();
+    }
+
+    private final class PageCollector {
+      private final ResultScanner scanner;
+      private final List<StoredRecord> records = new ArrayList<>();
+      private StoredRecord candidate;
+      private ByteKey group;
+      private long retained;
+      private long physicalRows;
+      private long cellBytes;
+
+      private PageCollector(ResultScanner scanner) { this.scanner = scanner; }
+
+      private StoragePage collect() throws Exception {
+        Result row;
+        while ((row = scanner.next()) != null) {
+          checkActive();
+          account(row);
+          StoragePage completed = accept(row);
+          if (completed != null) return completed;
+        }
         checkActive();
+        if (candidate != null && !append(records, candidate, retained)) return finish(false);
+        return finish(true);
+      }
+
+      private void account(Result row) throws BackendFailure {
         physicalRows++;
         for (var cell : row.rawCells()) {
           cellBytes += KeyValueUtil.length(cell.getRowLength(), cell.getFamilyLength(),
@@ -183,37 +212,46 @@ final class HBasePageReader {
         }
         if (physicalRows > request.maximumPhysicalRows()
             || cellBytes > 4 * request.maximumBytes() + MAX_RECORD_BYTES) throw resourceLimit();
+      }
+
+      private StoragePage accept(Result row) throws Exception {
         var decoded = binding.codec().decode(row.getRow());
         if (group != null && !group.equals(decoded.key()) && candidate != null) {
-          if (!append(records, candidate, retained)) return page(records, false, opened, physicalRows, cellBytes);
+          if (!append(records, candidate, retained)) return finish(false);
           retained += candidate.retainedBytes();
-          if (records.size() == request.maximumRows()) return page(records, false, opened, physicalRows, cellBytes);
+          if (records.size() == request.maximumRows()) return finish(false);
           candidate = null;
         }
         group = decoded.key();
-        if (request.after().isPresent() && request.direction().compare(group, request.after().get()) <= 0) continue;
+        if (request.after().isPresent() && request.direction().compare(group, request.after().get()) <= 0) return null;
         if (decoded.revision().isPresent() && decoded.revision().getAsLong() > request.revisionUpperBound()) {
-          if (request.direction() == ScanDirection.DESCENDING && physicalRows == request.maximumPhysicalRows()) {
-            if (!records.isEmpty()) return page(records, false, opened, physicalRows, cellBytes);
-            if (row.getRow().length > request.maximumBytes()) throw resourceLimit();
-            var progress = PhysicalScanProgress.after(request, ByteKey.copyOf(row.getRow()), store.scanSourceId());
-            return page(records, false, opened, physicalRows, cellBytes, Optional.of(progress));
-          }
-          continue;
+          return acceptFuture(row);
         }
         if (candidate == null || request.direction() == ScanDirection.ASCENDING) {
           candidate = store.decode(row, request.projection());
         }
-        if (request.direction() == ScanDirection.DESCENDING && physicalRows == request.maximumPhysicalRows()) {
-          if (!append(records, candidate, retained)) return page(records, false, opened, physicalRows, cellBytes);
-          return page(records, false, opened, physicalRows, cellBytes);
+        if (atReversePhysicalLimit()) {
+          append(records, candidate, retained);
+          return finish(false);
         }
+        return null;
       }
-      checkActive();
-      if (candidate != null && !append(records, candidate, retained)) {
-        return page(records, false, opened, physicalRows, cellBytes);
+
+      private StoragePage acceptFuture(Result row) throws BackendFailure {
+        if (!atReversePhysicalLimit()) return null;
+        if (!records.isEmpty()) return finish(false);
+        if (row.getRow().length > request.maximumBytes()) throw resourceLimit();
+        var progress = PhysicalScanProgress.after(request, ByteKey.copyOf(row.getRow()), store.scanSourceId());
+        return page(records, false, scanner, physicalRows, cellBytes, Optional.of(progress));
       }
-      return page(records, true, opened, physicalRows, cellBytes);
+
+      private boolean atReversePhysicalLimit() {
+        return request.direction() == ScanDirection.DESCENDING && physicalRows == request.maximumPhysicalRows();
+      }
+
+      private StoragePage finish(boolean exhausted) {
+        return page(records, exhausted, scanner, physicalRows, cellBytes);
+      }
     }
 
     private boolean append(List<StoredRecord> records, StoredRecord record, long retained) throws BackendFailure {

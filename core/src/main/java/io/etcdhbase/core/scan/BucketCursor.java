@@ -1,6 +1,7 @@
 package io.etcdhbase.core.scan;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.ScanRequest;
@@ -9,32 +10,16 @@ import io.etcdhbase.core.storage.ScanSource;
 import io.etcdhbase.core.storage.StoragePage;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.core.storage.ScanDirection;
-import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.Executor;
 
 /** One logical bucket cursor; physical page scanners belong to the request-bound store. */
 public final class BucketCursor implements AutoCloseable {
-  private static final ThreadLocal<ArrayDeque<Runnable>> CONTINUATIONS = new ThreadLocal<>();
-  private static final Executor CONTINUE = task -> {
-    ArrayDeque<Runnable> queue = CONTINUATIONS.get();
-    if (queue != null) { queue.addLast(task); return; }
-    queue = new ArrayDeque<>();
-    CONTINUATIONS.set(queue);
-    try {
-      queue.addLast(task);
-      Runnable next;
-      while ((next = queue.pollFirst()) != null) next.run();
-    } finally {
-      queue.clear();
-      CONTINUATIONS.remove();
-    }
-  };
+  private static final ContinuationExecutor CONTINUE = new ContinuationExecutor();
   public enum State { IDLE, FETCHING, PAGE_READY, PAUSED, EXHAUSTED, FAILED, CLOSED }
 
   private final ScanSource store;
@@ -87,42 +72,11 @@ public final class BucketCursor implements AutoCloseable {
   private void startRead(CompletableFuture<Page> result, ScanRequest request, BudgetManager.Lease progressLease,
       StoragePage.Cost priorCost) {
     try {
-      synchronized (this) {
-        if (state != State.FETCHING || scope.isClosed()) {
-          if (progressLease != null) progressLease.close();
-          releaseCheckpoint();
-          result.completeExceptionally(cancelled());
-          return;
-        }
-      }
+      if (!acceptRead(result, progressLease)) return;
       ScanOperation read = Objects.requireNonNull(store.startScan(request), "page operation");
-      boolean stop;
-      synchronized (this) {
-        activeRead = read;
-        stop = state == State.CLOSED || scope.isClosed();
-      }
-      read.completion().whenComplete((page, problem) -> {
-        try {
-          if (progressLease != null) progressLease.close();
-          synchronized (this) {
-            if (activeRead == read) activeRead = null;
-            if (state == State.CLOSED || scope.isClosed()) releaseCheckpoint();
-          }
-          if (problem == null && page != null && page.physicalProgress().isPresent()) {
-            continuePhysical(result, request, read, page, priorCost);
-          } else if (problem == null && page != null) {
-            receive(result, request, read, new StoragePage(page.records(), page.exhausted(),
-                priorCost.plus(page.cost())), null);
-          } else {
-            receive(result, request, read, page, problem);
-          }
-        } catch (RuntimeException failure) {
-          failRead(result, read, failure);
-        } catch (Error fatal) {
-          failRead(result, read, fatal);
-          throw fatal;
-        }
-      });
+      boolean stop = installRead(read);
+      read.completion().whenComplete((page, problem) ->
+          completeRead(result, request, read, progressLease, priorCost, page, problem));
       if (stop) read.close();
     } catch (RuntimeException problem) {
       if (progressLease != null) progressLease.close();
@@ -130,6 +84,43 @@ public final class BucketCursor implements AutoCloseable {
     } catch (Error fatal) {
       if (progressLease != null) progressLease.close();
       fail(result, fatal);
+      throw fatal;
+    }
+  }
+
+  private synchronized boolean acceptRead(CompletableFuture<Page> result, BudgetManager.Lease progressLease) {
+    if (state == State.FETCHING && !scope.isClosed()) return true;
+    if (progressLease != null) progressLease.close();
+    releaseCheckpoint();
+    result.completeExceptionally(cancelled());
+    return false;
+  }
+
+  private synchronized boolean installRead(ScanOperation read) {
+    activeRead = read;
+    return state == State.CLOSED || scope.isClosed();
+  }
+
+  private void completeRead(CompletableFuture<Page> result, ScanRequest request, ScanOperation read,
+      BudgetManager.Lease progressLease, StoragePage.Cost priorCost, StoragePage page, Throwable problem) {
+    try {
+      if (progressLease != null) progressLease.close();
+      synchronized (this) {
+        if (activeRead == read) activeRead = null;
+        if (state == State.CLOSED || scope.isClosed()) releaseCheckpoint();
+      }
+      if (problem == null && page != null && page.physicalProgress().isPresent()) {
+        continuePhysical(result, request, read, page, priorCost);
+      } else if (problem == null && page != null) {
+        receive(result, request, read, new StoragePage(page.records(), page.exhausted(),
+            priorCost.plus(page.cost())), null);
+      } else {
+        receive(result, request, read, page, problem);
+      }
+    } catch (RuntimeException failure) {
+      failRead(result, read, failure);
+    } catch (Error fatal) {
+      failRead(result, read, fatal);
       throw fatal;
     }
   }

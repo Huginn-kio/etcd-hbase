@@ -144,16 +144,7 @@ class M2ReadViewIT {
          var scheduler = new ScanScheduler(manager, Duration.ofSeconds(10))) {
       var request = new ScanRequest(0, KeyRange.all(), Optional.empty(), 3,
           ReadProjection.METADATA, 1, 4096, 1, ScanDirection.DESCENDING);
-      var actual = new ArrayList<StoredRecord>();
-      try (var cursor = new BucketCursor(scheduler.bind(view, account), request, fixture.scope(), account)) {
-        boolean exhausted = false;
-        while (!exhausted) {
-          try (var page = cursor.fetch().join()) {
-            page.next().ifPresent(actual::add);
-            exhausted = page.exhausted();
-          }
-        }
-      }
+      var actual = readDescendingPages(fixture, account, view, scheduler, request);
       var keys = fixture.keys();
       assertEquals(List.of(keys.updated(), keys.deleted(), keys.inserted(), keys.recreated()).stream()
               .sorted(Comparator.reverseOrder()).toList(), actual.stream().map(StoredRecord::key).toList());
@@ -164,6 +155,23 @@ class M2ReadViewIT {
     }
     assertEquals(0, manager.snapshot().allocatedBytes());
     assertEquals(0, manager.snapshot().scanners());
+  }
+
+  private static List<StoredRecord> readDescendingPages(ReadFixture fixture, BudgetManager.Account account,
+      ReadViewRecordStore view, ScanScheduler scheduler, ScanRequest request) {
+    var actual = new ArrayList<StoredRecord>();
+    try (var cursor = new BucketCursor(scheduler.bind(view, account), request, fixture.scope(), account)) {
+      boolean exhausted = false;
+      while (!exhausted) exhausted = readDescendingPage(cursor, actual);
+    }
+    return actual;
+  }
+
+  private static boolean readDescendingPage(BucketCursor cursor, List<StoredRecord> actual) {
+    try (var page = cursor.fetch().join()) {
+      page.next().ifPresent(actual::add);
+      return page.exhausted();
+    }
   }
 
   private static List<PreparedCandidate> selectedCandidates(TransactionId transactionId,
