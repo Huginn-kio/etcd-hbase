@@ -364,11 +364,18 @@ func (runner *runner) m3RangeHistory(ctx context.Context, kv etcdserverpb.KVClie
 		return errors.New("historical CountOnly lost a live key")
 	}
 	current, err := runner.m3Range(ctx, kv, "J34-history-recreated", &etcdserverpb.RangeRequest{Key: key})
-	if err != nil || len(current.Kvs) != 1 || current.Kvs[0].CreateRevision != base+5 ||
-		current.Kvs[0].ModRevision != base+5 || current.Kvs[0].Version != 1 || string(current.Kvs[0].Value) != "reborn" {
+	if err != nil || !m3RecreatedMetadataMatches(current, base+5) || string(current.Kvs[0].Value) != "reborn" {
 		return errors.New("recreated key metadata is incorrect")
 	}
 	return nil
+}
+
+func m3RecreatedMetadataMatches(response *etcdserverpb.RangeResponse, revision int64) bool {
+	if len(response.Kvs) != 1 {
+		return false
+	}
+	record := response.Kvs[0]
+	return record.CreateRevision == revision && record.ModRevision == revision && record.Version == 1
 }
 
 func (runner *runner) m3RangeCountAfterDelete(ctx context.Context, kv etcdserverpb.KVClient,
@@ -389,12 +396,22 @@ func (runner *runner) m3RangeCountAfterDelete(ctx context.Context, kv etcdserver
 	deleted := response.Responses[0].GetResponseDeleteRange()
 	pointResult := response.Responses[1].GetResponseRange()
 	rangeResult := response.Responses[2].GetResponseRange()
-	if deleted == nil || deleted.Deleted != 1 || pointResult == nil || pointResult.Count != 0 ||
-		len(pointResult.Kvs) != 0 || pointResult.More || rangeResult == nil || rangeResult.Count < 1 ||
-		len(rangeResult.Kvs) != 0 || rangeResult.More {
+	if !m3DeletedOneKey(deleted) || !m3PointCountIsAbsent(pointResult) || !m3RangeCountIsPresent(rangeResult) {
 		return errors.New("CountOnly did not see the transaction's prior delete")
 	}
 	return nil
+}
+
+func m3DeletedOneKey(response *etcdserverpb.DeleteRangeResponse) bool {
+	return response != nil && response.Deleted == 1
+}
+
+func m3PointCountIsAbsent(response *etcdserverpb.RangeResponse) bool {
+	return response != nil && response.Count == 0 && len(response.Kvs) == 0 && !response.More
+}
+
+func m3RangeCountIsPresent(response *etcdserverpb.RangeResponse) bool {
+	return response != nil && response.Count >= 1 && len(response.Kvs) == 0 && !response.More
 }
 
 type capturingRangeClient struct {
