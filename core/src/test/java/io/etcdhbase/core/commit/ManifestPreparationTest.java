@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.ScanDirection;
@@ -117,6 +118,228 @@ class ManifestPreparationTest {
       }
       assertEquals(0, budget.snapshot().allocatedBytes());
     }
+  }
+
+  @Test
+  void proofTraversalChargesMetadataAndFailsBeforeExceedingItsOwnPageLimit() throws Exception {
+    int count = 300;
+    var transactionId = TransactionId.create();
+    var repository = new MemoryRepository();
+    var candidates = IntStream.range(0, count)
+        .mapToObj(index -> candidate(transactionId, sequenceKey(index), new byte[] {(byte) index}))
+        .iterator();
+    var limits = new BudgetManager.Limits(4, 4, 4, 4, 4, 1_000_000, 1024L << 20);
+    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
+    var proofReservation = new BudgetManager.Reservation(8192, 8192, 256L << 20, 8192, 8192);
+    var directReservation = new BudgetManager.Reservation(8192, 8192, 8192, 8192, 8192);
+    try (var preparationScope = scope(); var proofScope = scope(); var directScope = scope();
+         var proofAccount = budget.admit("public", proofScope, proofReservation, proofReadLimits());
+         var directAccount = budget.admit("public", directScope, directReservation)) {
+      var root = new ManifestPreparation(repository, new ManifestPreparation.Limits(count, count, 0, 0))
+          .prepare(transactionId, OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION, candidates,
+              java.util.Collections.emptyIterator(), preparationScope).join();
+      var catalog = new ManifestCatalog(repository);
+      var point = KeyRange.point(ByteKey.copyOf(sequenceKey(100)));
+      var insufficient = new ManifestCatalog.ProofReadBudget(proofScope, proofAccount, 1, 4096L << 20);
+      var failure = assertThrows(CompletionException.class,
+          () -> catalog.candidatesForProof(root, 0, point, 8192, insufficient).join());
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT, ((BackendFailure) failure.getCause()).category());
+      assertEquals(1, insufficient.pages());
+      assertTrue(directAccount.isActive(), "proof exhaustion must not exhaust the direct read account");
+      assertEquals(0, budget.snapshot().allocatedBytes());
+
+      var proof = new ManifestCatalog.ProofReadBudget(proofScope, proofAccount, 8, 4096L << 20);
+      try (var overlap = catalog.candidatesForProof(root, 0, point, 8192, proof).join()) {
+        assertEquals(1, overlap.candidates().size());
+        assertEquals(ByteKey.copyOf(sequenceKey(100)), overlap.candidates().getFirst().record().key());
+      }
+      assertTrue(proof.pages() >= 2);
+      assertTrue(proof.bytes() >= 2 * ManifestCatalog.PROOF_SYSTEM_RECORD_ENVELOPE);
+      assertEquals(0, budget.snapshot().allocatedBytes());
+
+      var absent = KeyRange.point(ByteKey.copyOf(new byte[] {0, 0, 0, 100, 0}));
+      var absenceBudget = new ManifestCatalog.ProofReadBudget(proofScope, proofAccount, 8, 4096L << 20);
+      try (var noOverlap = catalog.candidatesForProof(root, 0, absent, 8192, absenceBudget).join()) {
+        assertTrue(noOverlap.candidates().isEmpty());
+        assertTrue(noOverlap.exhausted());
+      }
+      assertTrue(absenceBudget.pages() > 0);
+      assertEquals(0, budget.snapshot().allocatedBytes());
+
+      try (var cancelledScope = scope();
+           var cancelledAccount = budget.admit("public", cancelledScope, proofReservation, proofReadLimits())) {
+        var producer = new CompletableFuture<Void>();
+        cancelledScope.trackPhysicalProducer(producer);
+        repository.pendingDirectoryRead = new CompletableFuture<>();
+        var cancelledProof = new ManifestCatalog.ProofReadBudget(cancelledScope, cancelledAccount, 8, 4096L << 20);
+        var pending = catalog.candidatesForProof(root, 0, point, 8192, cancelledProof);
+        assertEquals(ManifestCatalog.PROOF_SYSTEM_RECORD_ENVELOPE, budget.snapshot().allocatedBytes());
+        cancelledScope.cancel();
+        repository.pendingDirectoryRead.complete(Optional.of(
+            repository.directories.get(root.candidateDirectory().orElseThrow().identity())));
+        assertThrows(CompletionException.class, pending::join);
+        assertEquals(ManifestCatalog.PROOF_SYSTEM_RECORD_ENVELOPE, budget.snapshot().allocatedBytes());
+        assertFalse(cancelledScope.cleanupCompletion().toCompletableFuture().isDone());
+        producer.complete(null);
+        cancelledScope.cleanupCompletion().toCompletableFuture().join();
+        assertEquals(0, budget.snapshot().allocatedBytes());
+      }
+    }
+  }
+
+  @Test
+  void coverageProofRequiresContiguousDecisionsAndAuthenticCompleteManifests() throws Exception {
+    var transaction = TransactionId.create();
+    var repository = new MemoryRepository();
+    var storedDecisions = new HashMap<Long, CommitDecision>();
+    var decisions = new CommitDecisionRepository() {
+      @Override public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope scope) {
+        return CompletableFuture.completedFuture(Optional.ofNullable(storedDecisions.get(sequence)));
+      }
+      @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+          CommitDecision decision, RequestScope scope) { throw new UnsupportedOperationException(); }
+    };
+    var limits = new BudgetManager.Limits(4, 4, 4, 4, 4, 1_000_000, 1024L << 20);
+    var manager = new BudgetManager(limits, Map.of("public", limits), limits);
+    var proofReservation = new BudgetManager.Reservation(8192, 8192, 256L << 20, 8192, 8192);
+    try (var preparationScope = scope(); var proofScope = scope(); var directScope = scope();
+         var proofAccount = manager.admit("public", proofScope, proofReservation, proofReadLimits());
+         var directAccount = manager.admit("public", directScope,
+             new BudgetManager.Reservation(8192, 8192, 8192, 8192, 8192))) {
+      var root = new ManifestPreparation(repository, new ManifestPreparation.Limits(1, 1, 0, 0))
+          .prepare(transaction, OWNER_EPOCH, 0, 1,
+              List.of(candidate(transaction, new byte[] {'a'}, new byte[] {1})).iterator(),
+              java.util.Collections.emptyIterator(), preparationScope).join();
+      var decision = new CommitDecision(transaction, InvocationId.create(), 1, 1, 2,
+          root.systemIdentity(), root.digest(), true);
+      storedDecisions.put(1L, decision);
+      var profile = ByteKey.copyOf(new byte[32]);
+      var authorization = ByteKey.copyOf(new byte[32]);
+      var previous = new ReadView(profile, authorization, 0, 0, 1, 1, 0,
+          Optional.empty(), Optional.empty(), 0);
+      var current = new ReadView(profile, authorization, 1, 1, 2, 2, 0,
+          Optional.empty(), Optional.empty(), 0);
+      var pending = new ReadView(profile, authorization, 1, 0, 2, 1, 0,
+          Optional.of(decision), Optional.of(root), 0);
+      var pointA = KeyRange.point(ByteKey.copyOf(new byte[] {'a'}));
+      var pointZ = KeyRange.point(ByteKey.copyOf(new byte[] {'z'}));
+      var prover = new UnchangedRangeProof(decisions, new ManifestCatalog(repository), 1, 8, 8192, ignored -> 0);
+      assertEquals(UnchangedRangeProof.Verdict.UNCHANGED,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      assertEquals(UnchangedRangeProof.Verdict.CHANGED,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointA, proofBudget(proofScope, proofAccount)).join());
+      assertEquals(UnchangedRangeProof.Verdict.CHANGED,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), pending, profile, profile, pointA, proofBudget(proofScope, proofAccount)).join());
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ,
+              new ManifestCatalog.ProofReadBudget(proofScope, proofAccount, 1, 4096L << 20)).join());
+      assertTrue(directAccount.isActive());
+      try (var cancelledScope = scope();
+           var cancelledAccount = manager.admit("public", cancelledScope, proofReservation, proofReadLimits())) {
+        var producer = new CompletableFuture<Void>();
+        var cancelled = new CompletableFuture<Void>();
+        cancelledScope.trackPhysicalProducer(producer);
+        cancelledScope.registerCleanup(() -> cancelled.complete(null));
+        var delayed = new CompletableFuture<Optional<CommitDecision>>();
+        var delayedDecisions = new CommitDecisionRepository() {
+          @Override public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope scope) {
+            return delayed;
+          }
+          @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+              CommitDecision value, RequestScope scope) { throw new UnsupportedOperationException(); }
+        };
+        var delayedProver = new UnchangedRangeProof(delayedDecisions, new ManifestCatalog(repository), 1, 8, 8192, ignored -> 0);
+        var result = delayedProver.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ,
+            proofBudget(cancelledScope, cancelledAccount));
+        assertTrue(result.cancel(true));
+        cancelled.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        delayed.complete(Optional.of(decision));
+        assertEquals(ManifestCatalog.PROOF_SYSTEM_RECORD_ENVELOPE, manager.snapshot().allocatedBytes());
+        assertFalse(cancelledScope.cleanupCompletion().toCompletableFuture().isDone());
+        producer.complete(null);
+        cancelledScope.cleanupCompletion().toCompletableFuture().join();
+        assertEquals(0, manager.snapshot().allocatedBytes());
+      }
+      try (var limitedScope = scope();
+           var limitedAccount = manager.admit("public", limitedScope, proofReservation,
+               new BudgetManager.ReadLimits(100, ManifestCatalog.PROOF_SYSTEM_RECORD_ENVELOPE,
+                   100, 100, 100))) {
+        assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+            prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ, proofBudget(limitedScope, limitedAccount)).join());
+        assertFalse(limitedAccount.isActive());
+        assertTrue(directAccount.isActive(), "proof read exhaustion must not consume the direct account");
+      }
+
+      storedDecisions.clear();
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      // The selected pending decision comes from the captured authoritative barrier, not the archive.
+      assertEquals(UnchangedRangeProof.Verdict.UNCHANGED,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), pending, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      storedDecisions.put(1L, decision);
+      repository.roots.remove(root.systemIdentity());
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      repository.roots.put(root.systemIdentity(), root);
+      var later = new ReadView(profile, authorization, 2, 2, 3, 3, 0,
+          Optional.empty(), Optional.empty(), 0);
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+
+      var secondTransaction = TransactionId.create();
+      var secondRecord = StoredRecord.live(ByteKey.copyOf(new byte[] {'b'}),
+          new StorageMetadata(3, 3, 1, 0, StorageMetadata.State.LIVE, 1), new byte[] {2});
+      var secondCandidate = new PreparedCandidate(secondTransaction, OWNER_EPOCH, 1, 2, secondRecord);
+      var secondRoot = new ManifestPreparation(repository, new ManifestPreparation.Limits(1, 1, 0, 0))
+          .prepare(secondTransaction, OWNER_EPOCH, 1, 2, List.of(secondCandidate).iterator(),
+              java.util.Collections.emptyIterator(), preparationScope).join();
+      var secondDecision = new CommitDecision(secondTransaction, InvocationId.create(), 2, 2, 3,
+          secondRoot.systemIdentity(), secondRoot.digest(), true);
+      storedDecisions.put(2L, secondDecision);
+      var pointB = KeyRange.point(ByteKey.copyOf(new byte[] {'b'}));
+      assertEquals(UnchangedRangeProof.Verdict.UNCHANGED,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      assertEquals(UnchangedRangeProof.Verdict.CHANGED,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointB, proofBudget(proofScope, proofAccount)).join());
+      storedDecisions.remove(1L);
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      storedDecisions.put(1L, decision);
+      storedDecisions.put(2L, new CommitDecision(secondTransaction, secondDecision.invocationId(), 2, 2, 3,
+          secondRoot.systemIdentity(), ByteKey.copyOf(new byte[32]), true));
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      storedDecisions.put(2L, new CommitDecision(secondTransaction, secondDecision.invocationId(), 2, 2, 2,
+          secondRoot.systemIdentity(), secondRoot.digest(), false));
+      var metadataOnly = new ReadView(profile, authorization, 2, 2, 2, 2, 0,
+          Optional.empty(), Optional.empty(), 0);
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), metadataOnly, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+
+      var compacted = new ReadView(profile, authorization, 1, 1, 2, 2, 1,
+          Optional.empty(), Optional.empty(), 0);
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), compacted, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      byte[] other = new byte[32];
+      other[0] = 1;
+      var otherIdentity = new ReadView(profile, ByteKey.copyOf(other), 1, 1, 2, 2, 0,
+          Optional.empty(), Optional.empty(), 0);
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), otherIdentity, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, ByteKey.copyOf(other), pointZ, proofBudget(proofScope, proofAccount)).join());
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 8, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      assertEquals(0, manager.snapshot().allocatedBytes());
+    }
+  }
+
+  private static ManifestCatalog.ProofReadBudget proofBudget(RequestScope scope, BudgetManager.Account account) {
+    return new ManifestCatalog.ProofReadBudget(scope, account, 32, 4096L << 20);
+  }
+
+  private static BudgetManager.ReadLimits proofReadLimits() {
+    return new BudgetManager.ReadLimits(1_000_000, 8L << 30, 100_000, 65_536, 65_536);
   }
 
   @Test
@@ -611,6 +834,7 @@ class ManifestPreparationTest {
     private boolean deferCreateResults;
     private final ArrayDeque<PendingCreate> pendingCreates = new ArrayDeque<>();
     private int maximumPendingCreates;
+    private CompletableFuture<Optional<ManifestDirectoryPage>> pendingDirectoryRead;
 
     @Override
     public int candidateBucket(PreparedCandidate candidate) {
@@ -691,6 +915,7 @@ class ManifestPreparationTest {
     @Override
     public CompletableFuture<Optional<ManifestDirectoryPage>> readDirectoryPage(
         ByteKey identity, RequestScope scope) {
+      if (pendingDirectoryRead != null) return pendingDirectoryRead;
       return completed(directories.get(identity));
     }
 

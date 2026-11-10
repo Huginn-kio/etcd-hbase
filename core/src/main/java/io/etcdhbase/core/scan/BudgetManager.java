@@ -120,6 +120,84 @@ public final class BudgetManager {
     return account;
   }
 
+  /** Reserves long-lived service memory without consuming a request concurrency slot. */
+  public ServiceMemory reserveServiceMemory(String groupId, RequestScope scope, long bytes) throws BackendFailure {
+    Objects.requireNonNull(scope, "scope");
+    if (bytes <= 0) throw new IllegalArgumentException("service reservation must be positive");
+    ServiceMemory memory;
+    synchronized (this) {
+      Group group = groups.get(groupId);
+      if (group == null) throw new IllegalArgumentException("unconfigured group ID");
+      checkScope(scope);
+      if (bytes > globalLimits.memoryBytes() - global.reservedBytes
+          || bytes > group.limits.memoryBytes() - group.usage.reservedBytes) {
+        throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+      }
+      global.reservedBytes += bytes;
+      group.usage.reservedBytes += bytes;
+      global.allocatedBytes += bytes;
+      group.usage.allocatedBytes += bytes;
+      global.peakAllocatedBytes = Math.max(global.peakAllocatedBytes, global.allocatedBytes);
+      group.usage.peakAllocatedBytes = Math.max(group.usage.peakAllocatedBytes, group.usage.allocatedBytes);
+      memory = new ServiceMemory(group, scope, bytes);
+    }
+    try {
+      memory.registration = scope.registerScopedCleanup(memory);
+      checkScope(scope);
+      return memory;
+    } catch (BackendFailure | RuntimeException | Error failure) {
+      try { memory.close(); }
+      catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+      throw failure;
+    }
+  }
+
+  /** A service reservation is bound to one manager, table group and lifecycle. */
+  public final class ServiceMemory implements AutoCloseable {
+    private final Group group;
+    private final RequestScope scope;
+    private final long bytes;
+    private RequestScope.ScopedCleanup registration;
+    private boolean closed;
+
+    private ServiceMemory(Group group, RequestScope scope, long bytes) {
+      this.group = group;
+      this.scope = scope;
+      this.bytes = bytes;
+    }
+
+    public boolean permits(Account account) {
+      Objects.requireNonNull(account, "account");
+      synchronized (BudgetManager.this) {
+        return isActive() && account.owner() == BudgetManager.this && account.group == group;
+      }
+    }
+
+    public boolean isActive() {
+      synchronized (BudgetManager.this) {
+        return !closed && !scope.isClosed() && !scope.isDeadlineExceeded();
+      }
+    }
+
+    @Override public void close() {
+      synchronized (BudgetManager.this) {
+        if (closed) return;
+        closed = true;
+        global.reservedBytes -= bytes;
+        group.usage.reservedBytes -= bytes;
+        global.allocatedBytes -= bytes;
+        group.usage.allocatedBytes -= bytes;
+      }
+      try {
+        if (registration != null) registration.close();
+      } catch (Exception cleanupFailure) {
+        throw new IllegalStateException("service reservation cleanup failed", cleanupFailure);
+      } finally {
+        changed();
+      }
+    }
+  }
+
   public synchronized Snapshot snapshot() { return global.snapshot(); }
 
   boolean owns(Account account) { return account.owner() == this; }

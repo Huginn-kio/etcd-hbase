@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class RuntimeServerTest {
   private final ObjectMapper mapper = new ObjectMapper();
@@ -85,6 +86,16 @@ class RuntimeServerTest {
     assertThrows(IllegalArgumentException.class, () -> RuntimeServer.startM3(configuration, activation));
     profile.put("credential_reference", "cleartext-password");
     assertThrows(IllegalArgumentException.class, () -> load(tree));
+  }
+
+  @Test
+  void rejectsCacheActivationBeforeStartingTheBackend(@TempDir Path directory) throws Exception {
+    var activation = (ObjectNode) mapper.readTree(Files.readAllBytes(Path.of("../config/examples/m3/activation.json")));
+    activation.put("read_cache_enabled", true);
+    Path activationFile = directory.resolve("activation.json");
+    Files.write(activationFile, mapper.writeValueAsBytes(activation));
+    assertEquals(2, RuntimeServer.run(new String[] {"--config", "../config/examples/m3/server.json",
+        "--m3-config", activationFile.toString()}));
   }
 
   private ObjectNode example() throws Exception {

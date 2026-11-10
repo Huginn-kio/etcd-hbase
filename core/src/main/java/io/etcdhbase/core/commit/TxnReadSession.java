@@ -162,6 +162,16 @@ public final class TxnReadSession implements AutoCloseable {
     return reader;
   }
 
+  /** Captures metadata for an already pinned target; sending still requires {@link #finish()}. */
+  public synchronized ReadView protectedView(long revision) {
+    if (state != State.ACTIVE || expanding || scope.isClosed() || scope.isDeadlineExceeded()) {
+      throw new IllegalStateException("transaction read session is not active");
+    }
+    ReadViewRecordStore store = stores.get(revision == 0 ? currentRevision : revision);
+    if (store == null) throw new IllegalArgumentException("revision was not captured by the transaction");
+    return store.protectedView();
+  }
+
   /** The caller retains all child outputs until this final protection check has succeeded. */
   public CompletableFuture<Void> finish() {
     CompletableFuture<Void> completion;

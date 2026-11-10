@@ -1,7 +1,9 @@
 package io.etcdhbase.server.config;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
@@ -32,10 +34,25 @@ class M3RuntimeConfigurationTest {
   @Test
   void acceptsAnExplicitUnsignedStableMemberIdentityAndPinConfiguration() {
     var configuration = load(valid());
+    assertFalse(configuration.readCacheEnabled());
     assertEquals(Long.MIN_VALUE, configuration.memberIdBits());
     assertEquals(2, configuration.pinConfiguration().shardCount());
     assertEquals(16, configuration.pinConfiguration().slotsPerShard());
     assertEquals(60_000, configuration.pinConfiguration().leaseMillis());
+  }
+
+  @Test
+  void cacheDefaultsOffAndCannotBeEnabledWithoutIdentityLifecycleProof() {
+    assertFalse(load(valid()).readCacheEnabled());
+    assertFalse(load(valid().replace("\"pin_lease_ms\":60000", "\"pin_lease_ms\":60000,\"read_cache_enabled\":false"))
+        .readCacheEnabled());
+    var enabled = assertThrows(M3RuntimeConfiguration.CacheActivationUnavailable.class, () -> load(valid().replace(
+        "\"pin_lease_ms\":60000", "\"pin_lease_ms\":60000,\"read_cache_enabled\":true")));
+    assertTrue(enabled.getMessage().contains("identity lifecycle"));
+    assertThrows(IllegalArgumentException.class, () -> load(valid().replace(
+        "\"pin_lease_ms\":60000", "\"pin_lease_ms\":60000,\"read_cache_enabled\":null")));
+    assertThrows(IllegalArgumentException.class, () -> load(valid().replace(
+        "\"pin_lease_ms\":60000", "\"pin_lease_ms\":60000,\"read_cache_enabled\":\"true\"")));
   }
 
   @Test

@@ -80,6 +80,11 @@ public final class ReadViewRecordStore implements RecordStore, BudgetedRecordSto
     return physical.pointReadUsesScanner();
   }
 
+  ReadView protectedView() {
+    if (!isActive()) throw new IllegalStateException("read view is not active");
+    return pinned.view();
+  }
+
   @Override
   public CompletableFuture<Optional<StoredRecord>> get(ByteKey key, long revisionUpperBound,
       ReadProjection projection, BudgetManager.Account account) {

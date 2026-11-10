@@ -70,7 +70,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
     byte[] row = binding.row(type, identity);
     return execute(scope, table -> table.get(
         new Get(row).setConsistency(Consistency.STRONG).addFamily(binding.family())))
-        .thenApply(result -> decode(result));
+        .thenApply(result -> decode(result, binding.family()));
   }
 
   @Override
@@ -111,14 +111,17 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
         .thenApply(result -> result.isSuccess());
   }
 
-  private Optional<ByteKey> decode(Result result) {
+  static Optional<ByteKey> decode(Result result, byte[] family) {
     if (result.isEmpty()) return Optional.empty();
     var cells = result.rawCells();
     if (cells == null || cells.length != 1
-        || !Arrays.equals(CellUtil.cloneQualifier(cells[0]), VALUE)) {
+        || !CellUtil.matchingQualifier(cells[0], VALUE)) {
       throw new IllegalArgumentException("system record contains an unexpected cell layout");
     }
-    byte[] bytes = result.getValue(binding.family(), VALUE);
+    // Check the already-decoded cell before getValue makes another potentially large copy.
+    // This does not impose a bound on the HBase client's incoming RPC frame.
+    validateValueLength(cells[0].getValueLength());
+    byte[] bytes = result.getValue(family, VALUE);
     if (bytes == null) throw new IllegalArgumentException("system record is missing its value");
     validateValueLength(bytes.length);
     return Optional.of(ByteKey.copyOf(bytes));

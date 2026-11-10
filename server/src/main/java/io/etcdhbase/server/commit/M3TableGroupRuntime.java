@@ -11,7 +11,9 @@ import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.RecoveryManager;
 import io.etcdhbase.core.commit.ResultPreparation;
+import io.etcdhbase.core.commit.UnchangedRangeProof;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.kv.RangeReadCache;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.ScanScheduler;
@@ -28,6 +30,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -70,6 +73,14 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       RuntimeConfiguration.ResourceBudgets limits, HBaseConnectionFactory connections,
       AuthorizedBackendIdentity identity, BudgetManager budgets, ScanScheduler scans,
       RequestScope startup) throws Exception {
+    return open(plan, activation, limits, connections, identity, budgets, scans, startup, Optional.empty());
+  }
+
+  /** Internal assembly path; public configuration still rejects cache activation. */
+  static M3TableGroupRuntime open(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
+      RuntimeConfiguration.ResourceBudgets limits, HBaseConnectionFactory connections,
+      AuthorizedBackendIdentity identity, BudgetManager budgets, ScanScheduler scans,
+      RequestScope startup, Optional<CacheLimits> cacheLimits) throws Exception {
     Objects.requireNonNull(plan, "plan");
     Objects.requireNonNull(activation, "activation");
     Objects.requireNonNull(limits, "limits");
@@ -78,6 +89,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     Objects.requireNonNull(budgets, "budgets");
     Objects.requireNonNull(scans, "scans");
     Objects.requireNonNull(startup, "startup");
+    Objects.requireNonNull(cacheLimits, "cacheLimits");
     if (limits.maxConcurrentRequests() < 1 || limits.maxConcurrentRequests() > 100_000
         || limits.requestDeadlineMs() < 1 || limits.requestDeadlineMs() > 600_000
         || limits.maxScannersPerTable() < 1 || limits.maxScannersPerTable() > 1024
@@ -102,7 +114,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       pending.trackOwner(ownerFuture);
       var owner = await(ownerFuture, startup);
       ByteKey authorization = authorizationDigest(identity);
-      var business = assembleBusiness(plan, activation, connections, budgets, scans, pending, stores, invocations, owner);
+      var business = assembleBusiness(plan, activation, connections, budgets, scans, pending, stores,
+          invocations, owner, cacheLimits);
       var service = assembleService(plan, activation, identity, authorization, budgets, pending, stores,
           invocations, owner, business);
       startup.closeAsync(CLEANUP);
@@ -122,9 +135,15 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private record BusinessComponents(PutOwnerProcessor putProcessor, TxnOwnerProcessor txnProcessor,
       TxnReadExecutor txnReads, RequestMetrics metrics) {}
 
+  record CacheLimits(long maximumBytes, int maximumEntries, int maximumRecords,
+      int maximumDecisions, long maximumCandidateBytes, BudgetManager.Reservation proofReservation,
+      BudgetManager.ReadLimits proofReads, int maximumProofPages, long maximumProofBytes,
+      int maximumEntriesExamined, long maximumProofNanos) {}
+
   private static BusinessComponents assembleBusiness(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
       HBaseConnectionFactory connections, BudgetManager budgets, ScanScheduler scans, Pending pending,
-      TableGroupStores stores, InvocationService invocations, M3OwnerLease owner) {
+      TableGroupStores stores, InvocationService invocations, M3OwnerLease owner,
+      Optional<CacheLimits> cacheLimits) throws BackendFailure {
     var preparation = new PutCommitPreparation(new ResultPreparation(stores.resultRepository()),
         stores.results(), new ManifestPreparation(stores.manifestRepository(),
             new ManifestPreparation.Limits(1, 4L << 20, 1, 8L << 20)), invocations);
@@ -146,8 +165,9 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         connections, plan.primary(), pending.worker, scans, txnPreparation, publisher, txnLimits, metrics);
     var txnProcessor = new TxnOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
         REQUEST_MEMORY, txnExecutor, stores.outcomes(), activation.maxEtcdRequestBytes());
+    if (cacheLimits.isPresent()) pending.createCache(plan, stores, budgets, cacheLimits.orElseThrow());
     var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),
-        connections, plan.primary(), pending.worker, scans, txnLimits, metrics);
+        connections, plan.primary(), pending.worker, scans, txnLimits, metrics, Optional.ofNullable(pending.cache));
     return new BusinessComponents(putProcessor, txnProcessor, txnReads, metrics);
   }
 
@@ -187,6 +207,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   public long clusterId() { return clusterId; }
   public long memberId() { return memberId; }
   public RequestMetrics metrics() { return metrics; }
+  long cacheHitCount() { return resources.cache == null ? 0 : resources.cache.hitCount(); }
   public boolean isReady() { return resources.isReady(); }
   public CompletableFuture<Void> drained() { return resources.drained.copy(); }
   @Override public void close() { resources.close(); }
@@ -281,8 +302,22 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     private SerialMutationQueue queue;
     private BoundedPublicationHandoff handoff;
     private ThreadPoolExecutor worker;
+    private RangeReadCache cache;
 
     private Pending(RequestScope startup) { this.startup = startup; }
+
+    private void createCache(M3TableGroupPlan plan, TableGroupStores stores, BudgetManager budgets,
+        CacheLimits limits) throws BackendFailure {
+      var prover = new UnchangedRangeProof(stores.decisions(), stores.manifests(),
+          plan.primary().codec().saltProfile().bucketCount(), limits.maximumDecisions(),
+          limits.maximumCandidateBytes(), plan.primary().codec()::bucket);
+      var proof = new RangeReadCache.ProofOptions(prover, limits.proofReservation(), limits.proofReads(),
+          limits.maximumProofPages(), limits.maximumProofBytes(), limits.maximumEntriesExamined(),
+          limits.maximumProofNanos());
+      cache = new RangeReadCache(stores.clusterId(), plan.system().profileFingerprint(), limits.maximumBytes(),
+          limits.maximumEntries(), limits.maximumRecords(), budgets, plan.source().tableGroupId(),
+          recoveryScope, Optional.of(proof));
+    }
 
     private void initialize(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
         RuntimeConfiguration.ResourceBudgets limits, BudgetManager budgets) throws BackendFailure {
