@@ -47,6 +47,10 @@ class M3TxnRpcIT {
 
   @Test
   void goTransactionsMatchNativeOnBothLayouts() throws Exception {
+    runScenario("j31", "m3-txn.yaml");
+  }
+
+  static void runScenario(String task, String scenario) throws Exception {
     Path root = WireProcesses.repositoryRoot();
     String configuredRun = System.getenv("M3_RUN_ID");
     String runId = configuredRun == null ? "txn-" + UUID.randomUUID() : configuredRun;
@@ -62,13 +66,14 @@ class M3TxnRpcIT {
     }
     Files.createDirectories(artifacts);
     String prefix = "etcd-hbase-m3-test/" + runId + "/";
-    Path nativeTrace = artifacts.resolve("j31-native-trace.jsonl");
-    runDriver(root, artifacts.resolve("j31-native.log"), "--native-data-dir",
-        artifacts.resolve("j31-native-data").toString(), "--scope", "native-etcd", "--prefix", prefix,
-        "--trace", nativeTrace.toString(), "--metadata", artifacts.resolve("j31-native-metadata.json").toString());
+    Path nativeTrace = artifacts.resolve(task + "-native-trace.jsonl");
+    runDriver(root, artifacts.resolve(task + "-native.log"), scenario, "--native-data-dir",
+        artifacts.resolve(task + "-native-data").toString(), "--scope", "native-etcd", "--prefix", prefix,
+        "--trace", nativeTrace.toString(), "--metadata", artifacts.resolve(task + "-native-metadata.json").toString());
+    var run = new ScenarioRun(task, scenario, root, artifacts, prefix, nativeTrace);
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
       for (String file : List.of("history-table.json", "native-cell-versions.json")) {
-        runTargetLayout(cluster, file, root, artifacts, prefix, nativeTrace);
+        runTargetLayout(cluster, file, run);
       }
     }
     String source = System.getenv("M3_SOURCE_COMMIT");
@@ -77,13 +82,16 @@ class M3TxnRpcIT {
       String metadata = "{\"kind\":\"java-grpc-hbase-minicluster\",\"run_id\":\"" + runId
           + "\",\"source_commit\":\"" + source
           + "\",\"authentication\":\"dev-no-auth\",\"layouts\":[\"HISTORY\",\"NATIVE\"]}\n";
-      Files.writeString(artifacts.resolve("j31-target-fixture.json"), metadata,
+      Files.writeString(artifacts.resolve(task + "-target-fixture.json"), metadata,
           java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE);
     }
   }
 
+  private record ScenarioRun(String task, String scenario, Path root, Path artifacts,
+      String prefix, Path nativeTrace) {}
+
   private static void runTargetLayout(TemporaryHBaseClusterProcess cluster, String file,
-      Path root, Path artifacts, String prefix, Path nativeTrace) throws Exception {
+      ScenarioRun run) throws Exception {
     var plan = M3TableGroupRuntimeIT.plan(file, cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
     String layout = file.startsWith("history") ? "HISTORY" : "NATIVE";
     String suffix = layout.toLowerCase(Locale.ROOT);
@@ -97,19 +105,19 @@ class M3TxnRpcIT {
       M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider, PINS);
       var limits = new BudgetManager.Limits(10, 10, 16, 8, 16, 4L << 20, 512L << 20);
       var budgets = new BudgetManager(limits, Map.of(plan.source().tableGroupId(), limits), limits);
-      runTargetRuntime(plan, provider, identity, budgets, root, artifacts, prefix, layout, suffix);
+      runTargetRuntime(plan, provider, identity, budgets, run, layout, suffix);
       assertEquals(0, budgets.snapshot().reservedBytes());
       assertEquals(0, budgets.snapshot().allocatedBytes());
     }
-    run(root, artifacts.resolve("j31-compare-" + suffix + ".log"), List.of(
-        root.resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare", "--m3-txn",
-        "--left", nativeTrace.toString(), "--right",
-        artifacts.resolve("j31-target-" + suffix + "-trace.jsonl").toString()));
+    run(run.root(), run.artifacts().resolve(run.task() + "-compare-" + suffix + ".log"), List.of(
+        run.root().resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare", "--m3-txn",
+        "--left", run.nativeTrace().toString(), "--right",
+        run.artifacts().resolve(run.task() + "-target-" + suffix + "-trace.jsonl").toString()));
   }
 
   private static void runTargetRuntime(M3TableGroupPlan plan, HBaseBackendIdentityProvider provider,
-      AuthorizedBackendIdentity identity, BudgetManager budgets, Path root, Path artifacts,
-      String prefix, String layout, String suffix) throws Exception {
+      AuthorizedBackendIdentity identity, BudgetManager budgets, ScenarioRun run,
+      String layout, String suffix) throws Exception {
     try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
       M3TableGroupRuntime runtime;
       try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
@@ -117,7 +125,7 @@ class M3TxnRpcIT {
             RESOURCES, provider, identity, budgets, scans, startup);
       }
       try {
-        runTargetServer(runtime, plan, provider, identity, root, artifacts, prefix, layout, suffix);
+        runTargetServer(runtime, plan, provider, identity, run, layout, suffix);
       } finally {
         runtime.close();
         runtime.drained().get(30, TimeUnit.SECONDS);
@@ -126,16 +134,16 @@ class M3TxnRpcIT {
   }
 
   private static void runTargetServer(M3TableGroupRuntime runtime, M3TableGroupPlan plan,
-      HBaseBackendIdentityProvider provider, AuthorizedBackendIdentity identity, Path root,
-      Path artifacts, String prefix, String layout, String suffix) throws Exception {
+      HBaseBackendIdentityProvider provider, AuthorizedBackendIdentity identity, ScenarioRun run,
+      String layout, String suffix) throws Exception {
     try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
         "m3-txn", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
-      runDriver(root, artifacts.resolve("j31-target-" + suffix + ".log"),
+      runDriver(run.root(), run.artifacts().resolve(run.task() + "-target-" + suffix + ".log"), run.scenario(),
           "--endpoint", "127.0.0.1:" + server.boundListener().port(), "--scope", "target-hbase",
-          "--layout", layout, "--prefix", prefix,
-          "--trace", artifacts.resolve("j31-target-" + suffix + "-trace.jsonl").toString(),
-          "--metadata", artifacts.resolve("j31-target-" + suffix + "-metadata.json").toString());
-      assertPhysicalRowLimits(server, provider, identity, plan);
+          "--layout", layout, "--prefix", run.prefix(),
+          "--trace", run.artifacts().resolve(run.task() + "-target-" + suffix + "-trace.jsonl").toString(),
+          "--metadata", run.artifacts().resolve(run.task() + "-target-" + suffix + "-metadata.json").toString());
+      if (run.task().equals("j31")) assertPhysicalRowLimits(server, provider, identity, plan);
     }
   }
 
@@ -167,12 +175,13 @@ class M3TxnRpcIT {
     }
   }
 
-  private static void runDriver(Path root, Path log, String... args) throws Exception {
+  private static void runDriver(Path root, Path log, String scenario, String... args) throws Exception {
+
     var command = new ArrayList<String>();
     command.add(root.resolve("scripts/dev/go-program.sh").toString());
     command.add("m3driver");
     command.add("--scenario");
-    command.add(root.resolve("testkit/scenarios/m3-txn.yaml").toString());
+    command.add(root.resolve("testkit/scenarios").resolve(scenario).toString());
     command.addAll(List.of(args));
     run(root, log, command);
   }

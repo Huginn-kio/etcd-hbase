@@ -151,4 +151,16 @@ class BudgetManagerTest {
           "candidate payload and returned cells share the bounded request read-byte budget");
     }
   }
+
+  @Test
+  void internalPointReadsShareBothPointAndReadByteLimits() throws Exception {
+    var manager = new BudgetManager(GLOBAL, Map.of("alpha", GROUP), REQUEST);
+    try (var scope = RequestScope.withoutDeadline();
+        var account = manager.admit("alpha", scope, MEMORY, new BudgetManager.ReadLimits(100, 1024, 100, 8, 2))) {
+      account.chargeInternalPointRead(512);
+      account.chargeInternalPointRead(512);
+      assertEquals(2, account.pointReads());
+      assertThrows(BackendFailure.class, () -> account.chargeInternalPointRead(1));
+    }
+  }
 }

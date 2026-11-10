@@ -37,6 +37,11 @@ TXN_CASES = ("native-baseline",) + tuple(
     "compare-missing-version", "compare-missing-value", "compare-range", "then-write", "else-write",
     "no-change", "client-read", "empty-compare", "duplicate-put",
 ))
+NESTED_CASES = ("native-baseline",) + tuple(f"J32-{case}" for case in (
+    "branch-base", "historical-reads", "nested-else", "unselected-dynamic", "mutually-exclusive",
+    "sibling-duplicate", "parent-overlap", "dynamic-priority", "future-revision",
+    "negative-revision", "unselected-empty-key",
+))
 HBASE_SUITE = "io.etcdhbase.hbase.storage.M3ResultRepositoryIT"
 INIT_SUITE = "io.etcdhbase.admin.M3InitializeTablesIT"
 SERVER_SUITE = "io.etcdhbase.server.M3PutRpcIT"
@@ -73,7 +78,9 @@ J31_GO_REQUIRED_CASES = {
     "internal/compare": GO_REQUIRED_CASES["internal/compare"] | {
         "TestM3TxnComparisonKeepsChildResponsesAndMethodsStrict",
         "TestM3TxnCountAllowanceMatchesOnlySelectedRangePosition",
-        "TestM3TxnCountValidationDoesNotPartiallyMutateOnMalformedSibling"},
+        "TestM3TxnCountValidationDoesNotPartiallyMutateOnMalformedSibling",
+        "TestM3TxnCountAllowanceRejectsMatchingMalformedOneof",
+        "TestM3TxnCountAllowanceRejectsMalformedStrictSibling"},
 }
 J31_INTEGRATION_CASES = {
     "io.etcdhbase.hbase.storage.M2SnapshotPinIT": {"transactionRetainsCurrentAndHistoricalPinsUntilFinalValidation"},
@@ -98,6 +105,66 @@ J31_UNIT_CASES = {
     "io.etcdhbase.grpc.protocol.TxnResponseMapperTest": {"projectsOuterIdentityAndPerOperationRevisionsWithoutInventingChildIdentities"},
     "io.etcdhbase.server.RequestLifecycleTest": {"drainCompletionWaitsForAdmittedRequestCleanupAfterShutdownStarts"},
     "io.etcdhbase.server.M3RuntimeGroupsTest": {"backendFactoryWaitsForRuntimeScannerAndRequestDrain"},
+}
+J32_GO_REQUIRED_CASES = {
+    **{package: set(cases) for package, cases in J31_GO_REQUIRED_CASES.items()},
+    "internal/scenario": J31_GO_REQUIRED_CASES["internal/scenario"] | {
+        "TestM3NestedTxnScenarioRunsAgainstIndependentNativeServers",
+        "TestM3NestedTxnSuiteRejectsMissingOrAlteredSteps",
+        "TestM3NativeNestedCompareUsesBaseAndChildHeaderIsEmpty",
+        "TestM3NativeNestedHistoricalReadAndRevisionPrecheck",
+        "TestM3NativeNestedStaticOverlapAndDynamicErrorOrder"},
+    "internal/compare": J31_GO_REQUIRED_CASES["internal/compare"] | {
+        "TestM3NestedTxnCountAllowanceIsRestrictedToItsSelectedRequestPath"},
+}
+J32_INTEGRATION_CASES = {
+    "io.etcdhbase.hbase.storage.M2SnapshotPinIT": {
+        "transactionRetainsCurrentAndHistoricalPinsUntilFinalValidation"},
+    HBASE_SUITE: {"persistsVerifiesAndRejectsDamagedResultOnDisposableHBase",
+                  "noChangeResultSurvivesLostCasAcknowledgementAndRejectsLateSeal"},
+    "io.etcdhbase.server.M3TxnCommitIT": {
+        "publishesMultipleKeysOnceAndReplaysAnEarlierNoChangeResultOnBothLayouts",
+        "nestedWorksetExceedsMemoryAndDoesNotReplayAnUncertainPageOnBothLayouts"},
+    "io.etcdhbase.server.M3NestedRpcIT": {"goNestedTransactionsMatchNativeOnBothLayouts"},
+    "io.etcdhbase.server.M3WorksetIT": {"orderedPrivateOverlayMergesWithRealScansAcrossBucketsAndLayouts"},
+}
+J32_UNIT_CASES = {
+    **{suite: set(cases) for suite, cases in J31_UNIT_CASES.items()},
+    "io.etcdhbase.core.commit.ReadViewRecordStoreTest": J31_UNIT_CASES[
+        "io.etcdhbase.core.commit.ReadViewRecordStoreTest"] | {
+            "nestedCompareUsesBaseWhileNestedReadSeesEarlierPut",
+            "nestedSelectionDoesNotReadUnselectedBranchesAndPropagatesBackendFailure",
+            "selectedNestedHistoricalReadUsesSameBarrierWithoutOverlayingPriorPut",
+            "nestedPreflightFollowsNativeDynamicErrorOrderAndSkipsUnselectedTargets",
+            "uncertainPreparedInvocationCannotRerunItsComparisons",
+            "abandonedHistoricalPinFutureCannotCancelInstallationOrLeakItsProtection",
+            "failedHistoricalPinClosesThePreviouslyAcquiredBasePin",
+            "tooManySelectedHistoricalPinsAreResourceExhaustion",
+            "selectedHistoricalPinsKeepTheOriginalBarrierAfterAnotherCommit"},
+    "io.etcdhbase.core.commit.PagedWorksetIndexTest": {
+        "pagesLargeOperationAndReadsOnlyCompletedBucketKeyOrder",
+        "incompleteOperationNeverChangesTheCommittedRootAndFailureFencesTheAttempt",
+        "detectsCorruptPagesAndDoesNotReuseAnotherTransaction",
+        "durableStartPreventsBlindReplayOfAnUnfinishedInvocation",
+        "laterCompletedOperationReplacesOneKeyButKeepsAllEventOrdinals",
+        "cancelledCursorFutureDoesNotReleaseItsInFlightReadOrSuppressFailure"},
+    "io.etcdhbase.core.kv.TxnWorkingSetTest": {
+        "orderedWritesShareOneRevisionAndOnlyTheWorkingViewSeesThem",
+        "persistedPayloadCanExceedTheWorkingMemoryBound", "mergesCompletedOverlayAndFixedBaseInBucketKeyOrder",
+        "failedPartialOperationFencesTheAttempt",
+        "frozenCheckpointCannotRaceWithAnUnfinishedOrLaterWrite",
+        "changedEventIsRejectedBeforeTheCandidateOrEventStreamCanComplete"},
+    "io.etcdhbase.core.commit.ManifestPreparationTest": {
+        "asynchronouslyStreamsCandidatesAndEventsBeforeSealing",
+        "cancellationBeforeAnAsyncCursorReturnsCannotSealAManifest"},
+    "io.etcdhbase.core.scan.BudgetManagerTest": {"internalPointReadsShareBothPointAndReadByteLimits"},
+    "io.etcdhbase.grpc.protocol.TxnRequestMapperTest": J31_UNIT_CASES[
+        "io.etcdhbase.grpc.protocol.TxnRequestMapperTest"] | {
+            "matchesNativeNestedPotentialWriteIntervalsEvenInUnselectedBranches",
+            "depthBudgetIncludesLeafResponseBeforeAnyTransactionStarts"},
+    "io.etcdhbase.grpc.protocol.TxnResponseMapperTest": J31_UNIT_CASES[
+        "io.etcdhbase.grpc.protocol.TxnResponseMapperTest"] | {
+            "projectsNestedTxnHeaderAndOrderedChildrenWithoutInventingIdentity"},
 }
 
 
@@ -192,7 +259,7 @@ def validate_metadata(metadata: dict, scope: str, layout: str,
 def validate_trace_cases(path: Path, scope: str, task: str = "J30") -> None:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 256 << 20:
         raise ValueError("M3 trace is missing, linked or oversized")
-    cases = {"J30": PUT_CASES, "J31": TXN_CASES}.get(task)
+    cases = {"J30": PUT_CASES, "J31": TXN_CASES, "J32": NESTED_CASES}.get(task)
     if cases is None:
         raise ValueError("unregistered M3 trace task")
     records = []
@@ -244,13 +311,21 @@ def validate_go_report(path: Path, required_cases: dict = GO_REQUIRED_CASES) -> 
 def validate_run(root: Path, repository: Path = REPO) -> dict:
     run, source, task = validate_run_identity(root, repository)
     prefix, txn = validate_run_traces(root, repository, run, source, task)
-    suites = validate_run_reports(root, txn)
+    suites = validate_run_reports(root, task)
     compare_run_traces(root, repository, prefix, txn)
+    limitations = ["raft_term=0 is a disclosed non-Raft projection",
+                   "public MiniCluster is not target HBase or target identity acceptance",
+                   "an unconfirmed scanner close retires local capacity; remote lifetime across restarts is unverified"]
+    if task == "J32":
+        limitations.extend([
+            "private workset pages are non-expiring until long-term collection is implemented in J53",
+            "a started invocation with an unknown outcome requires a durable decision or fencing proof; "
+            "automatic recovery is not yet integrated",
+        ])
     return {"phase": "M3", "tasks": [task], "scope": run["scope"], "run_id": run["run_id"],
-            "source_commit": source, "suites": suites, "trace_cases": list(TXN_CASES if txn else PUT_CASES),
-            "limitations": ["raft_term=0 is a disclosed non-Raft projection",
-                            "public MiniCluster is not target HBase or target identity acceptance",
-                            "an unconfirmed scanner close retires local capacity; remote lifetime across restarts is unverified"]}
+            "source_commit": source, "suites": suites,
+            "trace_cases": list({"J30": PUT_CASES, "J31": TXN_CASES, "J32": NESTED_CASES}[task]),
+            "limitations": limitations}
 
 
 def validate_run_identity(root: Path, repository: Path) -> tuple[dict, str, str]:
@@ -258,7 +333,7 @@ def validate_run_identity(root: Path, repository: Path) -> tuple[dict, str, str]
     run_id = run.get("run_id")
     tasks = run.get("tasks")
     if (run.get("schema") != "etcd-hbase-m3-run/v1"
-            or run.get("scope") != "public-local-minicluster" or tasks not in (["J30"], ["J31"])
+            or run.get("scope") != "public-local-minicluster" or tasks not in (["J30"], ["J31"], ["J32"])
             or not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", run_id)
             or root.name != run_id or run.get("commands_passed") is not True):
         raise ValueError("M3 run identity, scope, tasks, or command status is invalid")
@@ -276,10 +351,14 @@ def validate_run_identity(root: Path, repository: Path) -> tuple[dict, str, str]
 def validate_run_traces(root: Path, repository: Path, run: dict, source: str, task: str) -> tuple[str, bool]:
     run_id = run["run_id"]
     validate_case_registry(read_json(repository / "testkit/cases/m3-cases.json"))
-    txn = task == "J31"
-    prefix = "j31-" if txn else ""
-    scenario = "m3-txn-v1" if txn else "m3-put-v1"
-    suite_sha = file_digest(repository / ("testkit/scenarios/m3-txn.yaml" if txn else "testkit/scenarios/m3-put.yaml"))
+    txn = task != "J30"
+    prefix = {"J30": "", "J31": "j31-", "J32": "j32-"}[task]
+    scenario, suite_file = {
+        "J30": ("m3-put-v1", "m3-put.yaml"),
+        "J31": ("m3-txn-v1", "m3-txn.yaml"),
+        "J32": ("m3-nested-txn-v1", "m3-nested-txn.yaml"),
+    }[task]
+    suite_sha = file_digest(repository / "testkit/scenarios" / suite_file)
     prefix_sha = hashlib.sha256(f"etcd-hbase-m3-test/{run_id}/".encode()).hexdigest()
     for name, scope, layout in (("native", "native-etcd", ""), ("target-history", "target-hbase", "HISTORY"),
                                 ("target-native", "target-hbase", "NATIVE")):
@@ -296,14 +375,19 @@ def validate_run_traces(root: Path, repository: Path, run: dict, source: str, ta
     return prefix, txn
 
 
-def validate_run_reports(root: Path, txn: bool) -> dict:
-    validate_go_report(root / "go-test.jsonl", J31_GO_REQUIRED_CASES if txn else GO_REQUIRED_CASES)
-    integration = J31_INTEGRATION_CASES if txn else REQUIRED_CASES
+def validate_run_reports(root: Path, task: str) -> dict:
+    txn = task != "J30"
+    go_cases = {"J30": GO_REQUIRED_CASES, "J31": J31_GO_REQUIRED_CASES, "J32": J32_GO_REQUIRED_CASES}[task]
+    validate_go_report(root / "go-test.jsonl", go_cases)
+    integration = {"J30": REQUIRED_CASES, "J31": J31_INTEGRATION_CASES, "J32": J32_INTEGRATION_CASES}[task]
     _, suites = java_reports(root, set(integration), modules=("hbase", "admin", "server"),
                              required_cases=integration, report_kinds=("failsafe-reports",))
     if txn:
-        _, units = java_reports(root, set(J31_UNIT_CASES), modules=("core", "grpc", "server"),
-                                required_cases=J31_UNIT_CASES, report_kinds=("surefire-reports",))
+        required_units = J31_UNIT_CASES if task == "J31" else J32_UNIT_CASES
+        unit_modules = ("core", "grpc", "server") if task == "J31" else (
+            "protocol", "spi", "core", "hbase", "grpc", "admin", "server")
+        _, units = java_reports(root, set(required_units), modules=unit_modules,
+                                required_cases=required_units, report_kinds=("surefire-reports",))
         suites.update(units)
     return suites
 

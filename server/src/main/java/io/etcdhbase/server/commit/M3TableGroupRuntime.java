@@ -142,8 +142,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         stores.results(), new ManifestPreparation(stores.manifestRepository(),
             new ManifestPreparation.Limits(128, 4L << 20, 128, 8L << 20)), invocations, 8L << 20);
     var txnExecutor = new TxnMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
-        stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
-        scans, txnPreparation, publisher, txnLimits, metrics);
+        stores.control(), stores.views(), stores.manifests(), stores.records(), stores.manifestRepository(),
+        connections, plan.primary(), pending.worker, scans, txnPreparation, publisher, txnLimits, metrics);
     var txnProcessor = new TxnOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
         REQUEST_MEMORY, txnExecutor, stores.outcomes(), activation.maxEtcdRequestBytes());
     var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),

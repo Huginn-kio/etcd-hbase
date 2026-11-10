@@ -1,0 +1,28 @@
+schema_version: 1
+id: m3-nested-txn-v1
+protocol: etcd-v3.5.23
+steps:
+  - case_id: C13
+    id: native-baseline
+  - case_id: C13
+    id: J32-branch-base
+  - case_id: C13
+    id: J32-historical-reads
+  - case_id: C13
+    id: J32-nested-else
+  - case_id: C13
+    id: J32-unselected-dynamic
+  - case_id: C13
+    id: J32-mutually-exclusive
+  - case_id: C13
+    id: J32-sibling-duplicate
+  - case_id: C13
+    id: J32-parent-overlap
+  - case_id: C13
+    id: J32-dynamic-priority
+  - case_id: C13
+    id: J32-future-revision
+  - case_id: C13
+    id: J32-negative-revision
+  - case_id: C13
+    id: J32-unselected-empty-key

@@ -13,7 +13,8 @@ public enum SystemRecordType {
   SNAPSHOT_PIN(9),
   RECOVERY_CHECKPOINT(10),
   RESULT(11),
-  TABLE_GROUP_IDENTITY(12);
+  TABLE_GROUP_IDENTITY(12),
+  WORKSET(13);
 
   private final int id;
 

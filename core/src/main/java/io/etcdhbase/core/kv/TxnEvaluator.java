@@ -1,10 +1,14 @@
 package io.etcdhbase.core.kv;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.commit.AsyncCursor;
 import io.etcdhbase.core.commit.InvocationBinding;
+import io.etcdhbase.core.commit.ManifestRepository;
 import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.PreparedEvent;
+import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.TxnReadSession;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
@@ -13,6 +17,7 @@ import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -20,8 +25,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.ToIntFunction;
 
-/** Plans a flat transaction privately; publishing and final read validation remain caller-owned. */
+/** Selects transaction branches on one base, then plans their operations in order. */
 public final class TxnEvaluator {
+  private static final ContinuationExecutor CONTINUATION_EXECUTOR = new ContinuationExecutor();
+
   public record Limits(long pointBytes, long resultBytes, long workingBytes) {
     public Limits {
       if (pointBytes < 1 || resultBytes < 128 || resultBytes > ResultTree.MAX_RETAINED_BYTES
@@ -34,23 +41,27 @@ public final class TxnEvaluator {
   /** Private result remains bound to its original invocation, scope and protected read session. */
   public static final class Evaluation {
     private final ResultTree result;
-    private final List<PreparedCandidate> candidates;
-    private final List<PreparedEvent> events;
+    private final TxnWorkingSet working;
     private final Optional<InvocationBinding> invocation;
     private final TxnReadSession session;
 
-    private Evaluation(ResultTree result, List<PreparedCandidate> candidates,
-        List<PreparedEvent> events, Optional<InvocationBinding> invocation, TxnReadSession session) {
+    private Evaluation(ResultTree result, TxnWorkingSet working,
+        Optional<InvocationBinding> invocation, TxnReadSession session) {
       this.result = Objects.requireNonNull(result, "result");
-      this.candidates = List.copyOf(candidates);
-      this.events = List.copyOf(events);
+      this.working = working;
       this.invocation = Objects.requireNonNull(invocation, "invocation");
       this.session = Objects.requireNonNull(session, "session");
     }
 
     public ResultTree result() { return result; }
-    public List<PreparedCandidate> candidates() { return candidates; }
-    public List<PreparedEvent> events() { return events; }
+    public long candidateCount() { return working == null ? 0 : working.candidateCount(); }
+    public long eventCount() { return working == null ? 0 : working.eventCount(); }
+    public AsyncCursor<PreparedCandidate> candidates() {
+      return working == null ? AsyncCursor.fromIterator(List.<PreparedCandidate>of().iterator()) : working.candidates();
+    }
+    public AsyncCursor<PreparedEvent> events() {
+      return working == null ? AsyncCursor.fromIterator(List.<PreparedEvent>of().iterator()) : working.events();
+    }
     public boolean belongsTo(InvocationBinding expected, RequestScope scope) {
       return session.belongsTo(scope) && invocation.filter(binding -> binding.sameAttempt(expected)).isPresent();
     }
@@ -58,7 +69,7 @@ public final class TxnEvaluator {
 
     /** Produces an externally projectable read only after all transaction pins validate. */
     public CompletableFuture<ValidatedRead> finishReadOnly() {
-      if (invocation.isPresent() || !candidates.isEmpty() || !events.isEmpty()) {
+      if (invocation.isPresent() || candidateCount() != 0 || eventCount() != 0) {
         return CompletableFuture.failedFuture(new IllegalStateException("result is not a read-only transaction"));
       }
       return session.finish().thenApply(ignored -> new ValidatedRead(result, session));
@@ -83,17 +94,30 @@ public final class TxnEvaluator {
   private final RequestScope scope;
   private final Limits limits;
   private final ToIntFunction<ByteKey> bucket;
+  private final SystemRecordStore worksetRecords;
+  private final ManifestRepository worksetManifests;
   private final AtomicBoolean started = new AtomicBoolean();
 
   public TxnEvaluator(TxnReadSession session, CompareReadExecutor compares,
       BudgetManager.Account account, RequestScope scope, Limits limits,
       ToIntFunction<ByteKey> bucket) {
+    this(session, compares, account, scope, limits, bucket, null, null);
+  }
+
+  public TxnEvaluator(TxnReadSession session, CompareReadExecutor compares,
+      BudgetManager.Account account, RequestScope scope, Limits limits,
+      ToIntFunction<ByteKey> bucket, SystemRecordStore worksetRecords, ManifestRepository worksetManifests) {
     this.session = Objects.requireNonNull(session, "session");
     this.compares = Objects.requireNonNull(compares, "compares");
     this.account = Objects.requireNonNull(account, "account");
     this.scope = Objects.requireNonNull(scope, "scope");
     this.limits = Objects.requireNonNull(limits, "limits");
     this.bucket = Objects.requireNonNull(bucket, "bucket");
+    if ((worksetRecords == null) != (worksetManifests == null)) {
+      throw new IllegalArgumentException("workset stores must be provided together");
+    }
+    this.worksetRecords = worksetRecords;
+    this.worksetManifests = worksetManifests;
     if (!session.belongsTo(scope) || !account.belongsTo(scope)
         || !compares.belongsTo(session, account, scope)
         || limits.resultBytes() > account.reservation().output()
@@ -117,6 +141,12 @@ public final class TxnEvaluator {
     if (command.mayWrite() && invocation.isEmpty()) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("writing transaction requires an invocation"));
     }
+    if (command.mayWrite() && worksetRecords == null) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("writing transaction requires durable workset stores"));
+    }
+    if (command.mayWrite() && limits.workingBytes() < TxnWorkingSet.MIN_RETAINED_BYTES) {
+      return CompletableFuture.failedFuture(resourceLimit());
+    }
     if (invocation.filter(binding -> binding.state() != InvocationBinding.State.PREPARING
         || binding.baseRevision() != session.currentRevision()
         || binding.baseSequence() != session.barrierSequence()
@@ -136,13 +166,16 @@ public final class TxnEvaluator {
       TxnWorkingSet working = null;
       if (command.mayWrite()) {
         retainUntilDrain(requireMemory(BudgetManager.Memory.CANDIDATE, limits.workingBytes()));
-        working = new TxnWorkingSet(invocation.orElseThrow(), limits.workingBytes());
+        working = new TxnWorkingSet(invocation.orElseThrow(), limits.workingBytes(),
+            worksetRecords, worksetManifests, scope, account, bucket);
       }
       var state = new State(working, invocation);
-      operation = compares.evaluate(command.compares()).thenCompose(matched -> {
-        state.succeeded = matched;
-        return execute(matched ? command.success() : command.failure(), 0, state);
-      });
+      CompletableFuture<Void> started = state.working == null
+          ? CompletableFuture.completedFuture(null) : state.working.begin();
+      operation = started.thenComposeAsync(ignored -> select(command).thenComposeAsync(plan ->
+          preflight(plan).thenComposeAsync(ready -> execute(plan, 0, new ArrayList<>(), state)
+              .thenApply(responses -> finish(state, plan, responses)), CONTINUATION_EXECUTOR),
+          CONTINUATION_EXECUTOR), CONTINUATION_EXECUTOR);
     } catch (BackendFailure | RuntimeException failure) {
       drained.complete(null);
       return CompletableFuture.failedFuture(failure);
@@ -154,73 +187,192 @@ public final class TxnEvaluator {
     return operation.copy();
   }
 
-  private CompletableFuture<Evaluation> execute(List<TxnCommand.Operation> operations,
-      int index, State state) {
+  /** Selects every nested branch before any operation changes the private working view. */
+  private CompletableFuture<BranchPlan> select(TxnCommand command) {
+    return compares.evaluate(command.compares()).thenComposeAsync(matched -> selectOperations(
+        matched ? command.success() : command.failure(), 0, matched, new ArrayList<>()), CONTINUATION_EXECUTOR);
+  }
+
+  private CompletableFuture<BranchPlan> selectOperations(List<TxnCommand.Operation> operations,
+      int index, boolean succeeded, List<SelectedOperation> selected) {
+    if (index == operations.size()) {
+      return CompletableFuture.completedFuture(new BranchPlan(succeeded, List.copyOf(selected)));
+    }
+    TxnCommand.Operation operation = operations.get(index);
+    if (operation instanceof TxnCommand.Nested nested) {
+      return select(nested.command()).thenComposeAsync(child -> {
+        selected.add(new SelectedNested(child));
+        return selectOperations(operations, index + 1, succeeded, selected);
+      }, CONTINUATION_EXECUTOR);
+    }
+    selected.add(new SelectedLeaf(operation));
+    return CompletableFuture.completedFuture(null).thenComposeAsync(ignored ->
+        selectOperations(operations, index + 1, succeeded, selected), CONTINUATION_EXECUTOR);
+  }
+
+  /** Native Txn validates selected Put conditions before validating any selected Range revision. */
+  private CompletableFuture<Void> preflight(BranchPlan plan) {
+    var writes = new ArrayList<PutCommand>();
+    var revisions = new ArrayList<Long>();
+    collectSelected(plan, writes, revisions);
+    return checkPut(writes, 0).thenComposeAsync(ignored -> {
+      long firstRevision = session.compactRevision() == 0 ? -1 : session.compactRevision();
+      var historical = new LinkedHashSet<Long>();
+      for (long revision : revisions) {
+        if (revision != 0 && revision > session.currentRevision()) {
+          return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.FUTURE_REVISION));
+        }
+        if (revision != 0 && revision < firstRevision) {
+          return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.COMPACTED));
+        }
+        if (revision > 0) historical.add(revision);
+      }
+      return session.pinRevisions(List.copyOf(historical));
+    }, CONTINUATION_EXECUTOR);
+  }
+
+  private static void collectSelected(BranchPlan plan, List<PutCommand> writes, List<Long> revisions) {
+    for (SelectedOperation selected : plan.operations()) {
+      if (selected instanceof SelectedNested nested) collectSelected(nested.plan(), writes, revisions);
+      else if (((SelectedLeaf) selected).operation() instanceof TxnCommand.Put put) writes.add(put.command());
+      else if (((SelectedLeaf) selected).operation() instanceof TxnCommand.PointRange range) revisions.add(range.revision());
+    }
+  }
+
+  private CompletableFuture<Void> checkPut(List<PutCommand> writes, int index) {
+    if (index == writes.size()) return CompletableFuture.completedFuture(null);
+    PutCommand command = writes.get(index);
+    boolean needsPrevious = command.ignoreValue() || command.leaseIntent() == PutCommand.LeaseIntent.PRESERVE;
+    if (needsPrevious) {
+      long metadataBytes = Math.min(limits.pointBytes(), Math.addExact(512L, command.key().length()));
+      return new DirectRecordReader(session.reader(0), account, metadataBytes)
+          .readForPreparation(command.key(), session.currentRevision(), ReadProjection.METADATA)
+          .thenComposeAsync(point -> {
+            try (point) {
+              var prior = point.record().filter(record -> record.metadata().state() == StorageMetadata.State.LIVE)
+                  .orElseThrow(() -> new KvFailure(KvFailure.Reason.KEY_NOT_FOUND));
+              if (command.leaseIntent() == PutCommand.LeaseIntent.EXPLICIT || prior.metadata().leaseId() != 0) {
+                throw new KvFailure(KvFailure.Reason.LEASE_UNAVAILABLE);
+              }
+            }
+            return checkPut(writes, index + 1);
+          }, CONTINUATION_EXECUTOR);
+    }
+    if (command.leaseIntent() == PutCommand.LeaseIntent.EXPLICIT) {
+      return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.LEASE_UNAVAILABLE));
+    }
+    return CompletableFuture.completedFuture(null).thenComposeAsync(ignored ->
+        checkPut(writes, index + 1), CONTINUATION_EXECUTOR);
+  }
+
+  private CompletableFuture<List<ResultNode>> execute(BranchPlan plan,
+      int index, List<ResultNode> responses, State state) {
     try {
       requireActive();
       session.reader(0);
-      if (index == operations.size()) return CompletableFuture.completedFuture(finish(state));
-      TxnCommand.Operation operation = operations.get(index);
+      if (index == plan.operations().size()) return CompletableFuture.completedFuture(List.copyOf(responses));
+      SelectedOperation selected = plan.operations().get(index);
+      if (selected instanceof SelectedNested nested) return executeNested(plan, index, responses, state, nested);
+      TxnCommand.Operation operation = ((SelectedLeaf) selected).operation();
       if (operation instanceof TxnCommand.Unsupported) {
         return CompletableFuture.failedFuture(new KvFailure(KvFailure.Reason.UNSUPPORTED_OPERATION));
       }
-      if (operation instanceof TxnCommand.PointRange range) {
-        Optional<StoredRecord> overlay = state.working == null ? Optional.empty()
-            : state.working.current(range.key(), Optional.empty());
-        if (overlay.isPresent()) {
-          appendRange(state, index, overlay);
-          return execute(operations, index + 1, state);
-        }
-        return point(range.key()).thenCompose(point -> {
-          try (point) { appendRange(state, index, point.record()); }
-          catch (BackendFailure failure) { return CompletableFuture.failedFuture(failure); }
-          return execute(operations, index + 1, state);
-        });
-      }
-      TxnCommand.Put put = (TxnCommand.Put) operation;
-      return point(put.command().key()).thenCompose(point -> {
-        try (point) { appendPut(state, index, put.command(), point.record()); }
-        catch (BackendFailure failure) { return CompletableFuture.failedFuture(failure); }
-        return execute(operations, index + 1, state);
-      });
+      if (operation instanceof TxnCommand.PointRange range) return executeRange(plan, index, responses, state, range);
+      return executePut(plan, index, responses, state, (TxnCommand.Put) operation);
     } catch (BackendFailure | RuntimeException failure) {
       return CompletableFuture.failedFuture(failure);
     }
   }
 
-  private CompletableFuture<io.etcdhbase.core.scan.PointResult> point(ByteKey key) {
-    return new DirectRecordReader(session.reader(0), account, limits.pointBytes())
-        .readForPreparation(key, session.currentRevision(), ReadProjection.FULL);
+  private CompletableFuture<List<ResultNode>> executeNested(BranchPlan plan, int index,
+      List<ResultNode> responses, State state, SelectedNested nested) {
+    return execute(nested.plan(), 0, new ArrayList<>(), state).thenComposeAsync(children -> {
+      try {
+        state.reserve(128);
+        responses.add(new ResultNode.Txn(index, new ResultNode.Header(true, 0),
+            nested.plan().succeeded(), children));
+        return execute(plan, index + 1, responses, state);
+      } catch (BackendFailure failure) {
+        return CompletableFuture.failedFuture(failure);
+      }
+    }, CONTINUATION_EXECUTOR);
   }
 
-  private void appendRange(State state, int ordinal, Optional<StoredRecord> observed) throws BackendFailure {
+  private CompletableFuture<List<ResultNode>> executeRange(BranchPlan plan, int index,
+      List<ResultNode> responses, State state, TxnCommand.PointRange range) {
+    boolean current = range.revision() <= 0;
+    CompletableFuture<Optional<StoredRecord>> overlay = !current || state.working == null
+        ? CompletableFuture.completedFuture(Optional.empty())
+        : state.working.current(range.key(), Optional.empty());
+    return overlay.thenComposeAsync(value -> {
+      if (value.isPresent()) {
+        try { appendRange(state, responses, index, value); }
+        catch (BackendFailure failure) { return CompletableFuture.failedFuture(failure); }
+        return CompletableFuture.completedFuture(null);
+      }
+      return point(range.key(), current ? session.currentRevision() : range.revision()).thenAccept(point -> {
+        try (point) { appendRange(state, responses, index, point.record()); }
+        catch (BackendFailure failure) { throw new java.util.concurrent.CompletionException(failure); }
+      });
+    }, CONTINUATION_EXECUTOR).thenComposeAsync(ignored ->
+        execute(plan, index + 1, responses, state), CONTINUATION_EXECUTOR);
+  }
+
+  private CompletableFuture<List<ResultNode>> executePut(BranchPlan plan, int index,
+      List<ResultNode> responses, State state, TxnCommand.Put put) {
+    return point(put.command().key(), session.currentRevision()).thenComposeAsync(point -> {
+      CompletableFuture<Void> write;
+      try { write = appendPut(state, responses, index, put.command(), point.record()); }
+      catch (RuntimeException | Error failure) {
+        try { point.close(); }
+        catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+        throw failure;
+      }
+      return write.whenComplete((ignored, failure) -> point.close()).thenComposeAsync(ignored ->
+          execute(plan, index + 1, responses, state), CONTINUATION_EXECUTOR);
+    }, CONTINUATION_EXECUTOR);
+  }
+
+  private CompletableFuture<io.etcdhbase.core.scan.PointResult> point(ByteKey key, long revision) {
+    return new DirectRecordReader(session.reader(revision), account, limits.pointBytes())
+        .readForPreparation(key, revision, ReadProjection.FULL);
+  }
+
+  private void appendRange(State state, List<ResultNode> responses, int ordinal,
+      Optional<StoredRecord> observed) throws BackendFailure {
     List<StoredRecord> records = observed.filter(record -> record.metadata().state() == StorageMetadata.State.LIVE)
         .map(List::of).orElseGet(List::of);
     long bytes = 128;
     if (!records.isEmpty()) bytes = Math.addExact(bytes, resultRecordBytes(records.getFirst()));
     state.reserve(bytes);
-    state.responses.add(new ResultNode.Range(ordinal, new ResultNode.Header(true, state.currentRevision()),
+    responses.add(new ResultNode.Range(ordinal, new ResultNode.Header(true, state.currentRevision()),
         records, records.size(), false));
   }
 
-  private void appendPut(State state, int ordinal, PutCommand command,
-      Optional<StoredRecord> base) throws BackendFailure {
+  private CompletableFuture<Void> appendPut(State state, List<ResultNode> responses, int ordinal, PutCommand command,
+      Optional<StoredRecord> base) {
     if (state.working == null) throw new IllegalStateException("write was not routed through an invocation");
-    PutResult result = state.working.put(command, base);
-    long bytes = Math.addExact(128, command.key().length());
-    if (result.previous().isPresent()) bytes = Math.addExact(bytes, resultRecordBytes(result.previous().orElseThrow()));
-    state.reserve(bytes);
-    state.responses.add(new ResultNode.Put(ordinal, new ResultNode.Header(true, result.revision()),
-        result.key(), result.previous()));
+    return state.working.put(command, base).thenAccept(result -> {
+      long bytes = Math.addExact(128, command.key().length());
+      if (result.previous().isPresent()) bytes = Math.addExact(bytes, resultRecordBytes(result.previous().orElseThrow()));
+      try { state.reserve(bytes); }
+      catch (BackendFailure failure) { throw new java.util.concurrent.CompletionException(failure); }
+      responses.add(new ResultNode.Put(ordinal, new ResultNode.Header(true, result.revision()),
+          result.key(), result.previous()));
+    });
   }
 
-  private Evaluation finish(State state) throws BackendFailure {
-    requireActive();
-    var result = new ResultTree(new ResultNode.Txn(0,
-        new ResultNode.Header(true, state.currentRevision()), state.succeeded, state.responses));
-    if (result.retainedBytes() > limits.resultBytes()) throw resourceLimit();
-    return state.working == null ? new Evaluation(result, List.of(), List.of(), state.invocation, session)
-        : new Evaluation(result, state.working.candidates(bucket), state.working.events(), state.invocation, session);
+  private Evaluation finish(State state, BranchPlan plan, List<ResultNode> responses) {
+    try {
+      requireActive();
+      var result = new ResultTree(new ResultNode.Txn(0,
+          new ResultNode.Header(true, state.currentRevision()), plan.succeeded(), responses));
+      if (result.retainedBytes() > limits.resultBytes()) throw resourceLimit();
+      if (state.working != null) state.working.freeze();
+      return new Evaluation(result, state.working, state.invocation, session);
+    } catch (BackendFailure failure) {
+      throw new java.util.concurrent.CompletionException(failure);
+    }
   }
 
   private BudgetManager.Lease requireMemory(BudgetManager.Memory lane, long bytes) throws BackendFailure {
@@ -267,9 +419,7 @@ public final class TxnEvaluator {
   private final class State {
     private final TxnWorkingSet working;
     private final Optional<InvocationBinding> invocation;
-    private final List<ResultNode> responses = new ArrayList<>();
     private long resultBytes = 128;
-    private boolean succeeded;
 
     private State(TxnWorkingSet working, Optional<InvocationBinding> invocation) {
       this.working = working;
@@ -284,4 +434,9 @@ public final class TxnEvaluator {
       resultBytes += bytes;
     }
   }
+
+  private sealed interface SelectedOperation permits SelectedLeaf, SelectedNested {}
+  private record SelectedLeaf(TxnCommand.Operation operation) implements SelectedOperation {}
+  private record SelectedNested(BranchPlan plan) implements SelectedOperation {}
+  private record BranchPlan(boolean succeeded, List<SelectedOperation> operations) {}
 }

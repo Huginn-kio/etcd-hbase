@@ -189,6 +189,20 @@ public final class BudgetManager {
       }
     }
 
+    /** Charges a bounded internal system-record Get before its value is fetched. */
+    public void chargeInternalPointRead(long maximumBytes) throws BackendFailure {
+      if (maximumBytes < 0) throw new IllegalArgumentException("negative internal read bytes");
+      synchronized (BudgetManager.this) {
+        requireActive();
+        if (pointReads >= readLimits.pointOperations() || maximumBytes > readLimits.cellBytes() - cellBytes) {
+          readExhausted = true;
+          throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+        }
+        pointReads++;
+        cellBytes = Math.addExact(cellBytes, maximumBytes);
+      }
+    }
+
     /** Charges a candidate before its value is fetched so limits bound attempted bytes too. */
     public void chargeCandidateRead(long bytes) throws BackendFailure {
       if (bytes < 0) throw new IllegalArgumentException("negative candidate read bytes");

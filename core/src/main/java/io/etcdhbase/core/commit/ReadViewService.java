@@ -16,7 +16,7 @@ import java.util.concurrent.Executor;
 
 /** Captures, pins, then revalidates one control-row read barrier before data access. */
 public final class ReadViewService {
-  private static final int MAX_TRANSACTION_TARGETS = 128;
+  static final int MAX_TRANSACTION_TARGETS = 128;
   private static final Executor TRANSACTION_CLEANUP =
       task -> Thread.ofVirtual().name("txn-view-cleanup").start(task);
   private final CommitControlStore control;
@@ -61,7 +61,10 @@ public final class ReadViewService {
     Objects.requireNonNull(revisions, "revisions");
     Objects.requireNonNull(authorizationScopeDigest, "authorizationScopeDigest");
     Objects.requireNonNull(scope, "scope");
-    if (revisions.size() > MAX_TRANSACTION_TARGETS || authorizationScopeDigest.length() != 32
+    if (revisions.size() > MAX_TRANSACTION_TARGETS) {
+      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+    }
+    if (authorizationScopeDigest.length() != 32
         || revisions.stream().anyMatch(revision -> revision == null || revision < 0)) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid transaction read targets"));
     }
@@ -74,29 +77,47 @@ public final class ReadViewService {
       targets.add(current);
       for (long revision : requested) targets.add(revision == 0 ? current : revision);
       if (targets.size() > MAX_TRANSACTION_TARGETS) {
-        return CompletableFuture.failedFuture(new IllegalArgumentException("too many transaction read targets"));
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
       }
-      Map<Long, PinnedReadView> opened = new LinkedHashMap<>();
-      CompletableFuture<Void> pending = CompletableFuture.completedFuture(null);
-      for (long target : targets) {
-        pending = pending.thenCompose(ignored -> captureSelection(state, target, authorizationScopeDigest, scope)
-            .thenCompose(capture -> registerAndRecheck(capture, scope))
-            .thenAccept(pinned -> opened.put(target, pinned)));
-      }
-      return pending.thenApply(ignored -> new TransactionViews(current, state.publishedSequence(), opened))
-          .whenComplete((ignored, failure) -> {
-            if (failure != null) {
-              try { scope.cancelAsync(TRANSACTION_CLEANUP); }
-              catch (RuntimeException | Error cleanup) {
-                if (cleanup != failure) failure.addSuppressed(cleanup);
-              }
-            }
-          });
+      return pinTargets(state, List.copyOf(targets), authorizationScopeDigest, scope)
+          .thenApply(opened -> new TransactionViews(current, state.publishedSequence(), state, opened));
     });
   }
 
-  record TransactionViews(long currentRevision, long barrierSequence, Map<Long, PinnedReadView> views) {
-    TransactionViews { views = Map.copyOf(views); }
+  /** Adds selected historical targets without reading a new transaction barrier. */
+  CompletableFuture<Map<Long, PinnedReadView>> pinTargets(CommitState barrier, List<Long> targets,
+      ByteKey authorizationScopeDigest, RequestScope scope) {
+    Objects.requireNonNull(barrier, "barrier");
+    Objects.requireNonNull(targets, "targets");
+    Objects.requireNonNull(authorizationScopeDigest, "authorizationScopeDigest");
+    Objects.requireNonNull(scope, "scope");
+    if (targets.size() > MAX_TRANSACTION_TARGETS || authorizationScopeDigest.length() != 32
+        || targets.stream().anyMatch(target -> target == null || target <= 0)) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid transaction pin targets"));
+    }
+    Map<Long, PinnedReadView> opened = new LinkedHashMap<>();
+    CompletableFuture<Void> pending = CompletableFuture.completedFuture(null);
+    for (long target : targets) {
+      pending = pending.thenCompose(ignored -> captureSelection(barrier, target, authorizationScopeDigest, scope)
+          .thenCompose(capture -> registerAndRecheck(capture, scope))
+          .thenAccept(pinned -> opened.put(target, pinned)));
+    }
+    return pending.thenApply(ignored -> Map.copyOf(opened)).whenComplete((ignored, failure) -> {
+      if (failure != null) {
+        try { scope.cancelAsync(TRANSACTION_CLEANUP); }
+        catch (RuntimeException | Error cleanup) {
+          if (cleanup != failure) failure.addSuppressed(cleanup);
+        }
+      }
+    });
+  }
+
+  record TransactionViews(long currentRevision, long barrierSequence, CommitState barrier,
+      Map<Long, PinnedReadView> views) {
+    TransactionViews {
+      Objects.requireNonNull(barrier, "barrier");
+      views = Map.copyOf(views);
+    }
   }
 
   private CompletableFuture<Capture> captureSelection(CommitState state, long target,

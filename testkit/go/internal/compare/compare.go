@@ -108,7 +108,7 @@ func compare(left, right []trace.Record, policy tracePolicy) error {
 			}
 		}
 		if policy == m3TxnPolicy && leftScope != rightScope && bothSucceeded {
-			if applied, equal := equalFlatTxnWithCountAllowance(leftNormalized[index], rightNormalized[index], leftScope); applied {
+			if applied, equal := equalTxnWithCountAllowance(leftNormalized[index], rightNormalized[index], leftScope); applied {
 				if !equal {
 					return fmt.Errorf("trace record %d violates the selected Txn Range Count policy", index+1)
 				}

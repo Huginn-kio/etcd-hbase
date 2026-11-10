@@ -7,6 +7,7 @@ import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.kv.CompareCondition;
 import io.etcdhbase.core.kv.KvFailure;
 import io.etcdhbase.core.kv.ResultNode;
+import io.etcdhbase.core.kv.ResultTree;
 import io.etcdhbase.core.kv.TxnCommand;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -15,9 +16,9 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
-/** Validates both branches, then maps the flat operations currently supported by J31. */
+/** Validates both branches before mapping the supported transaction operations. */
 public final class TxnRequestMapper {
-  private static final int MAX_TREE_DEPTH = 16;
+  private static final int MAX_TREE_DEPTH = ResultTree.MAX_DEPTH;
   private static final int MAX_TREE_NODES = 4096;
   private TxnRequestMapper() {}
 
@@ -26,6 +27,10 @@ public final class TxnRequestMapper {
     validate(request, ResultNode.MAX_OPERATIONS, 1, new int[] {0});
     writes(request.getSuccessList());
     writes(request.getFailureList());
+    return command(request);
+  }
+
+  private static TxnCommand command(Rpc.TxnRequest request) {
     return new TxnCommand(request.getCompareList().stream().map(TxnRequestMapper::compare).toList(),
         operations(request.getSuccessList()), operations(request.getFailureList()));
   }
@@ -53,12 +58,16 @@ public final class TxnRequestMapper {
 
   private static void validate(Rpc.RequestOp operation, int remaining, int depth, int[] nodes) {
     switch (operation.getRequestCase()) {
-      case REQUEST_RANGE -> requireKey(operation.getRequestRange().getKey());
-      case REQUEST_PUT -> PutRequestMapper.fromWire(operation.getRequestPut());
-      case REQUEST_DELETE_RANGE -> requireKey(operation.getRequestDeleteRange().getKey());
+      case REQUEST_RANGE -> { requireKey(operation.getRequestRange().getKey()); requireLeafDepth(depth); }
+      case REQUEST_PUT -> { PutRequestMapper.fromWire(operation.getRequestPut()); requireLeafDepth(depth); }
+      case REQUEST_DELETE_RANGE -> { requireKey(operation.getRequestDeleteRange().getKey()); requireLeafDepth(depth); }
       case REQUEST_TXN -> validate(operation.getRequestTxn(), remaining, depth + 1, nodes);
       case REQUEST_NOT_SET -> throw new KvFailure(KvFailure.Reason.KEY_NOT_FOUND);
     }
+  }
+
+  private static void requireLeafDepth(int depth) {
+    if (depth >= MAX_TREE_DEPTH) throw new KvFailure(KvFailure.Reason.REQUEST_BUDGET_EXHAUSTED);
   }
 
   private static List<TxnCommand.Operation> operations(List<Rpc.RequestOp> operations) {
@@ -66,11 +75,12 @@ public final class TxnRequestMapper {
     for (Rpc.RequestOp operation : operations) {
       mapped.add(switch (operation.getRequestCase()) {
         case REQUEST_RANGE -> isPointRange(operation.getRequestRange())
-            ? new TxnCommand.PointRange(key(operation.getRequestRange().getKey()))
+            ? new TxnCommand.PointRange(key(operation.getRequestRange().getKey()),
+                operation.getRequestRange().getRevision())
             : new TxnCommand.Unsupported(false);
         case REQUEST_PUT -> new TxnCommand.Put(PutRequestMapper.fromWire(operation.getRequestPut()));
         case REQUEST_DELETE_RANGE -> new TxnCommand.Unsupported(true);
-        case REQUEST_TXN -> new TxnCommand.Unsupported(mayWrite(operation.getRequestTxn()));
+        case REQUEST_TXN -> new TxnCommand.Nested(command(operation.getRequestTxn()));
         case REQUEST_NOT_SET -> throw new KvFailure(KvFailure.Reason.KEY_NOT_FOUND);
       });
     }
@@ -78,26 +88,11 @@ public final class TxnRequestMapper {
   }
 
   private static boolean isPointRange(Rpc.RangeRequest range) {
-    return range.getRangeEnd().isEmpty() && range.getLimit() == 0 && range.getRevision() == 0
+    return range.getRangeEnd().isEmpty() && range.getLimit() == 0
         && range.getSortOrderValue() == 0 && range.getSortTargetValue() == 0
         && !range.getKeysOnly() && !range.getCountOnly() && range.getMinModRevision() == 0
         && range.getMaxModRevision() == 0 && range.getMinCreateRevision() == 0
         && range.getMaxCreateRevision() == 0;
-  }
-
-  private static boolean mayWrite(Rpc.TxnRequest request) {
-    return mayWrite(request.getSuccessList()) || mayWrite(request.getFailureList());
-  }
-
-  private static boolean mayWrite(List<Rpc.RequestOp> operations) {
-    for (Rpc.RequestOp operation : operations) {
-      switch (operation.getRequestCase()) {
-        case REQUEST_PUT, REQUEST_DELETE_RANGE -> { return true; }
-        case REQUEST_TXN -> { if (mayWrite(operation.getRequestTxn())) return true; }
-        default -> { }
-      }
-    }
-    return false;
   }
 
   private static CompareCondition compare(Rpc.Compare input) {

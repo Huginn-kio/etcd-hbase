@@ -1,9 +1,9 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -11,34 +11,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.Executor;
 import java.util.function.Supplier;
 
 /** Sequential, bounded writer for private candidates, ordered events, and Merkle directories. */
 public final class ManifestPreparation {
-  /** Queue for nested continuations currently draining on this thread. */
-  private static final ThreadLocal<ArrayDeque<Runnable>> CONTINUATION_QUEUE =
-      new ThreadLocal<>();
-  /** Runs queued continuations iteratively on the completing thread. */
-  private static final Executor CONTINUATION_EXECUTOR = command -> {
-    ArrayDeque<Runnable> queue = CONTINUATION_QUEUE.get();
-    if (queue != null) {
-      queue.addLast(command);
-      return;
-    }
-    queue = new ArrayDeque<>();
-    CONTINUATION_QUEUE.set(queue);
-    try {
-      queue.addLast(command);
-      Runnable next;
-      while ((next = queue.pollFirst()) != null) {
-        next.run();
-      }
-    } finally {
-      queue.clear();
-      CONTINUATION_QUEUE.remove();
-    }
-  };
+  private static final ContinuationExecutor CONTINUATION_EXECUTOR = new ContinuationExecutor();
 
   public record Limits(long maxCandidates, long maxValueBytes, long maxEvents, long maxEventBytes) {
     public Limits(long maxCandidates, long maxValueBytes) {
@@ -87,13 +64,23 @@ public final class ManifestPreparation {
     if (ownerEpoch <= 0 || baseSequence < 0 || baseRevision <= 0) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid manifest base"));
     }
-    return new Writer(transactionId, ownerEpoch, baseSequence, baseRevision, candidates, events,
-        Optional.empty(), null, () -> CompletableFuture.completedFuture(null), scope).next();
+    return new Writer(transactionId, ownerEpoch, baseSequence, baseRevision,
+        AsyncCursor.fromIterator(candidates), AsyncCursor.fromIterator(events),
+        Optional.empty(), null, () -> CompletableFuture.completedFuture(null), scope).start().copy();
   }
 
   /** Prepares a business manifest only after its result belongs to this invocation. */
   public CompletableFuture<ManifestRoot> prepareWithResult(InvocationBinding invocation,
       Iterator<PreparedCandidate> candidates, Iterator<PreparedEvent> events,
+      ResultReference result, ResultCatalog results,
+      Supplier<CompletableFuture<Void>> beforeSeal, RequestScope scope) {
+    return prepareWithResult(invocation, AsyncCursor.fromIterator(candidates), AsyncCursor.fromIterator(events),
+        result, results, beforeSeal, scope);
+  }
+
+  /** Streams bounded private records into a manifest without retaining the entire transaction. */
+  public CompletableFuture<ManifestRoot> prepareWithResult(InvocationBinding invocation,
+      AsyncCursor<PreparedCandidate> candidates, AsyncCursor<PreparedEvent> events,
       ResultReference result, ResultCatalog results,
       Supplier<CompletableFuture<Void>> beforeSeal, RequestScope scope) {
     Objects.requireNonNull(invocation, "invocation");
@@ -109,7 +96,7 @@ public final class ManifestPreparation {
     }
     return new Writer(invocation.transactionId(), invocation.preparedOwnerEpoch(),
         invocation.baseSequence(), invocation.baseRevision(), candidates, events,
-        Optional.of(result), results, beforeSeal, scope).next();
+        Optional.of(result), results, beforeSeal, scope).start().copy();
   }
 
   private final class Writer {
@@ -117,12 +104,13 @@ public final class ManifestPreparation {
     private final long ownerEpoch;
     private final long baseSequence;
     private final long baseRevision;
-    private final Iterator<PreparedCandidate> input;
-    private final Iterator<PreparedEvent> eventInput;
+    private final AsyncCursor<PreparedCandidate> input;
+    private final AsyncCursor<PreparedEvent> eventInput;
     private final RequestScope scope;
     private final Optional<ResultReference> result;
     private final ResultCatalog results;
     private final Supplier<CompletableFuture<Void>> beforeSeal;
+    private final CompletableFuture<ManifestRoot> completion = new CompletableFuture<>();
     private final List<ManifestCandidateReference> leaf = new ArrayList<>(ManifestPage.MAX_ENTRIES);
     private final List<List<ManifestChildReference>> levels = new ArrayList<>(ManifestDirectoryPage.MAX_DEPTH + 1);
     private long count;
@@ -135,7 +123,7 @@ public final class ManifestPreparation {
     private ByteKey previousKey;
 
     private Writer(TransactionId transactionId, long ownerEpoch, long baseSequence, long baseRevision,
-        Iterator<PreparedCandidate> input, Iterator<PreparedEvent> eventInput,
+        AsyncCursor<PreparedCandidate> input, AsyncCursor<PreparedEvent> eventInput,
         Optional<ResultReference> result, ResultCatalog results,
         Supplier<CompletableFuture<Void>> beforeSeal, RequestScope scope) {
       this.transactionId = Objects.requireNonNull(transactionId, "transactionId");
@@ -153,29 +141,64 @@ public final class ManifestPreparation {
       }
     }
 
-    private CompletableFuture<ManifestRoot> next() {
+    private CompletableFuture<ManifestRoot> start() {
+      next();
+      return completion;
+    }
+
+    private void next() {
       try {
-        if (scope.isClosed()) return failed(new BackendFailure(BackendFailure.Category.CANCELLED));
-        if (scope.isDeadlineExceeded()) return failed(new BackendFailure(BackendFailure.Category.TIMEOUT));
-        if (!input.hasNext()) return flushLeaf().thenCompose(ignored -> finishDirectories());
-        PreparedCandidate candidate = Objects.requireNonNull(input.next(), "candidate");
-        int bucket = repository.candidateBucket(candidate);
-        validateCandidate(candidate, bucket);
-        int bytes = referenceBytes(candidate);
-        if (!leaf.isEmpty() && (leaf.size() == ManifestPage.MAX_ENTRIES
-            || leafBucket != bucket || leafBytes + bytes > ManifestPage.MAX_PAGE_BYTES)) {
-          return flushLeaf().thenCompose(ignored -> accept(candidate, bucket));
-        }
-        return accept(candidate, bucket);
+        if (scope.isDeadlineExceeded()) throw new CompletionException(new BackendFailure(BackendFailure.Category.TIMEOUT));
+        if (scope.isClosed()) throw new CompletionException(new BackendFailure(BackendFailure.Category.CANCELLED));
+        Objects.requireNonNull(input.next(), "candidate cursor future")
+            .whenCompleteAsync(this::acceptInput, CONTINUATION_EXECUTOR);
       } catch (RuntimeException failure) {
-        return CompletableFuture.failedFuture(failure);
+        completion.completeExceptionally(failure);
+      } catch (Error fatal) {
+        completion.completeExceptionally(fatal);
+        throw fatal;
       }
     }
 
-    private CompletableFuture<ManifestRoot> accept(PreparedCandidate candidate, int bucket) {
+    private void acceptInput(Optional<PreparedCandidate> item, Throwable failure) {
+      if (failure != null) {
+        completion.completeExceptionally(failure);
+        return;
+      }
+      try {
+        if (scope.isDeadlineExceeded()) throw new CompletionException(new BackendFailure(BackendFailure.Category.TIMEOUT));
+        if (scope.isClosed()) throw new CompletionException(new BackendFailure(BackendFailure.Category.CANCELLED));
+        Optional<PreparedCandidate> found = Objects.requireNonNull(item, "candidate cursor result");
+        if (found.isEmpty()) {
+          flushLeaf().thenCompose(ignored -> finishDirectories()).whenComplete((root, problem) -> {
+            if (problem == null) completion.complete(root);
+            else completion.completeExceptionally(problem);
+          });
+          return;
+        }
+        PreparedCandidate candidate = found.orElseThrow();
+        int bucket = repository.candidateBucket(candidate);
+        validateCandidate(candidate, bucket);
+        int bytes = referenceBytes(candidate);
+        CompletableFuture<Void> ready = !leaf.isEmpty() && (leaf.size() == ManifestPage.MAX_ENTRIES
+            || leafBucket != bucket || leafBytes + bytes > ManifestPage.MAX_PAGE_BYTES)
+            ? flushLeaf() : CompletableFuture.completedFuture(null);
+        ready.thenCompose(ignored -> accept(candidate, bucket)).whenCompleteAsync((ignored, problem) -> {
+          if (problem == null) next();
+          else completion.completeExceptionally(problem);
+        }, CONTINUATION_EXECUTOR);
+      } catch (RuntimeException problem) {
+        completion.completeExceptionally(problem);
+      } catch (Error fatal) {
+        completion.completeExceptionally(fatal);
+        throw fatal;
+      }
+    }
+
+    private CompletableFuture<Void> accept(PreparedCandidate candidate, int bucket) {
       checkCandidateBudget(candidate);
       return repository.createCandidate(candidate, scope)
-          .thenComposeAsync(result -> {
+          .thenAccept(result -> {
         requireCreatedOrIdentical(result, "candidate");
         ManifestCandidateReference reference = ManifestCandidateReference.from(candidate, bucket);
         leaf.add(reference);
@@ -185,8 +208,7 @@ public final class ManifestPreparation {
         valueBytes = Math.addExact(valueBytes, reference.valueLength());
         previousBucket = bucket;
         previousKey = candidate.record().key();
-        return next();
-      }, CONTINUATION_EXECUTOR);
+      });
     }
 
     private CompletableFuture<Void> flushLeaf() {
@@ -330,8 +352,9 @@ public final class ManifestPreparation {
     private final long ownerEpoch;
     private final long baseSequence;
     private final long baseRevision;
-    private final Iterator<PreparedEvent> input;
+    private final AsyncCursor<PreparedEvent> input;
     private final RequestScope scope;
+    private final CompletableFuture<EventSummary> completion = new CompletableFuture<>();
     private final List<PreparedEventReference> leaf = new ArrayList<>(EventPage.MAX_EVENTS);
     private final List<List<EventReference>> levels = new ArrayList<>(EventDirectoryPage.MAX_DEPTH + 1);
     private long count;
@@ -342,7 +365,7 @@ public final class ManifestPreparation {
     private int directoryPageIndex;
 
     private EventWriter(TransactionId transactionId, long ownerEpoch, long baseSequence,
-        long baseRevision, Iterator<PreparedEvent> input, RequestScope scope) {
+        long baseRevision, AsyncCursor<PreparedEvent> input, RequestScope scope) {
       this.transactionId = transactionId;
       this.ownerEpoch = ownerEpoch;
       this.baseSequence = baseSequence;
@@ -354,28 +377,61 @@ public final class ManifestPreparation {
       }
     }
 
-    private CompletableFuture<EventSummary> write() { return next(); }
+    private CompletableFuture<EventSummary> write() {
+      next();
+      return completion;
+    }
 
-    private CompletableFuture<EventSummary> next() {
+    private void next() {
       try {
-        if (scope.isClosed()) return failed(new BackendFailure(BackendFailure.Category.CANCELLED));
-        if (scope.isDeadlineExceeded()) return failed(new BackendFailure(BackendFailure.Category.TIMEOUT));
-        if (!input.hasNext()) return flushLeaf().thenCompose(ignored -> finishDirectories());
-        PreparedEvent event = Objects.requireNonNull(input.next(), "event");
-        validate(event);
-        int referenceBytes = 64 + event.systemIdentity().length() + 32 + Integer.BYTES;
-        if (!leaf.isEmpty() && (leaf.size() == EventPage.MAX_EVENTS
-            || pageBytes + referenceBytes > EventPage.MAX_PAGE_BYTES)) {
-          return flushLeaf().thenCompose(ignored -> accept(event));
-        }
-        return accept(event);
+        if (scope.isDeadlineExceeded()) throw new CompletionException(new BackendFailure(BackendFailure.Category.TIMEOUT));
+        if (scope.isClosed()) throw new CompletionException(new BackendFailure(BackendFailure.Category.CANCELLED));
+        Objects.requireNonNull(input.next(), "event cursor future")
+            .whenCompleteAsync(this::acceptInput, CONTINUATION_EXECUTOR);
       } catch (RuntimeException failure) {
-        return CompletableFuture.failedFuture(failure);
+        completion.completeExceptionally(failure);
+      } catch (Error fatal) {
+        completion.completeExceptionally(fatal);
+        throw fatal;
       }
     }
 
-    private CompletableFuture<EventSummary> accept(PreparedEvent event) {
-      return repository.createEvent(event, scope).thenComposeAsync(result -> {
+    private void acceptInput(Optional<PreparedEvent> item, Throwable failure) {
+      if (failure != null) {
+        completion.completeExceptionally(failure);
+        return;
+      }
+      try {
+        if (scope.isDeadlineExceeded()) throw new CompletionException(new BackendFailure(BackendFailure.Category.TIMEOUT));
+        if (scope.isClosed()) throw new CompletionException(new BackendFailure(BackendFailure.Category.CANCELLED));
+        Optional<PreparedEvent> found = Objects.requireNonNull(item, "event cursor result");
+        if (found.isEmpty()) {
+          flushLeaf().thenCompose(ignored -> finishDirectories()).whenComplete((summary, problem) -> {
+            if (problem == null) completion.complete(summary);
+            else completion.completeExceptionally(problem);
+          });
+          return;
+        }
+        PreparedEvent event = found.orElseThrow();
+        validate(event);
+        int referenceBytes = 64 + event.systemIdentity().length() + 32 + Integer.BYTES;
+        CompletableFuture<Void> ready = !leaf.isEmpty() && (leaf.size() == EventPage.MAX_EVENTS
+            || pageBytes + referenceBytes > EventPage.MAX_PAGE_BYTES)
+            ? flushLeaf() : CompletableFuture.completedFuture(null);
+        ready.thenCompose(ignored -> accept(event)).whenCompleteAsync((ignored, problem) -> {
+          if (problem == null) next();
+          else completion.completeExceptionally(problem);
+        }, CONTINUATION_EXECUTOR);
+      } catch (RuntimeException problem) {
+        completion.completeExceptionally(problem);
+      } catch (Error fatal) {
+        completion.completeExceptionally(fatal);
+        throw fatal;
+      }
+    }
+
+    private CompletableFuture<Void> accept(PreparedEvent event) {
+      return repository.createEvent(event, scope).thenAccept(result -> {
         requireCreatedOrIdentical(result, "event");
         PreparedEventReference reference = PreparedEventReference.from(event);
         leaf.add(reference);
@@ -384,8 +440,7 @@ public final class ManifestPreparation {
         count = Math.addExact(count, 1);
         totalBytes = Math.addExact(totalBytes, reference.encodedBytes());
         nextOrdinal++;
-        return next();
-      }, CONTINUATION_EXECUTOR);
+      });
     }
 
     private CompletableFuture<Void> flushLeaf() {
