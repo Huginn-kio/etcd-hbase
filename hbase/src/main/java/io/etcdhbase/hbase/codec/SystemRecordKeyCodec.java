@@ -34,6 +34,9 @@ public final class SystemRecordKeyCodec {
     long identityBytes = type == SystemRecordType.CANDIDATE
         ? 16L + encodedCandidateKeyLength : Integer.BYTES + (long) identifier.length;
     long rowLength = (long) salt.profile().saltWidthBytes() + 1 + identityBytes;
+    if (type == SystemRecordType.CANDIDATE && rowLength > HConstants.MAX_ROW_LENGTH) {
+      throw new PhysicalRowLimitException();
+    }
     if (identifier.length == 0 || rowLength > HConstants.MAX_ROW_LENGTH) {
       throw new IllegalArgumentException("invalid or oversized system record identity");
     }
@@ -105,6 +108,9 @@ public final class SystemRecordKeyCodec {
     long identityBytes = type == SystemRecordType.CANDIDATE
         ? 16L + encodedCandidateKeyLength : Integer.BYTES + (long) bytes.length;
     long rowLength = (long) salt.profile().saltWidthBytes() + 1 + identityBytes;
+    if (type == SystemRecordType.CANDIDATE && rowLength > HConstants.MAX_ROW_LENGTH) {
+      throw new PhysicalRowLimitException();
+    }
     if (bytes.length == 0 || rowLength > HConstants.MAX_ROW_LENGTH) {
       throw new IllegalArgumentException("invalid or oversized system record identity");
     }

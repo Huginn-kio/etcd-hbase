@@ -90,6 +90,7 @@ class M3PutRpcIT {
       assertLeaseFailsBeforePublication(fixture, server, run.prefix());
       assertPhysicalRecords(fixture, run.prefix());
       assertLostOwnerReplyUsesOriginalResult(fixture, engine, server, run.prefix());
+      assertPhysicalRowLimits(fixture, server);
     }
     run(run.root(), run.artifacts().resolve("compare-" + suffix + ".log"), List.of(
         run.root().resolve("scripts/dev/go-program.sh").toString(), "native-etcd", "compare", "--m3-put",
@@ -197,6 +198,36 @@ class M3PutRpcIT {
         var state = fixture.control().read(scope).join().orElseThrow().state();
         assertEquals(sequence + 1, state.publishedSequence());
         assertEquals(reply.getHeader().getRevision(), state.publishedRevision());
+      }
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private static void assertPhysicalRowLimits(M3TestEnvironment fixture, Bootstrap server) throws Exception {
+    var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port())
+        .usePlaintext().build();
+    try {
+      var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(60, TimeUnit.SECONDS);
+      // Zero bytes double in the ordered encoding; the candidate adds kind and transaction ID.
+      int saltWidth = fixture.system().saltProfile().saltWidthBytes();
+      int largestCandidate = (org.apache.hadoop.hbase.HConstants.MAX_ROW_LENGTH - saltWidth - 1 - 16 - 2) / 2;
+      var accepted = stub.put(Rpc.PutRequest.newBuilder()
+          .setKey(ByteString.copyFrom(new byte[largestCandidate])).build());
+      long sequence;
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10))) {
+        sequence = fixture.control().read(scope).join().orElseThrow().state().publishedSequence();
+      }
+      for (int length : new int[] {largestCandidate + 1, 16_384}) {
+        var failure = assertThrows(StatusRuntimeException.class, () -> stub.put(
+            Rpc.PutRequest.newBuilder().setKey(ByteString.copyFrom(new byte[length])).build()));
+        assertEquals(Status.Code.RESOURCE_EXHAUSTED, failure.getStatus().getCode());
+        try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10))) {
+          var state = fixture.control().read(scope).join().orElseThrow().state();
+          assertEquals(sequence, state.publishedSequence());
+          assertEquals(accepted.getHeader().getRevision(), state.publishedRevision());
+        }
       }
     } finally {
       channel.shutdownNow();

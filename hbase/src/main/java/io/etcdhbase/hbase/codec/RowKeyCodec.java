@@ -114,12 +114,12 @@ public final class RowKeyCodec {
     long minimumLength = (long) key.length() + 2;
     int overhead = salt.profile().saltWidthBytes() + (shape == Shape.HISTORY ? Long.BYTES : 0);
     if (minimumLength + overhead > HConstants.MAX_ROW_LENGTH) {
-      throw new IllegalArgumentException("encoded key exceeds the storage row limit");
+      throw new PhysicalRowLimitException();
     }
     byte[] original = key.bytes();
     long length = OrderedKeyBytes.encodedLength(original);
     if (length + overhead > HConstants.MAX_ROW_LENGTH) {
-      throw new IllegalArgumentException("encoded key exceeds the storage row limit");
+      throw new PhysicalRowLimitException();
     }
     return OrderedKeyBytes.encode(original);
   }

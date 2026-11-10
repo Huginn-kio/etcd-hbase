@@ -12,6 +12,7 @@ import io.etcdhbase.core.commit.ManifestCatalog;
 import io.etcdhbase.core.commit.ReadViewRecordStore;
 import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.kv.PutCommand;
 import io.etcdhbase.core.kv.ResponseBudget;
 import io.etcdhbase.core.request.RequestScope;
@@ -20,6 +21,7 @@ import io.etcdhbase.core.scan.DirectRecordReader;
 import io.etcdhbase.core.scan.PointResult;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
+import io.etcdhbase.hbase.codec.PhysicalRowLimitException;
 import io.etcdhbase.hbase.storage.HBaseRecordStore;
 import io.etcdhbase.hbase.storage.StorageTableBinding;
 import io.etcdhbase.server.observability.RequestMetrics;
@@ -181,6 +183,10 @@ public final class PutMutationExecutor {
                 return reader.readForPreparation(command.key(), binding.baseRevision(), ReadProjection.FULL)
                     .thenCompose(point -> prepareFromPoint(command, binding, point, view, scope, account));
               });
+        }).exceptionallyCompose(failure -> {
+          Throwable cause = CompletionFailures.unwrapCompletion(failure);
+          return CompletableFuture.failedFuture(cause instanceof PhysicalRowLimitException
+              ? new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT, cause) : failure);
         }).whenComplete((ignored, failure) -> metrics.recordPutStage(RequestMetrics.PutStage.PREPARE,
             Math.max(0, System.nanoTime() - started)));
   }
