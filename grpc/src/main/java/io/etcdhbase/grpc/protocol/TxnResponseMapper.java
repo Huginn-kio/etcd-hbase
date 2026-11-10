@@ -141,29 +141,65 @@ public final class TxnResponseMapper {
     if (command.sort().target() != 0 || command.sort().order() < 0 || command.sort().order() > 1) {
       throw new IllegalArgumentException("range result uses an unsupported sort");
     }
+    validateRangeCount(command, range);
+    validateRangeRecords(command, range);
+    var response = Rpc.RangeResponse.newBuilder().setHeader(header).setCount(range.count()).setMore(range.more());
+    range.records().forEach(record -> response.addKvs(project(record, command.keysOnly())));
+    return response.build();
+  }
+
+  private static void validateRangeCount(RangeCommand command, ResultNode.Range range) {
     if (command.countOnly()) {
       if (!range.records().isEmpty() || range.count() > 1 || range.more()
-          || command.range().kind() != KeyRange.Kind.POINT && command.limit() != 1) {
+          || !isPoint(command) && command.limit() != 1) {
         throw new IllegalArgumentException("count-only result differs from its request");
       }
-    } else if (range.count() != range.records().size()
-        || command.limit() > 0 && range.records().size() > command.limit()
-        || range.more() && (command.limit() <= 0 || range.records().size() != command.limit())
-        || command.range().kind() == KeyRange.Kind.POINT && (range.records().size() > 1 || range.more())) {
+      return;
+    }
+    if (range.count() != range.records().size() || exceedsLimit(command, range)
+        || invalidMore(command, range) || invalidPointResult(command, range)) {
       throw new IllegalArgumentException("range count or limit differs from its request");
     }
+  }
+
+  private static boolean isPoint(RangeCommand command) {
+    return command.range().kind() == KeyRange.Kind.POINT;
+  }
+
+  private static boolean exceedsLimit(RangeCommand command, ResultNode.Range range) {
+    return command.limit() > 0 && range.records().size() > command.limit();
+  }
+
+  private static boolean invalidMore(RangeCommand command, ResultNode.Range range) {
+    return range.more() && (command.limit() <= 0 || range.records().size() != command.limit());
+  }
+
+  private static boolean invalidPointResult(RangeCommand command, ResultNode.Range range) {
+    return isPoint(command) && (range.records().size() > 1 || range.more());
+  }
+
+  private static void validateRangeRecords(RangeCommand command, ResultNode.Range range) {
     ByteKey previous = null;
     for (StoredRecord record : range.records()) {
-      if (!command.range().contains(record.key()) || previous != null && previous.compareTo(record.key()) >= 0
-          || !command.filter().matches(record.metadata()) || command.keysOnly() == record.hasValue()
-          || command.revision() > 0 && record.metadata().modificationRevision() > command.revision()) {
+      if (!isOrderedAndInRange(command, record, previous)
+          || !matchesRangeProjection(command, record)
+          || isNewerThanRequestedRevision(command, record)) {
         throw new IllegalArgumentException("range record differs from its request");
       }
       previous = record.key();
     }
-    var response = Rpc.RangeResponse.newBuilder().setHeader(header).setCount(range.count()).setMore(range.more());
-    range.records().forEach(record -> response.addKvs(project(record, command.keysOnly())));
-    return response.build();
+  }
+
+  private static boolean isOrderedAndInRange(RangeCommand command, StoredRecord record, ByteKey previous) {
+    return command.range().contains(record.key()) && (previous == null || previous.compareTo(record.key()) < 0);
+  }
+
+  private static boolean matchesRangeProjection(RangeCommand command, StoredRecord record) {
+    return command.filter().matches(record.metadata()) && command.keysOnly() != record.hasValue();
+  }
+
+  private static boolean isNewerThanRequestedRevision(RangeCommand command, StoredRecord record) {
+    return command.revision() > 0 && record.metadata().modificationRevision() > command.revision();
   }
 
   private static final class RevisionCursor {

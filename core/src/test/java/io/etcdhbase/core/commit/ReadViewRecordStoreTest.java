@@ -673,18 +673,15 @@ class ReadViewRecordStoreTest {
     fixture.physical.add(live("alpha", 1, 1, 1, 0, "old"));
     fixture.physical.add(live("alpha", 1, 2, 2, 0, "base"));
     fixture.physical.add(live("beta", 1, 1, 1, 0, "other"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-      var comparisons = new CompareReadExecutor(session, scheduler, account, scope,
-          new CompareReadExecutor.Limits(1, 4096, 64, 4096));
-      var evaluator = new TxnEvaluator(session, comparisons, account, scope,
-          new TxnEvaluator.Limits(4096, 16384, 65536), ignored -> 0, fixture.worksetRecords, fixture.repository);
+    var budget = transactionBudget();
+    var reservation = transactionRangeReservation();
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var session = openTransaction(fixture, scope);
+      var comparisons = transactionComparisons(session, scheduler, account, scope);
+      var evaluator = transactionEvaluator(fixture, session, comparisons, account, scope, 16384);
       var alpha = key("alpha");
       var all = new RangeCommand.RevisionFilter(0, 0, 0, 0);
       var filterNew = new RangeCommand.RevisionFilter(3, 0, 0, 0);
@@ -699,26 +696,34 @@ class ReadViewRecordStoreTest {
           TransactionId.create(), 1, session.barrierSequence(), session.currentRevision());
       var evaluated = evaluator.evaluate(command, Optional.of(binding)).join();
       var responses = assertInstanceOf(ResultNode.Txn.class, evaluated.result().root()).responses();
-      var current = assertInstanceOf(ResultNode.Range.class, responses.get(1));
-      assertEquals("new", new String(current.records().getFirst().value().orElseThrow()));
-      assertEquals(1, current.count());
-      assertFalse(current.more());
-      var historical = assertInstanceOf(ResultNode.Range.class, responses.get(2));
-      assertEquals(List.of("alpha", "beta"), historical.records().stream().map(record -> text(record.key())).toList());
-      assertEquals("old", new String(historical.records().getFirst().value().orElseThrow()));
-      assertEquals(3, historical.header().revision());
-      var keysOnly = assertInstanceOf(ResultNode.Range.class, responses.get(3));
-      assertEquals(1, keysOnly.count());
-      assertTrue(keysOnly.more());
-      assertFalse(keysOnly.records().getFirst().hasValue());
-      assertEquals(3, keysOnly.records().getFirst().metadata().modificationRevision());
-      var exists = assertInstanceOf(ResultNode.Range.class, responses.get(4));
-      assertEquals(1, exists.count());
-      assertTrue(exists.records().isEmpty());
-      assertFalse(exists.more());
+      assertWorkingAndHistoricalRangeResponses(responses);
+      assertProjectedRangeResponses(responses);
       evaluated.finishRead().join();
     }
     assertEquals(0, budget.snapshot().allocatedBytes());
+  }
+
+  private static void assertWorkingAndHistoricalRangeResponses(List<ResultNode> responses) {
+    var current = assertInstanceOf(ResultNode.Range.class, responses.get(1));
+    assertEquals("new", new String(current.records().getFirst().value().orElseThrow()));
+    assertEquals(1, current.count());
+    assertFalse(current.more());
+    var historical = assertInstanceOf(ResultNode.Range.class, responses.get(2));
+    assertEquals(List.of("alpha", "beta"), historical.records().stream().map(record -> text(record.key())).toList());
+    assertEquals("old", new String(historical.records().getFirst().value().orElseThrow()));
+    assertEquals(3, historical.header().revision());
+  }
+
+  private static void assertProjectedRangeResponses(List<ResultNode> responses) {
+    var keysOnly = assertInstanceOf(ResultNode.Range.class, responses.get(3));
+    assertEquals(1, keysOnly.count());
+    assertTrue(keysOnly.more());
+    assertFalse(keysOnly.records().getFirst().hasValue());
+    assertEquals(3, keysOnly.records().getFirst().metadata().modificationRevision());
+    var exists = assertInstanceOf(ResultNode.Range.class, responses.get(4));
+    assertEquals(1, exists.count());
+    assertTrue(exists.records().isEmpty());
+    assertFalse(exists.more());
   }
 
   private static RangeCommand range(KeyRange keyRange, long revision, long limit,
@@ -741,12 +746,12 @@ class ReadViewRecordStoreTest {
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
     fixture.physical.add(live("alpha", 1, 1, 1, 0, "old"));
     fixture.physical.add(live("beta", 1, 1, 1, 0, "other"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+    var budget = transactionBudget();
+    var reservation = transactionRangeReservation();
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
       var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
       var all = new RangeCommand.RevisionFilter(0, 0, 0, 0);
       var exclude = new RangeCommand.RevisionFilter(0, -1, 0, 0);
@@ -771,12 +776,12 @@ class ReadViewRecordStoreTest {
         candidate("beta", 1, 2, 2, StorageMetadata.State.TOMBSTONE, new byte[0]),
         candidate("gamma", 2, 2, 1, StorageMetadata.State.LIVE, bytes("selected"))));
     fixture.physical.add(live("beta", 1, 1, 1, 0, "old"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+    var budget = transactionBudget();
+    var reservation = transactionRangeReservation();
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
       var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
       var ignored = new RangeCommand.RevisionFilter(0, -1, 0, 0);
       var command = new TxnCommand(List.of(), List.of(
@@ -802,12 +807,13 @@ class ReadViewRecordStoreTest {
     fixture.physical.bucketOf = bucket;
     var limits = new BudgetManager.Limits(4, 32, 2, 2, 2, 1_000_000, 16_000_000);
     var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    var reservation = transactionRangeReservation();
     for (boolean exists : List.of(true, false)) {
       fixture.physical.scanBuckets.clear();
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-           BudgetManager.Account account = budget.admit("public", scope, reservation);
-           var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      try (var resources = transactionResources(budget, reservation)) {
+        var scope = resources.scope();
+        var account = resources.account();
+        var scheduler = resources.scheduler();
         var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
             new ManifestCatalog(fixture.repository), bucket, 2, scope).join();
         var compares = new CompareReadExecutor(session, scheduler, account, scope,
@@ -834,12 +840,12 @@ class ReadViewRecordStoreTest {
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
     fixture.physical.add(live("alpha", 1, 1, 1, 0, "value"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+    var budget = transactionBudget();
+    var reservation = transactionRangeReservation();
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
       var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
       var all = new RangeCommand.RevisionFilter(0, 0, 0, 0);
       var ignored = new RangeCommand.RevisionFilter(0, -1, 0, 0);
@@ -866,9 +872,8 @@ class ReadViewRecordStoreTest {
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
     fixture.physical.blockNextGet(key("alpha"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    var budget = transactionBudget();
+    var reservation = transactionRangeReservation();
     RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
     try (BudgetManager.Account account = budget.admit("public", scope, reservation);
          var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
@@ -899,12 +904,12 @@ class ReadViewRecordStoreTest {
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
     fixture.physical.add(liveBytes("a", 1, 1, 400));
     fixture.physical.add(liveBytes("b", 1, 1, 400));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+    var budget = transactionBudget();
+    var reservation = transactionRangeReservation();
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
       var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 800);
       var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(range(KeyRange.all(), 0, 0,
           new RangeCommand.RevisionFilter(0, 0, 0, 0), false, false))), List.of());
@@ -926,12 +931,12 @@ class ReadViewRecordStoreTest {
     var value = live("a", 1, 1, 1, 0, "old");
     fixture.physical.add(value);
     fixture.physical.blockNextGet(key("a"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+    var budget = transactionBudget();
+    var reservation = transactionRangeReservation();
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
       var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
       var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(range(KeyRange.all(), 0, 0,
           new RangeCommand.RevisionFilter(0, 0, 0, 0), false, false))), List.of());
@@ -955,12 +960,12 @@ class ReadViewRecordStoreTest {
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
     fixture.physical.add(live("a", 1, 1, 1, 0, "old"));
     fixture.physical.blockNextGet(key("a"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-         BudgetManager.Account account = budget.admit("public", scope, reservation);
-         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+    var budget = transactionBudget();
+    var reservation = transactionRangeReservation();
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
       var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
       var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(range(KeyRange.all(), 0, 0,
           new RangeCommand.RevisionFilter(0, 0, 0, 0), false, false))), List.of());
@@ -977,9 +982,8 @@ class ReadViewRecordStoreTest {
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("x"))));
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
     fixture.physical.add(live("alpha", 1, 1, 1, 0, "value"));
-    var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-    var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    var budget = transactionBudget();
+    var reservation = transactionRangeReservation();
     var filters = List.of(new RangeCommand.RevisionFilter(2, 0, 0, 0),
         new RangeCommand.RevisionFilter(0, -1, 0, 0), new RangeCommand.RevisionFilter(0, 0, 2, 0),
         new RangeCommand.RevisionFilter(0, 0, 0, -1), new RangeCommand.RevisionFilter(1, 0, 0, 0),
@@ -988,21 +992,28 @@ class ReadViewRecordStoreTest {
     for (boolean point : List.of(true, false)) {
       for (long limit : point ? List.of(0L, 1L) : List.of(0L, -1L)) {
         for (int i = 0; i < filters.size(); i++) {
-          try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-               BudgetManager.Account account = budget.admit("public", scope, reservation);
-               var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-            var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
-            var keyRange = point ? KeyRange.point(key("alpha")) : KeyRange.all();
-            var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(range(keyRange, 0, limit,
-                filters.get(i), false, false))), List.of());
-            var read = evaluator.evaluate(command, Optional.empty()).join().finishReadOnly().join();
-            var result = assertInstanceOf(ResultNode.Range.class,
-                assertInstanceOf(ResultNode.Txn.class, read.result().root()).responses().getFirst());
-            assertEquals(i < 4 ? 0 : 1, result.count());
-            assertEquals(result.count(), result.records().size());
-          }
+          verifyFilteredRangeCase(fixture, budget, reservation, point, limit, filters.get(i), i < 4 ? 0 : 1);
         }
       }
+    }
+  }
+
+  private static void verifyFilteredRangeCase(Fixture fixture, BudgetManager budget,
+      BudgetManager.Reservation reservation, boolean point, long limit,
+      RangeCommand.RevisionFilter filter, int expectedCount) throws Exception {
+    try (var resources = transactionResources(budget, reservation)) {
+      var scope = resources.scope();
+      var account = resources.account();
+      var scheduler = resources.scheduler();
+      var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
+      var keyRange = point ? KeyRange.point(key("alpha")) : KeyRange.all();
+      var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(range(keyRange, 0, limit,
+          filter, false, false))), List.of());
+      var read = evaluator.evaluate(command, Optional.empty()).join().finishReadOnly().join();
+      var result = assertInstanceOf(ResultNode.Range.class,
+          assertInstanceOf(ResultNode.Txn.class, read.result().root()).responses().getFirst());
+      assertEquals(expectedCount, result.count());
+      assertEquals(result.count(), result.records().size());
     }
   }
 
@@ -1014,12 +1025,12 @@ class ReadViewRecordStoreTest {
       fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
       if (scenario == 3) fixture.control.state = fixture.control.state.advanceCompactRevision(2);
       fixture.physical.add(live("a", 1, 1, 1, 0, "old"));
-      var limits = new BudgetManager.Limits(4, 32, 1, 1, 1, 1_000_000, 16_000_000);
-      var budget = new BudgetManager(limits, Map.of("public", limits), limits);
-      var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-           BudgetManager.Account account = budget.admit("public", scope, reservation);
-           var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var budget = transactionBudget();
+      var reservation = transactionRangeReservation();
+      try (var resources = transactionResources(budget, reservation)) {
+        var scope = resources.scope();
+        var account = resources.account();
+        var scheduler = resources.scheduler();
         var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
         var context = scenario == 0 ? RangeCommand.Context.STANDALONE : RangeCommand.Context.TRANSACTION;
         long revision = scenario < 2 ? -2 : scenario == 2 ? 3 : 1;
@@ -1041,6 +1052,10 @@ class ReadViewRecordStoreTest {
         }
       }
     }
+  }
+
+  private static BudgetManager.Reservation transactionRangeReservation() {
+    return new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
   }
 
   private static TxnEvaluator readRangeEvaluator(Fixture fixture, ScanScheduler scheduler,

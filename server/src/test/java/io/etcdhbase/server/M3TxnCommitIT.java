@@ -264,18 +264,46 @@ class M3TxnCommitIT {
     private final TxnOwnerProcessor processor;
     private final TxnReadExecutor readOnly;
 
+    private record PinFailureHarness(AtomicBoolean blockCompletion, CountDownLatch pinStarted,
+        CompletableFuture<Void> pendingPin) {}
+
+    private record CancellationEvidence(AtomicInteger responses, AtomicInteger terminations,
+        AtomicReference<Status.Code> terminalCode) {}
+
     private void assertFailedReadPinReturnsError() throws Exception {
-      var blockCompletion = new AtomicBoolean();
-      var pinStarted = new CountDownLatch(1);
-      var pendingPin = new CompletableFuture<Void>();
-      ReadViewPinRegistry failingPins = (view, scope) -> stores.pins().register(view, scope).thenApply(pin ->
+      var evidence = new CancellationEvidence(new AtomicInteger(), new AtomicInteger(), new AtomicReference<>());
+      var harness = new PinFailureHarness(new AtomicBoolean(), new CountDownLatch(1), new CompletableFuture<>());
+      var resources = new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000, 4 << 20, 4 << 20, 4, 0);
+      try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
+          "m3-read-pin-failure", "127.0.0.1", 0, environment.system().tableGroupId()), resources,
+          pinFailureService(harness))) {
+        var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port()).usePlaintext().build();
+        try {
+          var range = Rpc.RangeRequest.newBuilder().setKey(ByteString.copyFromUtf8("pin-failure"))
+              .setKeysOnly(true).build();
+          assertPinFailureReturnsUnavailable(channel, range);
+          cancelDuringPinFailure(channel, range, harness, evidence);
+        } finally {
+          channel.shutdownNow();
+          assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+        }
+      }
+      assertEquals(0, evidence.responses().get());
+      assertEquals(1, evidence.terminations().get());
+      assertEquals(Status.Code.CANCELLED, evidence.terminalCode().get());
+      assertEquals(0, budgets.snapshot().allocatedBytes());
+      assertEquals(0, budgets.snapshot().reservedBytes());
+    }
+
+    private ReadViewPinRegistry failingPins(PinFailureHarness harness) {
+      return (view, scope) -> stores.pins().register(view, scope).thenApply(pin ->
           new ReadViewPinRegistry.Pin() {
             @Override public long generation() { return pin.generation(); }
             @Override public CompletableFuture<Void> renew(RequestScope request) { return pin.renew(request); }
             @Override public CompletableFuture<Void> complete(RequestScope request) {
-              if (blockCompletion.get()) {
-                pinStarted.countDown();
-                return pendingPin;
+              if (harness.blockCompletion().get()) {
+                harness.pinStarted().countDown();
+                return harness.pendingPin();
               }
               return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
             }
@@ -284,7 +312,10 @@ class M3TxnCommitIT {
             }
             @Override public void close() { pin.close(); }
           });
-      var views = new ReadViewService(stores.control(), stores.manifests(), failingPins,
+    }
+
+    private KvService pinFailureService(PinFailureHarness harness) {
+      var views = new ReadViewService(stores.control(), stores.manifests(), failingPins(harness),
           environment.system().profileFingerprint());
       var reads = new TxnReadExecutor(environment.system().tableGroupId(), views, stores.manifests(),
           environment.factory(), environment.primary(), worker, scans,
@@ -295,57 +326,44 @@ class M3TxnCommitIT {
       var gateway = new TxnGateway(environment.system().tableGroupId(), environment.identity(), AUTHORIZATION,
           stores.clusterId(), 1, 1_572_864, stores.control(), relay, stores.invocationResults(),
           reads, budgets, reservation(), worker, new RequestMetrics());
-      var service = new KvService((request, observer) -> observer.onError(Status.UNIMPLEMENTED.asRuntimeException()),
+      return new KvService((request, observer) -> observer.onError(Status.UNIMPLEMENTED.asRuntimeException()),
           gateway, gateway::deleteRange, gateway::range);
-      var resources = new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000, 4 << 20, 4 << 20, 4, 0);
-      var responses = new AtomicInteger();
-      var terminations = new AtomicInteger();
-      var terminalCode = new AtomicReference<Status.Code>();
-      try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
-          "m3-read-pin-failure", "127.0.0.1", 0, environment.system().tableGroupId()), resources, service)) {
-        var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port()).usePlaintext().build();
-        try {
-          var key = ByteString.copyFromUtf8("pin-failure");
-          var range = Rpc.RangeRequest.newBuilder().setKey(key).setKeysOnly(true).build();
-          var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(5, TimeUnit.SECONDS);
-          var failure = assertThrows(io.grpc.StatusRuntimeException.class, () -> stub.range(range));
-          assertEquals(Status.Code.UNAVAILABLE, failure.getStatus().getCode());
-          var txn = Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder().setRequestRange(range)).build();
-          var txnStub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(5, TimeUnit.SECONDS);
-          var txnFailure = assertThrows(io.grpc.StatusRuntimeException.class, () -> txnStub.txn(txn));
-          assertEquals(Status.Code.UNAVAILABLE, txnFailure.getStatus().getCode());
+    }
 
-          blockCompletion.set(true);
-          var cancelled = new CountDownLatch(1);
-          var context = io.grpc.Context.current().withCancellation();
-          try {
-            context.run(() -> KVGrpc.newStub(channel).range(range, new StreamObserver<>() {
-              @Override public void onNext(Rpc.RangeResponse response) { responses.incrementAndGet(); }
-              @Override public void onError(Throwable failure) {
-                terminalCode.set(Status.fromThrowable(failure).getCode());
-                terminations.incrementAndGet();
-                cancelled.countDown();
-              }
-              @Override public void onCompleted() { terminations.incrementAndGet(); cancelled.countDown(); }
-            }));
-            assertTrue(pinStarted.await(5, TimeUnit.SECONDS));
-            context.cancel(null);
-            assertTrue(cancelled.await(5, TimeUnit.SECONDS));
-            pendingPin.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-          } finally {
-            context.cancel(null);
-            pendingPin.completeExceptionally(new BackendFailure(BackendFailure.Category.CANCELLED));
+    private static void assertPinFailureReturnsUnavailable(io.grpc.ManagedChannel channel,
+        Rpc.RangeRequest range) {
+      var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(5, TimeUnit.SECONDS);
+      var failure = assertThrows(io.grpc.StatusRuntimeException.class, () -> stub.range(range));
+      assertEquals(Status.Code.UNAVAILABLE, failure.getStatus().getCode());
+      var txn = Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder().setRequestRange(range)).build();
+      var txnStub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(5, TimeUnit.SECONDS);
+      var txnFailure = assertThrows(io.grpc.StatusRuntimeException.class, () -> txnStub.txn(txn));
+      assertEquals(Status.Code.UNAVAILABLE, txnFailure.getStatus().getCode());
+    }
+
+    private static void cancelDuringPinFailure(io.grpc.ManagedChannel channel,
+        Rpc.RangeRequest range, PinFailureHarness harness, CancellationEvidence evidence) throws Exception {
+      harness.blockCompletion().set(true);
+      var cancelled = new CountDownLatch(1);
+      var context = io.grpc.Context.current().withCancellation();
+      try {
+        context.run(() -> KVGrpc.newStub(channel).range(range, new StreamObserver<>() {
+          @Override public void onNext(Rpc.RangeResponse response) { evidence.responses().incrementAndGet(); }
+          @Override public void onError(Throwable failure) {
+            evidence.terminalCode().set(Status.fromThrowable(failure).getCode());
+            evidence.terminations().incrementAndGet();
+            cancelled.countDown();
           }
-        } finally {
-          channel.shutdownNow();
-          assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
-        }
+          @Override public void onCompleted() { evidence.terminations().incrementAndGet(); cancelled.countDown(); }
+        }));
+        assertTrue(harness.pinStarted().await(5, TimeUnit.SECONDS));
+        context.cancel(null);
+        assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+        harness.pendingPin().completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      } finally {
+        context.cancel(null);
+        harness.pendingPin().completeExceptionally(new BackendFailure(BackendFailure.Category.CANCELLED));
       }
-      assertEquals(0, responses.get());
-      assertEquals(1, terminations.get());
-      assertEquals(Status.Code.CANCELLED, terminalCode.get());
-      assertEquals(0, budgets.snapshot().allocatedBytes());
-      assertEquals(0, budgets.snapshot().reservedBytes());
     }
 
     private Engine(M3TestEnvironment environment) throws Exception {

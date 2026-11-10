@@ -61,21 +61,56 @@ func (runner *runner) m3RangeScenario(ctx context.Context, prefix string) error 
 	a := append(bytes.Clone(group), 'a')
 	zero := append(bytes.Clone(a), 0)
 	last := append(bytes.Clone(a), 0xff)
+	base, err := runner.prepareRangeFixture(ctx, kv, a, zero, last)
+	if err != nil {
+		return err
+	}
+	if err := runner.m3OrdinaryRanges(ctx, kv, a, zero, last, group, end, base); err != nil {
+		return err
+	}
+	if err := runner.m3FilteredCounts(ctx, kv, a, group, end, base); err != nil {
+		return err
+	}
+	if err := runner.m3RangeCounts(ctx, kv, a, group, end, base); err != nil {
+		return err
+	}
+	if err := runner.m3RangeTransaction(ctx, kv, group, end, a, base); err != nil {
+		return err
+	}
+	if err := runner.m3RangeHistory(ctx, kv, a, base); err != nil {
+		return err
+	}
+	if err := runner.m3ClientRange(ctx, kv, group); err != nil {
+		return err
+	}
+	if err := runner.m3RangeCountAfterDelete(ctx, kv, a, group, end, base); err != nil {
+		return err
+	}
+	return runner.m3RangeErrors(ctx, kv, a)
+}
+
+func (runner *runner) prepareRangeFixture(ctx context.Context, kv etcdserverpb.KVClient,
+	a, zero, last []byte) (int64, error) {
 	baseline, err := runner.m3Put(ctx, kv, "native-baseline", &etcdserverpb.PutRequest{Key: a, Value: []byte("old")})
 	if err != nil || baseline.Header == nil || baseline.Header.Revision < 1 {
-		return errors.New("Range baseline did not create a key")
+		return 0, errors.New("Range baseline did not create a key")
 	}
 	base := baseline.Header.Revision
 	seed, err := runner.m3Txn(ctx, kv, "J34-seed", &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
 		m3PutOp(zero, []byte("zero"), false), m3PutOp(last, []byte("last"), false),
 	}})
 	if err != nil || seed.Header == nil || seed.Header.Revision != base+1 {
-		return errors.New("Range seed did not commit once")
+		return 0, errors.New("Range seed did not commit once")
 	}
 	updated, err := runner.m3Put(ctx, kv, "J34-update", &etcdserverpb.PutRequest{Key: a, Value: []byte("new")})
 	if err != nil || updated.Header == nil || updated.Header.Revision != base+2 {
-		return errors.New("Range update did not advance the revision")
+		return 0, errors.New("Range update did not advance the revision")
 	}
+	return base, nil
+}
+
+func (runner *runner) m3OrdinaryRanges(ctx context.Context, kv etcdserverpb.KVClient,
+	a, zero, last, group, end []byte, base int64) error {
 	for _, test := range []struct {
 		id      string
 		request *etcdserverpb.RangeRequest
@@ -110,24 +145,10 @@ func (runner *runner) m3RangeScenario(ctx context.Context, prefix string) error 
 			}
 		}
 	}
-	if err := runner.m3FilteredCounts(ctx, kv, a, group, end, base); err != nil {
-		return err
-	}
-	if err := runner.m3RangeCounts(ctx, kv, a, group, end, base); err != nil {
-		return err
-	}
-	if err := runner.m3RangeTransaction(ctx, kv, group, end, a, base); err != nil {
-		return err
-	}
-	if err := runner.m3RangeHistory(ctx, kv, a, base); err != nil {
-		return err
-	}
-	if err := runner.m3ClientRange(ctx, kv, group); err != nil {
-		return err
-	}
-	if err := runner.m3RangeCountAfterDelete(ctx, kv, a, group, end, base); err != nil {
-		return err
-	}
+	return nil
+}
+
+func (runner *runner) m3RangeErrors(ctx context.Context, kv etcdserverpb.KVClient, a []byte) error {
 	future := &etcdserverpb.RangeRequest{Key: a, Revision: math.MaxInt64}
 	_, callErr := runner.callWithError(ctx, "J34-future", "etcdserverpb.KV/Range", future,
 		func(callContext context.Context) (protoMessage, error) { return kv.Range(callContext, future) })
@@ -143,18 +164,23 @@ func (runner *runner) m3RangeScenario(ctx context.Context, prefix string) error 
 	return nil
 }
 
+type rangeFilter struct {
+	id    string
+	apply func(*etcdserverpb.RangeRequest)
+}
+
+func m3RangeFilters(base int64) []rangeFilter {
+	return []rangeFilter{
+		{"min-mod", func(request *etcdserverpb.RangeRequest) { request.MinModRevision = base + 9 }},
+		{"max-mod", func(request *etcdserverpb.RangeRequest) { request.MaxModRevision = -1 }},
+		{"min-create", func(request *etcdserverpb.RangeRequest) { request.MinCreateRevision = base + 9 }},
+		{"max-create", func(request *etcdserverpb.RangeRequest) { request.MaxCreateRevision = -1 }},
+	}
+}
+
 func (runner *runner) m3FilteredCounts(ctx context.Context, kv etcdserverpb.KVClient,
 	a, group, end []byte, base int64) error {
-	filters := []struct {
-		id    string
-		apply func(*etcdserverpb.RangeRequest)
-	}{
-		{"min-mod", func(r *etcdserverpb.RangeRequest) { r.MinModRevision = base + 9 }},
-		{"max-mod", func(r *etcdserverpb.RangeRequest) { r.MaxModRevision = -1 }},
-		{"min-create", func(r *etcdserverpb.RangeRequest) { r.MinCreateRevision = base + 9 }},
-		{"max-create", func(r *etcdserverpb.RangeRequest) { r.MaxCreateRevision = -1 }},
-	}
-	for _, filter := range filters {
+	for _, filter := range m3RangeFilters(base) {
 		for _, ranged := range []bool{false, true} {
 			id := "J34-filtered-point-" + filter.id
 			request := &etcdserverpb.RangeRequest{Key: a, Limit: 1}
@@ -175,6 +201,14 @@ func (runner *runner) m3FilteredCounts(ctx context.Context, kv etcdserverpb.KVCl
 			}
 		}
 	}
+	if err := runner.m3PartiallyFilteredRanges(ctx, kv, a, group, end, base); err != nil {
+		return err
+	}
+	return runner.m3FilteredNestedTransaction(ctx, kv, a, group, end, base)
+}
+
+func (runner *runner) m3PartiallyFilteredRanges(ctx context.Context, kv etcdserverpb.KVClient,
+	a, group, end []byte, base int64) error {
 	partial, err := runner.m3Range(ctx, kv, "J34-filtered-range-partial", &etcdserverpb.RangeRequest{
 		Key: group, RangeEnd: end, MinModRevision: base + 2,
 	})
@@ -182,16 +216,24 @@ func (runner *runner) m3FilteredCounts(ctx context.Context, kv etcdserverpb.KVCl
 	if runner.evidenceScope == "native-etcd" {
 		expected = 3
 	}
-	if err != nil || partial.Count != expected || len(partial.Kvs) != 1 ||
-		!bytes.Equal(partial.Kvs[0].Key, a) || partial.More {
+	if err != nil || !m3FilteredRangeMatches(partial, a, expected) {
 		return errors.New("partially filtered Range returned an incorrect result")
 	}
 	matched, err := runner.m3Range(ctx, kv, "J34-filtered-point-match", &etcdserverpb.RangeRequest{
 		Key: a, MinModRevision: base + 2,
 	})
-	if err != nil || matched.Count != 1 || len(matched.Kvs) != 1 || !bytes.Equal(matched.Kvs[0].Key, a) || matched.More {
+	if err != nil || !m3FilteredRangeMatches(matched, a, 1) {
 		return errors.New("matching filtered point returned an incorrect result")
 	}
+	return nil
+}
+
+func m3FilteredRangeMatches(response *etcdserverpb.RangeResponse, key []byte, count int64) bool {
+	return response.Count == count && len(response.Kvs) == 1 && bytes.Equal(response.Kvs[0].Key, key) && !response.More
+}
+
+func (runner *runner) m3FilteredNestedTransaction(ctx context.Context, kv etcdserverpb.KVClient,
+	a, group, end []byte, base int64) error {
 	point := &etcdserverpb.RangeRequest{Key: a, MinModRevision: base + 9}
 	ranged := &etcdserverpb.RangeRequest{Key: group, RangeEnd: end, MinModRevision: base + 9}
 	request := &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{{
@@ -220,16 +262,7 @@ func (runner *runner) m3FilteredCounts(ctx context.Context, kv etcdserverpb.KVCl
 
 func (runner *runner) m3RangeCounts(ctx context.Context, kv etcdserverpb.KVClient,
 	a, group, end []byte, base int64) error {
-	filters := []struct {
-		id    string
-		apply func(*etcdserverpb.RangeRequest)
-	}{
-		{"min-mod", func(r *etcdserverpb.RangeRequest) { r.MinModRevision = base + 9 }},
-		{"max-mod", func(r *etcdserverpb.RangeRequest) { r.MaxModRevision = -1 }},
-		{"min-create", func(r *etcdserverpb.RangeRequest) { r.MinCreateRevision = base + 9 }},
-		{"max-create", func(r *etcdserverpb.RangeRequest) { r.MaxCreateRevision = -1 }},
-	}
-	for _, filter := range filters {
+	for _, filter := range m3RangeFilters(base) {
 		for _, ranged := range []bool{false, true} {
 			id := "J34-count-point-" + filter.id
 			request := &etcdserverpb.RangeRequest{Key: a, CountOnly: true, KeysOnly: true}

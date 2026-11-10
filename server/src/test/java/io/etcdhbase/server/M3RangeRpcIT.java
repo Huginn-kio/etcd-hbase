@@ -9,6 +9,7 @@ import com.google.protobuf.ByteString;
 import etcdserverpb.KVGrpc;
 import etcdserverpb.Rpc;
 import io.etcdhbase.admin.M3TableGroupInitializer;
+import io.etcdhbase.admin.M3TableGroupPlan;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
 import io.etcdhbase.core.request.RequestScope;
@@ -21,6 +22,7 @@ import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
 import io.etcdhbase.server.commit.M3TableGroupRuntime;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.spi.identity.AuthenticationScope;
+import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.etcdhbase.spi.identity.BackendCredentials;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
@@ -44,49 +46,63 @@ class M3RangeRpcIT {
   void standaloneAndTransactionRangeUseTheSameProtectedViewOnBothLayouts() throws Exception {
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
       for (String file : List.of("history-table.json", "native-cell-versions.json")) {
-        var plan = M3TableGroupRuntimeIT.plan(file,
-            cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
-        var auth = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
-        try (var provider = new HBaseBackendIdentityProvider(plan.source().identityProviderId(), auth,
-                cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
-                (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
-                1, 1, Duration.ofSeconds(30));
-             var credentials = new BackendCredentials("m3-range-fixture", new char[0])) {
-          var identity = provider.authenticate(credentials, auth).toCompletableFuture().get(30, TimeUnit.SECONDS);
-          M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider, PINS);
-          var limit = new BudgetManager.Limits(10, 10, 16, 8, 16, 4L << 20, 512L << 20);
-          var budgets = new BudgetManager(limit, Map.of(plan.source().tableGroupId(), limit), limit);
-          try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
-            M3TableGroupRuntime runtime;
-            try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
-              runtime = M3TableGroupRuntime.open(plan, M3TableGroupRuntimeIT.activation("1"),
-                  RESOURCES, provider, identity, budgets, scans, startup);
-            }
-            try {
-              try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
-                  "m3-range", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
-                var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port()).usePlaintext().build();
-                try {
-                  var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(90, TimeUnit.SECONDS);
-                  verifyRange(stub, runtime, plan.primary().codec()::bucket);
-                  try (var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
-                    var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope)
-                        .get(30, TimeUnit.SECONDS);
-                    verifyCompactedRange(stub, control, scope);
-                  }
-                } finally {
-                  channel.shutdownNow();
-                  assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
-                }
-              }
-            } finally {
-              runtime.close();
-              runtime.drained().get(30, TimeUnit.SECONDS);
-            }
-          }
-          assertEquals(0, budgets.snapshot().reservedBytes());
-          assertEquals(0, budgets.snapshot().allocatedBytes());
+        verifyLayout(cluster, file);
+      }
+    }
+  }
+
+  private static void verifyLayout(TemporaryHBaseClusterProcess cluster, String file) throws Exception {
+    var plan = M3TableGroupRuntimeIT.plan(file,
+        cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
+    var auth = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
+    try (var provider = new HBaseBackendIdentityProvider(plan.source().identityProviderId(), auth,
+             cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+             (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+             1, 1, Duration.ofSeconds(30));
+         var credentials = new BackendCredentials("m3-range-fixture", new char[0])) {
+      var identity = provider.authenticate(credentials, auth).toCompletableFuture().get(30, TimeUnit.SECONDS);
+      verifyAuthenticatedLayout(plan, provider, identity);
+    }
+  }
+
+  private static void verifyAuthenticatedLayout(M3TableGroupPlan plan, HBaseBackendIdentityProvider provider,
+      AuthorizedBackendIdentity identity) throws Exception {
+    M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider, PINS);
+    var limit = new BudgetManager.Limits(10, 10, 16, 8, 16, 4L << 20, 512L << 20);
+    var budgets = new BudgetManager(limit, Map.of(plan.source().tableGroupId(), limit), limit);
+    try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
+      M3TableGroupRuntime runtime;
+      try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+        runtime = M3TableGroupRuntime.open(plan, M3TableGroupRuntimeIT.activation("1"),
+            RESOURCES, provider, identity, budgets, scans, startup);
+      }
+      try {
+        verifyServer(plan, runtime, provider, identity);
+      } finally {
+        runtime.close();
+        runtime.drained().get(30, TimeUnit.SECONDS);
+      }
+    }
+    assertEquals(0, budgets.snapshot().reservedBytes());
+    assertEquals(0, budgets.snapshot().allocatedBytes());
+  }
+
+  private static void verifyServer(M3TableGroupPlan plan, M3TableGroupRuntime runtime,
+      HBaseBackendIdentityProvider provider, AuthorizedBackendIdentity identity) throws Exception {
+    try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
+        "m3-range", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
+      var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port()).usePlaintext().build();
+      try {
+        var stub = KVGrpc.newBlockingStub(channel).withDeadlineAfter(90, TimeUnit.SECONDS);
+        verifyRange(stub, runtime, plan.primary().codec()::bucket);
+        try (var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+          var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope)
+              .get(30, TimeUnit.SECONDS);
+          verifyCompactedRange(stub, control, scope);
         }
+      } finally {
+        channel.shutdownNow();
+        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
       }
     }
   }
@@ -102,9 +118,15 @@ class M3RangeRpcIT {
     assertEquals(2, stub.put(put(a, "old")).getHeader().getRevision());
     assertEquals(3, stub.put(put(last, "other")).getHeader().getRevision());
     assertEquals(4, stub.put(put(a, "new")).getHeader().getRevision());
+    verifyCurrentHistoricalAndFilteredRanges(stub, runtime, a, prefix, end);
+    verifyRangeErrorsAndUnboundedFilter(stub, a, prefix, end);
+    verifyTransactionAndBoundaryRanges(stub, a, prefix, last);
+  }
+
+  private static void verifyCurrentHistoricalAndFilteredRanges(KVGrpc.KVBlockingStub stub,
+      M3TableGroupRuntime runtime, ByteString a, ByteString prefix, ByteString end) {
     var beforeStages = runtime.metrics().txnStages();
     long beforeTxnBytes = runtime.metrics().txnOutputBytes();
-
     var page = stub.range(Rpc.RangeRequest.newBuilder().setKey(prefix).setRangeEnd(end).setLimit(1).build());
     assertEquals(1, page.getCount());
     assertTrue(page.getMore());
@@ -131,7 +153,10 @@ class M3RangeRpcIT {
     assertEquals(a, filtered.getKvs(0).getKey());
     assertEquals(beforeStages, runtime.metrics().txnStages());
     assertEquals(beforeTxnBytes, runtime.metrics().txnOutputBytes());
+  }
 
+  private static void verifyRangeErrorsAndUnboundedFilter(KVGrpc.KVBlockingStub stub,
+      ByteString a, ByteString prefix, ByteString end) {
     var fullFiltered = stub.range(Rpc.RangeRequest.newBuilder().setKey(prefix).setRangeEnd(end)
         .setMinModRevision(4).build());
     assertEquals(1, fullFiltered.getCount());
@@ -148,7 +173,10 @@ class M3RangeRpcIT {
     var nestedNegative = Rpc.TxnRequest.newBuilder().addSuccess(Rpc.RequestOp.newBuilder().setRequestRange(
         Rpc.RangeRequest.newBuilder().setKey(a).setRevision(-2))).build();
     assertEquals(Status.Code.OUT_OF_RANGE, status(() -> stub.txn(nestedNegative)));
+  }
 
+  private static void verifyTransactionAndBoundaryRanges(KVGrpc.KVBlockingStub stub,
+      ByteString a, ByteString prefix, ByteString last) {
     ByteString c = ByteString.copyFromUtf8("j34/c");
     var txn = Rpc.TxnRequest.newBuilder()
         .addSuccess(Rpc.RequestOp.newBuilder().setRequestPut(put(c, "txn")))

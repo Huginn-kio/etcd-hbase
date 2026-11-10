@@ -327,6 +327,31 @@ J34_UNIT_CASES = {
 }
 
 
+# One registry supplies the evidence contract to every validation stage.
+ALL_UNIT_MODULES = ("protocol", "spi", "core", "hbase", "grpc", "admin", "server")
+RUN_TASKS = {
+    "J30": {"cases": PUT_CASES, "methods": ("etcdserverpb.KV/Put",) * len(PUT_CASES),
+            "prefix": "", "scenario": "m3-put-v1", "suite": "m3-put.yaml", "compare": "--m3-put",
+            "go": GO_REQUIRED_CASES, "integration": REQUIRED_CASES, "units": None},
+    "J31": {"cases": TXN_CASES, "methods": ("etcdserverpb.KV/Put",) + ("etcdserverpb.KV/Txn",) * (len(TXN_CASES) - 1),
+            "prefix": "j31-", "scenario": "m3-txn-v1", "suite": "m3-txn.yaml", "compare": "--m3-txn",
+            "go": J31_GO_REQUIRED_CASES, "integration": J31_INTEGRATION_CASES, "units": J31_UNIT_CASES,
+            "unit_modules": ("core", "grpc", "server")},
+    "J32": {"cases": NESTED_CASES, "methods": ("etcdserverpb.KV/Put",) + ("etcdserverpb.KV/Txn",) * (len(NESTED_CASES) - 1),
+            "prefix": "j32-", "scenario": "m3-nested-txn-v1", "suite": "m3-nested-txn.yaml", "compare": "--m3-txn",
+            "go": J32_GO_REQUIRED_CASES, "integration": J32_INTEGRATION_CASES, "units": J32_UNIT_CASES,
+            "unit_modules": ALL_UNIT_MODULES},
+    "J33": {"cases": DELETE_CASES, "methods": DELETE_METHODS, "prefix": "j33-",
+            "scenario": "m3-delete-v1", "suite": "m3-delete.yaml", "compare": "--m3-delete",
+            "go": J33_GO_REQUIRED_CASES, "integration": J33_INTEGRATION_CASES, "units": J33_UNIT_CASES,
+            "unit_modules": ALL_UNIT_MODULES},
+    "J34": {"cases": RANGE_CASES, "methods": RANGE_METHODS, "prefix": "j34-",
+            "scenario": "m3-range-v1", "suite": "m3-range.yaml", "compare": "--m3-range",
+            "go": J34_GO_REQUIRED_CASES, "integration": J34_INTEGRATION_CASES, "units": J34_UNIT_CASES,
+            "unit_modules": ALL_UNIT_MODULES},
+}
+
+
 def unique_pairs(pairs):
     """Reject duplicate object keys wherever M3 metadata is parsed."""
     result = {}
@@ -418,9 +443,10 @@ def validate_metadata(metadata: dict, scope: str, layout: str,
 def validate_trace_cases(path: Path, scope: str, task: str = "J30") -> None:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 256 << 20:
         raise ValueError("M3 trace is missing, linked or oversized")
-    cases = {"J30": PUT_CASES, "J31": TXN_CASES, "J32": NESTED_CASES, "J33": DELETE_CASES, "J34": RANGE_CASES}.get(task)
-    if cases is None:
+    spec = RUN_TASKS.get(task)
+    if spec is None:
         raise ValueError("unregistered M3 trace task")
+    cases, methods = spec["cases"], spec["methods"]
     records = []
     with path.open(encoding="utf-8") as stream:
         for line in stream:
@@ -433,8 +459,7 @@ def validate_trace_cases(path: Path, scope: str, task: str = "J30") -> None:
     if (tuple(record.get("case_id") for record in records) != cases
             or any(record.get("schema") != "etcd-hbase-trace/v1"
                    or record.get("evidence_scope") != scope
-                   or record.get("method") != (RANGE_METHODS[index] if task == "J34" else DELETE_METHODS[index] if task == "J33" else
-                       "etcdserverpb.KV/Put" if task == "J30" or index == 0 else "etcdserverpb.KV/Txn")
+                   or record.get("method") != methods[index]
                    for index, record in enumerate(records))):
         raise ValueError("M3 trace is incomplete or belongs to another scope")
 
@@ -469,9 +494,9 @@ def validate_go_report(path: Path, required_cases: dict = GO_REQUIRED_CASES) -> 
 
 def validate_run(root: Path, repository: Path = REPO) -> dict:
     run, source, task = validate_run_identity(root, repository)
-    prefix, txn = validate_run_traces(root, repository, run, source, task)
+    prefix = validate_run_traces(root, repository, run, source, task)
     suites = validate_run_reports(root, task)
-    compare_run_traces(root, repository, prefix, txn, task)
+    compare_run_traces(root, repository, prefix, task)
     limitations = ["raft_term=0 is a disclosed non-Raft projection",
                    "public MiniCluster is not target HBase or target identity acceptance",
                    "an unconfirmed scanner close retires local capacity; remote lifetime across restarts is unverified"]
@@ -489,7 +514,7 @@ def validate_run(root: Path, repository: Path = REPO) -> dict:
         limitations.append("filtered ordinary Range Count follows returned Kvs and may differ from native prefilter Count")
     return {"phase": "M3", "tasks": [task], "scope": run["scope"], "run_id": run["run_id"],
             "source_commit": source, "suites": suites,
-            "trace_cases": list({"J30": PUT_CASES, "J31": TXN_CASES, "J32": NESTED_CASES, "J33": DELETE_CASES, "J34": RANGE_CASES}[task]),
+            "trace_cases": list(RUN_TASKS[task]["cases"]),
             "limitations": limitations}
 
 
@@ -498,7 +523,9 @@ def validate_run_identity(root: Path, repository: Path) -> tuple[dict, str, str]
     run_id = run.get("run_id")
     tasks = run.get("tasks")
     if (run.get("schema") != "etcd-hbase-m3-run/v1"
-            or run.get("scope") != "public-local-minicluster" or tasks not in (["J30"], ["J31"], ["J32"], ["J33"], ["J34"])
+            or run.get("scope") != "public-local-minicluster"
+            or not isinstance(tasks, list) or len(tasks) != 1
+            or not isinstance(tasks[0], str) or tasks[0] not in RUN_TASKS
             or not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", run_id)
             or root.name != run_id or run.get("commands_passed") is not True):
         raise ValueError("M3 run identity, scope, tasks, or command status is invalid")
@@ -513,18 +540,11 @@ def validate_run_identity(root: Path, repository: Path) -> tuple[dict, str, str]
     return run, source, tasks[0]
 
 
-def validate_run_traces(root: Path, repository: Path, run: dict, source: str, task: str) -> tuple[str, bool]:
+def validate_run_traces(root: Path, repository: Path, run: dict, source: str, task: str) -> str:
     run_id = run["run_id"]
     validate_case_registry(read_json(repository / "testkit/cases/m3-cases.json"))
-    txn = task != "J30"
-    prefix = {"J30": "", "J31": "j31-", "J32": "j32-", "J33": "j33-", "J34": "j34-"}[task]
-    scenario, suite_file = {
-        "J30": ("m3-put-v1", "m3-put.yaml"),
-        "J31": ("m3-txn-v1", "m3-txn.yaml"),
-        "J32": ("m3-nested-txn-v1", "m3-nested-txn.yaml"),
-        "J33": ("m3-delete-v1", "m3-delete.yaml"),
-        "J34": ("m3-range-v1", "m3-range.yaml"),
-    }[task]
+    spec = RUN_TASKS[task]
+    prefix, scenario, suite_file = spec["prefix"], spec["scenario"], spec["suite"]
     suite_sha = file_digest(repository / "testkit/scenarios" / suite_file)
     prefix_sha = hashlib.sha256(f"etcd-hbase-m3-test/{run_id}/".encode()).hexdigest()
     for name, scope, layout in (("native", "native-etcd", ""), ("target-history", "target-hbase", "HISTORY"),
@@ -539,32 +559,27 @@ def validate_run_traces(root: Path, repository: Path, run: dict, source: str, ta
             or fixture.get("source_commit") != source or fixture.get("authentication") != "dev-no-auth"
             or fixture.get("layouts") != ["HISTORY", "NATIVE"]):
         raise ValueError("M3 target fixture provenance is incomplete or mismatched")
-    return prefix, txn
+    return prefix
 
 
 def validate_run_reports(root: Path, task: str) -> dict:
-    txn = task != "J30"
-    go_cases = {"J30": GO_REQUIRED_CASES, "J31": J31_GO_REQUIRED_CASES, "J32": J32_GO_REQUIRED_CASES,
-                "J33": J33_GO_REQUIRED_CASES, "J34": J34_GO_REQUIRED_CASES}[task]
-    validate_go_report(root / "go-test.jsonl", go_cases)
-    integration = {"J30": REQUIRED_CASES, "J31": J31_INTEGRATION_CASES, "J32": J32_INTEGRATION_CASES,
-                   "J33": J33_INTEGRATION_CASES, "J34": J34_INTEGRATION_CASES}[task]
+    spec = RUN_TASKS[task]
+    validate_go_report(root / "go-test.jsonl", spec["go"])
+    integration = spec["integration"]
     _, suites = java_reports(root, set(integration), modules=("hbase", "admin", "server"),
                              required_cases=integration, report_kinds=("failsafe-reports",))
-    if txn:
-        required_units = {"J31": J31_UNIT_CASES, "J32": J32_UNIT_CASES, "J33": J33_UNIT_CASES, "J34": J34_UNIT_CASES}[task]
-        unit_modules = ("core", "grpc", "server") if task == "J31" else (
-            "protocol", "spi", "core", "hbase", "grpc", "admin", "server")
-        _, units = java_reports(root, set(required_units), modules=unit_modules,
+    required_units = spec["units"]
+    if required_units is not None:
+        _, units = java_reports(root, set(required_units), modules=spec["unit_modules"],
                                 required_cases=required_units, report_kinds=("surefire-reports",))
         suites.update(units)
     return suites
 
 
-def compare_run_traces(root: Path, repository: Path, prefix: str, txn: bool, task: str) -> None:
+def compare_run_traces(root: Path, repository: Path, prefix: str, task: str) -> None:
     for layout in ("history", "native"):
         command = [str(repository / "scripts/dev/go-program.sh"), "native-etcd", "compare",
-                   "--m3-range" if task == "J34" else "--m3-delete" if task == "J33" else "--m3-txn" if txn else "--m3-put",
+                   RUN_TASKS[task]["compare"],
                    "--left", str(root / f"{prefix}native-trace.jsonl"),
                    "--right", str(root / f"{prefix}target-{layout}-trace.jsonl")]
         subprocess.run(command, cwd=repository, check=True, stdout=subprocess.DEVNULL)
