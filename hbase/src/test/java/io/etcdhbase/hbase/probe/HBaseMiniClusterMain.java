@@ -3,6 +3,7 @@ package io.etcdhbase.hbase.probe;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
@@ -79,7 +80,7 @@ public final class HBaseMiniClusterMain {
               configurationFile.toString(),
               VersionInfo.getVersion(),
               Runtime.version().toString());
-      Files.writeString(readinessFile, readinessRecord, StandardCharsets.UTF_8);
+      publishReadiness(readinessFile, readinessRecord);
       System.out.println(readinessRecord);
       System.out.flush();
       System.err.println("m0-hbase-cluster phase=ready");
@@ -122,6 +123,16 @@ public final class HBaseMiniClusterMain {
           security.close();
         }
       }
+    }
+  }
+
+  static void publishReadiness(Path readinessFile, String record) throws java.io.IOException {
+    Path pending = Files.createTempFile(readinessFile.getParent(), "readiness-", ".pending");
+    try {
+      Files.writeString(pending, record, StandardCharsets.UTF_8);
+      Files.move(pending, readinessFile, StandardCopyOption.ATOMIC_MOVE);
+    } finally {
+      Files.deleteIfExists(pending);
     }
   }
 
