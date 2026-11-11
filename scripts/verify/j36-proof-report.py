@@ -35,6 +35,9 @@ UNITS = {
     'io.etcdhbase.server.config.M3RuntimeConfigurationTest': {
         'cacheDefaultsOffAndCannotBeEnabledWithoutIdentityLifecycleProof',
     },
+    'io.etcdhbase.server.M3CacheScopeDrainTest': {
+        'waitsForLateProducerAndCleanupAfterScopeClose',
+    },
     'io.etcdhbase.server.RuntimeServerTest': {
         'rejectsCacheActivationBeforeStartingTheBackend(Path)',
     },

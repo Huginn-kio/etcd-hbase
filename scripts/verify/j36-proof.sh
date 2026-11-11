@@ -30,7 +30,7 @@ PY
 )"
 python3 scripts/verify/test_j36_proof_report.py
 scripts/dev/mvn21.sh -B -ntp -pl server -am -P m3-j35-public \
-  -Dtest=ReadViewRecordStoreTest,ManifestPreparationTest,RangeResultCacheTest,BudgetManagerTest,RuntimeServerTest,M3RuntimeConfigurationTest,HBaseSystemRecordDecodeTest \
+  -Dtest=ReadViewRecordStoreTest,ManifestPreparationTest,RangeResultCacheTest,BudgetManagerTest,RuntimeServerTest,M3RuntimeConfigurationTest,HBaseSystemRecordDecodeTest,M3CacheScopeDrainTest \
   -Dsurefire.failIfNoSpecifiedTests=false '-Dit.test=M2ReadViewIT,M3CacheProofIT,M3CacheRuntimeIT,M3CacheProcessIT,M3CacheOversizeIT,SecureHBaseAuthenticationIT#revokedPermissionDeniesLiveBackendReadsAndFreshAuthentication' \
   -Dfailsafe.failIfNoSpecifiedTests=false clean verify > "$artifact_root/maven.log" 2>&1 || {
     tail -n 120 "$artifact_root/maven.log" >&2

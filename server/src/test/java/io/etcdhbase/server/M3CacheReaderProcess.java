@@ -135,7 +135,8 @@ public final class M3CacheReaderProcess {
     ByteKey key = ByteKey.copyOf(HexFormat.of().parseHex(input.readUTF()));
     var range = new RangeCommand(KeyRange.point(key), RangeCommand.Context.STANDALONE, 0, 0,
         new RangeCommand.Sort(0, 0), new RangeCommand.RevisionFilter(0, 0, 0, 0), false, false, false);
-    try (var scope = RequestScope.withTimeout(TIMEOUT);
+    var scope = RequestScope.withTimeout(TIMEOUT);
+    try (var drain = new M3CacheScopeDrain(scope); scope;
          var account = budget.admit(group, scope,
              new BudgetManager.Reservation(64L << 10, 64L << 10, 1L << 20, 4L << 20, 1L << 20))) {
       var request = new TxnCommand(List.of(), List.of(new TxnCommand.Range(range)), List.of());

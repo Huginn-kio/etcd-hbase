@@ -223,7 +223,8 @@ class M3CacheProofIT {
 
   private static ReadResult readThroughExecutor(M3TestEnvironment fixture, BudgetManager budget,
       TxnReadExecutor reads, RangeCommand command) throws Exception {
-    try (var scope = RequestScope.withTimeout(TIMEOUT);
+    var scope = RequestScope.withTimeout(TIMEOUT);
+    try (var drain = new M3CacheScopeDrain(scope); scope;
          var account = budget.admit(fixture.system().tableGroupId(), scope, readReservation())) {
       var request = new TxnCommand(List.of(), List.of(new TxnCommand.Range(command)), List.of());
       var result = reads.execute(request, M3PutCommitIT.AUTHORIZATION, fixture.identity(), scope, account)
@@ -248,7 +249,8 @@ class M3CacheProofIT {
   private static void admit(M3TestEnvironment fixture, TableGroupStores stores, BudgetManager budget,
       M3CacheTestProbe cache, RangeCommand command) throws Exception {
     String group = fixture.system().tableGroupId();
-    try (var scope = RequestScope.withTimeout(TIMEOUT);
+    var scope = RequestScope.withTimeout(TIMEOUT);
+    try (var drain = new M3CacheScopeDrain(scope); scope;
          var account = budget.admit(group, scope, readReservation());
          var scans = new ScanScheduler(budget, Duration.ofSeconds(10))) {
       var session = session(fixture, stores, scope);
@@ -264,7 +266,8 @@ class M3CacheProofIT {
 
   private static Optional<M3CacheTestProbe.Hit> sameSequence(M3TestEnvironment fixture, TableGroupStores stores,
       BudgetManager budget, M3CacheTestProbe cache, RangeCommand command) throws Exception {
-    try (var scope = RequestScope.withTimeout(TIMEOUT);
+    var scope = RequestScope.withTimeout(TIMEOUT);
+    try (var drain = new M3CacheScopeDrain(scope); scope;
          var account = budget.admit(fixture.system().tableGroupId(), scope, readReservation())) {
       var session = session(fixture, stores, scope);
       var hit = cache.sameSequence(session, command, account, scope);
@@ -278,8 +281,9 @@ class M3CacheProofIT {
     String group = fixture.system().tableGroupId();
     var proofReservation = new BudgetManager.Reservation(8192, 8192, 256L << 20, 8192, 8192);
     var reads = new BudgetManager.ReadLimits(1000, 4L << 30, 1000, 1000, 1000);
-    try (var scope = RequestScope.withTimeout(TIMEOUT);
-         var proofScope = RequestScope.withTimeout(TIMEOUT);
+    var scope = RequestScope.withTimeout(TIMEOUT);
+    var proofScope = RequestScope.withTimeout(TIMEOUT);
+    try (var drain = new M3CacheScopeDrain(scope, proofScope); scope; proofScope;
          var account = budget.admit(group, scope, readReservation());
          var proofAccount = budget.admit(group, proofScope, proofReservation, reads)) {
       var session = session(fixture, stores, scope);
@@ -317,8 +321,9 @@ class M3CacheProofIT {
     var reservation = new BudgetManager.Reservation(8192, 8192, 256L << 20, 8192, 8192);
     var reads = new BudgetManager.ReadLimits(1000, 4L << 30, 1000, 1000, 1000);
     UnchangedRangeProof.Verdict result;
-    try (var scope = RequestScope.withTimeout(TIMEOUT);
-         var proofScope = RequestScope.withTimeout(TIMEOUT);
+    var scope = RequestScope.withTimeout(TIMEOUT);
+    var proofScope = RequestScope.withTimeout(TIMEOUT);
+    try (var drain = new M3CacheScopeDrain(scope, proofScope); scope; proofScope;
          var account = budget.admit(group, proofScope, reservation, reads)) {
       var session = session(fixture, stores, scope);
       var view = session.protectedView(session.currentRevision());
