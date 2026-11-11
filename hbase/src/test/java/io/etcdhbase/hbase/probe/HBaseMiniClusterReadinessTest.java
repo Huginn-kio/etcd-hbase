@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -22,19 +23,24 @@ class HBaseMiniClusterReadinessTest {
           HBaseMiniClusterMain.publishReadiness(ready, record);
           return null;
         });
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (!published.isDone() && System.nanoTime() < deadline) {
-          if (Files.exists(ready)) {
-            assertEquals(record, Files.readString(ready, StandardCharsets.UTF_8));
-          }
-          java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(100));
-        }
+        observeCompleteRecordsUntilPublished(ready, record, published);
         published.get(10, TimeUnit.SECONDS);
         assertEquals(record, Files.readString(ready, StandardCharsets.UTF_8));
       }
     }
     try (var files = Files.list(directory)) {
       assertFalse(files.anyMatch(path -> path.getFileName().toString().endsWith(".pending")));
+    }
+  }
+
+  private static void observeCompleteRecordsUntilPublished(Path ready, String record,
+      Future<?> published) throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (!published.isDone() && System.nanoTime() < deadline) {
+      if (Files.exists(ready)) {
+        assertEquals(record, Files.readString(ready, StandardCharsets.UTF_8));
+      }
+      java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(100));
     }
   }
 }
