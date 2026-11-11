@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.admin.M3TableGroupInitializer;
+import io.etcdhbase.admin.M3TableGroupPlan;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
@@ -14,6 +15,7 @@ import io.etcdhbase.hbase.probe.TemporaryHBaseClusterProcess;
 import io.etcdhbase.server.commit.M3TableGroupRuntime;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.spi.identity.AuthenticationScope;
+import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.etcdhbase.spi.identity.BackendCredentials;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -59,24 +61,29 @@ class M3HistoryRpcIT {
       M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider, PINS);
       var limits = new BudgetManager.Limits(10, 10, 16, 8, 16, 4L << 20, 512L << 20);
       var budgets = new BudgetManager(limits, Map.of(plan.source().tableGroupId(), limits), limits);
-      try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
-        M3TableGroupRuntime runtime;
-        try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
-          runtime = M3TableGroupRuntime.open(plan, M3TableGroupRuntimeIT.activation("1"),
-              RESOURCES, provider, identity, budgets, scans, startup);
-        }
-        try {
-          try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
-              "m3-history", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
-            runGoClient(server.boundListener().port(), layout);
-          }
-        } finally {
-          runtime.close();
-          runtime.drained().get(30, TimeUnit.SECONDS);
-        }
-      }
+      runServer(plan, provider, identity, budgets, layout);
       assertEquals(0, budgets.snapshot().reservedBytes());
       assertEquals(0, budgets.snapshot().allocatedBytes());
+    }
+  }
+
+  private void runServer(M3TableGroupPlan plan, HBaseBackendIdentityProvider provider,
+      AuthorizedBackendIdentity identity, BudgetManager budgets, String layout) throws Exception {
+    try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
+      M3TableGroupRuntime runtime;
+      try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+        runtime = M3TableGroupRuntime.open(plan, M3TableGroupRuntimeIT.activation("1"),
+            RESOURCES, provider, identity, budgets, scans, startup);
+      }
+      try {
+        try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
+            "m3-history", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
+          runGoClient(server.boundListener().port(), layout);
+        }
+      } finally {
+        runtime.close();
+        runtime.drained().get(30, TimeUnit.SECONDS);
+      }
     }
   }
 

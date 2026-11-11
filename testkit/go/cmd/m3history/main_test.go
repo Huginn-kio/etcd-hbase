@@ -66,45 +66,7 @@ func TestEvidenceRecheckRejectsFixedSuccessAndLinkedFile(t *testing.T) {
 }
 
 func TestEvidenceRecheckAcceptsKnownHistoryAndRejectsTamperedValue(t *testing.T) {
-	encode := func(message proto.Message) []byte {
-		t.Helper()
-		wire, err := proto.Marshal(message)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return wire
-	}
-	key := []byte("model-key")
-	first := &mvccpb.KeyValue{Key: key, Value: []byte("first"), CreateRevision: 2, ModRevision: 2, Version: 1}
-	last := &mvccpb.KeyValue{Key: key, Value: []byte("last"), CreateRevision: 2, ModRevision: 3, Version: 2}
-	put := &etcdserverpb.PutRequest{Key: key, Value: first.Value}
-	change := &etcdserverpb.PutRequest{Key: key, Value: last.Value, PrevKv: true}
-	txn := &etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{{Key: key, Target: etcdserverpb.Compare_VERSION,
-		Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: 0}}},
-		Failure: []*etcdserverpb.RequestOp{{Request: &etcdserverpb.RequestOp_RequestPut{RequestPut: change}}}}
-	response := &etcdserverpb.TxnResponse{Header: &etcdserverpb.ResponseHeader{Revision: 3}, Responses: []*etcdserverpb.ResponseOp{
-		{Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: &etcdserverpb.PutResponse{Header: &etcdserverpb.ResponseHeader{Revision: 3}, PrevKv: first}}},
-	}}
-	operations := []history.Observation{
-		{ID: 1, Worker: 1, Begin: 1, End: 2, Method: "Put", Request: encode(put), Response: encode(&etcdserverpb.PutResponse{Header: &etcdserverpb.ResponseHeader{Revision: 2}}), Code: "OK"},
-		{ID: 2, Worker: 2, Begin: 3, End: 4, Method: "Txn", Request: encode(txn), Response: encode(response), Code: "OK"},
-	}
-	for i := 0; i < 8; i++ {
-		operations = append(operations, history.Observation{ID: uint64(i + 3), Worker: 3,
-			Begin: uint64(5 + 2*i), End: uint64(6 + 2*i), Method: "Range", Code: "OK",
-			Request:  encode(&etcdserverpb.RangeRequest{Key: key}),
-			Response: encode(&etcdserverpb.RangeResponse{Header: &etcdserverpb.ResponseHeader{Revision: 3}, Kvs: []*mvccpb.KeyValue{last}, Count: 1})})
-	}
-	initial, err := history.NewKVState(1, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := history.Check(context.Background(), operations, history.KVModel{}, initial, 10000)
-	if err != nil || result.Verdict != history.Linearizable {
-		t.Fatalf("known history: %+v, %v", result, err)
-	}
-	evidence := historyEvidence{Schema: evidenceSchema, Schedule: evidenceSchedule, Seed: evidenceSeed,
-		ModelScope: evidenceScope, RestartMode: "none", BaseRevision: 1, SuccessfulWrites: 2, Observations: operations, Result: result}
+	evidence, last := knownHistoryEvidence(t)
 	path := filepath.Join(t.TempDir(), "history.json")
 	write := func() {
 		data, err := json.Marshal(evidence)
@@ -120,11 +82,56 @@ func TestEvidenceRecheckAcceptsKnownHistoryAndRejectsTamperedValue(t *testing.T)
 		t.Fatal(err)
 	}
 	last.Value = []byte("tampered")
-	evidence.Observations[9].Response = encode(&etcdserverpb.RangeResponse{Header: &etcdserverpb.ResponseHeader{Revision: 3}, Kvs: []*mvccpb.KeyValue{last}, Count: 1})
+	evidence.Observations[9].Response = historyWire(t, &etcdserverpb.RangeResponse{Header: &etcdserverpb.ResponseHeader{Revision: 3}, Kvs: []*mvccpb.KeyValue{last}, Count: 1})
 	write()
 	if err := checkEvidence(path); err == nil {
 		t.Fatal("tampered observed value must fail recheck")
 	}
+}
+
+func historyWire(t *testing.T, message proto.Message) []byte {
+	t.Helper()
+	wire, err := proto.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
+func knownHistoryEvidence(t *testing.T) (historyEvidence, *mvccpb.KeyValue) {
+	t.Helper()
+	key := []byte("model-key")
+	first := &mvccpb.KeyValue{Key: key, Value: []byte("first"), CreateRevision: 2, ModRevision: 2, Version: 1}
+	last := &mvccpb.KeyValue{Key: key, Value: []byte("last"), CreateRevision: 2, ModRevision: 3, Version: 2}
+	put := &etcdserverpb.PutRequest{Key: key, Value: first.Value}
+	change := &etcdserverpb.PutRequest{Key: key, Value: last.Value, PrevKv: true}
+	txn := &etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{{Key: key, Target: etcdserverpb.Compare_VERSION,
+		Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: 0}}},
+		Failure: []*etcdserverpb.RequestOp{{Request: &etcdserverpb.RequestOp_RequestPut{RequestPut: change}}}}
+	response := &etcdserverpb.TxnResponse{Header: &etcdserverpb.ResponseHeader{Revision: 3}, Responses: []*etcdserverpb.ResponseOp{
+		{Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: &etcdserverpb.PutResponse{Header: &etcdserverpb.ResponseHeader{Revision: 3}, PrevKv: first}}},
+	}}
+	operations := []history.Observation{
+		{ID: 1, Worker: 1, Begin: 1, End: 2, Method: "Put", Request: historyWire(t, put), Response: historyWire(t, &etcdserverpb.PutResponse{Header: &etcdserverpb.ResponseHeader{Revision: 2}}), Code: "OK"},
+		{ID: 2, Worker: 2, Begin: 3, End: 4, Method: "Txn", Request: historyWire(t, txn), Response: historyWire(t, response), Code: "OK"},
+	}
+	for i := 0; i < 8; i++ {
+		operations = append(operations, history.Observation{ID: uint64(i + 3), Worker: 3,
+			Begin: uint64(5 + 2*i), End: uint64(6 + 2*i), Method: "Range", Code: "OK",
+			Request:  historyWire(t, &etcdserverpb.RangeRequest{Key: key}),
+			Response: historyWire(t, &etcdserverpb.RangeResponse{Header: &etcdserverpb.ResponseHeader{Revision: 3}, Kvs: []*mvccpb.KeyValue{last}, Count: 1})})
+	}
+	initial, err := history.NewKVState(1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := history.Check(context.Background(), operations, history.KVModel{}, initial, 10000)
+	if err != nil || result.Verdict != history.Linearizable {
+		t.Fatalf("known history: %+v, %v", result, err)
+	}
+	evidence := historyEvidence{Schema: evidenceSchema, Schedule: evidenceSchedule, Seed: evidenceSeed,
+		ModelScope: evidenceScope, RestartMode: "none", BaseRevision: 1, SuccessfulWrites: 2, Observations: operations, Result: result}
+	return evidence, last
 }
 
 func (server *unavailableServer) Put(context.Context, *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {

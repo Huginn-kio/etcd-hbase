@@ -1,6 +1,7 @@
 package scenario
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -84,6 +85,17 @@ func TestM3HistoryChecksNativeNestedTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	observations := recordNativeNestedHistory(t, ctx, client, recorder)
+	initial, err := history.NewKVState(1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyNativeNestedHistory(t, ctx, observations, initial)
+}
+
+func recordNativeNestedHistory(t *testing.T, ctx context.Context, client etcdserverpb.KVClient,
+	recorder *history.Recorder) []history.Observation {
+	t.Helper()
 	a, b := []byte("history-txn-a"), []byte("history-txn-b")
 	version := func(key []byte, v int64) *etcdserverpb.Compare {
 		return &etcdserverpb.Compare{Key: key, Target: etcdserverpb.Compare_VERSION, Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: v}}
@@ -143,10 +155,12 @@ func TestM3HistoryChecksNativeNestedTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial, err := history.NewKVState(1, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	return observations
+}
+
+func verifyNativeNestedHistory(t *testing.T, ctx context.Context, observations []history.Observation,
+	initial *history.KVState) {
+	t.Helper()
 	check := func(want history.Verdict) {
 		t.Helper()
 		result, err := history.Check(ctx, observations, history.KVModel{}, initial, 1000)
@@ -177,10 +191,11 @@ func TestM3HistoryChecksNativeNestedTransactions(t *testing.T) {
 				t.Fatal(err)
 			}
 			test.mutate(&response)
-			observations[test.index].Response, err = proto.Marshal(&response)
+			wire, err := proto.Marshal(&response)
 			if err != nil {
 				t.Fatal(err)
 			}
+			observations[test.index].Response = wire
 			check(history.Invalid)
 		})
 	}

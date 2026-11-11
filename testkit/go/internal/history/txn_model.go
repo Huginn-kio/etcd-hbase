@@ -11,17 +11,15 @@ import (
 	"go.etcd.io/etcd/api/v3/mvccpb"
 )
 
-// applyTxn models a deliberately restricted point-transaction subset. Static
-// validation includes both branches. Unsupported shapes are inconclusive.
+// applyTxn models a restricted nested-transaction subset, including supported
+// ranges. Static validation includes both branches; unsupported shapes are inconclusive.
 func applyTxn(base *KVState, observation Observation) (any, bool, error) {
 	var request etcdserverpb.TxnRequest
 	if proto.Unmarshal(observation.Request, &request) != nil || !knownFields(&request) {
 		return nil, false, errors.New("invalid Txn request")
 	}
-	budget := 64
-	nextNode := uint(0)
-	var writes []writeClaim
-	if err := validateTxn(&request, 0, &budget, &nextNode, &writes, 0, 0); err != nil {
+	validator := txnValidator{budget: 64}
+	if err := validator.validate(&request, 0, 0, 0); err != nil {
 		return nil, false, err
 	}
 	var response *etcdserverpb.TxnResponse
@@ -70,41 +68,27 @@ func claimWrite(writes *[]writeClaim, start, end []byte, put bool, known, choice
 	return true
 }
 
-func validateTxn(txn *etcdserverpb.TxnRequest, depth int, budget *int, nextNode *uint, writes *[]writeClaim, known, choices uint64) error {
-	if txn == nil || depth > 8 || *budget <= 0 || *nextNode >= 64 || (depth == 0 && len(txn.Compare)+len(txn.Success)+len(txn.Failure) == 0) {
+// txnValidator owns the shared node budget and branch-aware write claims.
+type txnValidator struct {
+	budget   int
+	nextNode uint
+	writes   []writeClaim
+}
+
+func (validator *txnValidator) validate(txn *etcdserverpb.TxnRequest, depth int, known, choices uint64) error {
+	if txn == nil || depth > 8 || validator.budget <= 0 || validator.nextNode >= 64 || (depth == 0 && len(txn.Compare)+len(txn.Success)+len(txn.Failure) == 0) {
 		return errors.New("unsupported Txn shape")
 	}
-	branchBit := uint64(1) << *nextNode
-	*nextNode++
-	*budget--
-	for _, c := range txn.Compare {
-		if *budget <= 0 || c == nil || len(c.Key) == 0 || c.Result < etcdserverpb.Compare_EQUAL || c.Result > etcdserverpb.Compare_NOT_EQUAL {
+	branchBit := uint64(1) << validator.nextNode
+	validator.nextNode++
+	validator.budget--
+	for _, compare := range txn.Compare {
+		if validator.budget <= 0 || compare == nil || len(compare.Key) == 0 || compare.Result < etcdserverpb.Compare_EQUAL || compare.Result > etcdserverpb.Compare_NOT_EQUAL {
 			return errors.New("unsupported Txn compare")
 		}
-		*budget--
-		switch c.Target {
-		case etcdserverpb.Compare_VERSION:
-			if _, ok := c.TargetUnion.(*etcdserverpb.Compare_Version); !ok {
-				return errors.New("invalid compare target")
-			}
-		case etcdserverpb.Compare_CREATE:
-			if _, ok := c.TargetUnion.(*etcdserverpb.Compare_CreateRevision); !ok {
-				return errors.New("invalid compare target")
-			}
-		case etcdserverpb.Compare_MOD:
-			if _, ok := c.TargetUnion.(*etcdserverpb.Compare_ModRevision); !ok {
-				return errors.New("invalid compare target")
-			}
-		case etcdserverpb.Compare_VALUE:
-			if _, ok := c.TargetUnion.(*etcdserverpb.Compare_Value); !ok {
-				return errors.New("invalid compare target")
-			}
-		case etcdserverpb.Compare_LEASE:
-			if _, ok := c.TargetUnion.(*etcdserverpb.Compare_Lease); !ok {
-				return errors.New("invalid compare target")
-			}
-		default:
-			return errors.New("unsupported compare target")
+		validator.budget--
+		if err := validateCompareTarget(compare); err != nil {
+			return err
 		}
 	}
 	for index, branch := range [][]*etcdserverpb.RequestOp{txn.Success, txn.Failure} {
@@ -112,35 +96,85 @@ func validateTxn(txn *etcdserverpb.TxnRequest, depth int, budget *int, nextNode 
 		if index == 0 {
 			branchChoices |= branchBit
 		}
-		for _, op := range branch {
-			if op == nil || *budget <= 0 {
-				return errors.New("unsupported Txn operation")
-			}
-			*budget--
-			switch value := op.Request.(type) {
-			case *etcdserverpb.RequestOp_RequestPut:
-				p := value.RequestPut
-				if p == nil || len(p.Key) == 0 || p.Lease != 0 || p.IgnoreLease || p.IgnoreValue || !claimWrite(writes, p.Key, nil, true, branchKnown, branchChoices) {
-					return errors.New("unsupported Txn Put")
-				}
-			case *etcdserverpb.RequestOp_RequestDeleteRange:
-				d := value.RequestDeleteRange
-				if d == nil || len(d.Key) == 0 || len(d.RangeEnd) == 1 && d.RangeEnd[0] == 0 || !claimWrite(writes, d.Key, d.RangeEnd, false, branchKnown, branchChoices) {
-					return errors.New("unsupported Txn DeleteRange")
-				}
-			case *etcdserverpb.RequestOp_RequestRange:
-				r := value.RequestRange
-				if !supportedRange(r) {
-					return errors.New("unsupported Txn Range")
-				}
-			case *etcdserverpb.RequestOp_RequestTxn:
-				if err := validateTxn(value.RequestTxn, depth+1, budget, nextNode, writes, branchKnown, branchChoices); err != nil {
-					return err
-				}
-			default:
-				return errors.New("unsupported Txn operation")
-			}
+		if err := validator.validateBranch(branch, depth, branchKnown, branchChoices); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func (validator *txnValidator) validateBranch(branch []*etcdserverpb.RequestOp, depth int, known, choices uint64) error {
+	for _, op := range branch {
+		if op == nil || validator.budget <= 0 {
+			return errors.New("unsupported Txn operation")
+		}
+		validator.budget--
+		if err := validator.validateOperation(op, depth, known, choices); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (validator *txnValidator) validateOperation(op *etcdserverpb.RequestOp, depth int, known, choices uint64) error {
+	switch value := op.Request.(type) {
+	case *etcdserverpb.RequestOp_RequestPut:
+		p := value.RequestPut
+		if !validator.validPut(p, known, choices) {
+			return errors.New("unsupported Txn Put")
+		}
+	case *etcdserverpb.RequestOp_RequestDeleteRange:
+		d := value.RequestDeleteRange
+		if !validator.validDelete(d, known, choices) {
+			return errors.New("unsupported Txn DeleteRange")
+		}
+	case *etcdserverpb.RequestOp_RequestRange:
+		if !supportedRange(value.RequestRange) {
+			return errors.New("unsupported Txn Range")
+		}
+	case *etcdserverpb.RequestOp_RequestTxn:
+		return validator.validate(value.RequestTxn, depth+1, known, choices)
+	default:
+		return errors.New("unsupported Txn operation")
+	}
+	return nil
+}
+
+func (validator *txnValidator) validPut(request *etcdserverpb.PutRequest, known, choices uint64) bool {
+	return request != nil && len(request.Key) != 0 && request.Lease == 0 && !request.IgnoreLease &&
+		!request.IgnoreValue && claimWrite(&validator.writes, request.Key, nil, true, known, choices)
+}
+
+func (validator *txnValidator) validDelete(request *etcdserverpb.DeleteRangeRequest, known, choices uint64) bool {
+	return request != nil && len(request.Key) != 0 &&
+		!(len(request.RangeEnd) == 1 && request.RangeEnd[0] == 0) &&
+		claimWrite(&validator.writes, request.Key, request.RangeEnd, false, known, choices)
+}
+
+func validateCompareTarget(c *etcdserverpb.Compare) error {
+	switch c.Target {
+	case etcdserverpb.Compare_VERSION:
+		if _, ok := c.TargetUnion.(*etcdserverpb.Compare_Version); !ok {
+			return errors.New("invalid compare target")
+		}
+	case etcdserverpb.Compare_CREATE:
+		if _, ok := c.TargetUnion.(*etcdserverpb.Compare_CreateRevision); !ok {
+			return errors.New("invalid compare target")
+		}
+	case etcdserverpb.Compare_MOD:
+		if _, ok := c.TargetUnion.(*etcdserverpb.Compare_ModRevision); !ok {
+			return errors.New("invalid compare target")
+		}
+	case etcdserverpb.Compare_VALUE:
+		if _, ok := c.TargetUnion.(*etcdserverpb.Compare_Value); !ok {
+			return errors.New("invalid compare target")
+		}
+	case etcdserverpb.Compare_LEASE:
+		if _, ok := c.TargetUnion.(*etcdserverpb.Compare_Lease); !ok {
+			return errors.New("invalid compare target")
+		}
+	default:
+		return errors.New("unsupported compare target")
 	}
 	return nil
 }
@@ -189,92 +223,108 @@ func (working *txnWorking) execute(request *etcdserverpb.TxnRequest, response *e
 func (working *txnWorking) applyOperation(op *etcdserverpb.RequestOp, response *etcdserverpb.ResponseOp, depth int) (bool, error) {
 	switch value := op.Request.(type) {
 	case *etcdserverpb.RequestOp_RequestTxn:
-		var child *etcdserverpb.TxnResponse
-		if response != nil {
-			child = response.GetResponseTxn()
-			if child == nil {
-				return false, nil
-			}
-		}
-		return working.execute(value.RequestTxn, child, depth+1)
+		return working.applyNestedTxn(value, response, depth)
 	case *etcdserverpb.RequestOp_RequestRange:
-		values := working.state.values
-		if value.RequestRange.Revision > 0 {
-			var err error
-			values, err = working.base.at(value.RequestRange.Revision)
-			if err != nil {
-				return false, err
-			}
-		}
-		if response == nil {
-			return true, nil
-		}
-		return matchesRange(values, value.RequestRange, response.GetResponseRange(), working.state.revision), nil
+		return working.applyRangeOperation(value, response)
 	case *etcdserverpb.RequestOp_RequestPut:
-		p := value.RequestPut
-		previous := working.state.values[string(p.Key)]
-		if previous != nil && previous.Version == math.MaxInt64 {
-			return false, errors.New("version overflow")
-		}
-		if err := working.markWrite(); err != nil {
-			return false, err
-		}
-		kv := &mvccpb.KeyValue{Key: append([]byte(nil), p.Key...), Value: append([]byte(nil), p.Value...), CreateRevision: working.state.revision, ModRevision: working.state.revision, Version: 1}
-		if previous != nil {
-			kv.CreateRevision, kv.Version = previous.CreateRevision, previous.Version+1
-		}
-		working.state.values[string(p.Key)] = kv
-		if response == nil {
-			return true, nil
-		}
-		r := response.GetResponsePut()
-		return r != nil && r.Header != nil && r.Header.Revision == working.state.revision && equalPrevious(p.PrevKv, previous, r.PrevKv), nil
+		return working.applyPutOperation(value, response)
 	case *etcdserverpb.RequestOp_RequestDeleteRange:
-		d := value.RequestDeleteRange
-		keys := make([]string, 0)
-		for key := range working.state.values {
-			if inRange(key, d.Key, d.RangeEnd) {
-				keys = append(keys, key)
-			}
-		}
-		sort.Strings(keys)
-		previous := make([]*mvccpb.KeyValue, 0, len(keys))
-		for _, key := range keys {
-			previous = append(previous, working.state.values[key])
-		}
-		if len(keys) > 0 {
-			if err := working.markWrite(); err != nil {
-				return false, err
-			}
-			for _, key := range keys {
-				delete(working.state.values, key)
-			}
-		}
-		if response == nil {
-			return true, nil
-		}
-		r := response.GetResponseDeleteRange()
-		if r == nil || r.Header == nil || r.Header.Revision != working.state.revision {
-			return false, nil
-		}
-		if r.Deleted != int64(len(keys)) {
-			return false, nil
-		}
-		if !d.PrevKv {
-			return len(r.PrevKvs) == 0, nil
-		}
-		if len(r.PrevKvs) != len(previous) {
-			return false, nil
-		}
-		for index, value := range previous {
-			if !proto.Equal(value, r.PrevKvs[index]) {
-				return false, nil
-			}
-		}
-		return true, nil
+		return working.applyDeleteOperation(value, response)
 	default:
 		return false, errors.New("unsupported Txn operation")
 	}
+}
+
+func (working *txnWorking) applyNestedTxn(value *etcdserverpb.RequestOp_RequestTxn, response *etcdserverpb.ResponseOp, depth int) (bool, error) {
+	var child *etcdserverpb.TxnResponse
+	if response != nil {
+		child = response.GetResponseTxn()
+		if child == nil {
+			return false, nil
+		}
+	}
+	return working.execute(value.RequestTxn, child, depth+1)
+}
+
+func (working *txnWorking) applyRangeOperation(value *etcdserverpb.RequestOp_RequestRange, response *etcdserverpb.ResponseOp) (bool, error) {
+	values := working.state.values
+	if value.RequestRange.Revision > 0 {
+		var err error
+		values, err = working.base.at(value.RequestRange.Revision)
+		if err != nil {
+			return false, err
+		}
+	}
+	if response == nil {
+		return true, nil
+	}
+	return matchesRange(values, value.RequestRange, response.GetResponseRange(), working.state.revision), nil
+}
+
+func (working *txnWorking) applyPutOperation(value *etcdserverpb.RequestOp_RequestPut, response *etcdserverpb.ResponseOp) (bool, error) {
+	p := value.RequestPut
+	previous := working.state.values[string(p.Key)]
+	if previous != nil && previous.Version == math.MaxInt64 {
+		return false, errors.New("version overflow")
+	}
+	if err := working.markWrite(); err != nil {
+		return false, err
+	}
+	kv := &mvccpb.KeyValue{Key: append([]byte(nil), p.Key...), Value: append([]byte(nil), p.Value...), CreateRevision: working.state.revision, ModRevision: working.state.revision, Version: 1}
+	if previous != nil {
+		kv.CreateRevision, kv.Version = previous.CreateRevision, previous.Version+1
+	}
+	working.state.values[string(p.Key)] = kv
+	if response == nil {
+		return true, nil
+	}
+	r := response.GetResponsePut()
+	return r != nil && r.Header != nil && r.Header.Revision == working.state.revision && equalPrevious(p.PrevKv, previous, r.PrevKv), nil
+}
+
+func (working *txnWorking) applyDeleteOperation(value *etcdserverpb.RequestOp_RequestDeleteRange, response *etcdserverpb.ResponseOp) (bool, error) {
+	d := value.RequestDeleteRange
+	keys := make([]string, 0)
+	for key := range working.state.values {
+		if inRange(key, d.Key, d.RangeEnd) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	previous := make([]*mvccpb.KeyValue, 0, len(keys))
+	for _, key := range keys {
+		previous = append(previous, working.state.values[key])
+	}
+	if len(keys) > 0 {
+		if err := working.markWrite(); err != nil {
+			return false, err
+		}
+		for _, key := range keys {
+			delete(working.state.values, key)
+		}
+	}
+	if response == nil {
+		return true, nil
+	}
+	r := response.GetResponseDeleteRange()
+	if r == nil || r.Header == nil || r.Header.Revision != working.state.revision {
+		return false, nil
+	}
+	if r.Deleted != int64(len(keys)) {
+		return false, nil
+	}
+	if !d.PrevKv {
+		return len(r.PrevKvs) == 0, nil
+	}
+	if len(r.PrevKvs) != len(previous) {
+		return false, nil
+	}
+	for index, value := range previous {
+		if !proto.Equal(value, r.PrevKvs[index]) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (working *txnWorking) markWrite() error {

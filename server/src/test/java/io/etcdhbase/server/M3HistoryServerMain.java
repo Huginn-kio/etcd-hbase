@@ -26,7 +26,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -42,11 +41,8 @@ public final class M3HistoryServerMain {
   private M3HistoryServerMain() {}
 
   public static void main(String[] arguments) throws Exception {
-    if (arguments.length != 7 || !Set.of("before-dispatch", "candidate-preparation", "result-preparation",
-        "sealed-before-publish", "cas-ack-lost", "partial-materialization", "old-owner-resume", "cancel-after-cas", "after-commit")
-        .contains(arguments[6])) {
-      throw new IllegalArgumentException("invalid history server fixture arguments");
-    }
+    if (arguments.length != 7) throw new IllegalArgumentException("invalid history server fixture arguments");
+    var mode = M3HistoryFaultMode.fromWire(arguments[6]);
     var configuration = HBaseConfiguration.create();
     configuration.addResource(new org.apache.hadoop.fs.Path(Path.of(arguments[0]).toUri()));
     try (var connection = ConnectionFactory.createAsyncConnection(configuration).get(20, TimeUnit.SECONDS)) {
@@ -54,6 +50,12 @@ public final class M3HistoryServerMain {
     }
     var plan = M3TableGroupRuntimeIT.plan(arguments[1], Integer.parseInt(arguments[2]), arguments[3]);
     var auth = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
+    runFixture(arguments, mode, configuration, plan, auth);
+  }
+
+  private static void runFixture(String[] arguments, M3HistoryFaultMode mode,
+      org.apache.hadoop.conf.Configuration configuration, io.etcdhbase.admin.M3TableGroupPlan plan,
+      AuthenticationScope auth) throws Exception {
     try (var provider = new HBaseBackendIdentityProvider(plan.source().identityProviderId(), auth,
             configuration, HBaseAuthenticators.simpleDevelopment(),
             (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
@@ -64,48 +66,55 @@ public final class M3HistoryServerMain {
       var budgets = new BudgetManager(limits, Map.of(plan.source().tableGroupId(), limits), limits);
       Path ready = Path.of(arguments[5]);
       var armed = new AtomicBoolean();
-      HBaseConnectionFactory connections = arguments[6].equals("cas-ack-lost")
-          || arguments[6].equals("partial-materialization") || arguments[6].equals("old-owner-resume")
-          || arguments[6].equals("cancel-after-cas")
-          || arguments[6].equals("candidate-preparation") || arguments[6].equals("result-preparation")
-          || arguments[6].equals("sealed-before-publish")
-          ? new M3HistoryFaultFactory(provider, plan, armed, ready.resolveSibling("rpc-held"), arguments[6]) : provider;
-      try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
-        M3TableGroupRuntime runtime;
-        try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
-          runtime = M3TableGroupRuntime.open(plan, M3TableGroupRuntimeIT.activation(arguments[4]),
-              RESOURCES, connections, identity, budgets, scans, startup);
-        }
-        try {
-          var deadlines = new ScheduledThreadPoolExecutor(1);
-          try (var requests = new RequestScopeInterceptor(deadlines, RESOURCES.maxConcurrentRequests(),
-              Duration.ofMillis(RESOURCES.requestDeadlineMs()), RESOURCES.maxRequestBytes(), new RequestMetrics())) {
-            var server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
-                .maxInboundMessageSize(RESOURCES.maxRpcBytes()).intercept(requests)
-                .intercept(new HoldRpc(ready.resolveSibling("rpc-held"), arguments[6], armed))
-                .addService(runtime.kvService()).build().start();
-            try {
-              Path pending = ready.resolveSibling(ready.getFileName() + ".tmp");
-              Files.writeString(pending, "127.0.0.1:" + server.getPort());
-              Files.move(pending, ready, StandardCopyOption.ATOMIC_MOVE);
-              if ((arguments[6].equals("old-owner-resume") || arguments[6].equals("cancel-after-cas"))
-                  && arguments[4].equals("1")) arrangeDrain(runtime, budgets, requests, ready);
-              if (arguments[6].equals("cancel-after-cas") && arguments[4].equals("1")) {
-                arrangeBudgetProbe(budgets, requests, ready);
-              }
-              new CountDownLatch(1).await();
-            } finally {
-              server.shutdownNow();
-              server.awaitTermination(10, TimeUnit.SECONDS);
-            }
-          } finally {
-            deadlines.shutdownNow();
-          }
-        } finally {
-          runtime.close();
-          runtime.drained().get(30, TimeUnit.SECONDS);
-        }
+      HBaseConnectionFactory connections = mode.interceptsHBase()
+          ? new M3HistoryFaultFactory(provider, plan, armed, ready.resolveSibling("rpc-held"), mode) : provider;
+      runRuntime(arguments, mode, plan, identity, budgets, ready, armed, connections);
+    }
+  }
+
+  private static void runRuntime(String[] arguments, M3HistoryFaultMode mode,
+      io.etcdhbase.admin.M3TableGroupPlan plan, io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      BudgetManager budgets, Path ready, AtomicBoolean armed, HBaseConnectionFactory connections) throws Exception {
+    try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
+      M3TableGroupRuntime runtime;
+      try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+        runtime = M3TableGroupRuntime.open(plan, M3TableGroupRuntimeIT.activation(arguments[4]),
+            RESOURCES, connections, identity, budgets, scans, startup);
       }
+      try {
+        serveRuntime(runtime, budgets, ready, armed, mode, arguments[4]);
+      } finally {
+        runtime.close();
+        runtime.drained().get(30, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  private static void serveRuntime(M3TableGroupRuntime runtime, BudgetManager budgets, Path ready,
+      AtomicBoolean armed, M3HistoryFaultMode mode, String member) throws Exception {
+    var deadlines = new ScheduledThreadPoolExecutor(1);
+    try (var requests = new RequestScopeInterceptor(deadlines, RESOURCES.maxConcurrentRequests(),
+        Duration.ofMillis(RESOURCES.requestDeadlineMs()), RESOURCES.maxRequestBytes(), new RequestMetrics())) {
+      var server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
+          .maxInboundMessageSize(RESOURCES.maxRpcBytes()).intercept(requests)
+          .intercept(new HoldRpc(ready.resolveSibling("rpc-held"), mode, armed))
+          .addService(runtime.kvService()).build().start();
+      try {
+        Path pending = ready.resolveSibling(ready.getFileName() + ".tmp");
+        Files.writeString(pending, "127.0.0.1:" + server.getPort());
+        Files.move(pending, ready, StandardCopyOption.ATOMIC_MOVE);
+        if (mode.holdsAcknowledgementForRelease()
+            && member.equals("1")) arrangeDrain(runtime, budgets, requests, ready);
+        if (mode == M3HistoryFaultMode.CANCEL_AFTER_CAS && member.equals("1")) {
+          arrangeBudgetProbe(budgets, requests, ready);
+        }
+        new CountDownLatch(1).await();
+      } finally {
+        server.shutdownNow();
+        server.awaitTermination(10, TimeUnit.SECONDS);
+      }
+    } finally {
+      deadlines.shutdownNow();
     }
   }
 
@@ -169,14 +178,14 @@ public final class M3HistoryServerMain {
   }
 
   /** Test-only barriers at dispatch or after a committed Txn result, before it is sent. */
-  private record HoldRpc(Path marker, String mode, AtomicBoolean armed) implements ServerInterceptor {
+  private record HoldRpc(Path marker, M3HistoryFaultMode mode, AtomicBoolean armed) implements ServerInterceptor {
     @Override
     public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
         Metadata headers, ServerCallHandler<ReqT, RespT> next) {
       var target = new AtomicBoolean();
       var guarded = new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
         @Override public void sendMessage(RespT message) {
-          if (target.get() && mode.equals("after-commit") && message instanceof Rpc.TxnResponse && !hold()) return;
+          if (target.get() && mode == M3HistoryFaultMode.AFTER_COMMIT && message instanceof Rpc.TxnResponse && !hold()) return;
           super.sendMessage(message);
         }
       };
@@ -186,7 +195,7 @@ public final class M3HistoryServerMain {
               .anyMatch(op -> op.hasRequestPut() && op.getRequestPut().getKey().toStringUtf8().endsWith("/lost-response"))) {
             target.set(true);
             armed.set(true);
-            if (mode.equals("before-dispatch") && !hold()) return;
+            if (mode == M3HistoryFaultMode.BEFORE_DISPATCH && !hold()) return;
           }
           super.onMessage(message);
         }
@@ -195,7 +204,7 @@ public final class M3HistoryServerMain {
 
     private boolean hold() {
       try {
-        Files.writeString(marker, mode);
+        Files.writeString(marker, mode.wire());
         new CountDownLatch(1).await();
         return true;
       } catch (InterruptedException interrupted) {

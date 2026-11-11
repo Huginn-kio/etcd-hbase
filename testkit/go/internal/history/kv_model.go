@@ -142,18 +142,30 @@ func inRange(key string, start, end []byte) bool {
 	return len(end) == 1 && end[0] == 0 || bytes.Compare([]byte(key), end) < 0
 }
 
+func sortedRangeKeys(values map[string]*mvccpb.KeyValue, start, end []byte) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if inRange(key, start, end) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func matchesRevisionFilter(value *mvccpb.KeyValue, request *etcdserverpb.RangeRequest) bool {
+	return !(request.MinModRevision > 0 && value.ModRevision < request.MinModRevision ||
+		request.MaxModRevision > 0 && value.ModRevision > request.MaxModRevision ||
+		request.MinCreateRevision > 0 && value.CreateRevision < request.MinCreateRevision ||
+		request.MaxCreateRevision > 0 && value.CreateRevision > request.MaxCreateRevision)
+}
+
 // matchesRange implements the approved M3 lightweight Count contract.
 func matchesRange(values map[string]*mvccpb.KeyValue, request *etcdserverpb.RangeRequest, response *etcdserverpb.RangeResponse, revision int64) bool {
 	if response == nil || response.Header == nil || response.Header.Revision != revision {
 		return false
 	}
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		if inRange(key, request.Key, request.RangeEnd) {
-			keys = append(keys, key)
-		}
-	}
-	sort.Strings(keys)
+	keys := sortedRangeKeys(values, request.Key, request.RangeEnd)
 	if request.CountOnly {
 		count := int64(0)
 		if len(keys) > 0 {
@@ -161,6 +173,11 @@ func matchesRange(values map[string]*mvccpb.KeyValue, request *etcdserverpb.Rang
 		}
 		return response.Count == count && len(response.Kvs) == 0 && !response.More
 	}
+	filtered, more := selectRangeRecords(values, keys, request)
+	return matchesRangeResponse(filtered, more, request.KeysOnly, response)
+}
+
+func selectRangeRecords(values map[string]*mvccpb.KeyValue, keys []string, request *etcdserverpb.RangeRequest) ([]*mvccpb.KeyValue, bool) {
 	if request.SortOrder == etcdserverpb.RangeRequest_DESCEND {
 		for left, right := 0, len(keys)-1; left < right; left, right = left+1, right-1 {
 			keys[left], keys[right] = keys[right], keys[left]
@@ -169,7 +186,7 @@ func matchesRange(values map[string]*mvccpb.KeyValue, request *etcdserverpb.Rang
 	filtered := make([]*mvccpb.KeyValue, 0, len(keys))
 	for _, key := range keys {
 		kv := values[key]
-		if request.MinModRevision > 0 && kv.ModRevision < request.MinModRevision || request.MaxModRevision > 0 && kv.ModRevision > request.MaxModRevision || request.MinCreateRevision > 0 && kv.CreateRevision < request.MinCreateRevision || request.MaxCreateRevision > 0 && kv.CreateRevision > request.MaxCreateRevision {
+		if !matchesRevisionFilter(kv, request) {
 			continue
 		}
 		filtered = append(filtered, kv)
@@ -178,12 +195,16 @@ func matchesRange(values map[string]*mvccpb.KeyValue, request *etcdserverpb.Rang
 	if more {
 		filtered = filtered[:int(request.Limit)]
 	}
+	return filtered, more
+}
+
+func matchesRangeResponse(filtered []*mvccpb.KeyValue, more bool, keysOnly bool, response *etcdserverpb.RangeResponse) bool {
 	if response.Count != int64(len(filtered)) || response.More != more || len(response.Kvs) != len(filtered) {
 		return false
 	}
 	for i, kv := range filtered {
 		expected := kv
-		if request.KeysOnly {
+		if keysOnly {
 			expected = proto.Clone(kv).(*mvccpb.KeyValue)
 			expected.Value = nil
 		}
@@ -199,13 +220,7 @@ func applyDelete(state *KVState, operation Observation) (any, bool, error) {
 	if proto.Unmarshal(operation.Request, &request) != nil || !knownFields(&request) || len(request.Key) == 0 {
 		return nil, false, errors.New("unsupported DeleteRange request")
 	}
-	keys := make([]string, 0)
-	for key := range state.values {
-		if inRange(key, request.Key, request.RangeEnd) {
-			keys = append(keys, key)
-		}
-	}
-	sort.Strings(keys)
+	keys := sortedRangeKeys(state.values, request.Key, request.RangeEnd)
 	next := state
 	if len(keys) > 0 {
 		next = state.copy()
@@ -225,21 +240,26 @@ func applyDelete(state *KVState, operation Observation) (any, bool, error) {
 	if proto.Unmarshal(operation.Response, &response) != nil || !knownFields(&response) || response.Header == nil {
 		return nil, false, errors.New("invalid DeleteRange response")
 	}
-	if response.Header.Revision != next.revision || response.Deleted != int64(len(keys)) {
-		return next, false, nil
+	return next, matchesDeleteResponse(state, keys, &request, &response, next.revision), nil
+}
+
+func matchesDeleteResponse(state *KVState, keys []string, request *etcdserverpb.DeleteRangeRequest,
+	response *etcdserverpb.DeleteRangeResponse, revision int64) bool {
+	if response.Header.Revision != revision || response.Deleted != int64(len(keys)) {
+		return false
 	}
 	if !request.PrevKv {
-		return next, len(response.PrevKvs) == 0, nil
+		return len(response.PrevKvs) == 0
 	}
 	if len(response.PrevKvs) != len(keys) {
-		return next, false, nil
+		return false
 	}
 	for i, key := range keys {
 		if !proto.Equal(state.values[key], response.PrevKvs[i]) {
-			return next, false, nil
+			return false
 		}
 	}
-	return next, true, nil
+	return true
 }
 
 func equalPrevious(requested bool, expected, actual *mvccpb.KeyValue) bool {

@@ -33,10 +33,10 @@ final class M3HistoryFaultFactory implements HBaseConnectionFactory {
   private final AtomicBoolean armed;
   private final AtomicBoolean fired = new AtomicBoolean();
   private final Path marker;
-  private final String mode;
+  private final M3HistoryFaultMode mode;
 
   M3HistoryFaultFactory(HBaseConnectionFactory delegate, M3TableGroupPlan plan,
-      AtomicBoolean armed, Path marker, String mode) {
+      AtomicBoolean armed, Path marker, M3HistoryFaultMode mode) {
     this.delegate = delegate;
     this.plan = plan;
     this.armed = armed;
@@ -78,35 +78,37 @@ final class M3HistoryFaultFactory implements HBaseConnectionFactory {
           if (shouldHold) {
             @SuppressWarnings("unchecked")
             var response = (CompletableFuture<CheckAndMutateResult>) result;
-            return response.thenCompose(actual -> {
-              if (!actual.isSuccess() || !armed.get() || !fired.compareAndSet(false, true)) {
-                return CompletableFuture.completedFuture(actual);
-              }
-              try {
-                Files.writeString(marker, mode);
-                // The physical CAS completed; the caller cannot receive its ACK before the barrier is released.
-                return mode.equals("old-owner-resume") || mode.equals("cancel-after-cas")
-                    ? waitForRelease(actual) : new CompletableFuture<CheckAndMutateResult>();
-              } catch (java.io.IOException failure) {
-                return CompletableFuture.failedFuture(failure);
-              }
-            });
+            return response.thenCompose(this::holdAcknowledgement);
           }
           return result;
         });
   }
 
+  private CompletableFuture<CheckAndMutateResult> holdAcknowledgement(CheckAndMutateResult actual) {
+    if (!actual.isSuccess() || !armed.get() || !fired.compareAndSet(false, true)) {
+      return CompletableFuture.completedFuture(actual);
+    }
+    try {
+      Files.writeString(marker, mode.wire());
+      // The physical CAS completed; the caller cannot receive its ACK before the barrier is released.
+      return mode.holdsAcknowledgementForRelease()
+          ? waitForRelease(actual) : new CompletableFuture<>();
+    } catch (java.io.IOException failure) {
+      return CompletableFuture.failedFuture(failure);
+    }
+  }
+
   private boolean targetedMutation(TableName table, CheckAndMutate mutation) {
     if (!armed.get()) return false;
-    if (mode.equals("partial-materialization")) return plan.primary().table().equals(table);
+    if (mode == M3HistoryFaultMode.PARTIAL_MATERIALIZATION) return plan.primary().table().equals(table);
     if (!plan.system().table().equals(table)) return false;
-    if (mode.equals("cas-ack-lost") || mode.equals("old-owner-resume") || mode.equals("cancel-after-cas")) {
+    if (mode == M3HistoryFaultMode.CAS_ACK_LOST || mode.holdsAcknowledgementForRelease()) {
       return selectedControl(mutation);
     }
     SystemRecordType type = plan.system().keyCodec().decode(mutation.getRow()).type();
-    if (mode.equals("candidate-preparation")) return type == SystemRecordType.CANDIDATE;
-    if (mode.equals("result-preparation")) return type == SystemRecordType.RESULT;
-    if (!mode.equals("sealed-before-publish") || type != SystemRecordType.INVOCATION
+    if (mode == M3HistoryFaultMode.CANDIDATE_PREPARATION) return type == SystemRecordType.CANDIDATE;
+    if (mode == M3HistoryFaultMode.RESULT_PREPARATION) return type == SystemRecordType.RESULT;
+    if (mode != M3HistoryFaultMode.SEALED_BEFORE_PUBLISH || type != SystemRecordType.INVOCATION
         || !(mutation.getAction() instanceof Put put)) return false;
     for (var cells : put.getFamilyCellMap().values()) {
       for (Cell cell : cells) {

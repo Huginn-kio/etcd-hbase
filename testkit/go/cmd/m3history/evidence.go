@@ -87,6 +87,20 @@ func checkEvidence(path string) error {
 }
 
 func validFixtureOperations(e historyEvidence) bool {
+	if !validInitialOperations(e) {
+		return false
+	}
+	faults, lostKey, faultEnd, valid := findFaultOperation(e)
+	if !valid {
+		return false
+	}
+	if e.RestartMode == "none" {
+		return faults == 0
+	}
+	return faults == 1 && validRecovery(e, lostKey, faultEnd)
+}
+
+func validInitialOperations(e historyEvidence) bool {
 	first, second := e.Observations[0], e.Observations[1]
 	if first.Worker == second.Worker || first.Worker < 1 || first.Worker > 2 || second.Worker < 1 || second.Worker > 2 {
 		return false
@@ -105,6 +119,10 @@ func validFixtureOperations(e historyEvidence) bool {
 	if success != e.SuccessfulWrites {
 		return false
 	}
+	return true
+}
+
+func findFaultOperation(e historyEvidence) (int, []byte, uint64, bool) {
 	faults := 0
 	var lostKey []byte
 	var faultEnd uint64
@@ -118,29 +136,41 @@ func validFixtureOperations(e historyEvidence) bool {
 		}
 		first := request.Success[0].GetRequestPut()
 		second := request.Success[1].GetRequestPut()
-		if first == nil || second == nil || !bytes.HasSuffix(first.Key, []byte("/lost-response")) || !bytes.Equal(second.Key, append(append([]byte(nil), first.Key...), []byte("-2")...)) || string(first.Value) != "first" || string(second.Value) != "second" {
+		if !isLostResponsePair(first, second) {
 			continue
 		}
 		faults++
 		lostKey = first.Key
 		faultEnd = operation.End
-		expected := "Unavailable"
-		if e.RestartMode == "old-owner-resume" {
-			expected = "DeadlineExceeded"
-		}
-		if e.RestartMode == "cancel-after-cas" {
-			expected = "Canceled"
-		}
+		expected := expectedFaultCode(e.RestartMode)
 		if operation.Code != expected {
-			return false
+			return 0, nil, 0, false
 		}
 	}
-	if e.RestartMode == "none" {
-		return faults == 0
-	}
-	if faults != 1 {
+	return faults, lostKey, faultEnd, true
+}
+
+func isLostResponsePair(first, second *etcdserverpb.PutRequest) bool {
+	if first == nil || second == nil {
 		return false
 	}
+	return bytes.HasSuffix(first.Key, []byte("/lost-response")) &&
+		bytes.Equal(second.Key, append(append([]byte(nil), first.Key...), []byte("-2")...)) &&
+		string(first.Value) == "first" && string(second.Value) == "second"
+}
+
+func expectedFaultCode(mode string) string {
+	switch mode {
+	case "old-owner-resume":
+		return "DeadlineExceeded"
+	case "cancel-after-cas":
+		return "Canceled"
+	default:
+		return "Unavailable"
+	}
+}
+
+func validRecovery(e historyEvidence, lostKey []byte, faultEnd uint64) bool {
 	foundRecovery := false
 	for _, operation := range e.Observations {
 		if operation.Method != "Range" || operation.Code != "OK" {

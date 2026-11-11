@@ -59,7 +59,8 @@ func run() (runErr error) {
 	if err != nil {
 		return errors.New("history client initialization failed")
 	}
-	defer func() { runErr = errors.Join(runErr, connection.Close()) }()
+	connections := &historyConnections{active: connection, options: options}
+	defer func() { runErr = errors.Join(runErr, connections.active.Close()) }()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	kv := client.RawKV(connection)
@@ -68,21 +69,9 @@ func run() (runErr error) {
 	lostKey := []byte(*prefix + "lost-response")
 	lostKey2 := []byte(*prefix + "lost-response-2")
 	end := append([]byte(*prefix), 0xff)
-	baseline, err := kv.Range(ctx, &etcdserverpb.RangeRequest{Key: key})
-	if err != nil || baseline == nil || baseline.Header == nil || len(baseline.Kvs) != 0 {
-		return errors.New("history fixture is not empty or unavailable")
-	}
-	otherBaseline, err := kv.Range(ctx, &etcdserverpb.RangeRequest{Key: otherKey})
-	if err != nil || otherBaseline == nil || otherBaseline.Header == nil || otherBaseline.Header.Revision != baseline.Header.Revision || len(otherBaseline.Kvs) != 0 {
-		return errors.New("nested history fixture is not empty or stable")
-	}
-	prefixBaseline, err := kv.Range(ctx, &etcdserverpb.RangeRequest{Key: []byte(*prefix), RangeEnd: end})
-	if err != nil || prefixBaseline == nil || prefixBaseline.Header == nil || prefixBaseline.Header.Revision != baseline.Header.Revision || len(prefixBaseline.Kvs) != 0 {
-		return errors.New("history prefix is not empty or stable")
-	}
-	initial, err := history.NewKVState(baseline.Header.Revision, nil)
+	initial, baseRevision, err := readInitialState(ctx, kv, key, otherKey, []byte(*prefix), end)
 	if err != nil {
-		return errors.New("invalid history initial revision")
+		return err
 	}
 	maxCalls := 10
 	if *restartDir != "" {
@@ -95,6 +84,240 @@ func run() (runErr error) {
 	if err != nil {
 		return err
 	}
+	workload := historyWorkload{ctx: ctx, kv: kv, recorder: recorder, key: key, otherKey: otherKey, prefix: *prefix, end: end}
+	successfulWrites, err := workload.concurrentWrites()
+	if err != nil {
+		return err
+	}
+	txnRevision, err := workload.nestedTransaction()
+	if err != nil {
+		return err
+	}
+	if err := workload.concurrentReads(); err != nil {
+		return err
+	}
+	if *restartDir != "" {
+		phase := failoverPhase{ctx: ctx, kv: kv, recorder: recorder, connections: connections,
+			directory: *restartDir, mode: *restartMode, lostKey: lostKey, lostKey2: lostKey2}
+		kv, err = phase.run()
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := recorder.Invoke(ctx, kv, &etcdserverpb.DeleteRangeRequest{Key: []byte(*prefix), RangeEnd: end, PrevKv: true}); err != nil {
+		return errors.New("history prefix DeleteRange failed")
+	}
+	if _, err := recorder.Invoke(ctx, kv, &etcdserverpb.RangeRequest{Key: []byte(*prefix), RangeEnd: end, Revision: txnRevision}); err != nil {
+		return errors.New("history historical prefix Range failed")
+	}
+	observations, err := recorder.Snapshot()
+	if err != nil {
+		return err
+	}
+	result, err := history.Check(ctx, observations, history.KVModel{}, initial, 10000)
+	if err != nil {
+		return errors.New("history validation failed")
+	}
+	evidenceRestartMode := "none"
+	if *restartDir != "" {
+		evidenceRestartMode = *restartMode
+	}
+	evidence := historyEvidence{
+		Schema: evidenceSchema, Schedule: evidenceSchedule, Seed: evidenceSeed, ModelScope: evidenceScope,
+		RestartMode: evidenceRestartMode, BaseRevision: baseRevision,
+		SuccessfulWrites: successfulWrites, Observations: observations, Result: result,
+	}
+	return persistEvidence(*output, evidence)
+}
+
+func persistEvidence(path string, evidence historyEvidence) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return errors.New("history evidence could not be created")
+	}
+	encodeErr := json.NewEncoder(file).Encode(evidence)
+	closeErr := file.Close()
+	if encodeErr != nil || closeErr != nil {
+		return errors.New("history evidence could not be written")
+	}
+	if evidence.Result.Verdict != history.Linearizable {
+		return errors.New("point and nested transaction history did not prove linearizable")
+	}
+	return nil
+}
+
+func readInitialState(ctx context.Context, kv etcdserverpb.KVClient, key, otherKey, prefix, end []byte) (*history.KVState, int64, error) {
+	baseline, err := kv.Range(ctx, &etcdserverpb.RangeRequest{Key: key})
+	if err != nil || baseline == nil || baseline.Header == nil || len(baseline.Kvs) != 0 {
+		return nil, 0, errors.New("history fixture is not empty or unavailable")
+	}
+	otherBaseline, err := kv.Range(ctx, &etcdserverpb.RangeRequest{Key: otherKey})
+	if err != nil || otherBaseline == nil || otherBaseline.Header == nil || otherBaseline.Header.Revision != baseline.Header.Revision || len(otherBaseline.Kvs) != 0 {
+		return nil, 0, errors.New("nested history fixture is not empty or stable")
+	}
+	prefixBaseline, err := kv.Range(ctx, &etcdserverpb.RangeRequest{Key: []byte(prefix), RangeEnd: end})
+	if err != nil || prefixBaseline == nil || prefixBaseline.Header == nil || prefixBaseline.Header.Revision != baseline.Header.Revision || len(prefixBaseline.Kvs) != 0 {
+		return nil, 0, errors.New("history prefix is not empty or stable")
+	}
+	initial, err := history.NewKVState(baseline.Header.Revision, nil)
+	if err != nil {
+		return nil, 0, errors.New("invalid history initial revision")
+	}
+	return initial, baseline.Header.Revision, nil
+}
+
+type historyConnections struct {
+	active  *clientv3.Client
+	options client.Options
+}
+
+// failoverPhase owns fault markers and the cancellation watcher until recovery completes.
+type failoverPhase struct {
+	ctx               context.Context
+	kv                etcdserverpb.KVClient
+	recorder          *history.Recorder
+	connections       *historyConnections
+	directory, mode   string
+	lostKey, lostKey2 []byte
+}
+
+func (phase failoverPhase) run() (etcdserverpb.KVClient, error) {
+	if err := phase.invokeFault(); err != nil {
+		return nil, err
+	}
+	kv, err := phase.reconnect()
+	if err != nil {
+		return nil, err
+	}
+	if err := phase.verifyRecovery(kv); err != nil {
+		return nil, err
+	}
+	return kv, nil
+}
+
+func (phase failoverPhase) invokeFault() error {
+	ctx, kv, recorder := phase.ctx, phase.kv, phase.recorder
+	lostKey, lostKey2 := phase.lostKey, phase.lostKey2
+
+	if phase.mode == "cancel-after-cas" {
+		if err := createMarker(phase.directory, "before-fault"); err != nil {
+			return err
+		}
+		if err := waitMarker(ctx, phase.directory, "fault-ready"); err != nil {
+			return err
+		}
+	}
+	lostTxn := &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
+		{Request: &etcdserverpb.RequestOp_RequestPut{RequestPut: &etcdserverpb.PutRequest{Key: lostKey, Value: []byte("first")}}},
+		{Request: &etcdserverpb.RequestOp_RequestPut{RequestPut: &etcdserverpb.PutRequest{Key: lostKey2, Value: []byte("second")}}},
+	}}
+	callContext := ctx
+	callCancel := func() {}
+	watchCancel := func() {}
+	var watcherDone chan struct{}
+	if phase.mode == "old-owner-resume" {
+		callContext, callCancel = context.WithTimeout(ctx, 10*time.Second)
+	}
+	if phase.mode == "cancel-after-cas" {
+		callContext, callCancel = context.WithCancel(ctx)
+		var watchContext context.Context
+		watchContext, watchCancel = context.WithCancel(ctx)
+		watcherDone = make(chan struct{})
+		go func() {
+			defer close(watcherDone)
+			if waitMarker(watchContext, phase.directory, "cancel-client") == nil {
+				callCancel()
+			}
+		}()
+	}
+	_, lostErr := recorder.Invoke(callContext, kv, lostTxn)
+	callCancel()
+	watchCancel()
+	if watcherDone != nil {
+		<-watcherDone
+	}
+	expectedCode := codes.Unavailable
+	if phase.mode == "old-owner-resume" {
+		expectedCode = codes.DeadlineExceeded
+	}
+	if phase.mode == "cancel-after-cas" {
+		expectedCode = codes.Canceled
+	}
+	if status.Code(lostErr) != expectedCode {
+		return fmt.Errorf("expected an unknown result at the fault barrier, got %s", status.Code(lostErr))
+	}
+	return nil
+}
+
+func (phase failoverPhase) reconnect() (etcdserverpb.KVClient, error) {
+	ctx := phase.ctx
+
+	endpoint, err := awaitRestart(ctx, phase.directory)
+	if err != nil {
+		return nil, err
+	}
+	if err := phase.connections.active.Close(); err != nil {
+		return nil, errors.New("history original connection close failed")
+	}
+	phase.connections.options.Endpoint = endpoint
+	if phase.connections.options.Validate() != nil {
+		return nil, errors.New("invalid restart endpoint")
+	}
+	next, err := newHistoryClient(phase.connections.options)
+	if err != nil {
+		return nil, errors.New("history restart connection failed")
+	}
+	phase.connections.active = next
+	kv := client.RawKV(phase.connections.active)
+	return kv, nil
+}
+
+func (phase failoverPhase) verifyRecovery(kv etcdserverpb.KVClient) error {
+	ctx, recorder := phase.ctx, phase.recorder
+	lostKey, lostKey2 := phase.lostKey, phase.lostKey2
+
+	recovered, err := recorder.Invoke(ctx, kv, &etcdserverpb.RangeRequest{Key: lostKey, RangeEnd: append(append([]byte(nil), lostKey...), 0xff)})
+	if err != nil {
+		return fmt.Errorf("history recovered Range failed: %s", status.Code(err))
+	}
+	read, ok := recovered.(*etcdserverpb.RangeResponse)
+	if !ok || !unpublishedMode(phase.mode) && (len(read.Kvs) != 2 || string(read.Kvs[0].Key) != string(lostKey) || string(read.Kvs[0].Value) != "first" || string(read.Kvs[1].Key) != string(lostKey2) || string(read.Kvs[1].Value) != "second") ||
+		unpublishedMode(phase.mode) && len(read.Kvs) != 0 {
+		return errors.New("lost response recovery did not match the observed barrier")
+	}
+	if phase.mode == "old-owner-resume" {
+		if _, err := recorder.Invoke(ctx, kv, &etcdserverpb.PutRequest{Key: lostKey, Value: []byte("new-owner"), PrevKv: true}); err != nil {
+			return fmt.Errorf("new owner write failed: %s", status.Code(err))
+		}
+		if err := createMarker(phase.directory, "new-owner-written"); err != nil {
+			return err
+		}
+		if err := waitMarker(ctx, phase.directory, "old-drained"); err != nil {
+			return err
+		}
+		observed, err := recorder.Invoke(ctx, kv, &etcdserverpb.RangeRequest{Key: lostKey})
+		if err != nil {
+			return fmt.Errorf("post-resume Range failed: %s", status.Code(err))
+		}
+		last, ok := observed.(*etcdserverpb.RangeResponse)
+		if !ok || len(last.Kvs) != 1 || string(last.Kvs[0].Value) != "new-owner" {
+			return errors.New("old owner changed a later committed value")
+		}
+	}
+	return nil
+}
+
+// historyWorkload owns the shared recorder and schedules each bounded RPC phase.
+type historyWorkload struct {
+	ctx                context.Context
+	kv                 etcdserverpb.KVClient
+	recorder           *history.Recorder
+	key, otherKey, end []byte
+	prefix             string
+}
+
+func (workload historyWorkload) concurrentWrites() (int, error) {
+	ctx, kv, recorder, key := workload.ctx, workload.kv, workload.recorder, workload.key
 	var workers sync.WaitGroup
 	failures := make(chan error, 2)
 	comparedPut := func(value string) *etcdserverpb.RequestOp {
@@ -121,12 +344,17 @@ func run() (runErr error) {
 		if failure == nil {
 			successfulWrites++
 		} else if status.Code(failure) != codes.ResourceExhausted {
-			return fmt.Errorf("concurrent history write failed: %s", status.Code(failure))
+			return 0, fmt.Errorf("concurrent history write failed: %s", status.Code(failure))
 		}
 	}
 	if successfulWrites == 0 {
-		return errors.New("no concurrent history write succeeded")
+		return 0, errors.New("no concurrent history write succeeded")
 	}
+	return successfulWrites, nil
+}
+
+func (workload historyWorkload) nestedTransaction() (int64, error) {
+	ctx, kv, recorder, key, otherKey, end := workload.ctx, workload.kv, workload.recorder, workload.key, workload.otherKey, workload.end
 	compare := func(key []byte, version int64) *etcdserverpb.Compare {
 		return &etcdserverpb.Compare{Key: key, Target: etcdserverpb.Compare_VERSION,
 			Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: version}}
@@ -153,28 +381,33 @@ func run() (runErr error) {
 	}()
 	go func() {
 		<-start
-		_, callErr := recorder.InvokeWorker(ctx, kv, 4, &etcdserverpb.RangeRequest{Key: []byte(*prefix), RangeEnd: end})
+		_, callErr := recorder.InvokeWorker(ctx, kv, 4, &etcdserverpb.RangeRequest{Key: []byte(workload.prefix), RangeEnd: end})
 		rangeDone <- callErr
 	}()
 	close(start)
 	transactionResult, concurrentRangeErr := <-transactionDone, <-rangeDone
 	if transactionResult.err != nil {
-		return fmt.Errorf("history nested Txn failed: %s", status.Code(transactionResult.err))
+		return 0, fmt.Errorf("history nested Txn failed: %s", status.Code(transactionResult.err))
 	}
 	if concurrentRangeErr != nil && status.Code(concurrentRangeErr) != codes.ResourceExhausted {
-		return fmt.Errorf("history concurrent Range failed: %s", status.Code(concurrentRangeErr))
+		return 0, fmt.Errorf("history concurrent Range failed: %s", status.Code(concurrentRangeErr))
 	}
 	txnResponse, ok := transactionResult.response.(*etcdserverpb.TxnResponse)
 	if !ok || txnResponse.Header == nil {
-		return errors.New("history nested Txn has no revision")
+		return 0, errors.New("history nested Txn has no revision")
 	}
+	return txnResponse.Header.Revision, nil
+}
+
+func (workload historyWorkload) concurrentReads() error {
+	ctx, kv, recorder, key, otherKey, end := workload.ctx, workload.kv, workload.recorder, workload.key, workload.otherKey, workload.end
 	reads := []proto.Message{
 		&etcdserverpb.RangeRequest{Key: key},
 		&etcdserverpb.RangeRequest{Key: otherKey},
-		&etcdserverpb.DeleteRangeRequest{Key: []byte(*prefix + "never-created"), PrevKv: true},
+		&etcdserverpb.DeleteRangeRequest{Key: []byte(workload.prefix + "never-created"), PrevKv: true},
 	}
 	readFailures := make(chan error, len(reads))
-	start = make(chan struct{})
+	start := make(chan struct{})
 	for index, request := range reads {
 		go func(worker uint32, request proto.Message) {
 			<-start
@@ -192,137 +425,8 @@ func run() (runErr error) {
 	if readFailure != nil {
 		return fmt.Errorf("history concurrent read/delete failed: %s", status.Code(readFailure))
 	}
-	if _, err := recorder.Invoke(ctx, kv, &etcdserverpb.RangeRequest{Key: []byte(*prefix), RangeEnd: end}); err != nil {
+	if _, err := recorder.Invoke(ctx, kv, &etcdserverpb.RangeRequest{Key: []byte(workload.prefix), RangeEnd: end}); err != nil {
 		return errors.New("history prefix Range failed")
-	}
-	if *restartDir != "" {
-		if *restartMode == "cancel-after-cas" {
-			if err := createMarker(*restartDir, "before-fault"); err != nil {
-				return err
-			}
-			if err := waitMarker(ctx, *restartDir, "fault-ready"); err != nil {
-				return err
-			}
-		}
-		lostTxn := &etcdserverpb.TxnRequest{Success: []*etcdserverpb.RequestOp{
-			{Request: &etcdserverpb.RequestOp_RequestPut{RequestPut: &etcdserverpb.PutRequest{Key: lostKey, Value: []byte("first")}}},
-			{Request: &etcdserverpb.RequestOp_RequestPut{RequestPut: &etcdserverpb.PutRequest{Key: lostKey2, Value: []byte("second")}}},
-		}}
-		callContext := ctx
-		callCancel := func() {}
-		watchCancel := func() {}
-		var watcherDone chan struct{}
-		if *restartMode == "old-owner-resume" {
-			callContext, callCancel = context.WithTimeout(ctx, 10*time.Second)
-		}
-		if *restartMode == "cancel-after-cas" {
-			callContext, callCancel = context.WithCancel(ctx)
-			var watchContext context.Context
-			watchContext, watchCancel = context.WithCancel(ctx)
-			watcherDone = make(chan struct{})
-			go func() {
-				defer close(watcherDone)
-				if waitMarker(watchContext, *restartDir, "cancel-client") == nil {
-					callCancel()
-				}
-			}()
-		}
-		_, lostErr := recorder.Invoke(callContext, kv, lostTxn)
-		callCancel()
-		watchCancel()
-		if watcherDone != nil {
-			<-watcherDone
-		}
-		expectedCode := codes.Unavailable
-		if *restartMode == "old-owner-resume" {
-			expectedCode = codes.DeadlineExceeded
-		}
-		if *restartMode == "cancel-after-cas" {
-			expectedCode = codes.Canceled
-		}
-		if status.Code(lostErr) != expectedCode {
-			return fmt.Errorf("expected an unknown result at the fault barrier, got %s", status.Code(lostErr))
-		}
-		endpoint, err := awaitRestart(ctx, *restartDir)
-		if err != nil {
-			return err
-		}
-		if err := connection.Close(); err != nil {
-			return errors.New("history original connection close failed")
-		}
-		options.Endpoint = endpoint
-		if options.Validate() != nil {
-			return errors.New("invalid restart endpoint")
-		}
-		next, err := newHistoryClient(options)
-		if err != nil {
-			return errors.New("history restart connection failed")
-		}
-		connection = next
-		kv = client.RawKV(connection)
-		recovered, err := recorder.Invoke(ctx, kv, &etcdserverpb.RangeRequest{Key: lostKey, RangeEnd: append(append([]byte(nil), lostKey...), 0xff)})
-		if err != nil {
-			return fmt.Errorf("history recovered Range failed: %s", status.Code(err))
-		}
-		read, ok := recovered.(*etcdserverpb.RangeResponse)
-		if !ok || !unpublishedMode(*restartMode) && (len(read.Kvs) != 2 || string(read.Kvs[0].Key) != string(lostKey) || string(read.Kvs[0].Value) != "first" || string(read.Kvs[1].Key) != string(lostKey2) || string(read.Kvs[1].Value) != "second") ||
-			unpublishedMode(*restartMode) && len(read.Kvs) != 0 {
-			return errors.New("lost response recovery did not match the observed barrier")
-		}
-		if *restartMode == "old-owner-resume" {
-			if _, err := recorder.Invoke(ctx, kv, &etcdserverpb.PutRequest{Key: lostKey, Value: []byte("new-owner"), PrevKv: true}); err != nil {
-				return fmt.Errorf("new owner write failed: %s", status.Code(err))
-			}
-			if err := createMarker(*restartDir, "new-owner-written"); err != nil {
-				return err
-			}
-			if err := waitMarker(ctx, *restartDir, "old-drained"); err != nil {
-				return err
-			}
-			observed, err := recorder.Invoke(ctx, kv, &etcdserverpb.RangeRequest{Key: lostKey})
-			if err != nil {
-				return fmt.Errorf("post-resume Range failed: %s", status.Code(err))
-			}
-			last, ok := observed.(*etcdserverpb.RangeResponse)
-			if !ok || len(last.Kvs) != 1 || string(last.Kvs[0].Value) != "new-owner" {
-				return errors.New("old owner changed a later committed value")
-			}
-		}
-	}
-	if _, err := recorder.Invoke(ctx, kv, &etcdserverpb.DeleteRangeRequest{Key: []byte(*prefix), RangeEnd: end, PrevKv: true}); err != nil {
-		return errors.New("history prefix DeleteRange failed")
-	}
-	if _, err := recorder.Invoke(ctx, kv, &etcdserverpb.RangeRequest{Key: []byte(*prefix), RangeEnd: end, Revision: txnResponse.Header.Revision}); err != nil {
-		return errors.New("history historical prefix Range failed")
-	}
-	observations, err := recorder.Snapshot()
-	if err != nil {
-		return err
-	}
-	result, err := history.Check(ctx, observations, history.KVModel{}, initial, 10000)
-	if err != nil {
-		return errors.New("history validation failed")
-	}
-	file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return errors.New("history evidence could not be created")
-	}
-	evidenceRestartMode := "none"
-	if *restartDir != "" {
-		evidenceRestartMode = *restartMode
-	}
-	evidence := historyEvidence{
-		Schema: evidenceSchema, Schedule: evidenceSchedule, Seed: evidenceSeed, ModelScope: evidenceScope,
-		RestartMode: evidenceRestartMode, BaseRevision: baseline.Header.Revision,
-		SuccessfulWrites: successfulWrites, Observations: observations, Result: result,
-	}
-	encodeErr := json.NewEncoder(file).Encode(evidence)
-	closeErr := file.Close()
-	if encodeErr != nil || closeErr != nil {
-		return errors.New("history evidence could not be written")
-	}
-	if result.Verdict != history.Linearizable {
-		return errors.New("point and nested transaction history did not prove linearizable")
 	}
 	return nil
 }

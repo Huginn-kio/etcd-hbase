@@ -60,29 +60,7 @@ class M3ReportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = "a" * 40
-            paths = []
-            for layout in ("history-table.json", "native-cell-versions.json"):
-                for fault in ("none", *M3.J28_FAULTS):
-                    name = f"rpc-{layout}" if fault == "none" else f"failover-{layout}-{fault}"
-                    fixture = {"layout": layout, "fault": fault, "source_commit": source,
-                               "scope": "public-local-minicluster", "authentication": "simple-development"}
-                    if fault != "none":
-                        selected = fault in {"cas-ack-lost", "partial-materialization", "old-owner-resume", "cancel-after-cas"}
-                        fixture.update({"first_pid": 10, "second_pid": 11, "first_epoch": 2, "second_epoch": 3,
-                                        "first_bucket": 1, "second_bucket": 2, "hbase_control_survived": True,
-                                        "selected_before_recovery": selected,
-                                        "partial_rows": "one" if fault == "partial-materialization" else "not-checked"})
-                    if fault == "old-owner-resume":
-                        fixture["old_owner_resumed_and_drained"] = True
-                    if fault == "cancel-after-cas":
-                        fixture.update({"second_pid": 0, "second_epoch": 2, "baseline_allocated": 1,
-                                        "baseline_reserved": 2, "held_allocated": 3, "held_reserved": 2,
-                                        "resources_drained": True})
-                    history = root / f"{name}-history.json"
-                    history.write_text(json.dumps({"restart_mode": fault}))
-                    metadata = root / f"{name}-fixture.json"
-                    metadata.write_text(json.dumps(fixture))
-                    paths.append((history, metadata))
+            paths = self.write_history_cases(root, source)
             with mock.patch.object(M3.subprocess, "run") as recheck:
                 self.assertEqual(20, len(M3.validate_j28_histories(root, root, source)))
                 self.assertEqual(20, recheck.call_count)
@@ -93,6 +71,36 @@ class M3ReportTest(unittest.TestCase):
                 paths[0][0].unlink()
                 with self.assertRaises(ValueError):
                     M3.validate_j28_histories(root, root, source)
+
+    def write_history_cases(self, root, source):
+        paths = []
+        for layout in ("history-table.json", "native-cell-versions.json"):
+            for fault in ("none", *M3.J28_FAULTS):
+                name = f"rpc-{layout}" if fault == "none" else f"failover-{layout}-{fault}"
+                history = root / f"{name}-history.json"
+                history.write_text(json.dumps({"restart_mode": fault}))
+                metadata = root / f"{name}-fixture.json"
+                metadata.write_text(json.dumps(self.history_fixture(layout, fault, source)))
+                paths.append((history, metadata))
+        return paths
+
+    def history_fixture(self, layout, fault, source):
+        fixture = {"layout": layout, "fault": fault, "source_commit": source,
+                   "scope": "public-local-minicluster", "authentication": "simple-development"}
+        if fault == "none":
+            return fixture
+        selected = fault in {"cas-ack-lost", "partial-materialization", "old-owner-resume", "cancel-after-cas"}
+        fixture.update({"first_pid": 10, "second_pid": 11, "first_epoch": 2, "second_epoch": 3,
+                        "first_bucket": 1, "second_bucket": 2, "hbase_control_survived": True,
+                        "selected_before_recovery": selected,
+                        "partial_rows": "one" if fault == "partial-materialization" else "not-checked"})
+        if fault == "old-owner-resume":
+            fixture["old_owner_resumed_and_drained"] = True
+        if fault == "cancel-after-cas":
+            fixture.update({"second_pid": 0, "second_epoch": 2, "baseline_allocated": 1,
+                            "baseline_reserved": 2, "held_allocated": 3, "held_reserved": 2,
+                            "resources_drained": True})
+        return fixture
 
     def test_registry_records_future_coverage_without_claiming_test_results(self):
         registry = M3.read_json(M3.REPO / "testkit/cases/m3-cases.json")
