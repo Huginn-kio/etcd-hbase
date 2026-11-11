@@ -1312,21 +1312,21 @@ class ReadViewRecordStoreTest {
         assertThrows(CompletionException.class,
             () -> cache.lookupWithProof(session, command, digest(7), prover, proofBudget, account, scope));
         assertEquals(physicalReads, fixture.physical.getCalls.get());
-      } else {
-        var cached = cache.lookupWithProof(session, command, digest(7), prover, proofBudget, account, scope);
-        if (!scenario.changed && !scenario.missingDecision && !scenario.exhaustProofBudget) {
-          assertEquals("old", cached.orElseThrow());
-          assertEquals(physicalReads, fixture.physical.getCalls.get());
-        } else {
-          assertTrue(cached.isEmpty());
-          try (var direct = new DirectRecordReader(session.reader(0), account, 4096)
-              .readForPreparation(key("alpha"), session.currentRevision(), ReadProjection.FULL).join()) {
-            assertEquals("new", new String(direct.record().orElseThrow().value().orElseThrow()));
-          }
-          session.finish().join();
-          assertEquals(physicalReads + 1, fixture.physical.getCalls.get());
-        }
+        return;
       }
+      var cached = cache.lookupWithProof(session, command, digest(7), prover, proofBudget, account, scope);
+      if (!scenario.changed && !scenario.missingDecision && !scenario.exhaustProofBudget) {
+        assertEquals("old", cached.orElseThrow());
+        assertEquals(physicalReads, fixture.physical.getCalls.get());
+        return;
+      }
+      assertTrue(cached.isEmpty());
+      try (var direct = new DirectRecordReader(session.reader(0), account, 4096)
+          .readForPreparation(key("alpha"), session.currentRevision(), ReadProjection.FULL).join()) {
+        assertEquals("new", new String(direct.record().orElseThrow().value().orElseThrow()));
+      }
+      session.finish().join();
+      assertEquals(physicalReads + 1, fixture.physical.getCalls.get());
     }
   }
 

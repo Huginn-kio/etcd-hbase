@@ -189,41 +189,75 @@ class ManifestPreparationTest {
 
   @Test
   void coverageProofRequiresContiguousDecisionsAndAuthenticCompleteManifests() throws Exception {
-    var transaction = TransactionId.create();
-    var repository = new MemoryRepository();
-    var storedDecisions = new HashMap<Long, CommitDecision>();
-    var decisions = new CommitDecisionRepository() {
-      @Override public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope scope) {
-        return CompletableFuture.completedFuture(Optional.ofNullable(storedDecisions.get(sequence)));
-      }
-      @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
-          CommitDecision decision, RequestScope scope) { throw new UnsupportedOperationException(); }
-    };
     var limits = new BudgetManager.Limits(4, 4, 4, 4, 4, 1_000_000, 1024L << 20);
     var manager = new BudgetManager(limits, Map.of("public", limits), limits);
-    var proofReservation = new BudgetManager.Reservation(8192, 8192, 256L << 20, 8192, 8192);
+    var reservation = new BudgetManager.Reservation(8192, 8192, 256L << 20, 8192, 8192);
     try (var preparationScope = scope(); var proofScope = scope(); var directScope = scope();
-         var proofAccount = manager.admit("public", proofScope, proofReservation, proofReadLimits());
+         var proofAccount = manager.admit("public", proofScope, reservation, proofReadLimits());
          var directAccount = manager.admit("public", directScope,
              new BudgetManager.Reservation(8192, 8192, 8192, 8192, 8192))) {
-      var root = new ManifestPreparation(repository, new ManifestPreparation.Limits(1, 1, 0, 0))
+      var fixture = new CoverageProofFixture(manager, reservation, preparationScope, proofScope,
+          proofAccount, directAccount);
+      fixture.verifyBasicCoverage();
+      fixture.verifyIndependentBudgetsAndCancellation();
+      fixture.verifyMissingEvidence();
+      fixture.verifyMultiDecisionProof();
+      fixture.verifyIdentityBoundaries();
+      assertEquals(0, fixture.manager.snapshot().allocatedBytes());
+    }
+  }
+
+  private static final class CoverageProofFixture {
+    final MemoryRepository repository = new MemoryRepository();
+    final Map<Long, CommitDecision> storedDecisions = new HashMap<>();
+    final BudgetManager manager;
+    final BudgetManager.Reservation proofReservation;
+    final RequestScope preparationScope;
+    final RequestScope proofScope;
+    final BudgetManager.Account proofAccount;
+    final BudgetManager.Account directAccount;
+    final ByteKey profile = ByteKey.copyOf(new byte[32]);
+    final ByteKey authorization = ByteKey.copyOf(new byte[32]);
+    final ReadView previous = new ReadView(profile, authorization, 0, 0, 1, 1, 0, Optional.empty(), Optional.empty(), 0);
+    final ReadView current = new ReadView(profile, authorization, 1, 1, 2, 2, 0, Optional.empty(), Optional.empty(), 0);
+    final ReadView later = new ReadView(profile, authorization, 2, 2, 3, 3, 0, Optional.empty(), Optional.empty(), 0);
+    final KeyRange pointA = KeyRange.point(ByteKey.copyOf(new byte[] {'a'}));
+    final KeyRange pointZ = KeyRange.point(ByteKey.copyOf(new byte[] {'z'}));
+    final ManifestRoot root;
+    final CommitDecision decision;
+    final ReadView pending;
+    final UnchangedRangeProof prover;
+
+    CoverageProofFixture(BudgetManager manager, BudgetManager.Reservation proofReservation,
+        RequestScope preparationScope, RequestScope proofScope,
+        BudgetManager.Account proofAccount, BudgetManager.Account directAccount) {
+      this.manager = manager;
+      this.proofReservation = proofReservation;
+      this.preparationScope = preparationScope;
+      this.proofScope = proofScope;
+      this.proofAccount = proofAccount;
+      this.directAccount = directAccount;
+      var transaction = TransactionId.create();
+      root = new ManifestPreparation(repository, new ManifestPreparation.Limits(1, 1, 0, 0))
           .prepare(transaction, OWNER_EPOCH, 0, 1,
               List.of(candidate(transaction, new byte[] {'a'}, new byte[] {1})).iterator(),
               java.util.Collections.emptyIterator(), preparationScope).join();
-      var decision = new CommitDecision(transaction, InvocationId.create(), 1, 1, 2,
+      decision = new CommitDecision(transaction, InvocationId.create(), 1, 1, 2,
           root.systemIdentity(), root.digest(), true);
       storedDecisions.put(1L, decision);
-      var profile = ByteKey.copyOf(new byte[32]);
-      var authorization = ByteKey.copyOf(new byte[32]);
-      var previous = new ReadView(profile, authorization, 0, 0, 1, 1, 0,
-          Optional.empty(), Optional.empty(), 0);
-      var current = new ReadView(profile, authorization, 1, 1, 2, 2, 0,
-          Optional.empty(), Optional.empty(), 0);
-      var pending = new ReadView(profile, authorization, 1, 0, 2, 1, 0,
+      pending = new ReadView(profile, authorization, 1, 0, 2, 1, 0,
           Optional.of(decision), Optional.of(root), 0);
-      var pointA = KeyRange.point(ByteKey.copyOf(new byte[] {'a'}));
-      var pointZ = KeyRange.point(ByteKey.copyOf(new byte[] {'z'}));
-      var prover = new UnchangedRangeProof(decisions, new ManifestCatalog(repository), 1, 8, 8192, ignored -> 0);
+      CommitDecisionRepository decisions = new CommitDecisionRepository() {
+        @Override public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope scope) {
+          return CompletableFuture.completedFuture(Optional.ofNullable(storedDecisions.get(sequence)));
+        }
+        @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+            CommitDecision value, RequestScope scope) { throw new UnsupportedOperationException(); }
+      };
+      prover = new UnchangedRangeProof(decisions, new ManifestCatalog(repository), 1, 8, 8192, ignored -> 0);
+    }
+
+    void verifyBasicCoverage() {
       assertEquals(UnchangedRangeProof.Verdict.UNCHANGED,
           prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
       assertEquals(UnchangedRangeProof.Verdict.CHANGED,
@@ -234,6 +268,9 @@ class ManifestPreparationTest {
           prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ,
               new ManifestCatalog.ProofReadBudget(proofScope, proofAccount, 1, 4096L << 20)).join());
       assertTrue(directAccount.isActive());
+    }
+
+    void verifyIndependentBudgetsAndCancellation() throws Exception {
       verifyCancelledProofWaitsForProducer(manager, proofReservation, repository, previous, current, profile, pointZ, decision);
       try (var limitedScope = scope();
            var limitedAccount = manager.admit("public", limitedScope, proofReservation,
@@ -244,7 +281,9 @@ class ManifestPreparationTest {
         assertFalse(limitedAccount.isActive());
         assertTrue(directAccount.isActive(), "proof read exhaustion must not consume the direct account");
       }
+    }
 
+    void verifyMissingEvidence() {
       storedDecisions.clear();
       assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
           prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
@@ -256,66 +295,46 @@ class ManifestPreparationTest {
       assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
           prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), current, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
       repository.roots.put(root.systemIdentity(), root);
-      var later = new ReadView(profile, authorization, 2, 2, 3, 3, 0,
-          Optional.empty(), Optional.empty(), 0);
       assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
           prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
-
-      verifyMultiDecisionProof(new ProofChainFixture(repository, storedDecisions, preparationScope,
-          decision, previous, later, profile, authorization, pointZ, prover, proofScope, proofAccount));
-
-      verifyProofIdentityBoundaries(prover, previous, current, profile, authorization, pointZ, proofScope, proofAccount);
-      assertEquals(0, manager.snapshot().allocatedBytes());
     }
-  }
 
-  private record ProofChainFixture(MemoryRepository repository, Map<Long, CommitDecision> storedDecisions,
-      RequestScope preparationScope, CommitDecision decision, ReadView previous, ReadView later,
-      ByteKey profile, ByteKey authorization, KeyRange pointZ, UnchangedRangeProof prover, RequestScope proofScope,
-      BudgetManager.Account proofAccount) {}
+    void verifyMultiDecisionProof() {
+      var secondTransaction = TransactionId.create();
+      var secondRecord = StoredRecord.live(ByteKey.copyOf(new byte[] {'b'}),
+          new StorageMetadata(3, 3, 1, 0, StorageMetadata.State.LIVE, 1), new byte[] {2});
+      var secondCandidate = new PreparedCandidate(secondTransaction, OWNER_EPOCH, 1, 2, secondRecord);
+      var secondRoot = new ManifestPreparation(repository, new ManifestPreparation.Limits(1, 1, 0, 0))
+          .prepare(secondTransaction, OWNER_EPOCH, 1, 2, List.of(secondCandidate).iterator(),
+              java.util.Collections.emptyIterator(), preparationScope).join();
+      var secondDecision = new CommitDecision(secondTransaction, InvocationId.create(), 2, 2, 3,
+          secondRoot.systemIdentity(), secondRoot.digest(), true);
+      storedDecisions.put(2L, secondDecision);
+      var pointB = KeyRange.point(ByteKey.copyOf(new byte[] {'b'}));
+      assertEquals(UnchangedRangeProof.Verdict.UNCHANGED,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      assertEquals(UnchangedRangeProof.Verdict.CHANGED,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointB, proofBudget(proofScope, proofAccount)).join());
+      storedDecisions.remove(1L);
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      storedDecisions.put(1L, decision);
+      storedDecisions.put(2L, new CommitDecision(secondTransaction, secondDecision.invocationId(), 2, 2, 3,
+          secondRoot.systemIdentity(), ByteKey.copyOf(new byte[32]), true));
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+      storedDecisions.put(2L, new CommitDecision(secondTransaction, secondDecision.invocationId(), 2, 2, 2,
+          secondRoot.systemIdentity(), secondRoot.digest(), false));
+      var metadataOnly = new ReadView(profile, authorization, 2, 2, 2, 2, 0,
+          Optional.empty(), Optional.empty(), 0);
+      assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
+          prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), metadataOnly, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+    }
 
-  private static void verifyMultiDecisionProof(ProofChainFixture fixture) {
-    var repository = fixture.repository();
-    var storedDecisions = fixture.storedDecisions();
-    var preparationScope = fixture.preparationScope();
-    var decision = fixture.decision();
-    var previous = fixture.previous();
-    var later = fixture.later();
-    var profile = fixture.profile();
-    var authorization = fixture.authorization();
-    var pointZ = fixture.pointZ();
-    var prover = fixture.prover();
-    var proofScope = fixture.proofScope();
-    var proofAccount = fixture.proofAccount();
-    var secondTransaction = TransactionId.create();
-    var secondRecord = StoredRecord.live(ByteKey.copyOf(new byte[] {'b'}),
-        new StorageMetadata(3, 3, 1, 0, StorageMetadata.State.LIVE, 1), new byte[] {2});
-    var secondCandidate = new PreparedCandidate(secondTransaction, OWNER_EPOCH, 1, 2, secondRecord);
-    var secondRoot = new ManifestPreparation(repository, new ManifestPreparation.Limits(1, 1, 0, 0))
-        .prepare(secondTransaction, OWNER_EPOCH, 1, 2, List.of(secondCandidate).iterator(),
-            java.util.Collections.emptyIterator(), preparationScope).join();
-    var secondDecision = new CommitDecision(secondTransaction, InvocationId.create(), 2, 2, 3,
-        secondRoot.systemIdentity(), secondRoot.digest(), true);
-    storedDecisions.put(2L, secondDecision);
-    var pointB = KeyRange.point(ByteKey.copyOf(new byte[] {'b'}));
-    assertEquals(UnchangedRangeProof.Verdict.UNCHANGED,
-        prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
-    assertEquals(UnchangedRangeProof.Verdict.CHANGED,
-        prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointB, proofBudget(proofScope, proofAccount)).join());
-    storedDecisions.remove(1L);
-    assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
-        prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
-    storedDecisions.put(1L, decision);
-    storedDecisions.put(2L, new CommitDecision(secondTransaction, secondDecision.invocationId(), 2, 2, 3,
-        secondRoot.systemIdentity(), ByteKey.copyOf(new byte[32]), true));
-    assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
-        prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), later, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
-    storedDecisions.put(2L, new CommitDecision(secondTransaction, secondDecision.invocationId(), 2, 2, 2,
-        secondRoot.systemIdentity(), secondRoot.digest(), false));
-    var metadataOnly = new ReadView(profile, authorization, 2, 2, 2, 2, 0,
-        Optional.empty(), Optional.empty(), 0);
-    assertEquals(UnchangedRangeProof.Verdict.INCONCLUSIVE,
-        prover.prove(7, 7, UnchangedRangeProof.Baseline.capture(previous), metadataOnly, profile, profile, pointZ, proofBudget(proofScope, proofAccount)).join());
+    void verifyIdentityBoundaries() {
+      verifyProofIdentityBoundaries(prover, previous, current, profile, authorization, pointZ, proofScope, proofAccount);
+    }
+
   }
 
   private static void verifyProofIdentityBoundaries(UnchangedRangeProof prover, ReadView previous,

@@ -124,6 +124,34 @@ class M3CacheProofIT {
           new BudgetManager.Reservation(8192, 8192, 256L << 20, 8192, 8192),
           new BudgetManager.ReadLimits(1000, 4L << 30, 1000, 1000, 1000),
           8, 512L << 20, 8, TIMEOUT.toNanos());
+      new ExecutorCacheFixture(fixture, engine, stores, budget, group, prover, proofOptions).run();
+      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+  }
+
+  /** Owns the scopes, caches, scheduler and worker for both barrier scenarios. */
+  private static final class ExecutorCacheFixture {
+    private final M3TestEnvironment fixture;
+    private final M3PutCommitIT.Engine engine;
+    private final TableGroupStores stores;
+    private final BudgetManager budget;
+    private final String group;
+    private final UnchangedRangeProof prover;
+    private final RangeReadCache.ProofOptions proofOptions;
+
+    ExecutorCacheFixture(M3TestEnvironment fixture, M3PutCommitIT.Engine engine,
+        TableGroupStores stores, BudgetManager budget, String group, UnchangedRangeProof prover,
+        RangeReadCache.ProofOptions proofOptions) {
+      this.fixture = fixture;
+      this.engine = engine;
+      this.stores = stores;
+      this.budget = budget;
+      this.group = group;
+      this.prover = prover;
+      this.proofOptions = proofOptions;
+    }
+
+    void run() throws Exception {
       try (var owner = RequestScope.withTimeout(TIMEOUT);
            var cache = new RangeReadCache(stores.clusterId(), fixture.system().profileFingerprint(),
                1L << 20, 8, 8, budget, group, owner, Optional.of(proofOptions));
@@ -133,31 +161,35 @@ class M3CacheProofIT {
             fixture.primary(), worker, scans, new TxnExecutionLimits(4096, 1L << 20, 1L << 20, 4096, 64),
             new RequestMetrics(), Optional.of(cache));
         var commands = verifyCacheAtBarriers(fixture, engine, budget, reads, cache);
-        var selected = commands.selected();
-        var unrelated = commands.unrelated();
-
-        var limitedProof = new RangeReadCache.ProofOptions(prover, proofOptions.reservation(),
-            proofOptions.reads(), 8, 1, 8, TIMEOUT.toNanos());
-        try (var limitedCache = new RangeReadCache(stores.clusterId(), fixture.system().profileFingerprint(),
-            1L << 20, 8, 8, budget, group, owner, Optional.of(limitedProof))) {
-          var limitedReads = new TxnReadExecutor(group, stores.views(), stores.manifests(), fixture.factory(),
-              fixture.primary(), worker, scans, new TxnExecutionLimits(4096, 1L << 20, 1L << 20, 4096, 64),
-              new RequestMetrics(), Optional.of(limitedCache));
-          assertEquals(new ReadResult(Optional.empty(), 3), readThroughExecutor(fixture, budget, limitedReads, unrelated));
-          engine.put("last".getBytes(StandardCharsets.UTF_8), false);
-          // The first cache and this second cache have independent ownership and observe the
-          // same HBase barrier; an unrelated entry may be proved, but the changed key must miss.
-          assertEquals(new ReadResult(Optional.empty(), 4), readThroughExecutor(fixture, budget, reads, unrelated));
-          assertEquals(4, M3CacheTestProbe.hits(cache));
-          assertEquals(new ReadResult(Optional.of("last"), 4), readThroughExecutor(fixture, budget, reads, selected));
-          assertEquals(4, M3CacheTestProbe.hits(cache));
-          assertEquals(new ReadResult(Optional.empty(), 4), readThroughExecutor(fixture, budget, limitedReads, unrelated));
-          assertEquals(0, M3CacheTestProbe.hits(limitedCache));
-          assertEquals(new ReadResult(Optional.empty(), 4), readThroughExecutor(fixture, budget, limitedReads, unrelated));
-          assertEquals(1, M3CacheTestProbe.hits(limitedCache));
-        }
+        verifyLimitedProof(owner, scans, worker, cache, reads, commands);
       }
-      assertEquals(0, budget.snapshot().allocatedBytes());
+    }
+
+    private void verifyLimitedProof(RequestScope owner, ScanScheduler scans,
+        java.util.concurrent.ExecutorService worker, RangeReadCache cache, TxnReadExecutor reads,
+        ReadCommands commands) throws Exception {
+      var selected = commands.selected();
+      var unrelated = commands.unrelated();
+      var limitedProof = new RangeReadCache.ProofOptions(prover, proofOptions.reservation(),
+          proofOptions.reads(), 8, 1, 8, TIMEOUT.toNanos());
+      try (var limitedCache = new RangeReadCache(stores.clusterId(), fixture.system().profileFingerprint(),
+          1L << 20, 8, 8, budget, group, owner, Optional.of(limitedProof))) {
+        var limitedReads = new TxnReadExecutor(group, stores.views(), stores.manifests(), fixture.factory(),
+            fixture.primary(), worker, scans, new TxnExecutionLimits(4096, 1L << 20, 1L << 20, 4096, 64),
+            new RequestMetrics(), Optional.of(limitedCache));
+        assertEquals(new ReadResult(Optional.empty(), 3), readThroughExecutor(fixture, budget, limitedReads, unrelated));
+        engine.put("last".getBytes(StandardCharsets.UTF_8), false);
+        // The first cache and this second cache have independent ownership and observe the
+        // same HBase barrier; an unrelated entry may be proved, but the changed key must miss.
+        assertEquals(new ReadResult(Optional.empty(), 4), readThroughExecutor(fixture, budget, reads, unrelated));
+        assertEquals(4, M3CacheTestProbe.hits(cache));
+        assertEquals(new ReadResult(Optional.of("last"), 4), readThroughExecutor(fixture, budget, reads, selected));
+        assertEquals(4, M3CacheTestProbe.hits(cache));
+        assertEquals(new ReadResult(Optional.empty(), 4), readThroughExecutor(fixture, budget, limitedReads, unrelated));
+        assertEquals(0, M3CacheTestProbe.hits(limitedCache));
+        assertEquals(new ReadResult(Optional.empty(), 4), readThroughExecutor(fixture, budget, limitedReads, unrelated));
+        assertEquals(1, M3CacheTestProbe.hits(limitedCache));
+      }
     }
   }
 
