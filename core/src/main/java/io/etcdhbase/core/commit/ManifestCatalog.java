@@ -15,9 +15,116 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Verifies and streams a sealed candidate/event manifest without collecting transaction data. */
 public final class ManifestCatalog {
+  // Conservative accounting for ordinary adapter-sized values and transient copies. The HBase
+  // client can receive an oversized cell before the adapter rejects it; this is not a hard wire
+  // bound and must be addressed before production proof reuse is enabled.
+  static final long PROOF_SYSTEM_RECORD_ENVELOPE = 64L << 20;
+  /** Proof-only page allowance; callers use a separate account so a miss can fall back safely. */
+  public static final class ProofReadBudget {
+    private final RequestScope scope;
+    private final BudgetManager.Account account;
+    private final int maximumPages;
+    private final long maximumBytes;
+    private int pages;
+    private long bytes;
+
+    public ProofReadBudget(RequestScope scope, BudgetManager.Account account, int maximumPages, long maximumBytes) {
+      this.scope = Objects.requireNonNull(scope, "scope");
+      this.account = Objects.requireNonNull(account, "account");
+      if (!account.belongsTo(scope) || maximumPages < 1 || maximumBytes < 1) {
+        throw new IllegalArgumentException("invalid proof read budget");
+      }
+      this.maximumPages = maximumPages;
+      this.maximumBytes = maximumBytes;
+    }
+
+    private synchronized BudgetManager.Lease retainPage(long maximumPageBytes) throws BackendFailure {
+      if (pages >= maximumPages || maximumPageBytes > maximumBytes - bytes) {
+        throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+      }
+      var lease = account.tryRetain(BudgetManager.Memory.IO, maximumPageBytes)
+          .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+      try {
+        account.chargeInternalPointRead(maximumPageBytes);
+      } catch (BackendFailure | RuntimeException | Error failure) {
+        try { lease.close(); }
+        catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+        throw failure;
+      }
+      pages++;
+      bytes += maximumPageBytes;
+      return lease;
+    }
+
+    public synchronized int pages() { return pages; }
+    public synchronized long bytes() { return bytes; }
+    public boolean belongsTo(RequestScope candidate) { return scope == candidate; }
+    RequestScope scope() { return scope; }
+
+    <T> CompletableFuture<T> read(long maximumBytes, Supplier<CompletableFuture<T>> work) {
+      BudgetManager.Lease lease;
+      try { lease = retainPage(maximumBytes); }
+      catch (BackendFailure | RuntimeException failure) { return CompletableFuture.failedFuture(failure); }
+      return new ProofPageRead<T>(lease).start(work);
+    }
+
+    /** Owns one admitted page until its producer and cleanup have both settled. */
+    private final class ProofPageRead<T> {
+      private final BudgetManager.Lease lease;
+      private final CompletableFuture<Void> released = new CompletableFuture<>();
+      private RequestScope.ScopedCleanup registration;
+
+      private ProofPageRead(BudgetManager.Lease lease) { this.lease = lease; }
+
+      private CompletableFuture<T> start(Supplier<CompletableFuture<T>> work) {
+        try {
+          registration = scope.registerScopedCleanup(this::releaseAfterProducers, released);
+        } catch (RuntimeException | Error failure) {
+          try { lease.close(); }
+          catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+          return CompletableFuture.failedFuture(failure);
+        }
+        if (scope.isClosed() || scope.isDeadlineExceeded()) {
+          var failure = new BackendFailure(scope.isDeadlineExceeded()
+              ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+          try { registration.close(); }
+          catch (Exception | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+          return CompletableFuture.failedFuture(failure);
+        }
+        CompletableFuture<T> operation;
+        try { operation = Objects.requireNonNull(work.get(), "proof metadata read"); }
+        catch (RuntimeException | Error failure) {
+          try { registration.close(); }
+          catch (Exception | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+          return CompletableFuture.failedFuture(failure);
+        }
+        return operation.whenComplete((ignored, failure) -> {
+          try { registration.close(); }
+          catch (Exception cleanup) { throw new java.util.concurrent.CompletionException(cleanup); }
+        });
+      }
+
+      private void releaseAfterProducers() {
+        Runnable release = this::releasePage;
+        if (scope.isClosed()) scope.physicalProducersCompletion().whenComplete((ignored, failure) -> release.run());
+        else release.run();
+      }
+
+      private void releasePage() {
+        try {
+          lease.close();
+          released.complete(null);
+        } catch (RuntimeException | Error failure) {
+          released.completeExceptionally(failure);
+          throw failure;
+        }
+      }
+    }
+  }
   /** Maximum retained candidate payload fetched for one range slice, independent of result bytes. */
   static final long MAX_RANGE_CANDIDATE_BYTES = 9L * 1024 * 1024;
 
@@ -150,6 +257,22 @@ public final class ManifestCatalog {
       KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
       long maximumCandidateBytes, RequestScope scope, BooleanSupplier cancelled,
       BudgetManager.Account account, ScanDirection direction) {
+    return candidatesInRange(root, bucket, range, afterExclusive, maximumCandidates,
+        maximumCandidateBytes, scope, cancelled, account, direction, null);
+  }
+
+  /** Reads a bounded overlap candidate with separate, precharged metadata-page ownership. */
+  public CompletableFuture<CandidateSlice> candidatesForProof(ManifestRoot root, int bucket,
+      KeyRange range, long maximumCandidateBytes, ProofReadBudget proof) {
+    Objects.requireNonNull(proof, "proof");
+    return candidatesInRange(root, bucket, range, Optional.empty(), 1, maximumCandidateBytes,
+        proof.scope, () -> false, proof.account, ScanDirection.ASCENDING, proof);
+  }
+
+  private CompletableFuture<CandidateSlice> candidatesInRange(ManifestRoot root, int bucket,
+      KeyRange range, Optional<ByteKey> afterExclusive, int maximumCandidates,
+      long maximumCandidateBytes, RequestScope scope, BooleanSupplier cancelled,
+      BudgetManager.Account account, ScanDirection direction, ProofReadBudget proof) {
     Objects.requireNonNull(root, "root");
     Objects.requireNonNull(range, "range");
     Objects.requireNonNull(afterExclusive, "afterExclusive");
@@ -170,7 +293,7 @@ public final class ManifestCatalog {
     var callerCancelled = new AtomicBoolean();
     var cursor = new CandidateRangeCursor(root, bucket, range, afterExclusive,
         maximumCandidates, maximumCandidateBytes, scope,
-        () -> cancelled.getAsBoolean() || callerCancelled.get(), account, direction);
+        () -> cancelled.getAsBoolean() || callerCancelled.get(), account, direction, proof);
     var result = new CompletableFuture<CandidateSlice>();
     CompletableFuture<Void> traversal;
     try {
@@ -229,6 +352,7 @@ public final class ManifestCatalog {
     private final BooleanSupplier cancelled;
     private final BudgetManager.Account account;
     private final ScanDirection direction;
+    private final ProofReadBudget proof;
     private final List<PreparedCandidate> candidates = new java.util.ArrayList<>();
     private final List<BudgetManager.Lease> leases = new java.util.ArrayList<>();
     private int directoryPages;
@@ -240,7 +364,7 @@ public final class ManifestCatalog {
     private CandidateRangeCursor(ManifestRoot root, int bucket, KeyRange range,
         Optional<ByteKey> after, int maximumCandidates, long maximumCandidateBytes,
         RequestScope scope, BooleanSupplier cancelled, BudgetManager.Account account,
-        ScanDirection direction) {
+        ScanDirection direction, ProofReadBudget proof) {
       this.root = root;
       this.bucket = bucket;
       this.range = range;
@@ -251,6 +375,7 @@ public final class ManifestCatalog {
       this.cancelled = cancelled;
       this.account = account;
       this.direction = direction;
+      this.proof = proof;
     }
 
     private CompletableFuture<Void> visit(ManifestChildReference reference) {
@@ -267,13 +392,13 @@ public final class ManifestCatalog {
       if (++directoryPages > MAX_CANDIDATE_DIRECTORY_PAGES) {
         return invalid("manifest range traversal exceeds its directory budget");
       }
-      return repository.readDirectoryPage(reference.identity(), scope).thenCompose(stored -> {
+      return withProofPage(PROOF_SYSTEM_RECORD_ENVELOPE, () -> repository.readDirectoryPage(reference.identity(), scope).thenCompose(stored -> {
         ManifestDirectoryPage page = stored.orElseThrow(() -> missing("manifest directory page"));
         if (!page.transactionId().equals(root.transactionId()) || !page.reference().equals(reference)) {
           return invalid("manifest directory page differs from its authenticated range reference");
         }
         return visitChildren(page.children(), firstIndex(page.children().size()));
-      });
+      }));
     }
 
     private CompletableFuture<Void> visitChildren(List<ManifestChildReference> children, int index) {
@@ -285,14 +410,18 @@ public final class ManifestCatalog {
       if (++leafPages > MAX_CANDIDATE_PAGES) {
         return invalid("manifest range traversal exceeds its leaf budget");
       }
-      return repository.readPage(reference.identity(), scope).thenCompose(stored -> {
+      return withProofPage(PROOF_SYSTEM_RECORD_ENVELOPE, () -> repository.readPage(reference.identity(), scope).thenCompose(stored -> {
         ManifestPage page = stored.orElseThrow(() -> missing("manifest leaf page"));
         if (!page.transactionId().equals(root.transactionId()) || !page.reference().equals(reference)
             || page.bucket() != bucket) {
           return invalid("manifest leaf page differs from its authenticated bucket range");
         }
         return visitCandidates(page.candidates(), firstIndex(page.candidates().size()));
-      });
+      }));
+    }
+
+    private CompletableFuture<Void> withProofPage(long maximumBytes, Supplier<CompletableFuture<Void>> work) {
+      return proof == null ? work.get() : proof.read(maximumBytes, work);
     }
 
     private CompletableFuture<Void> visitCandidates(
@@ -318,7 +447,8 @@ public final class ManifestCatalog {
       if (lastKey != null && direction.compare(lastKey, key) >= 0) {
         return invalid("manifest range candidates are duplicated or unordered");
       }
-      return readCandidate(references, index, reference, key);
+      return proof == null ? readCandidate(references, index, reference, key)
+          : proof.read(PROOF_SYSTEM_RECORD_ENVELOPE, () -> readCandidate(references, index, reference, key));
     }
 
     private CompletableFuture<Void> readCandidate(List<ManifestCandidateReference> references,

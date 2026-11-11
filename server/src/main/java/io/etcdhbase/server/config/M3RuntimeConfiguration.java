@@ -15,11 +15,30 @@ public record M3RuntimeConfiguration(
     int maxEtcdRequestBytes,
     int pinShards,
     int pinSlotsPerShard,
-    int pinLeaseMs) {
+    int pinLeaseMs,
+    boolean readCacheEnabled) {
   private static final long MIN_MEMORY = 256L << 20;
   private static final long MAX_MEMORY = 1L << 40;
 
+  public static final class CacheActivationUnavailable extends IllegalArgumentException {
+    private static final long serialVersionUID = 1L;
+    public CacheActivationUnavailable() {
+      super("read cache requires verified identity lifecycle and coverage proofs");
+    }
+  }
+
+  /** Existing callers retain the disabled-cache behavior. */
+  public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
+      int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
+      int pinShards, int pinSlotsPerShard, int pinLeaseMs) {
+    this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
+        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, false);
+  }
+
   public M3RuntimeConfiguration {
+    if (readCacheEnabled) {
+      throw new CacheActivationUnavailable();
+    }
     if (memberId == null || !memberId.matches("[1-9][0-9]{0,19}")) {
       throw new IllegalArgumentException("member ID must be an explicit nonzero uint64");
     }

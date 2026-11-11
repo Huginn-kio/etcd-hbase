@@ -37,6 +37,7 @@ import org.apache.hadoop.hbase.client.AsyncConnection;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
 import org.apache.hadoop.hbase.client.Durability;
+import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.apache.hadoop.hbase.exceptions.ConnectionClosedException;
 import org.apache.hadoop.hbase.protobuf.generated.AuthenticationProtos.AuthenticationService;
@@ -158,6 +159,54 @@ class SecureHBaseAuthenticationIT {
         TemporaryKerberosSecurity.PASSWORD.toCharArray(),
         Reason.INSUFFICIENT_PERMISSION);
     System.out.println("secure-hbase negative=kerberos-password-and-permissions status=passed");
+  }
+
+  @Test
+  void revokedPermissionDeniesLiveBackendReadsAndFreshAuthentication() throws Exception {
+    String user = "revocation-user";
+    String principal = user + "@" + realm;
+    var actions = Set.of(Action.READ, Action.WRITE, Action.EXEC);
+    var permission = Permission.newBuilder(table).withActions(actions.toArray(Action[]::new)).build();
+    grantAndAwait(user, actions);
+    var original = provider(HBaseAuthenticators.kerberosPassword());
+    AuthorizedBackendIdentity identity;
+    try {
+      identity = authenticate(original, principal, TemporaryKerberosSecurity.PASSWORD.toCharArray());
+      var connection = await(original.connectionFor(identity).toCompletableFuture());
+      var get = new Get(new byte[] {'r'}).addFamily(new byte[] {'d'});
+      await(connection.getTable(table).get(get));
+      await(adminConnection.getAdmin().revoke(new UserPermission(user, permission)));
+      awaitBackendReadDenial(connection, get);
+      assertAuthenticationFailure(HBaseAuthenticators.kerberosPassword(), principal,
+          TemporaryKerberosSecurity.PASSWORD.toCharArray(), Reason.INSUFFICIENT_PERMISSION);
+    } finally {
+      original.close();
+    }
+    var closed = assertThrows(ExecutionException.class,
+        () -> original.connectionFor(identity).toCompletableFuture().get(30, TimeUnit.SECONDS));
+    assertEquals(Reason.BACKEND_UNAVAILABLE,
+        assertInstanceOf(BackendIdentityException.class, closed.getCause()).reason());
+  }
+
+  private void awaitBackendReadDenial(AsyncConnection connection, Get get) throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+    while (System.nanoTime() < deadline) {
+      try {
+        await(connection.getTable(table).get(get));
+      } catch (ExecutionException failure) {
+        if (isAccessDenied(failure)) return;
+        throw failure;
+      }
+      Thread.sleep(50);
+    }
+    throw new IllegalStateException("revoked HBase permission remained effective");
+  }
+
+  private boolean isAccessDenied(Throwable failure) {
+    for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+      if (cause instanceof org.apache.hadoop.hbase.security.AccessDeniedException) return true;
+    }
+    return false;
   }
 
   @Test

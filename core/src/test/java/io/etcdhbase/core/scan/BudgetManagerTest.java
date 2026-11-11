@@ -38,6 +38,33 @@ class BudgetManagerTest {
   }
 
   @Test
+  void serviceMemoryUsesGlobalAndGroupCapacityWithoutTakingRequestAdmission() throws Exception {
+    var manager = new BudgetManager(GLOBAL, Map.of("alpha", GROUP, "beta", GROUP, "gamma", GROUP), REQUEST);
+    try (var alphaScope = RequestScope.withoutDeadline();
+         var betaScope = RequestScope.withoutDeadline();
+         var requestScope = RequestScope.withoutDeadline();
+         var alpha = manager.reserveServiceMemory("alpha", alphaScope, 3072);
+         var beta = manager.reserveServiceMemory("beta", betaScope, 4096);
+         var rest = manager.reserveServiceMemory("alpha", alphaScope, 1024)) {
+      assertEquals(0, manager.snapshot().requests());
+      assertEquals(8192, manager.snapshot().reservedBytes());
+      assertEquals(8192, manager.snapshot().allocatedBytes());
+      assertThrows(BackendFailure.class, () -> manager.reserveServiceMemory("gamma", requestScope, 1));
+      assertThrows(BackendFailure.class, () -> manager.admit("alpha", requestScope, MEMORY));
+      alpha.close();
+      try (var request = manager.admit("alpha", requestScope, MEMORY)) {
+        assertEquals(1, manager.snapshot().requests());
+        assertTrue(rest.permits(request));
+        assertFalse(beta.permits(request));
+      }
+      assertFalse(alpha.isActive());
+    }
+    assertEquals(0, manager.snapshot().requests());
+    assertEquals(0, manager.snapshot().reservedBytes());
+    assertEquals(0, manager.snapshot().allocatedBytes());
+  }
+
+  @Test
   void readCompletionChecksAccountStateUnderTheChargingLock() throws Exception {
     var manager = new BudgetManager(GLOBAL, Map.of("alpha", GROUP), REQUEST);
     try (var scope = RequestScope.withoutDeadline()) {

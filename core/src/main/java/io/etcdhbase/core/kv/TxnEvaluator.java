@@ -6,6 +6,7 @@ import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.ManifestRepository;
 import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.PreparedEvent;
+import io.etcdhbase.core.commit.ReadView;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.TxnReadSession;
 import io.etcdhbase.core.concurrent.ContinuationExecutor;
@@ -38,19 +39,23 @@ public final class TxnEvaluator {
     }
   }
 
+  record CacheContext(RangeCommand command, ReadView view) {}
+
   /** Private result remains bound to its original invocation, scope and protected read session. */
   public static final class Evaluation {
     private final ResultTree result;
     private final TxnWorkingSet working;
     private final Optional<InvocationBinding> invocation;
     private final TxnReadSession session;
+    private final Optional<RangeCommand> standaloneRange;
 
     private Evaluation(ResultTree result, TxnWorkingSet working,
-        Optional<InvocationBinding> invocation, TxnReadSession session) {
+        Optional<InvocationBinding> invocation, TxnReadSession session, Optional<RangeCommand> standaloneRange) {
       this.result = Objects.requireNonNull(result, "result");
       this.working = working;
       this.invocation = Objects.requireNonNull(invocation, "invocation");
       this.session = Objects.requireNonNull(session, "session");
+      this.standaloneRange = Objects.requireNonNull(standaloneRange, "standaloneRange");
     }
 
     public ResultTree result() { return result; }
@@ -69,23 +74,47 @@ public final class TxnEvaluator {
 
     /** Produces an externally projectable read only after all transaction pins validate. */
     public CompletableFuture<ValidatedRead> finishReadOnly() {
+      return finishReadOnly(false);
+    }
+
+    /** Used only by the disabled cache path; the result is cacheable after pin validation. */
+    CompletableFuture<ValidatedRead> finishReadOnlyForCache() {
+      return finishReadOnly(true);
+    }
+
+    private CompletableFuture<ValidatedRead> finishReadOnly(boolean captureCacheContext) {
       if (invocation.isPresent() || candidateCount() != 0 || eventCount() != 0) {
         return CompletableFuture.failedFuture(new IllegalStateException("result is not a read-only transaction"));
       }
-      return session.finish().thenApply(ignored -> new ValidatedRead(result, session));
+      Optional<CacheContext> context;
+      try {
+        context = captureCacheContext ? standaloneRange.map(command -> new CacheContext(command,
+            session.protectedView(command.revision() > 0 ? command.revision() : session.currentRevision())))
+            : Optional.empty();
+      } catch (RuntimeException failure) {
+        return CompletableFuture.failedFuture(failure);
+      }
+      return session.finish().thenApply(ignored -> new ValidatedRead(result, session, context));
     }
   }
 
   public static final class ValidatedRead {
     private final ResultTree result;
     private final TxnReadSession session;
-    private ValidatedRead(ResultTree result, TxnReadSession session) {
+    private final Optional<CacheContext> cacheContext;
+    private ValidatedRead(ResultTree result, TxnReadSession session, Optional<CacheContext> cacheContext) {
       this.result = result;
       this.session = session;
+      this.cacheContext = cacheContext;
     }
     public ResultTree result() { return result; }
     public long revision() { return result.root().header().revision(); }
     public boolean belongsTo(RequestScope scope) { return session.belongsTo(scope); }
+    Optional<CacheContext> cacheContext() { return cacheContext; }
+
+    static CompletableFuture<ValidatedRead> finishCached(ResultTree result, TxnReadSession session) {
+      return session.finish().thenApply(ignored -> new ValidatedRead(result, session, Optional.empty()));
+    }
   }
 
   private final TxnReadSession session;
@@ -125,6 +154,13 @@ public final class TxnEvaluator {
       throw new IllegalArgumentException("transaction inputs do not share a sufficient request budget");
     }
   }
+
+  boolean belongsTo(TxnReadSession expectedSession, BudgetManager.Account expectedAccount,
+      RequestScope expectedScope) {
+    return session == expectedSession && account == expectedAccount && scope == expectedScope;
+  }
+
+  long maximumResultBytes() { return limits.resultBytes(); }
 
   /**
    * A potentially writing request requires its original invocation. The caller closes the scope
@@ -169,7 +205,7 @@ public final class TxnEvaluator {
         working = new TxnWorkingSet(invocation.orElseThrow(), limits.workingBytes(),
             worksetRecords, worksetManifests, scope, account, bucket);
       }
-      var state = new State(working, invocation);
+      var state = new State(working, invocation, standaloneRange(command));
       CompletableFuture<Void> started = state.working == null
           ? CompletableFuture.completedFuture(null) : state.working.begin();
       operation = started.thenComposeAsync(ignored -> select(command).thenComposeAsync(plan ->
@@ -399,7 +435,7 @@ public final class TxnEvaluator {
           new ResultNode.Header(true, state.currentRevision()), plan.succeeded(), responses));
       if (result.retainedBytes() > limits.resultBytes()) throw resourceLimit();
       if (state.working != null) state.working.freeze();
-      return new Evaluation(result, state.working, state.invocation, session);
+      return new Evaluation(result, state.working, state.invocation, session, state.standaloneRange);
     } catch (BackendFailure failure) {
       throw new java.util.concurrent.CompletionException(failure);
     }
@@ -446,14 +482,23 @@ public final class TxnEvaluator {
     return Math.addExact(128L + record.key().length(), record.hasValue() ? record.metadata().valueLength() : 0);
   }
 
+  static Optional<RangeCommand> standaloneRange(TxnCommand command) {
+    if (!command.compares().isEmpty() || !command.failure().isEmpty() || command.success().size() != 1
+        || !(command.success().getFirst() instanceof TxnCommand.Range range)
+        || range.command().context() != RangeCommand.Context.STANDALONE) return Optional.empty();
+    return Optional.of(range.command());
+  }
+
   private final class State {
     private final TxnWorkingSet working;
     private final Optional<InvocationBinding> invocation;
+    private final Optional<RangeCommand> standaloneRange;
     private long resultBytes = 128;
 
-    private State(TxnWorkingSet working, Optional<InvocationBinding> invocation) {
+    private State(TxnWorkingSet working, Optional<InvocationBinding> invocation, Optional<RangeCommand> standaloneRange) {
       this.working = working;
       this.invocation = invocation;
+      this.standaloneRange = standaloneRange;
     }
     private long currentRevision() {
       return working != null && working.hasChanges()

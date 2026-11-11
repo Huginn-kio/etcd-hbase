@@ -188,6 +188,9 @@ public final class RuntimeServer implements AutoCloseable {
           }
         }
       }
+    } catch (M3RuntimeConfiguration.CacheActivationUnavailable unavailable) {
+      System.err.println("read cache requires verified identity lifecycle and coverage proofs");
+      return 2;
     } catch (IllegalArgumentException failure) {
       System.err.println("runtime configuration or activation is invalid");
       return 2;

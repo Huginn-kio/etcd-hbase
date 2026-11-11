@@ -83,8 +83,19 @@ secure_integration = root / "hbase/target/failsafe-reports/TEST-io.etcdhbase.hba
 if not secure_integration.is_file():
     raise SystemExit("J04 real secure HBase integration report is required")
 secure_suite = ET.parse(secure_integration).getroot()
-if int(secure_suite.attrib.get("tests", "0")) != 6:
-    raise SystemExit("J04 secure HBase must execute all six integration scenarios")
+required_secure_cases = {
+    "kerberosPasswordPerformsRealOperationsAndRejectsWrongCredentialsAndInsufficientPermissions",
+    "keytabAndTicketCacheIdentitiesPerformRealOperations",
+    "serverIssuedDelegationTokenPerformsRealOperationsAndTamperingIsRejected",
+    "secureServerRejectsASimpleClientWithoutFallback",
+    "customPasswordDigestExtensionPerformsRealOperationsAndRejectsBadCredentials",
+    "accountPasswordDigestCannotImpersonateAStandardDelegationToken",
+}
+secure_cases = secure_suite.findall("testcase")
+if (len(secure_cases) != int(secure_suite.attrib.get("tests", "0"))
+        or not required_secure_cases <= {case.get("name") for case in secure_cases}
+        or any(case.find(tag) is not None for case in secure_cases for tag in ("failure", "error", "skipped"))):
+    raise SystemExit("J04 secure HBase must pass every required integration scenario")
 secure_output = "\n".join(item.text or "" for item in secure_suite.iter("system-out"))
 mechanisms = dict(re.findall(
     r"secure-hbase authentication=(\S+) observed=(\S+) operations=put,get,cas,scan independentRead=true permissions=read-write status=passed",

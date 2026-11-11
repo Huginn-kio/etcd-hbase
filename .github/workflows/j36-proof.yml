@@ -1,0 +1,32 @@
+name: J36 cache component proof
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: j36-proof-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  component-proof:
+    name: J36 默认关闭缓存组件与临时 HBase 验证
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 下载固定 Java 21
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/j36-jdk.tar.gz"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: jdkfile
+          java-version: '21'
+          jdk-file: ${{ runner.temp }}/j36-jdk.tar.gz
+          cache: maven
+      - name: 验证组件；不代表缓存启用验收
+        env:
+          ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
+        run: scripts/verify/j36-proof.sh --artifact-root .artifacts/j36-proof/ci

@@ -6,6 +6,7 @@ import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.commit.TxnReadSession;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.kv.CompareReadExecutor;
+import io.etcdhbase.core.kv.RangeReadCache;
 import io.etcdhbase.core.kv.TxnCommand;
 import io.etcdhbase.core.kv.TxnEvaluator;
 import io.etcdhbase.core.request.RequestScope;
@@ -33,6 +34,7 @@ public final class TxnReadExecutor {
   private final ScanScheduler scans;
   private final TxnExecutionLimits limits;
   private final RequestMetrics metrics;
+  private final Optional<RangeReadCache> readCache;
 
   public TxnReadExecutor(String tableGroup, ReadViewService views, ManifestCatalog manifests,
       HBaseConnectionFactory connections, StorageTableBinding primary, Executor backendWorker,
@@ -43,6 +45,14 @@ public final class TxnReadExecutor {
   public TxnReadExecutor(String tableGroup, ReadViewService views, ManifestCatalog manifests,
       HBaseConnectionFactory connections, StorageTableBinding primary, Executor backendWorker,
       ScanScheduler scans, TxnExecutionLimits limits, RequestMetrics metrics) {
+    this(tableGroup, views, manifests, connections, primary, backendWorker, scans, limits, metrics, Optional.empty());
+  }
+
+  /** The cache is supplied by an authorized service owner; the normal runtime leaves it absent. */
+  public TxnReadExecutor(String tableGroup, ReadViewService views, ManifestCatalog manifests,
+      HBaseConnectionFactory connections, StorageTableBinding primary, Executor backendWorker,
+      ScanScheduler scans, TxnExecutionLimits limits, RequestMetrics metrics,
+      Optional<RangeReadCache> readCache) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
     this.views = Objects.requireNonNull(views, "views");
     this.manifests = Objects.requireNonNull(manifests, "manifests");
@@ -52,6 +62,7 @@ public final class TxnReadExecutor {
     this.scans = Objects.requireNonNull(scans, "scans");
     this.limits = Objects.requireNonNull(limits, "limits");
     this.metrics = Objects.requireNonNull(metrics, "metrics");
+    this.readCache = Objects.requireNonNull(readCache, "readCache");
     if (tableGroup.isBlank() || primary.layout() == StorageTableBinding.Layout.CURRENT) {
       throw new IllegalArgumentException("invalid transaction read identity");
     }
@@ -102,8 +113,10 @@ public final class TxnReadExecutor {
             var evaluator = new TxnEvaluator(session, compares, account, scope,
                 new TxnEvaluator.Limits(limits.pointBytes(), limits.resultBytes(), limits.workingBytes()),
                 primary.codec()::bucket);
-            return evaluator.evaluate(command, Optional.empty());
-          }).thenCompose(TxnEvaluator.Evaluation::finishReadOnly)
+            return readCache.isPresent()
+                ? readCache.orElseThrow().read(command, session, evaluator, account, scope)
+                : evaluator.evaluate(command, Optional.empty()).thenCompose(TxnEvaluator.Evaluation::finishReadOnly);
+          })
           .whenComplete((ignored, failure) -> {
             if (recordTxnMetrics) metrics.recordTxnStage(
                 RequestMetrics.TxnStage.COMPARE_AND_PREPARE, Math.max(0, System.nanoTime() - started));

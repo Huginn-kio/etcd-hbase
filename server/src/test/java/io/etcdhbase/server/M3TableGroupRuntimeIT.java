@@ -243,10 +243,13 @@ class M3TableGroupRuntimeIT {
   }
 
   static M3TableGroupPlan plan(String file, int port) throws Exception {
+    return plan(file, port, "m3_runtime_" + UUID.randomUUID().toString().replace("-", ""));
+  }
+
+  static M3TableGroupPlan plan(String file, int port, String namespace) throws Exception {
     var mapper = new ObjectMapper();
     ObjectNode tree = (ObjectNode) mapper.readTree(Files.readAllBytes(
         Path.of("..", "config", "examples", "j05", file)));
-    String namespace = "m3_runtime_" + UUID.randomUUID().toString().replace("-", "");
     ObjectNode backend = (ObjectNode) tree.withArray("hbase_profiles").get(0);
     backend.put("namespace", namespace).put("quorum", "127.0.0.1").put("client_port", port);
     ObjectNode group = (ObjectNode) tree.withArray("table_groups").get(0);

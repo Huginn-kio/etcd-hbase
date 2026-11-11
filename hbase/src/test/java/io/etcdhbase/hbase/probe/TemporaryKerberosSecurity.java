@@ -38,7 +38,7 @@ final class TemporaryKerberosSecurity implements AutoCloseable {
       kdc.createPrincipal(serviceKeytab.toFile(), "hbase/localhost");
       kdc.createPrincipal(adminKeytab.toFile(), "admin");
       kdc.createPrincipal(userKeytab.toFile(), "keytab-user");
-      for (String principal : new String[] {"alice", "reader", "denied"}) {
+      for (String principal : new String[] {"alice", "reader", "denied", "revocation-user"}) {
         kdc.createPrincipal(principal, PASSWORD);
       }
       String servicePrincipal = "hbase/localhost@" + kdc.getRealm();
