@@ -387,10 +387,45 @@ J35_UNIT_CASES = {
         "io.etcdhbase.grpc.protocol.TxnResponseMapperTest"] | {"projectsDescendingRangeAndRejectsIncorrectOrdering"},
 }
 
+J28_GO_REQUIRED_CASES = {
+    **{package: set(cases) for package, cases in GO_REQUIRED_CASES.items()},
+    "cmd/m3history": {"TestHistoryClientDoesNotReplayMutableRPC", "TestRestartHandshakeHonorsCancellation",
+                      "TestEvidenceRecheckRejectsFixedSuccessAndLinkedFile",
+                      "TestEvidenceRecheckAcceptsKnownHistoryAndRejectsTamperedValue"},
+    "internal/history": {"TestCheckHonorsKnownRealTimeOrder", "TestUnknownWriteCanTakeEffectAfterErrorReturn",
+                         "TestIncompleteSearchCannotPassOrReject", "TestUnknownWireFieldsRemainInconclusive",
+                         "TestUnknownTxnWithConflictingSiblingWritesIsInconclusive",
+                         "TestRangeUsesApprovedPageCountAndByteOrder", "TestRangeCountOnlyIgnoresRevisionFilter",
+                         "TestRecorderRetainsActualRPCAndOrdersOverlappingCalls"},
+    "internal/scenario": GO_REQUIRED_CASES["internal/scenario"] | {
+        "TestM3HistoryChecksRealNativeConcurrentPointOperations", "TestM3HistoryChecksNativeNestedTransactions"},
+}
+J28_INTEGRATION_CASES = {
+    "io.etcdhbase.hbase.storage.M2ReadViewIT": {"readsSelectedPendingVersionsAndHistoricalRowsInBothLayouts"},
+    "io.etcdhbase.server.M3HistoryRpcIT": {"pointAndNestedTxnHistoryUsesRealHBaseOnBothLayouts"},
+    "io.etcdhbase.server.M3HistoryFailoverIT": {
+        "goHistorySurvivesOwnerProcessDeathOnBothLayouts", "goHistoryRecoversAfterSelectedControlCasAckIsLost",
+        "goHistoryRecoversAfterOneOfTwoRowsIsMaterialized", "resumedOldOwnerCannotOverwriteNewOwnerOnBothLayouts",
+        "unpublishedPreparationNeverBecomesVisibleAfterOwnerDeath", "canceledClientKeepsResourcesUntilTheSelectedWriteDrains"},
+    "io.etcdhbase.server.M3ProcessRecoveryIT": {"selectedPutIsRecoveredAfterPublisherProcessExits",
+                                                  "selectedDeleteIsRecoveredAfterPublisherProcessExits"},
+    "io.etcdhbase.server.M3TxnCommitIT": {"partialDeleteMaterializationRecoversWithoutPartialReadsOnBothLayouts",
+                                            "publishesMultipleKeysOnceAndReplaysAnEarlierNoChangeResultOnBothLayouts"},
+}
+J28_UNIT_CASES = {
+    "io.etcdhbase.core.commit.KernelHistoryModelTest": {
+        "selectedUnknownTransactionIsVisibleAcrossCancellationAndRecovery",
+        "selectedUnknownMayDecideAfterCallerReturns", "cancelledCallerMayObserveAServiceDecisionLater"},
+}
+J28_FAULTS = ("before-dispatch", "candidate-preparation", "result-preparation", "sealed-before-publish",
+              "cas-ack-lost", "partial-materialization", "old-owner-resume", "cancel-after-cas", "after-commit")
+
 
 # One registry supplies the evidence contract to every validation stage.
 ALL_UNIT_MODULES = ("protocol", "spi", "core", "hbase", "grpc", "admin", "server")
 RUN_TASKS = {
+    "J28.2": {"go": J28_GO_REQUIRED_CASES, "integration": J28_INTEGRATION_CASES,
+              "units": J28_UNIT_CASES, "unit_modules": ALL_UNIT_MODULES},
     "J30": {"cases": PUT_CASES, "methods": ("etcdserverpb.KV/Put",) * len(PUT_CASES),
             "prefix": "", "scenario": "m3-put-v1", "suite": "m3-put.yaml", "compare": "--m3-put",
             "go": GO_REQUIRED_CASES, "integration": REQUIRED_CASES, "units": None},
@@ -559,6 +594,15 @@ def validate_go_report(path: Path, required_cases: dict = GO_REQUIRED_CASES) -> 
 
 def validate_run(root: Path, repository: Path = REPO) -> dict:
     run, source, task = validate_run_identity(root, repository)
+    if task == "J28.2":
+        validate_case_registry(read_json(repository / "testkit/cases/m3-cases.json"))
+        histories = validate_j28_histories(root, repository, source)
+        suites = validate_run_reports(root, task)
+        return {"phase": "M3", "tasks": [task], "scope": run["scope"], "run_id": run["run_id"],
+                "source_commit": source, "suites": suites, "history_cases": histories,
+                "limitations": ["history model covers the recorded no-Lease KV subset and revision, not member or raft headers",
+                                "internal replay uses the documented in-process loopback rather than target peer authentication",
+                                "public MiniCluster does not prove target authentication, network, HDFS or WAL failure behavior"]}
     prefix = validate_run_traces(root, repository, run, source, task)
     suites = validate_run_reports(root, task)
     compare_run_traces(root, repository, prefix, task)
@@ -581,6 +625,58 @@ def validate_run(root: Path, repository: Path = REPO) -> dict:
             "source_commit": source, "suites": suites,
             "trace_cases": list(RUN_TASKS[task]["cases"]),
             "limitations": limitations}
+
+
+def validate_j28_histories(root: Path, repository: Path, source: str) -> list[str]:
+    """Require source-bound real fixtures and independently recheck every saved history."""
+    expected = [(f"rpc-{layout}", layout, "none") for layout in
+                ("history-table.json", "native-cell-versions.json")]
+    expected += [(f"failover-{layout}-{fault}", layout, fault)
+                 for layout in ("history-table.json", "native-cell-versions.json") for fault in J28_FAULTS]
+    expected_files = {f"{name}-history.json" for name, _, _ in expected}
+    found_files = {path.name for pattern in ("rpc-*-history.json", "failover-*-history.json") for path in root.glob(pattern)}
+    if found_files != expected_files:
+        raise ValueError("J28.2 history set is incomplete or contains an unexpected case")
+    for name, layout, fault in expected:
+        history_path = root / f"{name}-history.json"
+        history = read_json(history_path)
+        fixture = read_json(root / f"{name}-fixture.json")
+        if (history.get("restart_mode") != fault or fixture.get("layout") != layout
+                or fixture.get("fault") != fault or fixture.get("source_commit") != source
+                or fixture.get("scope") != "public-local-minicluster"
+                or fixture.get("authentication") != "simple-development"):
+            raise ValueError("J28.2 fixture provenance or fault mode is invalid")
+        if fault != "none":
+            validate_j28_failover_fixture(fixture, fault)
+        subprocess.run([str(repository / "scripts/dev/go-program.sh"), "m3history", "--check-evidence",
+                        str(history_path)], cwd=repository, check=True, stdout=subprocess.DEVNULL)
+    return [name for name, _, _ in expected]
+
+
+def validate_j28_failover_fixture(fixture: dict, fault: str) -> None:
+    first, second = fixture.get("first_pid"), fixture.get("second_pid")
+    old_epoch, new_epoch = fixture.get("first_epoch"), fixture.get("second_epoch")
+    first_bucket, second_bucket = fixture.get("first_bucket"), fixture.get("second_bucket")
+    if (any(type(value) is not int for value in (first, second, old_epoch, new_epoch, first_bucket, second_bucket))
+            or first <= 0 or old_epoch <= 0 or not 0 <= first_bucket < 4096
+            or not 0 <= second_bucket < 4096 or first_bucket == second_bucket
+            or fixture.get("hbase_control_survived") is not True):
+        raise ValueError("J28.2 process, epoch, bucket or HBase evidence is invalid")
+    if fault == "cancel-after-cas":
+        values = [fixture.get(key) for key in ("baseline_allocated", "baseline_reserved", "held_allocated", "held_reserved")]
+        if (second != 0 or new_epoch != old_epoch or fixture.get("resources_drained") is not True
+                or any(type(value) is not int or value < 0 for value in values)
+                or not (values[2] > values[0] or values[3] > values[1])):
+            raise ValueError("J28.2 cancellation ownership or cleanup evidence is invalid")
+    elif second <= 0 or second == first or new_epoch <= old_epoch:
+        raise ValueError("J28.2 owner takeover evidence is invalid")
+    selected = fault in {"cas-ack-lost", "partial-materialization", "old-owner-resume", "cancel-after-cas"}
+    if fixture.get("selected_before_recovery") is not selected:
+        raise ValueError("J28.2 publication evidence does not match its fault")
+    if fixture.get("partial_rows") != ("one" if fault == "partial-materialization" else "not-checked"):
+        raise ValueError("J28.2 physical materialization evidence is invalid")
+    if fault == "old-owner-resume" and fixture.get("old_owner_resumed_and_drained") is not True:
+        raise ValueError("J28.2 stale-owner drain evidence is missing")
 
 
 def validate_run_identity(root: Path, repository: Path) -> tuple[dict, str, str]:
