@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 
 /** Bounded materialized results. Runtime activation and identity lifecycle are separate gates. */
@@ -137,27 +138,47 @@ final class RangeResultCache implements AutoCloseable {
     Objects.requireNonNull(key, "key");
     Objects.requireNonNull(result, "result");
     if (closed || !ownerLease.isActive()) return false;
-    if (!exhausted || result.size() > maximumRecords || count < 0
-        || key.sort().target() != 0 || key.sort().order() < 0 || key.sort().order() > 2
-        || key.countOnly() && key.kind() != KeyRange.Kind.POINT && key.limit() != 1
-        || !key.countOnly() && key.limit() > 0 && result.size() > key.limit()
-        || key.countOnly() && (!result.isEmpty() || count > 1)
-        || !key.countOnly() && count != result.size()) return false;
+    OptionalLong size = admittedBytes(key, result, count, exhausted);
+    if (size.isEmpty()) return false;
+    return retain(key, result, count, baseline, size.orElseThrow());
+  }
+
+  private OptionalLong admittedBytes(Key key, List<StoredRecord> result, long count, boolean exhausted) {
+    if (!eligibleResult(key, result, count, exhausted)) return OptionalLong.empty();
     long bytes = key.retainedBytes();
     ByteKey previous = null;
     for (StoredRecord record : result) {
       Objects.requireNonNull(record, "record");
-      if (!key.contains(record.key()) || record.metadata().state() != StorageMetadata.State.LIVE
-          || record.metadata().modificationRevision() > key.targetRevision()
-          || !key.filter().matches(record.metadata())
-          || key.keysOnly() && record.hasValue() || !key.keysOnly() && !record.hasValue()
-          || previous != null && (key.sort().order() == 2
-              ? previous.compareTo(record.key()) <= 0 : previous.compareTo(record.key()) >= 0)) return false;
+      if (!eligibleRecord(key, record, previous)) return OptionalLong.empty();
       previous = record.key();
       try { bytes = Math.addExact(bytes, record.retainedBytes()); }
-      catch (ArithmeticException overflow) { return false; }
-      if (bytes > maximumBytes) return false;
+      catch (ArithmeticException overflow) { return OptionalLong.empty(); }
+      if (bytes > maximumBytes) return OptionalLong.empty();
     }
+    return OptionalLong.of(bytes);
+  }
+
+  private boolean eligibleResult(Key key, List<StoredRecord> result, long count, boolean exhausted) {
+    if (!exhausted || result.size() > maximumRecords || count < 0) return false;
+    if (key.sort().target() != 0 || key.sort().order() < 0 || key.sort().order() > 2) return false;
+    if (key.countOnly()) {
+      return (key.kind() == KeyRange.Kind.POINT || key.limit() == 1)
+          && result.isEmpty() && count <= 1;
+    }
+    return (key.limit() <= 0 || result.size() <= key.limit()) && count == result.size();
+  }
+
+  private boolean eligibleRecord(Key key, StoredRecord record, ByteKey previous) {
+    if (!key.contains(record.key()) || record.metadata().state() != StorageMetadata.State.LIVE
+        || record.metadata().modificationRevision() > key.targetRevision()
+        || !key.filter().matches(record.metadata())) return false;
+    if (key.keysOnly() == record.hasValue()) return false;
+    return previous == null || (key.sort().order() == 2
+        ? previous.compareTo(record.key()) > 0 : previous.compareTo(record.key()) < 0);
+  }
+
+  private boolean retain(Key key, List<StoredRecord> result, long count,
+      Optional<UnchangedRangeProof.Baseline> baseline, long bytes) {
     // LinkedHashMap does not shrink its backing array after eviction. Continue charging its
     // peak capacity until the map itself is discarded, even when few entries remain.
     if (bytes > maximumBytes - indexBytes(peakEntries)) return false;
@@ -237,20 +258,53 @@ final class RangeResultCache implements AutoCloseable {
       saved.hit().close();
       return CompletableFuture.failedFuture(failure);
     }
-    var outcome = new CompletableFuture<Optional<Hit>>();
-    var exposed = outcome.copy();
-    outcome.thenAccept(found -> exposed.whenComplete((delivered, failure) -> {
-      if (found.isPresent() && (delivered == null || delivered.orElse(null) != found.orElseThrow())) {
-        found.orElseThrow().close();
-      }
-    }));
-    exposed.whenComplete((ignored, failure) -> {
-      if (exposed.isCancelled()) {
-        proof.cancel(true);
-        saved.hit().close();
-      }
-    });
-    proof.whenComplete((verdict, failure) -> {
+    return new ProofDelivery(saved, scope, account, session, target, command, key).start(proof);
+  }
+
+  /** Owns the retained hit until it is delivered, cancelled, or rejected by the current view. */
+  private final class ProofDelivery {
+    private final Candidate saved;
+    private final RequestScope scope;
+    private final BudgetManager.Account account;
+    private final TxnReadSession session;
+    private final long target;
+    private final RangeCommand command;
+    private final Key key;
+    private final CompletableFuture<Optional<Hit>> outcome = new CompletableFuture<>();
+    private final CompletableFuture<Optional<Hit>> exposed = outcome.copy();
+
+    private ProofDelivery(Candidate saved, RequestScope scope, BudgetManager.Account account,
+        TxnReadSession session, long target, RangeCommand command, Key key) {
+      this.saved = saved;
+      this.scope = scope;
+      this.account = account;
+      this.session = session;
+      this.target = target;
+      this.command = command;
+      this.key = key;
+    }
+
+    private CompletableFuture<Optional<Hit>> start(CompletableFuture<UnchangedRangeProof.Verdict> proof) {
+      outcome.thenAccept(this::closeUndeliveredHit);
+      exposed.whenComplete((ignored, failure) -> {
+        if (exposed.isCancelled()) {
+          proof.cancel(true);
+          saved.hit().close();
+        }
+      });
+      proof.whenComplete(this::completeProof);
+      return exposed;
+    }
+
+    private void closeUndeliveredHit(Optional<Hit> found) {
+      exposed.whenComplete((delivered, failure) -> {
+        if (found.isPresent() && (delivered == null || delivered.orElse(null) != found.orElseThrow())) {
+          found.orElseThrow().close();
+        }
+      });
+    }
+
+    private void completeProof(UnchangedRangeProof.Verdict verdict, Throwable failure) {
       boolean valid = false;
       try {
         if (scope.isClosed() || scope.isDeadlineExceeded()) {
@@ -264,7 +318,7 @@ final class RangeResultCache implements AutoCloseable {
         if (failure == null && verdict == UnchangedRangeProof.Verdict.UNCHANGED
             && isOpen() && account.isActive() && !scope.isClosed() && !scope.isDeadlineExceeded()) {
           ReadView stillPinned = session.protectedView(target);
-          valid = Key.from(tableGroupId, storageProfile, stillPinned, command).equals(key);
+          valid = Key.from(key.tableGroupId(), key.storageProfile(), stillPinned, command).equals(key);
         }
         if (valid) outcome.complete(Optional.of(saved.hit()));
         else {
@@ -277,8 +331,7 @@ final class RangeResultCache implements AutoCloseable {
         outcome.completeExceptionally(problem);
         if (problem instanceof Error fatal) throw fatal;
       }
-    });
-    return exposed;
+    }
   }
 
   private synchronized Optional<Candidate> olderCandidate(Key current, int maximumEntriesExamined,

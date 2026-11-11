@@ -12,18 +12,28 @@ spec.loader.exec_module(report)
 
 
 class ProofReportTest(unittest.TestCase):
+    def write_required_reports(self, root):
+        for required, kind in ((report.UNITS, 'surefire-reports'), (report.INTEGRATION, 'failsafe-reports')):
+            for suite, cases in required.items():
+                self.write_suite(root, kind, suite, cases)
+
+    def write_suite(self, root, kind, suite, cases):
+        module = 'core'
+        if '.hbase.' in suite:
+            module = 'hbase'
+        elif '.server.' in suite:
+            module = 'server'
+        target = root / module / 'target' / kind
+        target.mkdir(parents=True, exist_ok=True)
+        xml = ET.Element('testsuite', name=suite, tests=str(len(cases)), failures='0', errors='0', skipped='0')
+        for name in sorted(cases):
+            ET.SubElement(xml, 'testcase', name=name)
+        ET.ElementTree(xml).write(target / f'TEST-{suite}.xml')
+
     def test_missing_or_skipped_component_test_is_not_a_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for required, kind in ((report.UNITS, 'surefire-reports'), (report.INTEGRATION, 'failsafe-reports')):
-                for suite, cases in required.items():
-                    module = 'hbase' if '.hbase.' in suite else 'server' if '.server.' in suite else 'core'
-                    target = root / module / 'target' / kind
-                    target.mkdir(parents=True, exist_ok=True)
-                    xml = ET.Element('testsuite', name=suite, tests=str(len(cases)), failures='0', errors='0', skipped='0')
-                    for name in sorted(cases):
-                        ET.SubElement(xml, 'testcase', name=name)
-                    ET.ElementTree(xml).write(target / f'TEST-{suite}.xml')
+            self.write_required_reports(root)
             self.assertEqual(len(report.UNITS) + len(report.INTEGRATION), len(report.validate_reports(root)))
             path = root / 'server/target/failsafe-reports/TEST-io.etcdhbase.server.M3CacheProofIT.xml'
             original = path.read_text()

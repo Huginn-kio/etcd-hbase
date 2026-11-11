@@ -41,44 +41,53 @@ class M3CacheRuntimeIT {
   void serviceOwnsCacheAndPreservesCurrentBarriersOnBothLayouts() throws Exception {
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
       for (String file : List.of("history-table.json", "native-cell-versions.json")) {
-        var plan = M3TableGroupRuntimeIT.plan(file,
-            cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
-        var authentication = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
-        try (var provider = new HBaseBackendIdentityProvider(plan.source().identityProviderId(), authentication,
-                 cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
-                 (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
-                 1, 1, Duration.ofSeconds(30));
-             var credentials = new BackendCredentials("m3-cache-runtime-fixture", new char[0])) {
-          var identity = provider.authenticate(credentials, authentication).toCompletableFuture().get(30, TimeUnit.SECONDS);
-          M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider,
-              new SnapshotPinConfiguration(2, 16, Duration.ofSeconds(60)));
-          var limit = new BudgetManager.Limits(10, 10, 16, 8, 16, 4L << 20, 512L << 20);
-          var budgets = new BudgetManager(limit, Map.of(plan.source().tableGroupId(), limit), limit);
-          try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
-            io.etcdhbase.server.commit.M3TableGroupRuntime runtime;
-            try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
-              runtime = M3CacheRuntimeTestAccess.open(plan, M3TableGroupRuntimeIT.activation("1"),
-                  RESOURCES, provider, identity, budgets, scans, startup);
-            }
-            try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
-                "m3-cache", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
-              assertSecondRuntimeIsRejected(cluster, file, plan.source().namespace());
-              var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListener().port()).usePlaintext().build();
-              try {
-                exerciseCache(KVGrpc.newBlockingStub(channel).withDeadlineAfter(90, TimeUnit.SECONDS), runtime);
-              } finally {
-                channel.shutdownNow();
-                assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
-              }
-            } finally {
-              runtime.close();
-              runtime.drained().get(30, TimeUnit.SECONDS);
-            }
-          }
-          assertEquals(0, budgets.snapshot().reservedBytes());
-          assertEquals(0, budgets.snapshot().allocatedBytes());
+        exerciseLayout(cluster, file);
+      }
+    }
+  }
+
+  private void exerciseLayout(TemporaryHBaseClusterProcess cluster, String file) throws Exception {
+    var plan = M3TableGroupRuntimeIT.plan(file,
+        cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1));
+    var authentication = new AuthenticationScope(plan.source().tableGroupId(), plan.source().hbaseProfile().id());
+    try (var provider = new HBaseBackendIdentityProvider(plan.source().identityProviderId(), authentication,
+             cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+             (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+             1, 1, Duration.ofSeconds(30));
+         var credentials = new BackendCredentials("m3-cache-runtime-fixture", new char[0])) {
+      var identity = provider.authenticate(credentials, authentication).toCompletableFuture().get(30, TimeUnit.SECONDS);
+      M3TableGroupInitializer.initializeFresh(plan, "sha256:" + plan.source().fingerprint(), identity, provider,
+          new SnapshotPinConfiguration(2, 16, Duration.ofSeconds(60)));
+      var limit = new BudgetManager.Limits(10, 10, 16, 8, 16, 4L << 20, 512L << 20);
+      var budgets = new BudgetManager(limit, Map.of(plan.source().tableGroupId(), limit), limit);
+      try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30))) {
+        io.etcdhbase.server.commit.M3TableGroupRuntime runtime;
+        try (var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+          runtime = M3CacheRuntimeTestAccess.open(plan, M3TableGroupRuntimeIT.activation("1"),
+              RESOURCES, provider, identity, budgets, scans, startup);
+        }
+        try (var server = Bootstrap.startConfigured(new RuntimeConfiguration.Listener(
+            "m3-cache", "127.0.0.1", 0, plan.source().tableGroupId()), RESOURCES, runtime.kvService())) {
+          assertSecondRuntimeIsRejected(cluster, file, plan.source().namespace());
+          exerciseThroughChannel(server.boundListener().port(), runtime);
+        } finally {
+          runtime.close();
+          runtime.drained().get(30, TimeUnit.SECONDS);
         }
       }
+      assertEquals(0, budgets.snapshot().reservedBytes());
+      assertEquals(0, budgets.snapshot().allocatedBytes());
+    }
+  }
+
+  private static void exerciseThroughChannel(int port,
+      io.etcdhbase.server.commit.M3TableGroupRuntime runtime) throws Exception {
+    var channel = NettyChannelBuilder.forAddress("127.0.0.1", port).usePlaintext().build();
+    try {
+      exerciseCache(KVGrpc.newBlockingStub(channel).withDeadlineAfter(90, TimeUnit.SECONDS), runtime);
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
     }
   }
 

@@ -1086,71 +1086,89 @@ class ReadViewRecordStoreTest {
         0, 0, new RangeCommand.Sort(0, 0), filter, false, false, false);
     var standaloneTxn = new TxnCommand(List.of(), List.of(new TxnCommand.Range(standalone)), List.of());
     try (RequestScope ownerScope = RequestScope.withTimeout(Duration.ofSeconds(10)); var cache = new CacheAdmissionTestSupport(budget, ownerScope)) {
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation);
-           var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-        var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
-        var ordinary = evaluator.evaluate(standaloneTxn, Optional.empty()).join().finishReadOnly().join();
-        assertFalse(cache.admit(ordinary, scope, digest(7)), "ordinary results have no cache admission proof");
-      }
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation);
-           var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-        var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
-        var validated = cache.finish(evaluator.evaluate(standaloneTxn, Optional.empty()).join()).join();
-        assertTrue(cache.admit(validated, scope, digest(7)));
-      }
-      int physicalReads = fixture.physical.getCalls.get();
-      int barriers = fixture.control.reads.get();
-      int pinCompletions = fixture.pinCompletions.get();
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation)) {
-        var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-            new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-        assertEquals(1, cache.lookup(session, standalone, digest(7), account, scope));
-        assertTrue(fixture.control.reads.get() > barriers, "every cache lookup needs a fresh barrier");
-        assertEquals(pinCompletions + 1, fixture.pinCompletions.get());
-        assertEquals(physicalReads, fixture.physical.getCalls.get());
-      }
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation)) {
-        var session = TxnReadSession.open(fixture.views, List.of(), digest(8), fixture.physical,
-            new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-        assertEquals(-1, cache.lookup(session, standalone, digest(7), account, scope));
-        try (var direct = new DirectRecordReader(session.reader(0), account, 4096)
-            .readForPreparation(key("alpha"), session.currentRevision(), ReadProjection.FULL).join()) {
-          assertEquals("one", new String(direct.record().orElseThrow().value().orElseThrow()));
-        }
-        session.finish().join();
-      }
-      var partial = new RangeCommand(KeyRange.all(), RangeCommand.Context.STANDALONE,
-          0, 1, new RangeCommand.Sort(0, 0), filter, false, false, false);
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation);
-           var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-        var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
-        var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(partial)), List.of());
-        var validated = cache.finish(evaluator.evaluate(command, Optional.empty()).join()).join();
-        assertFalse(cache.admit(validated, scope, digest(7)), "partial ranges cannot become complete entries");
-      }
-      var beta = new RangeCommand(KeyRange.point(key("beta")), RangeCommand.Context.STANDALONE,
-          0, 0, new RangeCommand.Sort(0, 0), filter, false, false, false);
-      fixture.pinCompletion = new CompletableFuture<>();
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation);
-           var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
-        var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
-        var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(beta)), List.of());
-        var pending = cache.finish(evaluator.evaluate(command, Optional.empty()).join());
-        assertFalse(pending.isDone());
-        fixture.pinCompletion.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-        assertThrows(CompletionException.class, pending::join);
-        scope.cleanupCompletion().toCompletableFuture().join();
-      }
-      fixture.pinCompletion = CompletableFuture.completedFuture(null);
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation)) {
-        var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-            new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-        assertEquals(-1, cache.lookup(session, beta, digest(7), account, scope),
-            "a failed pin completion must never create a cache entry");
-        session.finish().join();
-      }
+      verifyValidatedAdmission(fixture, budget, reservation, standaloneTxn, cache);
+      verifyFreshBarrierAndIdentity(fixture, budget, reservation, standalone, cache);
+      verifyPartialAndFailedPinAreNotAdmitted(fixture, budget, reservation, filter, cache);
     }
     assertEquals(0, budget.snapshot().allocatedBytes());
+  }
+
+  private static void verifyPartialAndFailedPinAreNotAdmitted(Fixture fixture, BudgetManager budget,
+      BudgetManager.Reservation reservation, RangeCommand.RevisionFilter filter,
+      CacheAdmissionTestSupport cache) throws Exception {
+    var partial = new RangeCommand(KeyRange.all(), RangeCommand.Context.STANDALONE,
+        0, 1, new RangeCommand.Sort(0, 0), filter, false, false, false);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
+      var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(partial)), List.of());
+      var validated = cache.finish(evaluator.evaluate(command, Optional.empty()).join()).join();
+      assertFalse(cache.admit(validated, scope, digest(7)), "partial ranges cannot become complete entries");
+    }
+    var beta = new RangeCommand(KeyRange.point(key("beta")), RangeCommand.Context.STANDALONE,
+        0, 0, new RangeCommand.Sort(0, 0), filter, false, false, false);
+    fixture.pinCompletion = new CompletableFuture<>();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
+      var command = new TxnCommand(List.of(), List.of(new TxnCommand.Range(beta)), List.of());
+      var pending = cache.finish(evaluator.evaluate(command, Optional.empty()).join());
+      assertFalse(pending.isDone());
+      fixture.pinCompletion.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      assertThrows(CompletionException.class, pending::join);
+      scope.cleanupCompletion().toCompletableFuture().join();
+    }
+    fixture.pinCompletion = CompletableFuture.completedFuture(null);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation)) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      assertEquals(-1, cache.lookup(session, beta, digest(7), account, scope),
+          "a failed pin completion must never create a cache entry");
+      session.finish().join();
+    }
+  }
+
+  private static void verifyFreshBarrierAndIdentity(Fixture fixture, BudgetManager budget,
+      BudgetManager.Reservation reservation, RangeCommand standalone,
+      CacheAdmissionTestSupport cache) throws Exception {
+    int physicalReads = fixture.physical.getCalls.get();
+    int barriers = fixture.control.reads.get();
+    int pinCompletions = fixture.pinCompletions.get();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation)) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      assertEquals(1, cache.lookup(session, standalone, digest(7), account, scope));
+      assertTrue(fixture.control.reads.get() > barriers, "every cache lookup needs a fresh barrier");
+      assertEquals(pinCompletions + 1, fixture.pinCompletions.get());
+      assertEquals(physicalReads, fixture.physical.getCalls.get());
+    }
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation)) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(8), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      assertEquals(-1, cache.lookup(session, standalone, digest(7), account, scope));
+      try (var direct = new DirectRecordReader(session.reader(0), account, 4096)
+          .readForPreparation(key("alpha"), session.currentRevision(), ReadProjection.FULL).join()) {
+        assertEquals("one", new String(direct.record().orElseThrow().value().orElseThrow()));
+      }
+      session.finish().join();
+    }
+  }
+
+  private static void verifyValidatedAdmission(Fixture fixture, BudgetManager budget,
+      BudgetManager.Reservation reservation, TxnCommand standaloneTxn,
+      CacheAdmissionTestSupport cache) throws Exception {
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
+      var ordinary = evaluator.evaluate(standaloneTxn, Optional.empty()).join().finishReadOnly().join();
+      assertFalse(cache.admit(ordinary, scope, digest(7)), "ordinary results have no cache admission proof");
+    }
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10)); var account = budget.admit("public", scope, reservation);
+         var scheduler = new ScanScheduler(budget, Duration.ofSeconds(5))) {
+      var evaluator = readRangeEvaluator(fixture, scheduler, account, scope, 16384);
+      var validated = cache.finish(evaluator.evaluate(standaloneTxn, Optional.empty()).join()).join();
+      assertTrue(cache.admit(validated, scope, digest(7)));
+    }
   }
 
   @Test
@@ -1192,15 +1210,30 @@ class ReadViewRecordStoreTest {
 
   @Test
   void cacheReuseAcrossBarriersRequiresCoverageAndOtherwiseFallsBackToDirectRead() throws Exception {
-    assertCacheProofScenario(false, false, false, false);
-    assertCacheProofScenario(true, false, false, false);
-    assertCacheProofScenario(true, true, false, false);
-    assertCacheProofScenario(true, false, true, false);
-    assertCacheProofScenario(false, false, false, true);
+    for (ProofScenario scenario : ProofScenario.values()) assertCacheProofScenario(scenario);
   }
 
-  private static void assertCacheProofScenario(boolean changed, boolean missingDecision,
-      boolean exhaustProofBudget, boolean failPinCompletion) throws Exception {
+  private enum ProofScenario {
+    UNRELATED_WRITE(false, false, false, false),
+    MATCHING_WRITE(true, false, false, false),
+    MISSING_DECISION(true, true, false, false),
+    EXHAUSTED_BUDGET(true, false, true, false),
+    FAILED_PIN(false, false, false, true);
+
+    final boolean changed;
+    final boolean missingDecision;
+    final boolean exhaustProofBudget;
+    final boolean failPinCompletion;
+
+    ProofScenario(boolean changed, boolean missingDecision, boolean exhaustProofBudget, boolean failPinCompletion) {
+      this.changed = changed;
+      this.missingDecision = missingDecision;
+      this.exhaustProofBudget = exhaustProofBudget;
+      this.failPinCompletion = failPinCompletion;
+    }
+  }
+
+  private static void assertCacheProofScenario(ProofScenario scenario) throws Exception {
     Fixture fixture = new Fixture(1, List.of(
         candidate("delta", 1, 2, 2, StorageMetadata.State.LIVE, bytes("selected"))));
     fixture.control.state = fixture.control.state.finalizePublication(fixture.transactionId);
@@ -1208,8 +1241,6 @@ class ReadViewRecordStoreTest {
     var limits = new BudgetManager.Limits(8, 32, 2, 2, 2, 1_000_000, 512L << 20);
     var budget = new BudgetManager(limits, Map.of("public", limits), limits);
     var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
-    var proofReservation = new BudgetManager.Reservation(8192, 8192, 256L << 20, 8192, 8192);
-    var proofLimits = new BudgetManager.ReadLimits(1000, 4L << 30, 1000, 1000, 1000);
     var command = new RangeCommand(KeyRange.point(key("alpha")), RangeCommand.Context.STANDALONE,
         0, 0, new RangeCommand.Sort(0, 0), new RangeCommand.RevisionFilter(0, 0, 0, 0),
         false, false, false);
@@ -1224,7 +1255,7 @@ class ReadViewRecordStoreTest {
         assertTrue(cache.admit(validated, scope, digest(7)));
       }
       var transaction = TransactionId.create();
-      var changedRecord = live(changed ? "alpha" : "beta", 3, 3, 1, 0, "new");
+      var changedRecord = live(scenario.changed ? "alpha" : "beta", 3, 3, 1, 0, "new");
       var prepared = new PreparedCandidate(transaction, 1, 1, 2, changedRecord);
       var page = ManifestPage.create(transaction, 0, List.of(ManifestCandidateReference.from(prepared, 0)));
       var root = ManifestRoot.create(transaction, 1, 1, 2, 1,
@@ -1234,7 +1265,7 @@ class ReadViewRecordStoreTest {
           root.systemIdentity(), root.digest(), true);
       var decisions = new CommitDecisionRepository() {
         @Override public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope scope) {
-          return CompletableFuture.completedFuture(missingDecision ? Optional.empty() : Optional.of(decision));
+          return CompletableFuture.completedFuture(scenario.missingDecision ? Optional.empty() : Optional.of(decision));
         }
         @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
             CommitDecision ignored, RequestScope scope) { throw new UnsupportedOperationException(); }
@@ -1243,40 +1274,60 @@ class ReadViewRecordStoreTest {
       fixture.control.state = CommitState.restore(previous.profileFingerprint(), previous.ownerInstance(),
           previous.ownerEpoch(), previous.ownerLeaseDeadlineEpochMillis(), previous.stateVersion() + 1,
           2, 3, 2, 3, Optional.empty(), 0);
-      if (changed) fixture.physical.add(live("alpha", 3, 3, 1, 0, "new"));
+      if (scenario.changed) fixture.physical.add(live("alpha", 3, 3, 1, 0, "new"));
       int physicalReads = fixture.physical.getCalls.get();
-      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
-           RequestScope proofScope = RequestScope.withTimeout(Duration.ofSeconds(10));
-           var account = budget.admit("public", scope, reservation);
-           var proofAccount = budget.admit("public", proofScope, proofReservation, proofLimits)) {
-        var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
-            new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
-        var prover = new UnchangedRangeProof(decisions, new ManifestCatalog(repository), 1, 8, 8192, ignored -> 0);
-        var proofBudget = new ManifestCatalog.ProofReadBudget(proofScope, proofAccount, 8,
-            exhaustProofBudget ? 1 : 512L << 20);
-        if (failPinCompletion) {
-          fixture.pinCompletion = CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-          assertThrows(CompletionException.class,
-              () -> cache.lookupWithProof(session, command, digest(7), prover, proofBudget, account, scope));
+      verifyProofLookup(new ProofLookupContext(fixture, budget, cache, command, scenario,
+          decisions, repository, physicalReads));
+    }
+    assertEquals(0, budget.snapshot().allocatedBytes());
+  }
+
+  private record ProofLookupContext(Fixture fixture, BudgetManager budget, CacheAdmissionTestSupport cache,
+      RangeCommand command, ProofScenario scenario, CommitDecisionRepository decisions,
+      MemoryManifestRepository repository, int physicalReads) {}
+
+  private static void verifyProofLookup(ProofLookupContext context) throws Exception {
+    var fixture = context.fixture();
+    var budget = context.budget();
+    var cache = context.cache();
+    var command = context.command();
+    var scenario = context.scenario();
+    var decisions = context.decisions();
+    var repository = context.repository();
+    int physicalReads = context.physicalReads();
+    var reservation = new BudgetManager.Reservation(8192, 8192, 8192, 65536, 131072);
+    var proofReservation = new BudgetManager.Reservation(8192, 8192, 256L << 20, 8192, 8192);
+    var proofLimits = new BudgetManager.ReadLimits(1000, 4L << 30, 1000, 1000, 1000);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         RequestScope proofScope = RequestScope.withTimeout(Duration.ofSeconds(10));
+         var account = budget.admit("public", scope, reservation);
+         var proofAccount = budget.admit("public", proofScope, proofReservation, proofLimits)) {
+      var session = TxnReadSession.open(fixture.views, List.of(), digest(9), fixture.physical,
+          new ManifestCatalog(fixture.repository), ignored -> 0, 1, scope).join();
+      var prover = new UnchangedRangeProof(decisions, new ManifestCatalog(repository), 1, 8, 8192, ignored -> 0);
+      var proofBudget = new ManifestCatalog.ProofReadBudget(proofScope, proofAccount, 8,
+          scenario.exhaustProofBudget ? 1 : 512L << 20);
+      if (scenario.failPinCompletion) {
+        fixture.pinCompletion = CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        assertThrows(CompletionException.class,
+            () -> cache.lookupWithProof(session, command, digest(7), prover, proofBudget, account, scope));
+        assertEquals(physicalReads, fixture.physical.getCalls.get());
+      } else {
+        var cached = cache.lookupWithProof(session, command, digest(7), prover, proofBudget, account, scope);
+        if (!scenario.changed && !scenario.missingDecision && !scenario.exhaustProofBudget) {
+          assertEquals("old", cached.orElseThrow());
           assertEquals(physicalReads, fixture.physical.getCalls.get());
         } else {
-          var cached = cache.lookupWithProof(session, command, digest(7), prover, proofBudget, account, scope);
-          if (!changed && !missingDecision && !exhaustProofBudget) {
-            assertEquals("old", cached.orElseThrow());
-            assertEquals(physicalReads, fixture.physical.getCalls.get());
-          } else {
-            assertTrue(cached.isEmpty());
-            try (var direct = new DirectRecordReader(session.reader(0), account, 4096)
-                .readForPreparation(key("alpha"), session.currentRevision(), ReadProjection.FULL).join()) {
-              assertEquals("new", new String(direct.record().orElseThrow().value().orElseThrow()));
-            }
-            session.finish().join();
-            assertEquals(physicalReads + 1, fixture.physical.getCalls.get());
+          assertTrue(cached.isEmpty());
+          try (var direct = new DirectRecordReader(session.reader(0), account, 4096)
+              .readForPreparation(key("alpha"), session.currentRevision(), ReadProjection.FULL).join()) {
+            assertEquals("new", new String(direct.record().orElseThrow().value().orElseThrow()));
           }
+          session.finish().join();
+          assertEquals(physicalReads + 1, fixture.physical.getCalls.get());
         }
       }
     }
-    assertEquals(0, budget.snapshot().allocatedBytes());
   }
 
   @Test

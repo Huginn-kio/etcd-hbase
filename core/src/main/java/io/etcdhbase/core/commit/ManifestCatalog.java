@@ -69,45 +69,60 @@ public final class ManifestCatalog {
       BudgetManager.Lease lease;
       try { lease = retainPage(maximumBytes); }
       catch (BackendFailure | RuntimeException failure) { return CompletableFuture.failedFuture(failure); }
-      var released = new CompletableFuture<Void>();
-      RequestScope.ScopedCleanup registration;
-      try {
-        registration = scope.registerScopedCleanup(() -> {
-          Runnable release = () -> {
-            try {
-              lease.close();
-              released.complete(null);
-            } catch (RuntimeException | Error failure) {
-              released.completeExceptionally(failure);
-              throw failure;
-            }
-          };
-          if (scope.isClosed()) scope.physicalProducersCompletion().whenComplete((ignored, failure) -> release.run());
-          else release.run();
-        }, released);
-      } catch (RuntimeException | Error failure) {
-        try { lease.close(); }
-        catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-        return CompletableFuture.failedFuture(failure);
+      return new ProofPageRead<T>(lease).start(work);
+    }
+
+    /** Owns one admitted page until its producer and cleanup have both settled. */
+    private final class ProofPageRead<T> {
+      private final BudgetManager.Lease lease;
+      private final CompletableFuture<Void> released = new CompletableFuture<>();
+      private RequestScope.ScopedCleanup registration;
+
+      private ProofPageRead(BudgetManager.Lease lease) { this.lease = lease; }
+
+      private CompletableFuture<T> start(Supplier<CompletableFuture<T>> work) {
+        try {
+          registration = scope.registerScopedCleanup(this::releaseAfterProducers, released);
+        } catch (RuntimeException | Error failure) {
+          try { lease.close(); }
+          catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+          return CompletableFuture.failedFuture(failure);
+        }
+        if (scope.isClosed() || scope.isDeadlineExceeded()) {
+          var failure = new BackendFailure(scope.isDeadlineExceeded()
+              ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+          try { registration.close(); }
+          catch (Exception | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+          return CompletableFuture.failedFuture(failure);
+        }
+        CompletableFuture<T> operation;
+        try { operation = Objects.requireNonNull(work.get(), "proof metadata read"); }
+        catch (RuntimeException | Error failure) {
+          try { registration.close(); }
+          catch (Exception | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+          return CompletableFuture.failedFuture(failure);
+        }
+        return operation.whenComplete((ignored, failure) -> {
+          try { registration.close(); }
+          catch (Exception cleanup) { throw new java.util.concurrent.CompletionException(cleanup); }
+        });
       }
-      if (scope.isClosed() || scope.isDeadlineExceeded()) {
-        var failure = new BackendFailure(scope.isDeadlineExceeded()
-            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
-        try { registration.close(); }
-        catch (Exception | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-        return CompletableFuture.failedFuture(failure);
+
+      private void releaseAfterProducers() {
+        Runnable release = this::releasePage;
+        if (scope.isClosed()) scope.physicalProducersCompletion().whenComplete((ignored, failure) -> release.run());
+        else release.run();
       }
-      CompletableFuture<T> operation;
-      try { operation = Objects.requireNonNull(work.get(), "proof metadata read"); }
-      catch (RuntimeException | Error failure) {
-        try { registration.close(); }
-        catch (Exception | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-        return CompletableFuture.failedFuture(failure);
+
+      private void releasePage() {
+        try {
+          lease.close();
+          released.complete(null);
+        } catch (RuntimeException | Error failure) {
+          released.completeExceptionally(failure);
+          throw failure;
+        }
       }
-      return operation.whenComplete((ignored, failure) -> {
-        try { registration.close(); }
-        catch (Exception cleanup) { throw new java.util.concurrent.CompletionException(cleanup); }
-      });
     }
   }
   /** Maximum retained candidate payload fetched for one range slice, independent of result bytes. */

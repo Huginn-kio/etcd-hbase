@@ -194,16 +194,19 @@ class SecureHBaseAuthenticationIT {
       try {
         await(connection.getTable(table).get(get));
       } catch (ExecutionException failure) {
-        Throwable cause = failure;
-        while (cause != null) {
-          if (cause instanceof org.apache.hadoop.hbase.security.AccessDeniedException) return;
-          cause = cause.getCause();
-        }
+        if (isAccessDenied(failure)) return;
         throw failure;
       }
       Thread.sleep(50);
     }
     throw new IllegalStateException("revoked HBase permission remained effective");
+  }
+
+  private boolean isAccessDenied(Throwable failure) {
+    for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+      if (cause instanceof org.apache.hadoop.hbase.security.AccessDeniedException) return true;
+    }
+    return false;
   }
 
   @Test

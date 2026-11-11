@@ -38,21 +38,34 @@ public final class M3SecondReplicaProcess {
       var resources = new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000, 4 << 20, 4 << 20, 8, 0);
       try (var scans = new ScanScheduler(budgets, Duration.ofSeconds(30));
            var startup = RequestScope.withTimeout(Duration.ofSeconds(30))) {
-        try {
-          var unexpected = M3CacheRuntimeTestAccess.open(plan, M3TableGroupRuntimeIT.activation("2"),
-              resources, provider, identity, budgets, scans, startup);
-          try { throw new IllegalStateException("second runtime unexpectedly acquired an active owner"); }
-          finally { unexpected.close(); unexpected.drained().get(30, TimeUnit.SECONDS); }
-        } catch (M3TableGroupRuntime.StartupException failure) {
-          failure.cleanup().toCompletableFuture().get(30, TimeUnit.SECONDS);
-          if (!(failure.getCause() instanceof BackendFailure backend)
-              || backend.category() != BackendFailure.Category.UNAVAILABLE) throw failure;
-        }
+        expectOwnerRejection(() -> M3CacheRuntimeTestAccess.open(plan, M3TableGroupRuntimeIT.activation("2"),
+            resources, provider, identity, budgets, scans, startup));
       }
       if (budgets.snapshot().reservedBytes() != 0 || budgets.snapshot().allocatedBytes() != 0) {
         throw new IllegalStateException("second runtime did not release its resources");
       }
       System.out.println("m3-second-replica: active owner rejected; resources drained");
     }
+  }
+
+  @FunctionalInterface
+  private interface RuntimeOpen {
+    M3TableGroupRuntime open() throws Exception;
+  }
+
+  private static void expectOwnerRejection(RuntimeOpen opener) throws Exception {
+    try {
+      var unexpected = opener.open();
+      try { throw new IllegalStateException("second runtime unexpectedly acquired an active owner"); }
+      finally { unexpected.close(); unexpected.drained().get(30, TimeUnit.SECONDS); }
+    } catch (M3TableGroupRuntime.StartupException failure) {
+      verifyOwnerRejection(failure);
+    }
+  }
+
+  private static void verifyOwnerRejection(M3TableGroupRuntime.StartupException failure) throws Exception {
+    failure.cleanup().toCompletableFuture().get(30, TimeUnit.SECONDS);
+    if (!(failure.getCause() instanceof BackendFailure backend)
+        || backend.category() != BackendFailure.Category.UNAVAILABLE) throw failure;
   }
 }

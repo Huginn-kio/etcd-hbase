@@ -45,18 +45,40 @@ public final class M3CacheReaderProcess {
   private M3CacheReaderProcess() {}
 
   public static void main(String[] arguments) throws Exception {
-    if (arguments.length != 8) throw new IllegalArgumentException("invalid cache fixture arguments");
-    var configuration = HBaseConfiguration.create();
-    configuration.addResource(new org.apache.hadoop.fs.Path(Path.of(arguments[0]).toUri()));
-    var authentication = new AuthenticationScope(arguments[1], "public");
-    var salt = new HashSaltStrategy();
-    var system = new SystemTableBinding(TableName.valueOf(arguments[2]), new byte[] {'s'},
-        authentication.tableGroupId(), arguments[3], salt);
-    var primary = new StorageTableBinding(TableName.valueOf(arguments[5]), new byte[] {'d'},
-        StorageTableBinding.Layout.valueOf(arguments[4]), salt);
-    var current = arguments[6].equals("-") ? Optional.<StorageTableBinding>empty()
-        : Optional.of(new StorageTableBinding(TableName.valueOf(arguments[6]), new byte[] {'d'},
-            StorageTableBinding.Layout.CURRENT, salt));
+    var settings = ReaderSettings.parse(arguments);
+    var configuration = settings.configuration();
+    var authentication = settings.authentication();
+    var salt = settings.salt();
+    var system = settings.system();
+    var primary = settings.primary();
+    var current = settings.current();
+    runReader(settings.port(), configuration, authentication, salt, system, primary, current);
+  }
+
+  private record ReaderSettings(org.apache.hadoop.conf.Configuration configuration,
+      AuthenticationScope authentication, HashSaltStrategy salt, SystemTableBinding system,
+      StorageTableBinding primary, Optional<StorageTableBinding> current, int port) {
+    private static ReaderSettings parse(String[] arguments) {
+      if (arguments.length != 8) throw new IllegalArgumentException("invalid cache fixture arguments");
+      var configuration = HBaseConfiguration.create();
+      configuration.addResource(new org.apache.hadoop.fs.Path(Path.of(arguments[0]).toUri()));
+      var authentication = new AuthenticationScope(arguments[1], "public");
+      var salt = new HashSaltStrategy();
+      var system = new SystemTableBinding(TableName.valueOf(arguments[2]), new byte[] {'s'},
+          authentication.tableGroupId(), arguments[3], salt);
+      var primary = new StorageTableBinding(TableName.valueOf(arguments[5]), new byte[] {'d'},
+          StorageTableBinding.Layout.valueOf(arguments[4]), salt);
+      var current = arguments[6].equals("-") ? Optional.<StorageTableBinding>empty()
+          : Optional.of(new StorageTableBinding(TableName.valueOf(arguments[6]), new byte[] {'d'},
+              StorageTableBinding.Layout.CURRENT, salt));
+      return new ReaderSettings(configuration, authentication, salt, system, primary, current,
+          Integer.parseInt(arguments[7]));
+    }
+  }
+
+  private static void runReader(int port, org.apache.hadoop.conf.Configuration configuration,
+      AuthenticationScope authentication, HashSaltStrategy salt, SystemTableBinding system,
+      StorageTableBinding primary, Optional<StorageTableBinding> current) throws Exception {
     try (var provider = new HBaseBackendIdentityProvider("m3-cache-child", authentication,
             configuration, HBaseAuthenticators.simpleDevelopment(),
             (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
@@ -80,23 +102,29 @@ public final class M3CacheReaderProcess {
                8, 8, budget, authentication.tableGroupId(), owner, Optional.of(proofOptions));
            var scans = new ScanScheduler(budget, Duration.ofSeconds(10));
            var worker = Executors.newVirtualThreadPerTaskExecutor();
-           var socket = new Socket(InetAddress.getByName("127.0.0.1"), Integer.parseInt(arguments[7]));
+           var socket = new Socket(InetAddress.getByName("127.0.0.1"), port);
            var input = new DataInputStream(socket.getInputStream());
            var output = new DataOutputStream(socket.getOutputStream())) {
         var executor = new TxnReadExecutor(authentication.tableGroupId(), stores.views(), stores.manifests(),
             provider, primary, worker, scans, new TxnExecutionLimits(4096, 1L << 20, 1L << 20, 4096, 64),
             new RequestMetrics(), Optional.of(cache));
-        output.writeUTF("ready");
-        output.flush();
-        while (true) {
-          String command = input.readUTF();
-          if (command.equals("stop")) break;
-          respond(command, executor, identity, authentication.tableGroupId(), budget, cache, input, output);
-        }
+        serve(executor, identity, authentication.tableGroupId(), budget, cache, input, output);
       }
       if (budget.snapshot().allocatedBytes() != 0 || budget.snapshot().reservedBytes() != 0) {
         throw new IllegalStateException("cache subprocess did not release its budgets");
       }
+    }
+  }
+
+  private static void serve(TxnReadExecutor executor,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity, String group, BudgetManager budget,
+      RangeReadCache cache, DataInputStream input, DataOutputStream output) throws Exception {
+    output.writeUTF("ready");
+    output.flush();
+    while (true) {
+      String command = input.readUTF();
+      if (command.equals("stop")) return;
+      respond(command, executor, identity, group, budget, cache, input, output);
     }
   }
 

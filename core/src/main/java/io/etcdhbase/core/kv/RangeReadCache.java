@@ -119,44 +119,69 @@ public final class RangeReadCache implements AutoCloseable {
 
   private CompletableFuture<Optional<RangeResultCache.Hit>> prove(RangeCommand range,
       TxnReadSession session, BudgetManager.Account account, RequestScope scope) {
-    ProofOptions options = proofOptions.orElseThrow();
-    RequestScope proofScope = scope.childWithTimeoutNanos(options.maximumNanos());
-    RequestScope.ScopedCleanup registration = scope.registerScopedCleanup(
-        () -> proofScope.cancelAsync(Runnable::run), proofScope.cleanupCompletion());
-    CompletableFuture<Optional<RangeResultCache.Hit>> operation;
-    try {
-      var proofAccount = budget.admit(group, proofScope, options.reservation(), options.reads());
-      var allowance = new ManifestCatalog.ProofReadBudget(
-          proofScope, proofAccount, options.maximumPages(), options.maximumBytes());
-      operation = cache.getWithProof(tableGroupId, storageProfile, session, range, options.prover(),
-          allowance, options.maximumEntriesExamined(), account, scope);
-    } catch (BackendFailure failure) {
-      operation = failure.category() == BackendFailure.Category.RESOURCE_LIMIT
-          ? CompletableFuture.completedFuture(Optional.empty()) : CompletableFuture.failedFuture(failure);
-    } catch (RuntimeException failure) {
-      operation = CompletableFuture.failedFuture(failure);
+    return new ProofOperation(proofOptions.orElseThrow(), scope).start(range, session, account);
+  }
+
+  /** Owns the independent proof scope and its registration until cleanup and producer drain. */
+  private final class ProofOperation {
+    private final ProofOptions options;
+    private final RequestScope parentScope;
+    private final RequestScope proofScope;
+    private final RequestScope.ScopedCleanup registration;
+
+    private ProofOperation(ProofOptions options, RequestScope parentScope) {
+      this.options = options;
+      this.parentScope = parentScope;
+      proofScope = parentScope.childWithTimeoutNanos(options.maximumNanos());
+      registration = parentScope.registerScopedCleanup(
+          () -> proofScope.cancelAsync(Runnable::run), proofScope.cleanupCompletion());
     }
-    return operation.handle((found, failure) -> {
-      proofScope.close();
-      return new ProofOutcome(found, failure);
-    }).thenCompose(outcome -> CompletableFuture.allOf(
-        proofScope.cleanupCompletion().toCompletableFuture(),
-        proofScope.physicalProducersCompletion().toCompletableFuture()).handle((ignored, cleanupFailure) -> {
-          Throwable failure = outcome.failure();
-          if (failure == null) failure = cleanupFailure;
-          else if (cleanupFailure != null && cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
-          if (failure != null) {
-            if (outcome.found() != null && outcome.found().isPresent()) {
-              try { outcome.found().orElseThrow().close(); }
-              catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-            }
-            throw new java.util.concurrent.CompletionException(failure);
-          }
-          return outcome.found();
-        })).whenComplete((ignored, failure) -> {
-          try { registration.close(); }
-          catch (Exception cleanup) { throw new java.util.concurrent.CompletionException(cleanup); }
-        });
+
+    private CompletableFuture<Optional<RangeResultCache.Hit>> start(RangeCommand range,
+        TxnReadSession session, BudgetManager.Account account) {
+      CompletableFuture<Optional<RangeResultCache.Hit>> operation;
+      try {
+        var proofAccount = budget.admit(group, proofScope, options.reservation(), options.reads());
+        var allowance = new ManifestCatalog.ProofReadBudget(
+            proofScope, proofAccount, options.maximumPages(), options.maximumBytes());
+        operation = cache.getWithProof(tableGroupId, storageProfile, session, range, options.prover(),
+            allowance, options.maximumEntriesExamined(), account, parentScope);
+      } catch (BackendFailure failure) {
+        operation = failure.category() == BackendFailure.Category.RESOURCE_LIMIT
+            ? CompletableFuture.completedFuture(Optional.empty()) : CompletableFuture.failedFuture(failure);
+      } catch (RuntimeException failure) {
+        operation = CompletableFuture.failedFuture(failure);
+      }
+      return operation.handle((found, failure) -> {
+        proofScope.close();
+        return new ProofOutcome(found, failure);
+      }).thenCompose(this::settleProof)
+          .whenComplete((ignored, failure) -> closeRegistration());
+    }
+
+    private CompletableFuture<Optional<RangeResultCache.Hit>> settleProof(ProofOutcome outcome) {
+      return CompletableFuture.allOf(
+          proofScope.cleanupCompletion().toCompletableFuture(),
+          proofScope.physicalProducersCompletion().toCompletableFuture())
+          .handle((ignored, cleanupFailure) -> proofResult(outcome, cleanupFailure));
+    }
+
+    private Optional<RangeResultCache.Hit> proofResult(ProofOutcome outcome, Throwable cleanupFailure) {
+      Throwable failure = outcome.failure();
+      if (failure == null) failure = cleanupFailure;
+      else if (cleanupFailure != null && cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+      if (failure == null) return outcome.found();
+      if (outcome.found() != null && outcome.found().isPresent()) {
+        try { outcome.found().orElseThrow().close(); }
+        catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+      }
+      throw new java.util.concurrent.CompletionException(failure);
+    }
+
+    private void closeRegistration() {
+      try { registration.close(); }
+      catch (Exception cleanup) { throw new java.util.concurrent.CompletionException(cleanup); }
+    }
   }
 
   private record ProofOutcome(Optional<RangeResultCache.Hit> found, Throwable failure) {}

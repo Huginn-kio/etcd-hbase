@@ -2,9 +2,9 @@ package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
+import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
-import java.util.ArrayDeque;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -34,22 +34,8 @@ public final class UnchangedRangeProof {
     }
   }
 
-  private static final ThreadLocal<ArrayDeque<Runnable>> CONTINUATIONS = new ThreadLocal<>();
   private static final Executor CLEANUP = task -> Thread.ofVirtual().name("coverage-proof-cleanup").start(task);
-  private static final Executor CONTINUE = task -> {
-    ArrayDeque<Runnable> queue = CONTINUATIONS.get();
-    if (queue != null) { queue.addLast(task); return; }
-    queue = new ArrayDeque<>();
-    CONTINUATIONS.set(queue);
-    try {
-      queue.addLast(task);
-      Runnable next;
-      while ((next = queue.pollFirst()) != null) next.run();
-    } finally {
-      queue.clear();
-      CONTINUATIONS.remove();
-    }
-  };
+  private static final Executor CONTINUE = new ContinuationExecutor();
 
   private final CommitDecisionRepository decisions;
   private final ManifestCatalog manifests;

@@ -30,35 +30,44 @@ class M3CacheProcessIT {
   @Test
   void independentProcessesObserveWritesAndProveUnrelatedKeysOnBothLayouts() throws Exception {
     for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
-      try (var fixture = M3TestEnvironment.start(layout); var writer = new M3PutCommitIT.Engine(fixture)) {
-        writer.put("before".getBytes(StandardCharsets.UTF_8), false);
-        Path directory = Files.createDirectory(temporaryDirectory.resolve(layout.name()));
-        Path configuration = directory.resolve("hbase-site.xml");
-        Path hosts = directory.resolve("hosts");
-        Path log = directory.resolve("reader.log");
-        fixture.writeClientConfiguration(configuration);
-        Files.writeString(hosts, "127.0.0.1 localhost\n::1 localhost\n");
-        try (var listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
-          listener.setSoTimeout(60_000);
-          Process reader = startReader(fixture, configuration, hosts, log, listener.getLocalPort());
-          try (var socket = listener.accept();
-               var input = new DataInputStream(socket.getInputStream());
-               var output = new DataOutputStream(socket.getOutputStream())) {
-            socket.setSoTimeout(90_000);
-            assertTrue(reader.pid() > 0 && reader.pid() != ProcessHandle.current().pid());
-            assertEquals("ready", input.readUTF());
-            verifyIndependentReader(fixture, writer, input, output);
-            output.writeUTF("stop");
-            output.flush();
-            assertTrue(reader.waitFor(60, TimeUnit.SECONDS), "cache reader did not stop; log: " + log);
-            assertEquals(0, reader.exitValue(), "cache reader failed; log: " + log);
-          } finally {
-            if (reader.isAlive()) {
-              reader.destroyForcibly();
-              assertTrue(reader.waitFor(10, TimeUnit.SECONDS), "cache reader did not terminate");
-            }
-          }
-        }
+      exerciseLayout(layout);
+    }
+  }
+
+  private void exerciseLayout(StorageTableBinding.Layout layout) throws Exception {
+    try (var fixture = M3TestEnvironment.start(layout); var writer = new M3PutCommitIT.Engine(fixture)) {
+      writer.put("before".getBytes(StandardCharsets.UTF_8), false);
+      Path directory = Files.createDirectory(temporaryDirectory.resolve(layout.name()));
+      Path configuration = directory.resolve("hbase-site.xml");
+      Path hosts = directory.resolve("hosts");
+      Path log = directory.resolve("reader.log");
+      fixture.writeClientConfiguration(configuration);
+      Files.writeString(hosts, "127.0.0.1 localhost\n::1 localhost\n");
+      try (var listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+        listener.setSoTimeout(60_000);
+        runReader(fixture, writer, configuration, hosts, log, listener);
+      }
+    }
+  }
+
+  private static void runReader(M3TestEnvironment fixture, M3PutCommitIT.Engine writer,
+      Path configuration, Path hosts, Path log, ServerSocket listener) throws Exception {
+    Process reader = startReader(fixture, configuration, hosts, log, listener.getLocalPort());
+    try (var socket = listener.accept();
+         var input = new DataInputStream(socket.getInputStream());
+         var output = new DataOutputStream(socket.getOutputStream())) {
+      socket.setSoTimeout(90_000);
+      assertTrue(reader.pid() > 0 && reader.pid() != ProcessHandle.current().pid());
+      assertEquals("ready", input.readUTF());
+      verifyIndependentReader(fixture, writer, input, output);
+      output.writeUTF("stop");
+      output.flush();
+      assertTrue(reader.waitFor(60, TimeUnit.SECONDS), "cache reader did not stop; log: " + log);
+      assertEquals(0, reader.exitValue(), "cache reader failed; log: " + log);
+    } finally {
+      if (reader.isAlive()) {
+        reader.destroyForcibly();
+        assertTrue(reader.waitFor(10, TimeUnit.SECONDS), "cache reader did not terminate");
       }
     }
   }
