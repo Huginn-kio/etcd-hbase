@@ -24,6 +24,42 @@ func TestM3HistoryChecksRealNativeConcurrentPointOperations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	recordNativeConcurrentPointOperations(t, ctx, client, recorder)
+	observations, err := recorder.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := history.NewKVState(1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := history.Check(ctx, observations, history.KVModel{}, initial, 1000)
+	if err != nil || result.Verdict != history.Linearizable {
+		t.Fatalf("native history: %+v, %v", result, err)
+	}
+	verifyTamperedPointResponse(t, ctx, observations, initial)
+}
+
+func verifyTamperedPointResponse(t *testing.T, ctx context.Context, observations []history.Observation, initial *history.KVState) {
+	t.Helper()
+	var read etcdserverpb.RangeResponse
+	if err := proto.Unmarshal(observations[2].Response, &read); err != nil {
+		t.Fatal(err)
+	}
+	read.Kvs[0].Value = []byte("not-written")
+	wire, err := proto.Marshal(&read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observations[2].Response = wire
+	result, err := history.Check(ctx, observations, history.KVModel{}, initial, 1000)
+	if err != nil || result.Verdict != history.Invalid {
+		t.Fatalf("tampered history: %+v, %v", result, err)
+	}
+}
+
+func recordNativeConcurrentPointOperations(t *testing.T, ctx context.Context, client etcdserverpb.KVClient, recorder *history.Recorder) {
+	t.Helper()
 	var workers sync.WaitGroup
 	failures := make(chan error, 2)
 	for _, value := range []string{"one", "two"} {
@@ -43,31 +79,6 @@ func TestM3HistoryChecksRealNativeConcurrentPointOperations(t *testing.T) {
 	}
 	if _, err := recorder.Invoke(ctx, client, &etcdserverpb.RangeRequest{Key: []byte("history-key")}); err != nil {
 		t.Fatal(err)
-	}
-	observations, err := recorder.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	initial, err := history.NewKVState(1, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := history.Check(ctx, observations, history.KVModel{}, initial, 1000)
-	if err != nil || result.Verdict != history.Linearizable {
-		t.Fatalf("native history: %+v, %v", result, err)
-	}
-	var read etcdserverpb.RangeResponse
-	if err := proto.Unmarshal(observations[2].Response, &read); err != nil {
-		t.Fatal(err)
-	}
-	read.Kvs[0].Value = []byte("not-written")
-	observations[2].Response, err = proto.Marshal(&read)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err = history.Check(ctx, observations, history.KVModel{}, initial, 1000)
-	if err != nil || result.Verdict != history.Invalid {
-		t.Fatalf("tampered history: %+v, %v", result, err)
 	}
 }
 
@@ -96,28 +107,52 @@ func TestM3HistoryChecksNativeNestedTransactions(t *testing.T) {
 func recordNativeNestedHistory(t *testing.T, ctx context.Context, client etcdserverpb.KVClient,
 	recorder *history.Recorder) []history.Observation {
 	t.Helper()
-	a, b := []byte("history-txn-a"), []byte("history-txn-b")
-	version := func(key []byte, v int64) *etcdserverpb.Compare {
-		return &etcdserverpb.Compare{Key: key, Target: etcdserverpb.Compare_VERSION, Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: v}}
+	recordNativeFirstTransaction(t, ctx, client, recorder)
+	recordNativeElseAndHistory(t, ctx, client, recorder)
+	recordNativeRangeCompare(t, ctx, client, recorder)
+	recordNativeDeleteAndRecreate(t, ctx, client, recorder)
+	observations, err := recorder.Snapshot()
+	if err != nil {
+		t.Fatal(err)
 	}
-	request := &etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{version(a, 0)}, Success: []*etcdserverpb.RequestOp{
+	return observations
+}
+
+func nativeVersionCompare(key []byte, version int64) *etcdserverpb.Compare {
+	return &etcdserverpb.Compare{Key: key, Target: etcdserverpb.Compare_VERSION, Result: etcdserverpb.Compare_EQUAL, TargetUnion: &etcdserverpb.Compare_Version{Version: version}}
+}
+
+func recordNativeFirstTransaction(t *testing.T, ctx context.Context, client etcdserverpb.KVClient, recorder *history.Recorder) {
+	t.Helper()
+	a, b := []byte("history-txn-a"), []byte("history-txn-b")
+	request := &etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{nativeVersionCompare(a, 0)}, Success: []*etcdserverpb.RequestOp{
 		m3Range(a), m3PutOp(a, []byte("one"), true),
 		{Request: &etcdserverpb.RequestOp_RequestTxn{RequestTxn: &etcdserverpb.TxnRequest{
-			Compare: []*etcdserverpb.Compare{version(a, 0)}, Success: []*etcdserverpb.RequestOp{m3Range(a), m3PutOp(b, []byte("two"), false)},
+			Compare: []*etcdserverpb.Compare{nativeVersionCompare(a, 0)}, Success: []*etcdserverpb.RequestOp{m3Range(a), m3PutOp(b, []byte("two"), false)},
 		}}},
 	}}
 	if _, err := recorder.Invoke(ctx, client, request); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func recordNativeElseAndHistory(t *testing.T, ctx context.Context, client etcdserverpb.KVClient, recorder *history.Recorder) {
+	t.Helper()
+	a := []byte("history-txn-a")
 	historical := m3Range(a)
 	historical.GetRequestRange().Revision = 2
-	second := &etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{version(a, 0)},
+	second := &etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{nativeVersionCompare(a, 0)},
 		Success: []*etcdserverpb.RequestOp{m3PutOp(a, []byte("unused"), false)},
 		Failure: []*etcdserverpb.RequestOp{m3PutOp(a, []byte("next"), true), historical}}
 	if _, err := recorder.Invoke(ctx, client, second); err != nil {
 		t.Fatal(err)
 	}
-	rangeCompare := version([]byte("history-txn-"), 0)
+}
+
+func recordNativeRangeCompare(t *testing.T, ctx context.Context, client etcdserverpb.KVClient, recorder *history.Recorder) {
+	t.Helper()
+	b := []byte("history-txn-b")
+	rangeCompare := nativeVersionCompare([]byte("history-txn-"), 0)
 	rangeCompare.RangeEnd = []byte("history-txn.")
 	rangeCompare.Result = etcdserverpb.Compare_GREATER
 	third := &etcdserverpb.TxnRequest{Compare: []*etcdserverpb.Compare{rangeCompare}, Success: []*etcdserverpb.RequestOp{m3Range(b)}}
@@ -127,6 +162,11 @@ func recordNativeNestedHistory(t *testing.T, ctx context.Context, client etcdser
 	if _, err := recorder.Invoke(ctx, client, &etcdserverpb.RangeRequest{Key: []byte("history-txn-"), RangeEnd: []byte("history-txn.")}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func recordNativeDeleteAndRecreate(t *testing.T, ctx context.Context, client etcdserverpb.KVClient, recorder *history.Recorder) {
+	t.Helper()
+	a, b := []byte("history-txn-a"), []byte("history-txn-b")
 	if _, err := recorder.Invoke(ctx, client, &etcdserverpb.DeleteRangeRequest{Key: b, PrevKv: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -151,11 +191,6 @@ func recordNativeNestedHistory(t *testing.T, ctx context.Context, client etcdser
 	if _, err := recorder.Invoke(ctx, client, &etcdserverpb.RangeRequest{Key: []byte("history-txn-"), RangeEnd: []byte("history-txn."), Revision: 2}); err != nil {
 		t.Fatal(err)
 	}
-	observations, err := recorder.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return observations
 }
 
 func verifyNativeNestedHistory(t *testing.T, ctx context.Context, observations []history.Observation,

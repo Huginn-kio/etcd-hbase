@@ -37,7 +37,7 @@ func NewKVState(revision int64, values []*mvccpb.KeyValue) (*KVState, error) {
 	return state, nil
 }
 
-// KVModel checks the explicitly supported point operations. Other requests
+// KVModel checks the supported point, range, delete, and nested transaction subset. Other requests
 // return inconclusive through Check, never a false pass.
 type KVModel struct{}
 

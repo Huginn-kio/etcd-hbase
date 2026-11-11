@@ -62,7 +62,7 @@ func checkEvidence(path string) error {
 	}
 	count := 10
 	if evidence.RestartMode != "none" {
-		if !unpublishedMode(evidence.RestartMode) && evidence.RestartMode != "cas-ack-lost" && evidence.RestartMode != "partial-materialization" && evidence.RestartMode != "old-owner-resume" && evidence.RestartMode != "cancel-after-cas" && evidence.RestartMode != "after-commit" {
+		if !validRestartMode(evidence.RestartMode) {
 			return errors.New("invalid history fault mode")
 		}
 		count += 2

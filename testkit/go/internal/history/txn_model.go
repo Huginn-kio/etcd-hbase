@@ -120,12 +120,12 @@ func (validator *txnValidator) validateOperation(op *etcdserverpb.RequestOp, dep
 	switch value := op.Request.(type) {
 	case *etcdserverpb.RequestOp_RequestPut:
 		p := value.RequestPut
-		if !validator.validPut(p, known, choices) {
+		if !validator.validateAndClaimPut(p, known, choices) {
 			return errors.New("unsupported Txn Put")
 		}
 	case *etcdserverpb.RequestOp_RequestDeleteRange:
 		d := value.RequestDeleteRange
-		if !validator.validDelete(d, known, choices) {
+		if !validator.validateAndClaimDelete(d, known, choices) {
 			return errors.New("unsupported Txn DeleteRange")
 		}
 	case *etcdserverpb.RequestOp_RequestRange:
@@ -140,12 +140,12 @@ func (validator *txnValidator) validateOperation(op *etcdserverpb.RequestOp, dep
 	return nil
 }
 
-func (validator *txnValidator) validPut(request *etcdserverpb.PutRequest, known, choices uint64) bool {
+func (validator *txnValidator) validateAndClaimPut(request *etcdserverpb.PutRequest, known, choices uint64) bool {
 	return request != nil && len(request.Key) != 0 && request.Lease == 0 && !request.IgnoreLease &&
 		!request.IgnoreValue && claimWrite(&validator.writes, request.Key, nil, true, known, choices)
 }
 
-func (validator *txnValidator) validDelete(request *etcdserverpb.DeleteRangeRequest, known, choices uint64) bool {
+func (validator *txnValidator) validateAndClaimDelete(request *etcdserverpb.DeleteRangeRequest, known, choices uint64) bool {
 	return request != nil && len(request.Key) != 0 &&
 		!(len(request.RangeEnd) == 1 && request.RangeEnd[0] == 0) &&
 		claimWrite(&validator.writes, request.Key, request.RangeEnd, false, known, choices)
