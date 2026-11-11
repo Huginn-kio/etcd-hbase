@@ -163,16 +163,12 @@ class M3HistoryFailoverIT {
     void run() throws Exception {
       firstReady = run.resolve("first-ready");
       first = startServer(configuration, layout, port, namespace, "1", mode, firstReady, run.resolve("first.log"));
-      try {
+      try (var cleanup = new M3HistoryProcessCleanup(() -> new Process[] {driver, second, first})) {
         startDriverAndAwaitFault();
         stopOwnerAndInspectControl();
         recoverOwnerAndPublishEndpoint();
         resumeOldOwnerIfNeeded();
         finishDriverAndSaveEvidence();
-      } finally {
-        stop(driver);
-        stop(second);
-        stop(first);
       }
     }
 
@@ -377,13 +373,6 @@ class M3HistoryFailoverIT {
       }
       if (System.nanoTime() >= deadline) throw new IllegalStateException("fixture readiness timed out: " + path.getFileName());
       Thread.sleep(25);
-    }
-  }
-
-  private static void stop(Process process) throws Exception {
-    if (process != null && process.isAlive()) {
-      process.destroyForcibly();
-      assertTrue(process.waitFor(10, TimeUnit.SECONDS));
     }
   }
 
