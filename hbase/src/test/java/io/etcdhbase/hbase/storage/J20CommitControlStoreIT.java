@@ -8,6 +8,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.CommitState;
+import io.etcdhbase.core.commit.CommitOwnerService;
+import io.etcdhbase.core.commit.AuxiliaryFormatUpgrade;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.codec.CommitControlMessages;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
@@ -49,7 +51,8 @@ class J20CommitControlStoreIT {
         .setValue("etcdhbase.m0.salt-width-bytes",
             Integer.toString(SALT.profile().saltWidthBytes()))
         .setValue("etcdhbase.m0.record-categories",
-            "CONTROL,INVOCATION,CANDIDATE,MANIFEST,DECISION,SNAPSHOT_PIN")
+            "CONTROL,INVOCATION,CANDIDATE,MANIFEST,DECISION,SNAPSHOT_PIN,RESULT")
+        .setValue("etcdhbase.m4.auxiliary-format", "1")
         .build();
 
     try (var environment = M1TestEnvironment.start(1);
@@ -100,6 +103,42 @@ class J20CommitControlStoreIT {
       assertEquals(raceSnapshot.state().stateVersion() + 1, current.stateVersion());
       assertTrue(current.ownerLeaseDeadlineEpochMillis() == 30
           || current.ownerLeaseDeadlineEpochMillis() == 40);
+
+      var oldOwnerSnapshot = M1TestEnvironment.await(store.read(scope)).orElseThrow();
+      var upgraded = M1TestEnvironment.await(new AuxiliaryFormatUpgrade(store)
+          .upgrade(new CommitOwnerService.OwnerToken("owner-a", 1), 11, scope));
+      assertEquals(2, upgraded.epoch());
+      assertEquals(CommitState.AUXILIARY_FORMAT_VERSION,
+          M1TestEnvironment.await(store.read(scope)).orElseThrow().state().formatVersion());
+      assertFalse(M1TestEnvironment.await(store.compareAndSet(oldOwnerSnapshot,
+          oldOwnerSnapshot.state().heartbeat("owner-a", 1, 50), scope)),
+          "an old writer's exact control snapshot must fail after the format upgrade");
+      var upgradedSnapshot = M1TestEnvironment.await(store.read(scope)).orElseThrow();
+      var upgradedState = upgradedSnapshot.state();
+      var downgrade = CommitState.restore(upgradedState.profileFingerprint(), upgradedState.ownerInstance(),
+          upgradedState.ownerEpoch(), upgradedState.ownerLeaseDeadlineEpochMillis(), upgradedState.stateVersion() + 1,
+          upgradedState.publishedSequence(), upgradedState.publishedRevision(), upgradedState.finalizedSequence(),
+          upgradedState.finalizedRevision(), upgradedState.publication(), upgradedState.compactRevision());
+      assertThrows(ExecutionException.class,
+          () -> M1TestEnvironment.await(store.compareAndSet(upgradedSnapshot, downgrade, scope)));
+
+      TableName legacyTable = TableName.valueOf("j20_legacy_" + UUID.randomUUID().toString().replace("-", ""));
+      var legacyDescriptor = TableDescriptorBuilder.newBuilder(TableDescriptorBuilder.copy(legacyTable, descriptor))
+          .removeValue("etcdhbase.m4.auxiliary-format").build();
+      var legacyBinding = new SystemTableBinding(legacyTable, FAMILY, TABLE_GROUP, SALT_PROFILE, SALT);
+      environment.create(legacyTable, legacyDescriptor, SALT.splitKeys().toArray(byte[][]::new));
+      var legacyStore = M1TestEnvironment.await(HBaseCommitControlStore.open(
+          environment.factory(), environment.identity(), legacyBinding, scope));
+      assertTrue(M1TestEnvironment.await(legacyStore.initializeIfAbsent(
+          CommitState.initial(legacyBinding.profileFingerprint(), 1), scope)));
+      var legacyInitial = M1TestEnvironment.await(legacyStore.read(scope)).orElseThrow();
+      assertTrue(M1TestEnvironment.await(legacyStore.compareAndSet(legacyInitial,
+          legacyInitial.state().claimOwner("legacy-owner", 1, 100), scope)));
+      assertThrows(ExecutionException.class, () -> M1TestEnvironment.await(
+          new AuxiliaryFormatUpgrade(legacyStore).upgrade(
+              new CommitOwnerService.OwnerToken("legacy-owner", 1), 2, scope)));
+      assertEquals(CommitState.FORMAT_VERSION,
+          M1TestEnvironment.await(legacyStore.read(scope)).orElseThrow().state().formatVersion());
 
       byte[] wrongFingerprint = new byte[32];
       wrongFingerprint[0] = 1;
