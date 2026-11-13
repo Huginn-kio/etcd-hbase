@@ -235,7 +235,7 @@ tailer 不对每个 watcher 扫 latest，不将全部历史装进内存。历史
 
 ### 8.2 inclusive 起点与交接协议
 
-`start_revision>0` 从指定 revision **inclusive** 回放；零/原生接受的非正起点按当前创建屏障建立新监听，正常接收该屏障之后的变更。起点在未来时等待，不伪造 FutureRev 或用 progress 越过该目标。Get 得 R 后是否使用 R+1 由客户端决定，服务不统一加一。[固定 Go watch client][watch-client]
+`start_revision>0` 从指定 revision **inclusive** 回放；`start_revision=0` 按当前创建屏障建立新监听，正常接收该屏障之后的变更。负数起点保留原值并按固定原生实现的历史路径处理，不归一化为零；已执行 Compact 且起点小于实际逻辑 compact 边界时，按原生顺序返回 Created，随后以该边界返回 Canceled 和 `compact_revision`。[固定 MVCC watch][watch-store]、[压缩边界检查][watch-group]。未压缩初始状态及其负数边界也须与原生逐字段对照，不能假定负数总是同一种结果。起点在未来时等待，不伪造 FutureRev 或用 progress 越过该目标。Get 得 R 后是否使用 R+1 由客户端决定，服务不统一加一。[固定 Go watch client][watch-client]
 
 创建时必须原子建立以下内部关系，避免“先扫历史，扫完再注册实时”的窗口：
 
@@ -244,7 +244,7 @@ tailer 不对每个 watcher 扫 latest，不将全部历史装进内存。历史
 3. 已验证 B 以前的回放完成，再接续 B 之后的日志；用 `(sequence,ordinal)` 去除交界重复，不能只按 key 去重。
 4. 交接积压必须有字节上限。超限时从受保护持久游标追赶或按资源错误关闭，不能继续扩大内存；追赶超出可保留窗口则走真实 compaction 取消。
 
-登记期间若 tailer 已超过 B，必须能够从持久日志补上间隙，不能依赖内存刚好保留全部事件。若 Compact/保护代次在注册期间变化，先复核重试或取消，再发 Created/历史；不能在保护缺失时继续回放。
+登记期间若 tailer 已超过 B，必须能够从持久日志补上间隙，不能依赖内存刚好保留全部事件。若 Compact/保护代次在注册期间变化，先复核并重试或决定取消；对有效创建因压缩取消时，按原生顺序先发 Created 再发 Canceled，不交付历史事件。不能在保护缺失时继续回放。
 
 ### 8.3 Header 与 progress
 
@@ -290,8 +290,8 @@ Watch 保留窗口不足时返回 `Canceled + compact_revision` 等固定字段�
 | J42 | 原版 Go KeepAlive 多 ID、未知 ID、TTL/3、持久后回复、Header 顺序、断流/取消/结果未知；真实双运行时 owner 路由与接管 |
 | J43 | 限定窗口扫描、迟到索引、检查点重启、续约/到期/显式撤销竞争、旧 worker/epoch、时钟跳变、空/大 Lease 原子撤销 |
 | J44 | 提交归属、待收尾事件、元数据无事件、索引回填/缺页、顺序与覆盖、共享 tailer、事件 pin/GC；两种布局数据一致 |
-| J45 | 原始 proto 和 Go client 的 create/cancel、多 ID/重复 ID、空/二进制范围、FromKey、Created、filter/PrevKV、取消顺序 |
-| J46.1 | Get R→Watch R+1、直接 Watch R、创建/回放/交接期间写入、未来起点、重连，确定性 barrier 证明无间隙 |
+| J45 | 原始 proto 和 Go client 的 create/cancel、多 ID/重复 ID、空/二进制范围、FromKey、Created、filter/PrevKV、取消顺序；原始 proto 的负数和零起点分别对照，覆盖压缩后 Created/Canceled 与 `compact_revision`，以及未压缩初始状态 |
+| J46.1 | Get R→Watch R+1、直接 Watch R、负数与零起点、创建/回放/交接期间写入、未来起点、重连，确定性 barrier 证明无间隙；原始 proto 对照压缩后负起点取消与零起点接收新事件 |
 | J46.2 | 显式/周期/全流 progress、过滤后空区间、metadata sequence、历史积压与未就绪时不超前 |
 | J46.3 | 一个大 revision、多 watch、单大事件、多个片段、首/中/末片断流、实际 Go client 重组与恢复位置 |
 | J47 | 慢消费隔离、onReady、half-close、取消/deadline/断连、逻辑 Compact 与物理 GC 竞争、授权失效、资源恢复到基线 |
@@ -348,5 +348,6 @@ M4 开发检查点要求所有 Lease/Watch 管理与选项按矩阵实现，注�
 [lease-client]: https://github.com/etcd-io/etcd/blob/1cf4bc40111fd95d1e14a90a09a146357b15eb13/client/v3/lease.go
 [watch-rpc]: https://github.com/etcd-io/etcd/blob/1cf4bc40111fd95d1e14a90a09a146357b15eb13/server/etcdserver/api/v3rpc/watch.go
 [watch-store]: https://github.com/etcd-io/etcd/blob/1cf4bc40111fd95d1e14a90a09a146357b15eb13/server/mvcc/watchable_store.go
+[watch-group]: https://github.com/etcd-io/etcd/blob/1cf4bc40111fd95d1e14a90a09a146357b15eb13/server/mvcc/watcher_group.go
 [watch-client]: https://github.com/etcd-io/etcd/blob/1cf4bc40111fd95d1e14a90a09a146357b15eb13/client/v3/watch.go
 [guarantees]: https://etcd.io/docs/v3.5/learning/api_guarantees/
