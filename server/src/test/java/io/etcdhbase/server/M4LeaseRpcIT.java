@@ -43,6 +43,7 @@ import org.junit.jupiter.api.Timeout;
 /** Verifies J40 Lease RPCs against a disposable HBase cluster, both layouts, and runtime restart. */
 @Timeout(600)
 class M4LeaseRpcIT {
+  private static final int MAX_DRIVER_DIAGNOSTIC_BYTES = 8 * 1024;
   private static final List<String> LAYOUT_FILES =
       List.of("history-table.json", "native-cell-versions.json");
   private static final RuntimeConfiguration.ResourceBudgets RESOURCES =
@@ -312,12 +313,30 @@ class M4LeaseRpcIT {
       if (!process.waitFor(180, TimeUnit.SECONDS)) {
         throw new IllegalStateException("M4 driver timed out; inspect the local run log");
       }
-      assertEquals(0, process.exitValue(), "M4 Go driver failed; inspect its local run log");
+      int exitCode = process.exitValue();
+      if (exitCode != 0) {
+        assertEquals(0, exitCode, "M4 Go driver failed; last log bytes:\n" + tail(log));
+      }
     } finally {
       if (process.isAlive()) {
         process.destroyForcibly();
         assertTrue(process.waitFor(10, TimeUnit.SECONDS));
       }
+    }
+  }
+
+  private static String tail(Path log) {
+    try {
+      long size = Files.size(log);
+      long offset = Math.max(0, size - MAX_DRIVER_DIAGNOSTIC_BYTES);
+      try (var input = Files.newInputStream(log)) {
+        input.skipNBytes(offset);
+        byte[] bytes = input.readNBytes(MAX_DRIVER_DIAGNOSTIC_BYTES);
+        return (offset == 0 ? "" : "[earlier log output omitted]\n")
+            + new String(bytes, StandardCharsets.UTF_8);
+      }
+    } catch (IOException failure) {
+      return "driver log unavailable (" + failure.getClass().getSimpleName() + ")";
     }
   }
 
