@@ -45,16 +45,19 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
   private final SystemTableBinding binding;
   private final boolean resultsSupported;
   private final boolean auxiliarySupported;
+  private final boolean leaseBindingsSupported;
 
   HBaseSystemRecordStore(AsyncConnection connection, SystemTableBinding binding,
-      boolean resultsSupported, boolean auxiliarySupported) {
+      boolean resultsSupported, boolean auxiliarySupported, boolean leaseBindingsSupported) {
     this.connection = connection;
     this.binding = binding;
     this.resultsSupported = resultsSupported;
     this.auxiliarySupported = auxiliarySupported;
+    this.leaseBindingsSupported = leaseBindingsSupported;
   }
 
   public boolean supportsAuxiliary() { return auxiliarySupported; }
+  public boolean supportsLeaseBindings() { return leaseBindingsSupported; }
 
   @Override
   public int bucket(SystemRecordType type, ByteKey identity) {
@@ -74,7 +77,9 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
             .thenApply(descriptor -> {
               boolean supportsResults = binding.supportsResults(descriptor);
               boolean supportsAuxiliary = binding.supportsAuxiliary(descriptor);
-              return new HBaseSystemRecordStore(connection, binding, supportsResults, supportsAuxiliary);
+              boolean supportsLeaseBindings = binding.supportsLeaseBindings(descriptor);
+              return new HBaseSystemRecordStore(connection, binding, supportsResults,
+                  supportsAuxiliary, supportsLeaseBindings);
             })).exceptionallyCompose(failure -> CompletableFuture.failedFuture(
                 HBaseFailures.classify(failure)));
   }
@@ -201,7 +206,11 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
       SystemRecordType type, ByteKey routePrefix, long sequence, RequestScope scope) {
     requireTypeSupported(type);
     Objects.requireNonNull(routePrefix, "routePrefix");
-    var bounds = binding.keyCodec().leaseVersionBounds(type, routePrefix, sequence);
+    var bounds = switch (type) {
+      case LEASE_STATE -> binding.keyCodec().leaseVersionBounds(type, routePrefix, sequence);
+      case LEASE_BINDING -> binding.keyCodec().leaseBindingVersionBounds(routePrefix, sequence);
+      default -> throw new IllegalArgumentException("system record type has no versioned seek");
+    };
     Scan scan = new Scan()
         .withStartRow(bounds.startRow(), bounds.startInclusive())
         .withStopRow(bounds.stopRow(), bounds.stopInclusive())
@@ -382,10 +391,15 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
       }
       SystemRecordKeyCodec.DecodedKey decoded = binding.keyCodec().decode(row.getRow());
       if (decoded.type() != type || !startsWith(decoded.identity(), routePrefix)) {
-        throw new IllegalArgumentException("version seek escaped its lease route");
+        throw new IllegalArgumentException("version seek escaped its logical route");
       }
-      if (io.etcdhbase.core.lease.LeaseRecordIdentity.sequence(decoded.identity()) > sequence) {
-        throw new IllegalArgumentException("version seek returned a future lease version");
+      long actualSequence = switch (type) {
+        case LEASE_STATE -> io.etcdhbase.core.lease.LeaseRecordIdentity.sequence(decoded.identity());
+        case LEASE_BINDING -> io.etcdhbase.core.lease.LeaseBindingIdentity.sequence(decoded.identity());
+        default -> throw new IllegalArgumentException("system record type has no versioned sequence");
+      };
+      if (actualSequence > sequence) {
+        throw new IllegalArgumentException("version seek returned a future record version");
       }
       latest = Optional.of(new SystemRecordEntry(decoded.identity(),
           decode(row, binding.family()).orElseThrow()));
@@ -467,6 +481,9 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
         || type == SystemRecordType.LEASE_RESULT || type == SystemRecordType.LEASE_BINDING)
         && !auxiliarySupported) {
       throw new IllegalStateException("system table does not declare M4 auxiliary capability");
+    }
+    if (type == SystemRecordType.LEASE_BINDING && !leaseBindingsSupported) {
+      throw new IllegalStateException("system table does not declare J41 Lease binding capability");
     }
   }
 

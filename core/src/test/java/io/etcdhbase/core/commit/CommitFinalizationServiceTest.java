@@ -1,12 +1,14 @@
 package io.etcdhbase.core.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
+import io.etcdhbase.core.lease.LeaseBindingIdentity;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.request.RequestScope;
@@ -138,8 +140,34 @@ class CommitFinalizationServiceTest {
 
       var recovered = fixture.service.finish(fixture.invocation, pending, scope).get();
       assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED, recovered.state());
-      assertEquals(3, fixture.materialized.size());
-      assertEquals(5, fixture.materializationCalls.get());
+      assertEquals(4, fixture.materialized.size());
+      assertEquals(6, fixture.materializationCalls.get());
+      assertEquals(1, fixture.control.state.finalizedSequence());
+      assertTrue(fixture.control.state.publication().isEmpty());
+    }
+  }
+
+  @Test
+  void selectedLeaseBindingRecordIsReplayableAfterRestartAtItsMaterializationBoundary() throws Exception {
+    AuxiliaryFixture fixture = new AuxiliaryFixture(false, 3);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pending = new CommitOutcomeResolver.Resolution(
+          CommitOutcomeResolver.State.SELECTED_PENDING, Optional.of(fixture.decision), Optional.empty());
+
+      assertThrows(ExecutionException.class,
+          () -> fixture.service.finish(fixture.invocation, pending, scope).get());
+      assertEquals(3, fixture.materialized.size(), "state, pointer, and expiry should already be durable");
+      assertFalse(fixture.materialized.contains(fixture.leaseBindingSystemIdentity));
+      assertEquals(0, fixture.control.state.finalizedSequence());
+      assertTrue(fixture.control.state.publication().isPresent());
+
+      CommitFinalizationService recoveredService = fixture.reopenService();
+      var recovered = recoveredService.finish(fixture.invocation, pending, scope).get();
+
+      assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED, recovered.state());
+      assertTrue(fixture.materialized.contains(fixture.leaseBindingSystemIdentity));
+      assertEquals(4, fixture.materialized.size());
+      assertEquals(8, fixture.materializationCalls.get());
       assertEquals(1, fixture.control.state.finalizedSequence());
       assertTrue(fixture.control.state.publication().isEmpty());
     }
@@ -269,13 +297,22 @@ class CommitFinalizationServiceTest {
     private final MemoryDecisions decisions;
     private final AtomicInteger materializationCalls = new AtomicInteger();
     private final java.util.Set<ByteKey> materialized = new java.util.HashSet<>();
+    private final ManifestCatalog catalog;
+    private final MaterializationStore materialization;
+    private final ResultCatalog results;
+    private final AuxiliaryMaterializationStore auxiliaryMaterialization;
+    private final ByteKey leaseBindingSystemIdentity;
     private final CommitFinalizationService service;
 
     private AuxiliaryFixture() {
-      this(false);
+      this(false, 1);
     }
 
     private AuxiliaryFixture(boolean superseded) {
+      this(superseded, 1);
+    }
+
+    private AuxiliaryFixture(boolean superseded, long injectedFailureOrdinal) {
       InvocationBinding preparing = InvocationBinding.begin(invocationId,
           repeatedDigest(), repeatedDigest(), transactionId, 1, 0, 1);
       ResultIdentity resultIdentity = ResultIdentity.from(preparing);
@@ -283,6 +320,7 @@ class CommitFinalizationServiceTest {
       ResultDirectory resultDirectory = ResultDirectory.create(resultIdentity,
           List.of(ResultPageReference.from(resultPage)));
       List<PreparedAuxiliaryRecord> auxiliaryRecords = auxiliaryRecords(transactionId);
+      leaseBindingSystemIdentity = auxiliaryRecords.getLast().systemIdentity();
       List<AuxiliaryRecordReference> recordReferences = auxiliaryRecords.stream()
           .map(record -> new AuxiliaryRecordReference(record.ordinal(), record.systemIdentity(),
               record.digest(), record.encodedBytes())).toList();
@@ -302,8 +340,8 @@ class CommitFinalizationServiceTest {
       decisions = new MemoryDecisions(decision, SystemRecordStore.CreateResult.ALREADY_PRESENT);
       ManifestRepository repository = new StubManifestRepository(root, null, null, auxiliaryRecords,
           auxiliaryPage, auxiliaryDirectory);
-      ManifestCatalog catalog = new ManifestCatalog(repository);
-      MaterializationStore materialization = new MaterializationStore() {
+      catalog = new ManifestCatalog(repository);
+      materialization = new MaterializationStore() {
         @Override public CompletableFuture<ApplyResult> applySelected(
             CommitDecision selected, PreparedCandidate candidate, RequestScope scope) {
           throw new UnsupportedOperationException();
@@ -327,8 +365,9 @@ class CommitFinalizationServiceTest {
           return CompletableFuture.completedFuture(Optional.of(resultDirectory));
         }
       };
+      results = new ResultCatalog(resultRepository);
       AtomicInteger injectedFailures = new AtomicInteger();
-      AuxiliaryMaterializationStore auxiliaryMaterialization = new AuxiliaryMaterializationStore() {
+      auxiliaryMaterialization = new AuxiliaryMaterializationStore() {
         @Override public CompletableFuture<Void> preflight(
             PreparedAuxiliaryRecord record, RequestScope scope) {
           return CompletableFuture.completedFuture(null);
@@ -339,15 +378,19 @@ class CommitFinalizationServiceTest {
           if (record.ordinal() == 1 && superseded) {
             return CompletableFuture.completedFuture(ApplyResult.SUPERSEDED);
           }
-          if (record.ordinal() == 1 && injectedFailures.getAndIncrement() == 0) {
+          if (record.ordinal() == injectedFailureOrdinal && injectedFailures.getAndIncrement() == 0) {
             return CompletableFuture.failedFuture(new IllegalStateException("injected auxiliary write failure"));
           }
           return CompletableFuture.completedFuture(materialized.add(record.systemIdentity())
               ? ApplyResult.APPLIED : ApplyResult.ALREADY_APPLIED);
         }
       };
-      service = new CommitFinalizationService(control, new CommitOutcomeResolver(control, decisions),
-          decisions, catalog, materialization, new ResultCatalog(resultRepository), auxiliaryMaterialization);
+      service = reopenService();
+    }
+
+    private CommitFinalizationService reopenService() {
+      return new CommitFinalizationService(control, new CommitOutcomeResolver(control, decisions),
+          decisions, catalog, materialization, results, auxiliaryMaterialization);
     }
   }
 
@@ -496,6 +539,8 @@ class CommitFinalizationServiceTest {
 
   private static List<PreparedAuxiliaryRecord> auxiliaryRecords(TransactionId transactionId) {
     long leaseId = 31;
+    ByteKey bindingKey = ByteKey.copyOf(new byte[] {'k'});
+    LeaseBindingIdentity bindingIdentity = new LeaseBindingIdentity(leaseId, 1, bindingKey, 1);
     return List.of(
         PreparedAuxiliaryRecord.create(transactionId, 1, 0, 0, SystemRecordType.LEASE_STATE,
             LeaseRecordIdentity.stateVersion(leaseId, 1), ByteKey.copyOf(new byte[] {1})),
@@ -503,7 +548,9 @@ class CommitFinalizationServiceTest {
             LeaseRecordIdentity.enumeration(leaseId), new LeaseEnumerationPointer(1).encode()),
         PreparedAuxiliaryRecord.create(transactionId, 1, 0, 2, SystemRecordType.EXPIRY_CANDIDATE,
             new ExpiryCandidateIdentity(20_000, leaseId, 1, 0).encode(),
-            new ExpiryCandidateRecord(1).encode()));
+            new ExpiryCandidateRecord(1).encode()),
+        PreparedAuxiliaryRecord.create(transactionId, 1, 0, 3, SystemRecordType.LEASE_BINDING,
+            bindingIdentity.encode(), ByteKey.copyOf(new byte[] {4})));
   }
 
   private static ByteKey repeatedDigest() {

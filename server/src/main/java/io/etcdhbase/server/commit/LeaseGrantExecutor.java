@@ -154,7 +154,7 @@ public final class LeaseGrantExecutor {
       if (!state.profileFingerprint().equals(profileFingerprint)) {
         throw new IllegalStateException("Grant control profile differs from its table group");
       }
-      if (state.formatVersion() != CommitState.AUXILIARY_FORMAT_VERSION
+      if (!state.supportsAuxiliaryRecords()
           || state.ownerEpoch() != owner.epoch()
           || state.ownerInstance().filter(owner.instance()::equals).isEmpty()
           || state.ownerLeaseExpired(ownerClock.millis()) || state.publication().isPresent()

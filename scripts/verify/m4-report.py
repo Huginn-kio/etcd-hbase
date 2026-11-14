@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import subprocess
 import sys
@@ -24,6 +25,7 @@ JAVA_KINDS = {"surefire", "failsafe"}
 RUN_SCHEMA = "etcd-hbase-m4-run/v1"
 TRACE_SCHEMA = "etcd-hbase-trace/v1"
 COMPARE_SUCCESS = "M4 Lease traces match the registered native comparison policy"
+J41_COMPARE_SUCCESS = "M4 Lease binding traces match the registered native comparison policy"
 REQUIRED_COMMANDS = {"go-module-lock", "go-tests", "maven-verify", "collect-maven-reports"}
 
 J40_TRACE_CASES = (
@@ -38,6 +40,47 @@ J40_TRACE_CASES = (
     ("leases-list", "etcdserverpb.Lease/LeaseLeases"),
     ("oversized-ttl", "etcdserverpb.Lease/LeaseGrant"),
     ("zero-id-ttl", "etcdserverpb.Lease/LeaseTimeToLive"),
+)
+J41_TRACE_CASES = (
+    ("binding-baseline", "etcdserverpb.Lease/LeaseLeases"),
+    ("binding-grant-a", "etcdserverpb.Lease/LeaseGrant"),
+    ("binding-grant-b", "etcdserverpb.Lease/LeaseGrant"),
+    ("binding-register-then", "etcdserverpb.KV/Txn"),
+    ("binding-ttl-a-initial", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-ttl-b-initial", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-ignore-flags", "etcdserverpb.KV/Put"),
+    ("binding-ttl-a-preserved", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-rebind-a-to-b", "etcdserverpb.KV/Put"),
+    ("binding-ttl-a-after-rebind", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-ttl-b-after-rebind", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-register-else", "etcdserverpb.KV/Txn"),
+    ("binding-ttl-b-after-else", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-register-nested", "etcdserverpb.KV/Txn"),
+    ("binding-ttl-a-after-nested", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-ttl-b-after-nested", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-unbind", "etcdserverpb.KV/Put"),
+    ("binding-ttl-a-after-unbind", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-delete", "etcdserverpb.KV/DeleteRange"),
+    ("binding-ttl-b-after-delete", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-recreate-unleased", "etcdserverpb.KV/Put"),
+    ("binding-ttl-b-after-recreate", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-delete-range", "etcdserverpb.KV/DeleteRange"),
+    ("binding-ttl-a-after-delete-range", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-ttl-b-after-delete-range", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-role-prefix-after-delete-range", "etcdserverpb.KV/Range"),
+    ("binding-version-after-delete-range", "etcdserverpb.KV/Range"),
+    ("binding-survivor-put", "etcdserverpb.KV/Put"),
+    ("binding-ttl-b-after-survivor-put", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-invalid-lease-atomicity", "etcdserverpb.KV/Txn"),
+    ("binding-atomicity-range-first", "etcdserverpb.KV/Range"),
+    ("binding-atomicity-range-second", "etcdserverpb.KV/Range"),
+    ("binding-ttl-a-after-failed-txn", "etcdserverpb.Lease/LeaseTimeToLive"),
+    ("binding-invalid-lease-put", "etcdserverpb.KV/Put"),
+    ("binding-atomicity-range-invalid-put", "etcdserverpb.KV/Range"),
+    ("binding-invalid-lease-unselected-branch", "etcdserverpb.KV/Txn"),
+    ("binding-unselected-then-absent", "etcdserverpb.KV/Range"),
+    ("binding-unselected-else-visible", "etcdserverpb.KV/Range"),
+    ("binding-ttl-b-after-unselected-branch", "etcdserverpb.Lease/LeaseTimeToLive"),
 )
 J40_GO_TESTS = {
     "cmd/m4driver": {
@@ -95,6 +138,72 @@ J40_CRITICAL_JAVA_TESTS = {
         "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts"
     },
 }
+J41_GO_TESTS = {
+    "cmd/m4driver": {
+        "TestRunNativeLeaseBindingWritesFreshTraceAndVerifiableMetadata",
+        "TestCompareBindingsRejectsCorruptOrEmptyTrace",
+    },
+    "internal/scenario": {
+        "TestM4LeaseBindingScenarioMatchesItsPinnedNativeOracle",
+        "TestLoadM4LeaseBindingSuiteRejectsMissingOrChangedCoverage",
+    },
+    "internal/compare": {
+        "TestCompareM4LeaseBindingRecordsNormalizesTransportAndScenarioRelativeTtl",
+        "TestCompareM4LeaseBindingRecordsRejectsRevisionAndPartialResult",
+        "TestCompareM4LeaseBindingRecordsRejectsInvalidTtlAndUnexpectedRenewal",
+        "TestCompareM4LeaseBindingRequiresNotFoundForInvalidLeaseOperations",
+    },
+    "internal/trace": {
+        "TestSnapshotProtoPreservesBinaryAndInt64Values",
+        "TestReadJSONLRejectsInvalidOrderingAndSecrets",
+        "TestStreamTerminalCannotContradictItsOutcome",
+    },
+}
+J41_JAVA_CLASSES = {
+    "io.etcdhbase.core.commit.LeaseBindingFormatUpgradeTest",
+    "io.etcdhbase.core.commit.CommitFinalizationServiceTest",
+    "io.etcdhbase.core.kv.LeaseBindingChangeSetTest",
+    "io.etcdhbase.core.lease.LeaseBindingIdentityTest",
+    "io.etcdhbase.core.lease.LeaseCostAdmissionTest",
+    "io.etcdhbase.core.commit.LeaseReadViewTest",
+    "io.etcdhbase.core.commit.AuxiliaryLeasePlanVerifierTest",
+    "io.etcdhbase.hbase.codec.LeaseStateMessagesTest",
+    "io.etcdhbase.hbase.codec.SystemRecordKeyCodecTest",
+    "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT",
+    "io.etcdhbase.server.M4LeaseRpcIT",
+    "io.etcdhbase.server.M4LeaseBindingRpcIT",
+    "io.etcdhbase.server.commit.LeaseBindingMutationPlannerTest",
+    "io.etcdhbase.server.commit.M3OwnerLeaseTest",
+    "io.etcdhbase.server.config.M3RuntimeConfigurationTest",
+}
+J41_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.core.kv.LeaseBindingChangeSetTest": {
+        "deleteAndUnleasedRecreationRetainTheOriginalUnbind"
+    },
+    "io.etcdhbase.core.lease.LeaseBindingIdentityTest": {
+        "isolatesBindingRowsAcrossIncarnationsOfTheSameLeaseId"
+    },
+    "io.etcdhbase.core.commit.CommitFinalizationServiceTest": {
+        "selectedLeaseBindingRecordIsReplayableAfterRestartAtItsMaterializationBoundary"
+    },
+    "io.etcdhbase.core.lease.LeaseCostAdmissionTest": {
+        "acceptsAccountingExactlyAtEachConfiguredBoundary",
+        "rejectsCountKeyBytesAndRevokeCostOverTheConfiguredBoundary",
+    },
+    "io.etcdhbase.server.M4LeaseBindingRpcIT": {
+        "realGoLeaseBindingCallsMatchNativeAndSurviveRestartAcrossLayouts"
+    },
+    "io.etcdhbase.server.commit.LeaseBindingMutationPlannerTest": {
+        "activeStateUpdateIncludesItsCurrentExpiryCandidate",
+        "revokedStateUpdatesDoNotWriteNewExpiryCandidates",
+    },
+    "io.etcdhbase.server.commit.M3OwnerLeaseTest": {
+        "startupFormatUpgradeRotatesTheFenceWithoutLosingOwnerRenewal"
+    },
+    "io.etcdhbase.server.config.M3RuntimeConfigurationTest": {
+        "m4ActivationRequiresExplicitLeaseRevocationLimits"
+    },
+}
 
 
 class ReportError(ValueError):
@@ -148,6 +257,9 @@ def validate_registry_document(document: object) -> dict[str, object]:
     if j40 is None:
         raise ReportError("J40 evidence registration is required")
     _validate_j40_registration(j40)
+    j41 = task_map.get("J41")
+    if j41 is not None:
+        _validate_j41_registration(j41)
     return document
 
 
@@ -232,6 +344,70 @@ def _validate_j40_registration(task: dict[str, object]) -> None:
         raise ReportError("J40 must compare both real HBase layouts")
     if evidence.get("compare_logs") != ["compare-history.log", "compare-native.log"]:
         raise ReportError("J40 comparison log registration changed")
+
+
+def _validate_j41_registration(task: dict[str, object]) -> None:
+    if (task.get("api_ids") != ["L01", "L04", "L05", "P01", "T01", "D01", "R01"]
+            or task.get("scenario") != "m4-lease-bindings-v1"
+            or task.get("manifest") != "m4-lease-bindings.yaml"
+            or task.get("artifact_subdir") != "j41"):
+        raise ReportError("J41 API or scenario registration changed")
+    traces = task["trace_cases"]
+    if any(not isinstance(item, dict) for item in traces):
+        raise ReportError("J41 binding trace case is malformed")
+    if [(item.get("id"), item.get("method")) for item in traces] != list(J41_TRACE_CASES):
+        raise ReportError("J41 lease-binding trace coverage is missing, reordered, or changed")
+    if any(not isinstance(item.get("api_id"), str) or not item["api_id"] for item in traces):
+        raise ReportError("J41 trace case has no API mapping")
+
+    go_tests: dict[str, set[str]] = {}
+    for package in task["go_tests"]:
+        if not isinstance(package, dict) or not isinstance(package.get("package"), str):
+            raise ReportError("J41 Go test registration is malformed")
+        names = package.get("tests")
+        if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
+            raise ReportError("J41 Go package has no named required tests")
+        if package["package"] in go_tests:
+            raise ReportError("J41 Go package is registered more than once")
+        go_tests[package["package"]] = set(names)
+    if any(not expected.issubset(go_tests.get(package, set()))
+           for package, expected in J41_GO_TESTS.items()):
+        raise ReportError("J41 Go binding regression coverage is incomplete")
+
+    java_classes: set[str] = set()
+    java_methods: dict[str, set[str]] = {}
+    for suite in task["maven_tests"]:
+        if not isinstance(suite, dict):
+            raise ReportError("J41 Maven test registration is malformed")
+        module, kind, class_name, tests = (
+            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
+        )
+        if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
+            raise ReportError("J41 Maven test registration has an invalid module, kind, or class")
+        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
+            raise ReportError("J41 Maven suite has no named required tests")
+        java_classes.add(class_name)
+        java_methods.setdefault(class_name, set()).update(tests)
+    if not J41_JAVA_CLASSES.issubset(java_classes):
+        raise ReportError("J41 Maven unit or MiniCluster suites are not all registered")
+    if any(not methods.issubset(java_methods.get(class_name, set()))
+           for class_name, methods in J41_CRITICAL_JAVA_TESTS.items()):
+        raise ReportError("J41 binding budget, restart, or atomic registration regression is not registered")
+
+    evidence = task["evidence"]
+    native = evidence["native"]
+    target_layouts = {
+        (target.get("scope"), target.get("layout"), target.get("embedded_native"))
+        for target in evidence["targets"] if isinstance(target, dict)
+    }
+    if (native.get("scope"), native.get("layout"), native.get("embedded_native")) != (
+        "native-etcd", "", True
+    ) or target_layouts != {
+        ("target-hbase", "HISTORY", False), ("target-hbase", "NATIVE", False)
+    }:
+        raise ReportError("J41 must compare native etcd with both HBase layouts")
+    if evidence.get("compare_logs") != ["compare-history.log", "compare-native.log"]:
+        raise ReportError("J41 comparison log registration changed")
 
 
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, object]:
@@ -435,6 +611,28 @@ def _validate_java_tests(artifact: Path, task: dict[str, object]) -> int:
     return sum(len(item[2]) for item in suites.values())
 
 
+def _task_artifact_root(artifact: Path, task: dict[str, object]) -> Path:
+    subdirectory = task.get("artifact_subdir", "")
+    if not isinstance(subdirectory, str):
+        raise ReportError("M4 evidence subdirectory is malformed")
+    if not subdirectory:
+        return artifact
+    relative = PurePosixPath(subdirectory)
+    if (relative.is_absolute() or "\\" in subdirectory
+            or any(part in {"", ".", ".."} for part in relative.parts)):
+        raise ReportError("M4 evidence subdirectory is unsafe")
+    current = artifact
+    if current.is_symlink():
+        raise ReportError("M4 evidence root must not be a symlink")
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ReportError("M4 evidence subdirectory must not traverse a symlink")
+    if not current.is_dir():
+        raise ReportError("M4 task evidence subdirectory is missing")
+    return current
+
+
 def _read_trace(path: Path, expected_cases: list[dict[str, object]], scope: str) -> bytes:
     try:
         raw = path.read_bytes()
@@ -446,7 +644,7 @@ def _read_trace(path: Path, expected_cases: list[dict[str, object]], scope: str)
     if len(lines) != len(expected_cases):
         raise ReportError(f"M4 trace {path.name} does not contain every registered case")
     expected_ordinals: dict[str, int] = {}
-    for line, expected in zip(lines, expected_cases):
+    for ordinal, (line, expected) in enumerate(zip(lines, expected_cases), start=1):
         try:
             record = json.loads(line, object_pairs_hook=_unique_object)
         except (json.JSONDecodeError, ReportError) as error:
@@ -466,14 +664,21 @@ def _read_trace(path: Path, expected_cases: list[dict[str, object]], scope: str)
             raise ReportError("M4 trace has a changed case, order, method, or evidence scope")
         if not isinstance(record["request"], dict):
             raise ReportError("M4 trace request snapshot is missing")
-        if expected["id"] in {"duplicate-id", "oversized-ttl"}:
-            expected_code = "FailedPrecondition" if expected["id"] == "duplicate-id" else "OutOfRange"
-            if not isinstance(record["error"], dict) or record["error"].get("grpc_code") != expected_code:
+        expected_error = {
+            "duplicate-id": "FailedPrecondition",
+            "oversized-ttl": "OutOfRange",
+            "binding-invalid-lease-atomicity": "NotFound",
+            "binding-invalid-lease-put": "NotFound",
+        }.get(expected_case_id)
+        if expected_error is not None:
+            if (not isinstance(record["error"], dict)
+                    or record["error"].get("grpc_code") != expected_error
+                    or record["response"] is not None):
                 raise ReportError("M4 trace did not preserve its required native error")
         elif record["error"] is not None or not isinstance(record["response"], dict):
             raise ReportError("M4 successful Lease case has no response or has an error")
         if record["stream_terminal"] is not None:
-            raise ReportError("J40 unary Lease trace unexpectedly has a stream terminal")
+            raise ReportError("M4 unary Lease trace unexpectedly has a stream terminal")
     return raw
 
 
@@ -509,6 +714,7 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
     task = next((item for item in registry["tasks"] if item["id"] == task_id), None)
     if task is None:
         raise ReportError("M4 run task is not registered")
+    evidence_root = _task_artifact_root(artifact, task)
     run_id = run.get("run_id")
     source_commit = run.get("source_commit")
     if (not isinstance(run_id, str) or run_id != artifact.name
@@ -531,16 +737,19 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
         suite_hash = hashlib.sha256(suite_path.read_bytes()).hexdigest()
     except OSError as error:
         raise ReportError("registered M4 scenario manifest is missing") from error
-    prefix_hash = hashlib.sha256(f"etcd-hbase-m4-test/{run_id}/".encode()).hexdigest()
+    prefix = f"etcd-hbase-m4-test/{run_id}/"
+    if task_id == "J41":
+        prefix += "bindings/"
+    prefix_hash = hashlib.sha256(prefix.encode()).hexdigest()
 
     expected_cases = task["trace_cases"]
     native = task["evidence"]["native"]
-    native_bytes = _read_trace(artifact / "native-trace.jsonl", expected_cases, native["scope"])
+    native_bytes = _read_trace(evidence_root / "native-trace.jsonl", expected_cases, native["scope"])
     _validate_run_metadata(
-        artifact / "native-metadata.json", run=run, descriptor=native, trace_bytes=native_bytes,
+        evidence_root / "native-metadata.json", run=run, descriptor=native, trace_bytes=native_bytes,
         suite_hash=suite_hash, prefix_hash=prefix_hash, layout="",
     )
-    native_log = artifact / "native.log"
+    native_log = evidence_root / "native.log"
     if not native_log.is_file() or "M4 Lease scenario passed" not in native_log.read_text(encoding="utf-8"):
         raise ReportError("native Go Lease run has no success record")
 
@@ -548,19 +757,22 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
     for descriptor in task["evidence"]["targets"]:
         layout = descriptor["layout"]
         suffix = layout.lower()
-        trace_bytes = _read_trace(artifact / f"target-{suffix}-trace.jsonl", expected_cases, descriptor["scope"])
+        trace_bytes = _read_trace(
+            evidence_root / f"target-{suffix}-trace.jsonl", expected_cases, descriptor["scope"]
+        )
         _validate_run_metadata(
-            artifact / f"target-{suffix}-metadata.json", run=run, descriptor=descriptor,
+            evidence_root / f"target-{suffix}-metadata.json", run=run, descriptor=descriptor,
             trace_bytes=trace_bytes, suite_hash=suite_hash, prefix_hash=prefix_hash, layout=layout,
         )
-        target_log = artifact / f"target-{suffix}.log"
+        target_log = evidence_root / f"target-{suffix}.log"
         if not target_log.is_file() or "M4 Lease scenario passed" not in target_log.read_text(encoding="utf-8"):
             raise ReportError(f"target Go Lease run for {layout} has no success record")
         layouts.append(layout)
 
+    compare_success = J41_COMPARE_SUCCESS if task_id == "J41" else COMPARE_SUCCESS
     for compare_log in task["evidence"]["compare_logs"]:
-        path = artifact / compare_log
-        if not path.is_file() or COMPARE_SUCCESS not in path.read_text(encoding="utf-8"):
+        path = evidence_root / compare_log
+        if not path.is_file() or compare_success not in path.read_text(encoding="utf-8"):
             raise ReportError(f"M4 native comparison {compare_log} is missing or failed")
 
     return {

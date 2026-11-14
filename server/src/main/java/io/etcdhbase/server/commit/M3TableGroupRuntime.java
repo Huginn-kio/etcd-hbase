@@ -8,8 +8,10 @@ import io.etcdhbase.core.commit.CommitPublisher;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.AuxiliaryFormatUpgrade;
 import io.etcdhbase.core.commit.AuxiliaryLeasePlanVerifier;
+import io.etcdhbase.core.commit.LeaseBindingFormatUpgrade;
 import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.LeaseBindingReader;
+import io.etcdhbase.core.commit.LeaseBindingReadView;
 import io.etcdhbase.core.commit.LeaseEnumerationReader;
 import io.etcdhbase.core.commit.LeaseReadView;
 import io.etcdhbase.core.commit.ManifestCatalog;
@@ -21,6 +23,7 @@ import io.etcdhbase.core.commit.ResultPreparation;
 import io.etcdhbase.core.commit.UnchangedRangeProof;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.LeaseIdAllocator;
+import io.etcdhbase.core.lease.LeaseCostAdmission;
 import io.etcdhbase.core.lease.LeaseTimeRules;
 import io.etcdhbase.core.lease.LeaseTimeSource;
 import io.etcdhbase.core.kv.RangeReadCache;
@@ -65,7 +68,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static final BudgetManager.Reservation REQUEST_MEMORY =
       new BudgetManager.Reservation(64L << 10, 64L << 10, 2L << 20, 16L << 20, 64L << 20);
   // Lease state proofs may receive a conservative system-record envelope larger than the M3
-  // point-read lane. Keep that capacity scoped to Lease RPCs so ordinary KV admission is unchanged.
+  // point-read lane. Keep that capacity scoped to Lease RPCs and lease-aware mutations so
+  // ordinary KV admission is unchanged.
   private static final BudgetManager.Reservation LEASE_REQUEST_MEMORY = new BudgetManager.Reservation(
       REQUEST_MEMORY.heads(), REQUEST_MEMORY.page(),
       Math.max(REQUEST_MEMORY.io(), ManifestCatalog.maximumProofReadPageBytes()),
@@ -138,24 +142,28 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       var recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
           stores.invocations(), stores.outcomes(), stores.finalizer());
       String instance = CommitOwnerService.newInstanceId();
-      if (activation.m4LeaseApiEnabled()) {
-        ensureAuxiliaryFormat(plan, activation, connections, identity, stores, recovery, instance, startup);
-        stores = await(TableGroupStores.openConfigured(connections, identity, plan,
-            activation.pinConfiguration(), startup), startup);
-        verifyAuxiliaryFormat(stores, startup);
-        invocations = new InvocationService(stores.invocations());
-        owners = new CommitOwnerService(stores.control());
-        recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
-            stores.invocations(), stores.outcomes(), stores.finalizer());
-      }
       var ownerFuture = M3OwnerLease.acquire(recovery, owners, instance,
           Duration.ofMillis(activation.ownerLeaseMs()), Duration.ofMillis(activation.heartbeatMs()),
           Duration.ofMillis(2L * activation.heartbeatMs()), startup, pending.queue::close);
       pending.trackOwner(ownerFuture);
       var owner = await(ownerFuture, startup);
+      if (activation.m4LeaseApiEnabled()) {
+        ensureM4LeaseBindingFormat(plan, connections, identity, stores, owner, startup);
+        stores = await(TableGroupStores.openConfigured(connections, identity, plan,
+            activation.pinConfiguration(), startup), startup);
+        verifyLeaseBindingFormat(stores, startup);
+        invocations = new InvocationService(stores.invocations());
+        owners = new CommitOwnerService(stores.control());
+        recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
+            stores.invocations(), stores.outcomes(), stores.finalizer());
+      }
       ByteKey authorization = authorizationDigest(identity);
       var business = assembleBusiness(plan, activation, connections, budgets, scans, pending, stores,
           invocations, owner, cacheLimits);
+      if (business.lease().isPresent()) {
+        verifyExistingLeaseLimits(plan, activation, budgets, stores, authorization,
+            business.lease().orElseThrow(), startup);
+      }
       ServiceComponents services = assembleService(plan, activation, identity, authorization, budgets,
           pending, stores, invocations, owner, business);
       startup.closeAsync(CLEANUP);
@@ -183,33 +191,72 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     }
   }
 
-  private static void ensureAuxiliaryFormat(M3TableGroupPlan plan,
-      M3RuntimeConfiguration activation, HBaseConnectionFactory connections,
-      AuthorizedBackendIdentity identity, TableGroupStores stores, RecoveryManager recovery,
-      String instance, RequestScope startup) throws Exception {
-    long now = Clock.systemUTC().millis();
-    long deadline = Math.addExact(now, activation.ownerLeaseMs());
-    RecoveryManager.Result recovered = await(recovery.recover(instance, now, deadline, startup), startup);
-    if (recovered.state() == RecoveryManager.State.OWNER_ACTIVE) {
+  private static void ensureM4LeaseBindingFormat(M3TableGroupPlan plan,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity,
+      TableGroupStores stores, M3OwnerLease ownerLease, RequestScope startup) throws Exception {
+    if (!ownerLease.isReady()) {
       throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
     }
-    CommitOwnerService.OwnerToken owner = recovered.owner().orElseThrow();
-    // Declare the additive table capability before the control-row format transition. The CAS
-    // adapter intentionally refuses to upgrade a table whose descriptor does not advertise the
-    // auxiliary records, so a failed startup can safely retry this idempotent descriptor change.
+    CommitState initial = await(stores.control().read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    if (!initial.supportsAuxiliaryRecords() && initial.formatVersion() != CommitState.FORMAT_VERSION) {
+      throw new IllegalStateException("table-group control format cannot be activated for M4");
+    }
+
+    // Descriptor and control-format capabilities advance separately. Publish the descriptor
+    // marker first, then reopen the CAS adapter so it validates the capability snapshot it uses.
     await(ensureAuxiliaryDescriptor(plan, connections, identity, startup), startup);
-    // Stores were opened before the descriptor mutation and retain the old capability snapshot.
-    HBaseCommitControlStore upgradedControl = await(
+    HBaseCommitControlStore auxiliaryControl = await(
         HBaseCommitControlStore.open(connections, identity, plan.system(), startup), startup);
-    if (!upgradedControl.supportsAuxiliary()) {
+    if (!auxiliaryControl.supportsAuxiliary()) {
       throw new IllegalStateException("M4 auxiliary descriptor capability is not available");
     }
-    CommitState state = await(upgradedControl.read(startup), startup)
-        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized")).state();
-    if (state.formatVersion() == CommitState.FORMAT_VERSION) {
-      await(new AuxiliaryFormatUpgrade(upgradedControl).upgrade(owner, now, startup), startup);
-    } else if (state.formatVersion() != CommitState.AUXILIARY_FORMAT_VERSION) {
+    CommitOwnerService auxiliaryOwners = new CommitOwnerService(auxiliaryControl);
+    CommitState auxiliaryState = await(auxiliaryControl.read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    if (auxiliaryState.formatVersion() == CommitState.FORMAT_VERSION) {
+      await(ownerLease.transitionFence(auxiliaryOwners,
+          owner -> new AuxiliaryFormatUpgrade(auxiliaryControl)
+              .upgrade(owner, Clock.systemUTC().millis(), startup), startup), startup);
+    } else if (auxiliaryState.supportsAuxiliaryRecords()) {
+      await(ownerLease.transitionFence(auxiliaryOwners,
+          CompletableFuture::completedFuture, startup), startup);
+    } else {
       throw new IllegalStateException("table-group control format cannot be activated for M4");
+    }
+
+    await(ensureLeaseBindingDescriptor(plan, connections, identity, startup), startup);
+    HBaseCommitControlStore bindingControl = await(
+        HBaseCommitControlStore.open(connections, identity, plan.system(), startup), startup);
+    if (!bindingControl.supportsAuxiliary() || !bindingControl.supportsLeaseBindings()) {
+      throw new IllegalStateException("J41 binding descriptor capability is not available");
+    }
+    CommitOwnerService bindingOwners = new CommitOwnerService(bindingControl);
+    CommitState bindingState = await(bindingControl.read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    if (bindingState.formatVersion() == CommitState.AUXILIARY_FORMAT_VERSION) {
+      await(ownerLease.transitionFence(bindingOwners,
+          owner -> new LeaseBindingFormatUpgrade(bindingControl)
+              .upgrade(owner, Clock.systemUTC().millis(), startup), startup), startup);
+    } else if (bindingState.supportsLeaseBindings()) {
+      await(ownerLease.transitionFence(bindingOwners,
+          CompletableFuture::completedFuture, startup), startup);
+    } else {
+      throw new IllegalStateException("table-group control format cannot be activated for J41");
+    }
+
+    CommitState verified = await(bindingControl.read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    CommitOwnerService.OwnerToken owner = ownerLease.token();
+    if (!verified.supportsLeaseBindings()
+        || verified.ownerInstance().filter(owner.instance()::equals).isEmpty()
+        || verified.ownerEpoch() != owner.epoch()
+        || verified.ownerLeaseExpired(Clock.systemUTC().millis()) || !ownerLease.isReady()) {
+      throw new IllegalStateException("J41 control format upgrade lost its owner fence");
     }
   }
 
@@ -232,12 +279,32 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     }).exceptionallyCompose(failure -> CompletableFuture.failedFuture(HBaseFailures.classify(failure)));
   }
 
-  private static void verifyAuxiliaryFormat(TableGroupStores stores, RequestScope scope) throws Exception {
+  private static CompletableFuture<Void> ensureLeaseBindingDescriptor(M3TableGroupPlan plan,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity, RequestScope scope) {
+    var request = new HBaseRequestContext(scope);
+    return request.borrowConnection(connections, identity).thenCompose(connection -> {
+      var admin = connection.getAdmin();
+      return request.execute(() -> admin.getDescriptor(plan.system().table())).thenCompose(descriptor -> {
+        if (plan.system().supportsLeaseBindings(descriptor)) return CompletableFuture.completedFuture(null);
+        var replacement = plan.system().withLeaseBindingCapability(descriptor);
+        return request.execute(() -> admin.modifyTable(replacement))
+            .thenCompose(ignored -> request.execute(() -> admin.getDescriptor(plan.system().table())))
+            .thenAccept(verified -> {
+              if (!plan.system().supportsLeaseBindings(verified)) {
+                throw new IllegalStateException("J41 system-table capability was not persisted");
+              }
+            });
+      });
+    }).exceptionallyCompose(failure -> CompletableFuture.failedFuture(HBaseFailures.classify(failure)));
+  }
+
+  private static void verifyLeaseBindingFormat(TableGroupStores stores, RequestScope scope) throws Exception {
     CommitState state = await(stores.control().read(scope), scope)
         .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized")).state();
-    if (state.formatVersion() != CommitState.AUXILIARY_FORMAT_VERSION
-        || !stores.control().supportsAuxiliary() || !stores.records().supportsAuxiliary()) {
-      throw new IllegalStateException("M4 auxiliary format is not fenced and available");
+    if (!state.supportsLeaseBindings()
+        || !stores.control().supportsAuxiliary() || !stores.control().supportsLeaseBindings()
+        || !stores.records().supportsAuxiliary() || !stores.records().supportsLeaseBindings()) {
+      throw new IllegalStateException("J41 Lease binding format is not fenced and available");
     }
   }
 
@@ -248,7 +315,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private record LeaseComponents(LeaseGrantOwnerProcessor grantProcessor,
       LeaseEmptyExpiryOwnerProcessor expiryProcessor,
       LeaseReadView readView, LeaseEnumerationReader enumeration, LeaseBindingReader bindings,
-      LeaseTimeSource time) {}
+      LeaseTimeSource time, LeaseBindingMutationPlanner bindingPlanner) {}
 
   private record ServiceComponents(KvService kvService, LeaseService leaseService) {}
 
@@ -270,43 +337,60 @@ public final class M3TableGroupRuntime implements AutoCloseable {
                 LeaseStateMessages::decode, LeaseBindingMessages::decode)),
         stores.invocations(), pending.handoff, stores.finalizer());
     var metrics = new RequestMetrics();
-    var executor = new PutMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
-        stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
-        preparation, publisher, 5L << 20, 8L << 20, metrics);
+    Optional<LeaseComponents> lease = activation.m4LeaseApiEnabled()
+        ? Optional.of(assembleLease(plan, activation, budgets, stores, invocations, owner, publisher))
+        : Optional.empty();
+    PutMutationExecutor executor = lease.isPresent()
+        ? new PutMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
+            stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
+            preparation, publisher, 5L << 20, 8L << 20,
+            lease.orElseThrow().bindingPlanner(), metrics)
+        : new PutMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
+            stores.control(), stores.views(), stores.manifests(), connections, plan.primary(), pending.worker,
+            preparation, publisher, 5L << 20, 8L << 20, metrics);
+    BudgetManager.Reservation mutationReservation = lease.isPresent()
+        ? LEASE_REQUEST_MEMORY : REQUEST_MEMORY;
     var putProcessor = new PutOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
-        REQUEST_MEMORY, executor, stores.outcomes());
+        mutationReservation, executor, stores.outcomes());
     var txnLimits = new TxnExecutionLimits(5L << 20, 8L << 20, 32L << 20, 4096, 4096);
     var txnPreparation = new TxnCommitPreparation(new ResultPreparation(stores.resultRepository()),
         stores.results(), new ManifestPreparation(stores.manifestRepository(),
             new ManifestPreparation.Limits(128, 4L << 20, 128, 8L << 20)), invocations, 8L << 20);
-    var txnExecutor = new TxnMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
-        stores.control(), stores.views(), stores.manifests(), stores.records(), stores.manifestRepository(),
-        connections, plan.primary(), pending.worker, scans, txnPreparation, publisher, txnLimits, metrics);
+    TxnMutationExecutor txnExecutor = lease.isPresent()
+        ? new TxnMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
+            stores.control(), stores.views(), stores.manifests(), stores.records(), stores.manifestRepository(),
+            connections, plan.primary(), pending.worker, scans, txnPreparation, publisher,
+            txnLimits, lease.orElseThrow().bindingPlanner(), metrics)
+        : new TxnMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
+            stores.control(), stores.views(), stores.manifests(), stores.records(), stores.manifestRepository(),
+            connections, plan.primary(), pending.worker, scans, txnPreparation, publisher, txnLimits, metrics);
     var txnProcessor = new TxnOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
-        REQUEST_MEMORY, txnExecutor, stores.outcomes(), activation.maxEtcdRequestBytes());
+        mutationReservation, txnExecutor, stores.outcomes(), activation.maxEtcdRequestBytes());
     if (cacheLimits.isPresent()) pending.createCache(plan, stores, budgets, cacheLimits.orElseThrow());
     var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),
         connections, plan.primary(), pending.worker, scans, txnLimits, metrics, Optional.ofNullable(pending.cache));
-    Optional<LeaseComponents> lease = activation.m4LeaseApiEnabled()
-        ? Optional.of(assembleLease(plan, activation, budgets, stores, invocations, owner, publisher))
-        : Optional.empty();
     return new BusinessComponents(putProcessor, txnProcessor, txnReads, metrics, publisher, lease);
   }
 
   private static LeaseComponents assembleLease(M3TableGroupPlan plan,
       M3RuntimeConfiguration activation, BudgetManager budgets, TableGroupStores stores,
       InvocationService invocations, M3OwnerLease owner, CommitPublisher publisher) {
+    int maximumMutationRecords = LeaseBindingMutationPlanner.MAX_AUXILIARY_RECORDS_PER_MUTATION;
     var leaseReads = new LeaseReadView(stores.records(), stores.manifests(), LeaseStateMessages::decode,
-        1_024, 64L << 20);
+        maximumMutationRecords, 64L << 20);
     var enumeration = new LeaseEnumerationReader(stores.records(), stores.manifests(),
         LeaseStateMessages::decode, plan.primary().codec().saltProfile().bucketCount(),
-        64, 8L << 10, 100_000, 100_000, 1_024, 64L << 20);
+        64, 8L << 10, 100_000, 100_000, maximumMutationRecords, 64L << 20);
     var bindings = new LeaseBindingReader(stores.records(), stores.manifests(),
         LeaseBindingMessages::decode, LeaseGateway.BINDING_PAGE_ENTRIES,
         LeaseGateway.bindingPageBytes(activation.maxEtcdRequestBytes()), 100_000, 64L << 20,
-        100_000, activation.maxEtcdRequestBytes(), 1_024, 64L << 20);
+        100_000, activation.maxEtcdRequestBytes(), maximumMutationRecords, 64L << 20);
     LeaseTimeSource time = new BoundedSystemLeaseTimeSource(
         Clock.systemUTC(), activation.leaseClockUncertaintyMs());
+    var bindingReadView = new LeaseBindingReadView(stores.records(), stores.manifests(),
+        LeaseBindingMessages::decode, maximumMutationRecords, 64L << 20);
+    var bindingPlanner = new LeaseBindingMutationPlanner(leaseReads, bindingReadView, time,
+        new LeaseCostAdmission(activation.leaseCostLimits()));
     var allocator = new LeaseIdAllocator(
         () -> ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE), 16);
     var mutationPreparation = new LeaseAuxiliaryMutationPreparation(
@@ -326,7 +410,29 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     var expiryProcessor = new LeaseEmptyExpiryOwnerProcessor(plan.source().tableGroupId(),
         owner.token(), budgets, LEASE_REQUEST_MEMORY, expiryExecutor, stores.outcomes(), invocations,
         Clock.systemUTC());
-    return new LeaseComponents(processor, expiryProcessor, leaseReads, enumeration, bindings, time);
+    return new LeaseComponents(processor, expiryProcessor, leaseReads, enumeration, bindings,
+        time, bindingPlanner);
+  }
+
+  /** Refuses a stricter restart configuration that could strand a previously accepted Lease. */
+  private static void verifyExistingLeaseLimits(M3TableGroupPlan plan,
+      M3RuntimeConfiguration activation, BudgetManager budgets, TableGroupStores stores,
+      ByteKey authorization, LeaseComponents lease, RequestScope startup) throws Exception {
+    BudgetManager.Reservation scanReservation = new BudgetManager.Reservation(
+        LEASE_REQUEST_MEMORY.heads(), LEASE_REQUEST_MEMORY.page(), LEASE_REQUEST_MEMORY.io(),
+        32L << 20, LEASE_REQUEST_MEMORY.candidates());
+    var account = budgets.admit(plan.source().tableGroupId(), startup, scanReservation,
+        new BudgetManager.ReadLimits(100_000, 64L << 20, 100_000, 100_000, 100_000));
+    try {
+      var proof = new ManifestCatalog.ProofReadBudget(startup, account, 100_000, 64L << 20);
+      var pin = await(stores.views().openAuxiliary(authorization, startup), startup);
+      var existing = await(lease.enumeration().read(pin, startup, account, proof), startup);
+      var admission = new LeaseCostAdmission(activation.leaseCostLimits());
+      for (var state : existing) admission.requireExistingStateFits(state);
+      await(lease.readView().finish(pin, startup), startup);
+    } finally {
+      account.close();
+    }
   }
 
   private static ServiceComponents assembleService(M3TableGroupPlan plan,

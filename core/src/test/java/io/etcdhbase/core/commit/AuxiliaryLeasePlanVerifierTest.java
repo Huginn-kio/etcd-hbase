@@ -41,6 +41,19 @@ class AuxiliaryLeasePlanVerifierTest {
   }
 
   @Test
+  void bindingUpdateCanReuseTheImmutableExpiryCandidateFromItsCurrentGeneration() {
+    LeaseState state = new LeaseState(LEASE_IDENTITY, 30, 20_000, 4,
+        LeaseState.Status.ACTIVE, SELECTED_SEQUENCE, 3, 1, KEY.length(), 512);
+    LeaseBindingVersion binding = new LeaseBindingVersion(LEASE_IDENTITY, KEY, true,
+        SELECTED_SEQUENCE, 2, 9);
+    var transaction = verifier(state, binding).begin(BASE_SEQUENCE);
+    records(state, binding, new LeaseEnumerationPointer(SELECTED_SEQUENCE), expiry(state))
+        .forEach(transaction::accept);
+
+    assertDoesNotThrow(transaction::finish);
+  }
+
+  @Test
   void rejectsMissingOrMismatchedEnumerationPointer() {
     LeaseState state = activeState();
     var missing = verifier(state, null).begin(BASE_SEQUENCE);
@@ -123,7 +136,7 @@ class AuxiliaryLeasePlanVerifierTest {
     }
     if (expiry != null) {
       records.add(record(transactionId, ordinal++, SystemRecordType.EXPIRY_CANDIDATE,
-          expiry.encode(), new ExpiryCandidateRecord(SELECTED_SEQUENCE).encode()));
+          expiry.encode(), new ExpiryCandidateRecord(state.expiryCandidateSequence()).encode()));
     }
     if (binding != null) {
       records.add(record(transactionId, ordinal, SystemRecordType.LEASE_BINDING,

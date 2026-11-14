@@ -10,6 +10,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.kv.KvFailure;
 import io.etcdhbase.core.kv.PutCommand;
+import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.RequestScopeInterceptor;
@@ -173,6 +174,9 @@ public final class PutGateway implements BiConsumer<Rpc.PutRequest, StreamObserv
     }
     if (reply instanceof MutationRelay.SemanticRejection semantic) {
       return CompletableFuture.failedFuture(new KvFailure(semantic.reason()));
+    }
+    if (reply instanceof MutationRelay.LeaseRejection rejection) {
+      return CompletableFuture.failedFuture(new LeaseFailure(rejection.reason()));
     }
     if (reply instanceof MutationRelay.KnownRejection rejection) {
       return CompletableFuture.failedFuture(new BackendFailure(rejection.category()));

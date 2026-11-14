@@ -8,6 +8,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
+import io.etcdhbase.core.lease.LeaseBindingVersion;
 import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
@@ -105,6 +106,40 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
       assertThrows(CompletionException.class, () -> wrongId.preflight(record, scope).join());
       assertThrows(CompletionException.class, () -> wrongSequence.preflight(record, scope).join());
       assertThrows(CompletionException.class, () -> corrupt.preflight(record, scope).join());
+    }
+  }
+
+  @Test
+  void leaseBindingVersionsAreValidatedAndAppliedIdempotently() {
+    var records = new MemorySystemRecordStore();
+    ByteKey key = ByteKey.copyOf(new byte[] {'k'});
+    LeaseBindingVersion binding = new LeaseBindingVersion(
+        new LeaseIdentity(-11, 1), key, true, 1, 1, 1);
+    var materialization = new SystemRecordAuxiliaryMaterializationStore(records,
+        payload -> LeaseState.grant(new LeaseIdentity(-11, 1), 1, 1, 1), ignored -> binding);
+    TransactionId transactionId = TransactionId.create();
+    PreparedAuxiliaryRecord record = PreparedAuxiliaryRecord.create(transactionId, 1, 0, 0,
+        SystemRecordType.LEASE_BINDING, binding.recordIdentity().encode(),
+        ByteKey.copyOf(new byte[] {1}));
+    CommitDecision decision = decision(transactionId, 1);
+
+    try (RequestScope scope = scope()) {
+      materialization.preflight(record, scope).join();
+      assertEquals(AuxiliaryMaterializationStore.ApplyResult.APPLIED,
+          materialization.applySelected(decision, record, scope).join());
+      assertEquals(AuxiliaryMaterializationStore.ApplyResult.ALREADY_APPLIED,
+          materialization.applySelected(decision, record, scope).join());
+
+      var missingDecoder = materialization(records);
+      assertThrows(CompletionException.class, () -> missingDecoder.preflight(record, scope).join());
+
+      LeaseBindingVersion mismatchedBinding = new LeaseBindingVersion(
+          new LeaseIdentity(-11, 1), ByteKey.copyOf(new byte[] {'x'}), true, 1, 1, 1);
+      var mismatchedDecoder = new SystemRecordAuxiliaryMaterializationStore(records,
+          payload -> LeaseState.grant(new LeaseIdentity(-11, 1), 1, 1, 1),
+          ignored -> mismatchedBinding);
+      assertThrows(CompletionException.class,
+          () -> mismatchedDecoder.preflight(record, scope).join());
     }
   }
 

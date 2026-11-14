@@ -39,6 +39,7 @@ public final class AuxiliaryLeasePlanVerifier {
     private final Map<Long, LeaseState> states = new HashMap<>();
     private final Set<Long> enumerationIds = new HashSet<>();
     private final Map<Long, ExpiryCandidateIdentity> expiryByLease = new HashMap<>();
+    private final Map<Long, ExpiryCandidateRecord> expiryRecords = new HashMap<>();
     private final Map<BindingKey, LeaseBindingVersion> bindings = new HashMap<>();
     private boolean finished;
 
@@ -76,7 +77,9 @@ public final class AuxiliaryLeasePlanVerifier {
           if (expiry == null || expiry.deadlineEpochMillis() != state.deadlineEpochMillis()
               || expiry.leaseId() != leaseId
               || expiry.incarnation() != state.identity().incarnation()
-              || expiry.renewalGeneration() != state.renewalGeneration()) {
+              || expiry.renewalGeneration() != state.renewalGeneration()
+              || expiryRecords.get(leaseId) == null
+              || expiryRecords.get(leaseId).stateSequence() != state.expiryCandidateSequence()) {
             throw invalid("active Lease state and expiry candidate differ");
           }
         } else if (expiry != null) {
@@ -119,9 +122,11 @@ public final class AuxiliaryLeasePlanVerifier {
 
     private void acceptExpiry(PreparedAuxiliaryRecord record) {
       ExpiryCandidateIdentity expiry = ExpiryCandidateIdentity.decode(record.targetIdentity());
+      ExpiryCandidateRecord expiryRecord = ExpiryCandidateRecord.decode(record.payload());
       if (expiry.leaseId() == 0
-          || ExpiryCandidateRecord.decode(record.payload()).stateSequence() != selectedSequence
-          || expiryByLease.putIfAbsent(expiry.leaseId(), expiry) != null) {
+          || expiryRecord.stateSequence() > selectedSequence
+          || expiryByLease.putIfAbsent(expiry.leaseId(), expiry) != null
+          || expiryRecords.putIfAbsent(expiry.leaseId(), expiryRecord) != null) {
         throw invalid("Lease expiry candidate differs from its selected transaction");
       }
     }

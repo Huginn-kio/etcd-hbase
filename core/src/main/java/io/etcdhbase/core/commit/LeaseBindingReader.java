@@ -63,6 +63,14 @@ public final class LeaseBindingReader {
   public CompletableFuture<List<ByteKey>> read(PinnedReadView pin, LeaseState state,
       RequestScope scope, BudgetManager.Account account,
       ManifestCatalog.ProofReadBudget metadataBudget) {
+    return readBindings(pin, state, scope, account, metadataBudget)
+        .thenApply(bindings -> bindings.stream().map(LeaseBindingVersion::key).toList()).copy();
+  }
+
+  /** Returns the effective binding versions for an atomic revoke plan at this pinned barrier. */
+  public CompletableFuture<List<LeaseBindingVersion>> readBindings(PinnedReadView pin, LeaseState state,
+      RequestScope scope, BudgetManager.Account account,
+      ManifestCatalog.ProofReadBudget metadataBudget) {
     Objects.requireNonNull(pin, "pin");
     Objects.requireNonNull(state, "state");
     Objects.requireNonNull(scope, "scope");
@@ -85,7 +93,7 @@ public final class LeaseBindingReader {
       return CompletableFuture.failedFuture(inactive(scope));
     }
     ScopedBudgetLeases reservations = null;
-    CompletableFuture<List<ByteKey>> operation;
+    CompletableFuture<List<LeaseBindingVersion>> operation;
     try {
       if (state.boundKeyCount() > maximumBindings || state.boundKeyBytes() > maximumOutputBytes) {
         throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
@@ -289,7 +297,7 @@ public final class LeaseBindingReader {
       return binding;
     }
 
-    private List<ByteKey> result() {
+    private List<LeaseBindingVersion> result() {
       active();
       long bindingCount = 0;
       long keyBytes = 0;
@@ -312,18 +320,18 @@ public final class LeaseBindingReader {
       if (bindingCount != lease.boundKeyCount() || keyBytes != lease.boundKeyBytes()) {
         throw new IllegalStateException("Lease binding records disagree with authoritative counters");
       }
-      var keys = new ArrayList<ByteKey>(Math.toIntExact(bindingCount));
+      var bindings = new ArrayList<LeaseBindingVersion>(Math.toIntExact(bindingCount));
       for (Map.Entry<ByteKey, StableBinding> entry : stable.entrySet()) {
         LeaseBindingVersion binding = selected.getOrDefault(entry.getKey(), entry.getValue().value());
-        if (binding.bound()) keys.add(binding.key());
+        if (binding.bound()) bindings.add(binding);
       }
       for (Map.Entry<ByteKey, LeaseBindingVersion> entry : selected.entrySet()) {
         if (!stable.containsKey(entry.getKey()) && entry.getValue().bound()) {
-          keys.add(entry.getValue().key());
+          bindings.add(entry.getValue());
         }
       }
-      keys.sort(ByteKey::compareTo);
-      return List.copyOf(keys);
+      bindings.sort(java.util.Comparator.comparing(LeaseBindingVersion::key));
+      return List.copyOf(bindings);
     }
 
     private long stableBindingMemoryBytes(SystemRecordEntry entry, LeaseBindingVersion binding) {

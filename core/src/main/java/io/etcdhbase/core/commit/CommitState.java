@@ -8,6 +8,7 @@ import java.util.Optional;
 public final class CommitState {
   public static final int FORMAT_VERSION = 1;
   public static final int AUXILIARY_FORMAT_VERSION = 2;
+  public static final int LEASE_BINDING_FORMAT_VERSION = 3;
   public static final int MAX_OWNER_INSTANCE_BYTES = 128;
 
   private final ByteKey profileFingerprint;
@@ -39,7 +40,8 @@ public final class CommitState {
     this.profileFingerprint = Objects.requireNonNull(profileFingerprint, "profileFingerprint");
     this.ownerInstance = Objects.requireNonNull(ownerInstance, "ownerInstance");
     this.publication = Objects.requireNonNull(publication, "publication");
-    if (formatVersion != FORMAT_VERSION && formatVersion != AUXILIARY_FORMAT_VERSION) {
+    if (formatVersion != FORMAT_VERSION && formatVersion != AUXILIARY_FORMAT_VERSION
+        && formatVersion != LEASE_BINDING_FORMAT_VERSION) {
       throw new IllegalArgumentException("unknown commit control format");
     }
     this.formatVersion = formatVersion;
@@ -93,6 +95,8 @@ public final class CommitState {
   }
 
   public int formatVersion() { return formatVersion; }
+  public boolean supportsAuxiliaryRecords() { return formatVersion >= AUXILIARY_FORMAT_VERSION; }
+  public boolean supportsLeaseBindings() { return formatVersion >= LEASE_BINDING_FORMAT_VERSION; }
   public ByteKey profileFingerprint() { return profileFingerprint; }
   public Optional<String> ownerInstance() { return ownerInstance; }
   public long ownerEpoch() { return ownerEpoch; }
@@ -112,6 +116,20 @@ public final class CommitState {
       throw new IllegalStateException("control state cannot be upgraded while active work is pending");
     }
     return new CommitState(AUXILIARY_FORMAT_VERSION, profileFingerprint, ownerInstance,
+        Math.addExact(ownerEpoch, 1), ownerLeaseDeadlineEpochMillis, nextStateVersion(),
+        publishedSequence, publishedRevision, finalizedSequence, finalizedRevision,
+        publication, compactRevision);
+  }
+
+  /** Fences J40 writers before J41 persists Lease binding histories and accounting. */
+  public CommitState upgradeLeaseBindingFormat(
+      String expectedOwner, long expectedEpoch, long nowMillis) {
+    requireOwner(expectedOwner, expectedEpoch);
+    if (formatVersion != AUXILIARY_FORMAT_VERSION || publication.isPresent()
+        || ownerLeaseExpired(nowMillis)) {
+      throw new IllegalStateException("control state cannot enable Lease bindings while work is pending");
+    }
+    return new CommitState(LEASE_BINDING_FORMAT_VERSION, profileFingerprint, ownerInstance,
         Math.addExact(ownerEpoch, 1), ownerLeaseDeadlineEpochMillis, nextStateVersion(),
         publishedSequence, publishedRevision, finalizedSequence, finalizedRevision,
         publication, compactRevision);

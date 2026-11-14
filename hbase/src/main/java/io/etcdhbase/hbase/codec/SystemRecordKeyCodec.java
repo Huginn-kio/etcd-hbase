@@ -172,18 +172,46 @@ public final class SystemRecordKeyCodec {
     return new ScanBounds(start, startInclusive, prefixEnd(prefix), false, false);
   }
 
-  /** Reverse-seeks one lease's latest state version at or below the requested sequence. */
+  /** Reverse-seeks one Lease state history at or below the requested sequence. */
   public ScanBounds leaseVersionBounds(SystemRecordType type, ByteKey routePrefix, long sequence) {
     if (type != SystemRecordType.LEASE_STATE || routePrefix.length() != LeaseRecordIdentity.ROUTE_BYTES
         || sequence <= 0) {
       throw new IllegalArgumentException("invalid lease-version seek");
     }
-    ByteKey identity = ByteKey.copyOf(ByteBuffer.allocate(LeaseRecordIdentity.IDENTITY_BYTES)
+    return versionBounds(type, routePrefix, sequence, LeaseRecordIdentity.IDENTITY_BYTES);
+  }
+
+  /** Reverse-seeks one key's Lease binding history at or below the requested sequence. */
+  public ScanBounds leaseBindingVersionBounds(ByteKey keyRoutePrefix, long sequence) {
+    Objects.requireNonNull(keyRoutePrefix, "keyRoutePrefix");
+    if (keyRoutePrefix.length() < LeaseBindingIdentity.ROUTE_BYTES + 2 || sequence <= 0) {
+      throw new IllegalArgumentException("invalid Lease binding-version seek");
+    }
+    byte[] identityBytes = ByteBuffer.allocate(Math.addExact(keyRoutePrefix.length(), Long.BYTES))
+        .put(keyRoutePrefix.bytes()).putLong(1).array();
+    LeaseBindingIdentity.Decoded decoded = LeaseBindingIdentity.decode(ByteKey.copyOf(identityBytes));
+    ByteKey identity = ByteKey.copyOf(ByteBuffer.allocate(identityBytes.length)
+        .put(keyRoutePrefix.bytes()).putLong(sequence).array());
+    byte[] start = encode(SystemRecordType.LEASE_BINDING, identity);
+    byte[] route = LeaseBindingIdentity.routePrefix(decoded.leaseId(), decoded.incarnation()).bytes();
+    byte[] saltPrefix = checkedPrefix(salt.salt(
+        saltIdentifier(SystemRecordType.LEASE_BINDING, route)));
+    int encodedKeyLength = Math.toIntExact(OrderedKeyBytes.encodedLength(decoded.key().bytes()));
+    int exactBindingPrefixLength = Math.addExact(saltPrefix.length + 1 + route.length, encodedKeyLength);
+    byte[] exactBindingPrefix = ByteBuffer.allocate(exactBindingPrefixLength)
+        .put(saltPrefix).put((byte) SystemRecordType.LEASE_BINDING.id()).put(route)
+        .put(OrderedKeyBytes.encode(decoded.key().bytes())).array();
+    return new ScanBounds(start, true, exactBindingPrefix, false, true);
+  }
+
+  private ScanBounds versionBounds(SystemRecordType type, ByteKey routePrefix, long sequence,
+      int identityBytes) {
+    ByteKey identity = ByteKey.copyOf(ByteBuffer.allocate(identityBytes)
         .put(routePrefix.bytes()).putLong(sequence).array());
     byte[] start = encode(type, identity);
     byte[] prefix = typePrefix(type, bucket(type, identity));
     byte[] exactIdPrefix = Arrays.copyOf(prefix, prefix.length + Integer.BYTES + routePrefix.length());
-    ByteBuffer.wrap(exactIdPrefix, prefix.length, Integer.BYTES).putInt(LeaseRecordIdentity.IDENTITY_BYTES);
+    ByteBuffer.wrap(exactIdPrefix, prefix.length, Integer.BYTES).putInt(identityBytes);
     System.arraycopy(routePrefix.bytes(), 0, exactIdPrefix, prefix.length + Integer.BYTES,
         routePrefix.length());
     return new ScanBounds(start, true, exactIdPrefix, false, true);

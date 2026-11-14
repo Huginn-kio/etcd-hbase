@@ -146,7 +146,438 @@
         ],
         "compare_logs": ["compare-history.log", "compare-native.log"]
       }
+    },
+    {
+      "id": "J41",
+      "artifact_subdir": "j41",
+      "api_ids": [
+        "L01",
+        "L04",
+        "L05",
+        "P01",
+        "T01",
+        "D01",
+        "R01"
+      ],
+      "scenario": "m4-lease-bindings-v1",
+      "manifest": "m4-lease-bindings.yaml",
+      "trace_cases": [
+        {
+          "id": "binding-baseline",
+          "api_id": "L05",
+          "method": "etcdserverpb.Lease/LeaseLeases"
+        },
+        {
+          "id": "binding-grant-a",
+          "api_id": "L01",
+          "method": "etcdserverpb.Lease/LeaseGrant"
+        },
+        {
+          "id": "binding-grant-b",
+          "api_id": "L01",
+          "method": "etcdserverpb.Lease/LeaseGrant"
+        },
+        {
+          "id": "binding-register-then",
+          "api_id": "T01",
+          "method": "etcdserverpb.KV/Txn"
+        },
+        {
+          "id": "binding-ttl-a-initial",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-ttl-b-initial",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-ignore-flags",
+          "api_id": "P01",
+          "method": "etcdserverpb.KV/Put"
+        },
+        {
+          "id": "binding-ttl-a-preserved",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-rebind-a-to-b",
+          "api_id": "P01",
+          "method": "etcdserverpb.KV/Put"
+        },
+        {
+          "id": "binding-ttl-a-after-rebind",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-ttl-b-after-rebind",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-register-else",
+          "api_id": "T01",
+          "method": "etcdserverpb.KV/Txn"
+        },
+        {
+          "id": "binding-ttl-b-after-else",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-register-nested",
+          "api_id": "T01",
+          "method": "etcdserverpb.KV/Txn"
+        },
+        {
+          "id": "binding-ttl-a-after-nested",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-ttl-b-after-nested",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-unbind",
+          "api_id": "P01",
+          "method": "etcdserverpb.KV/Put"
+        },
+        {
+          "id": "binding-ttl-a-after-unbind",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-delete",
+          "api_id": "D01",
+          "method": "etcdserverpb.KV/DeleteRange"
+        },
+        {
+          "id": "binding-ttl-b-after-delete",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-recreate-unleased",
+          "api_id": "P01",
+          "method": "etcdserverpb.KV/Put"
+        },
+        {
+          "id": "binding-ttl-b-after-recreate",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-delete-range",
+          "api_id": "D01",
+          "method": "etcdserverpb.KV/DeleteRange"
+        },
+        {
+          "id": "binding-ttl-a-after-delete-range",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-ttl-b-after-delete-range",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-role-prefix-after-delete-range",
+          "api_id": "R01",
+          "method": "etcdserverpb.KV/Range"
+        },
+        {
+          "id": "binding-version-after-delete-range",
+          "api_id": "R01",
+          "method": "etcdserverpb.KV/Range"
+        },
+        {
+          "id": "binding-survivor-put",
+          "api_id": "P01",
+          "method": "etcdserverpb.KV/Put"
+        },
+        {
+          "id": "binding-ttl-b-after-survivor-put",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-invalid-lease-atomicity",
+          "api_id": "T01",
+          "method": "etcdserverpb.KV/Txn"
+        },
+        {
+          "id": "binding-atomicity-range-first",
+          "api_id": "R01",
+          "method": "etcdserverpb.KV/Range"
+        },
+        {
+          "id": "binding-atomicity-range-second",
+          "api_id": "R01",
+          "method": "etcdserverpb.KV/Range"
+        },
+        {
+          "id": "binding-ttl-a-after-failed-txn",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        },
+        {
+          "id": "binding-invalid-lease-put",
+          "api_id": "P01",
+          "method": "etcdserverpb.KV/Put"
+        },
+        {
+          "id": "binding-atomicity-range-invalid-put",
+          "api_id": "R01",
+          "method": "etcdserverpb.KV/Range"
+        },
+        {
+          "id": "binding-invalid-lease-unselected-branch",
+          "api_id": "T01",
+          "method": "etcdserverpb.KV/Txn"
+        },
+        {
+          "id": "binding-unselected-then-absent",
+          "api_id": "R01",
+          "method": "etcdserverpb.KV/Range"
+        },
+        {
+          "id": "binding-unselected-else-visible",
+          "api_id": "R01",
+          "method": "etcdserverpb.KV/Range"
+        },
+        {
+          "id": "binding-ttl-b-after-unselected-branch",
+          "api_id": "L04",
+          "method": "etcdserverpb.Lease/LeaseTimeToLive"
+        }
+      ],
+      "go_tests": [
+        {
+          "package": "cmd/m4driver",
+          "tests": [
+            "TestRunNativeLeaseBindingWritesFreshTraceAndVerifiableMetadata",
+            "TestCompareBindingsRejectsCorruptOrEmptyTrace"
+          ]
+        },
+        {
+          "package": "internal/scenario",
+          "tests": [
+            "TestM4LeaseBindingScenarioMatchesItsPinnedNativeOracle",
+            "TestLoadM4LeaseBindingSuiteRejectsMissingOrChangedCoverage"
+          ]
+        },
+        {
+          "package": "internal/compare",
+          "tests": [
+            "TestCompareM4LeaseBindingRecordsNormalizesTransportAndScenarioRelativeTtl",
+            "TestCompareM4LeaseBindingRecordsTreatsTtlKeysAsAnUnorderedSet",
+            "TestCompareM4LeaseBindingRecordsRejectsMissingOrDuplicateTtlKeys",
+            "TestCompareM4LeaseBindingRecordsRejectsRevisionAndPartialResult",
+            "TestCompareM4LeaseBindingRecordsRejectsInvalidTtlAndUnexpectedRenewal",
+            "TestCompareM4LeaseBindingRequiresNotFoundForInvalidLeaseOperations"
+          ]
+        },
+        {
+          "package": "internal/trace",
+          "tests": [
+            "TestSnapshotProtoPreservesBinaryAndInt64Values",
+            "TestReadJSONLRejectsInvalidOrderingAndSecrets",
+            "TestStreamTerminalCannotContradictItsOutcome"
+          ]
+        }
+      ],
+      "maven_tests": [
+        {
+          "module": "core",
+          "kind": "surefire",
+          "class": "io.etcdhbase.core.commit.CommitFinalizationServiceTest",
+          "tests": [
+            "selectedAuxiliaryRecordsMustFinishBeforeFinalizedWatermarkAdvances",
+            "selectedLeaseBindingRecordIsReplayableAfterRestartAtItsMaterializationBoundary"
+          ]
+        },
+        {
+          "module": "core",
+          "kind": "surefire",
+          "class": "io.etcdhbase.core.commit.LeaseBindingFormatUpgradeTest",
+          "tests": [
+            "upgradeFencesJ40WriterAndResolvesLostControlCasResponse",
+            "competingControlRowChangeCannotBeReportedAsSuccessfulUpgrade"
+          ]
+        },
+        {
+          "module": "core",
+          "kind": "surefire",
+          "class": "io.etcdhbase.core.commit.CommitStateTest",
+          "tests": [
+            "leaseBindingUpgradeFencesTheAuxiliaryOwnerBeforeChangingCapabilities"
+          ]
+        },
+        {
+          "module": "core",
+          "kind": "surefire",
+          "class": "io.etcdhbase.core.kv.LeaseBindingChangeSetTest",
+          "tests": [
+            "keepsTheBaseToFinalTransitionAcrossSeveralPrivatePuts",
+            "createThenDeleteWithinOneTxnLeavesNoBindingDelta",
+            "deleteAndUnleasedRecreationRetainTheOriginalUnbind"
+          ]
+        },
+        {
+          "module": "core",
+          "kind": "surefire",
+          "class": "io.etcdhbase.core.lease.LeaseBindingIdentityTest",
+          "tests": [
+            "roundTripsBinaryKeysAndSignedLeaseIds",
+            "preservesKeyOrderBeforeSequenceAndRejectsMalformedIdentity",
+            "isolatesBindingRowsAcrossIncarnationsOfTheSameLeaseId"
+          ]
+        },
+        {
+          "module": "core",
+          "kind": "surefire",
+          "class": "io.etcdhbase.core.lease.LeaseCostAdmissionTest",
+          "tests": [
+            "acceptsAccountingExactlyAtEachConfiguredBoundary",
+            "rejectsCountKeyBytesAndRevokeCostOverTheConfiguredBoundary",
+            "releasesTheBindingReserveIntoRetainedHistoryWhenRevoked",
+            "rejectsAccountingUnderflowAsCorruptState",
+            "rejectsKeyAndValueSizeArithmeticThatCannotBeRepresented"
+          ]
+        },
+        {
+          "module": "core",
+          "kind": "surefire",
+          "class": "io.etcdhbase.core.commit.LeaseReadViewTest",
+          "tests": [
+            "bindingReadMergesStableHistoryWithSelectedChangesAtOneBarrier",
+            "bindingReadFailsAsAWholeWhenTheOutputBudgetIsExceeded",
+            "bindingReadReservesMemoryForTheLeaseRatherThanMaximumLimits"
+          ]
+        },
+        {
+          "module": "core",
+          "kind": "surefire",
+          "class": "io.etcdhbase.core.commit.AuxiliaryLeasePlanVerifierTest",
+          "tests": [
+            "acceptsMatchingStatePointerExpiryAndBindingUpdates",
+            "bindingUpdateCanReuseTheImmutableExpiryCandidateFromItsCurrentGeneration",
+            "requiresBindingUpdateToMatchTheSameLeaseIncarnationAndSequence"
+          ]
+        },
+        {
+          "module": "hbase",
+          "kind": "surefire",
+          "class": "io.etcdhbase.hbase.codec.LeaseStateMessagesTest",
+          "tests": [
+            "roundTripsSignedIdsAndBothStates",
+            "rejectsMissingFieldsUnknownFormatStatusAndInvalidState",
+            "readsLegacyStateWithExpirySequenceEqualToItsStateSequence",
+            "readsExpirySequenceFormatWithoutBindingHistoryAccounting"
+          ]
+        },
+        {
+          "module": "hbase",
+          "kind": "surefire",
+          "class": "io.etcdhbase.hbase.codec.SystemRecordKeyCodecTest",
+          "tests": [
+            "leaseBindingRowsAreRoutedAndOrderedByLeaseKeyAndVersion",
+            "leaseBindingVersionSeekStopsAtOneExactKeyRoute"
+          ]
+        },
+        {
+          "module": "hbase",
+          "kind": "surefire",
+          "class": "io.etcdhbase.hbase.storage.SystemTableBindingTest",
+          "tests": [
+            "acceptsTheExactDurableSingleVersionSystemTable",
+            "resultCapabilityIsExplicitAndDoesNotChangeLegacyValidation"
+          ]
+        },
+        {
+          "module": "hbase",
+          "kind": "failsafe",
+          "class": "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT",
+          "tests": [
+            "scansOneBucketInBoundedExclusiveResumePages",
+            "stopsBeforeCrossingTheByteBudgetAndResumesAfterTheLastIncludedRecord",
+            "rejectsPagesThatExceedTheirByteBudgetAndSeeksVersionsAtTheBarrier",
+            "seeksOneKeyBindingHistoryWithoutCrossingIntoNeighborKeys"
+          ]
+        },
+        {
+          "module": "server",
+          "kind": "surefire",
+          "class": "io.etcdhbase.server.commit.LeaseBindingMutationPlannerTest",
+          "tests": [
+            "revokedStateUpdatesDoNotWriteNewExpiryCandidates",
+            "activeStateUpdateIncludesItsCurrentExpiryCandidate"
+          ]
+        },
+        {
+          "module": "server",
+          "kind": "surefire",
+          "class": "io.etcdhbase.server.commit.M3OwnerLeaseTest",
+          "tests": [
+            "startupFormatUpgradeRotatesTheFenceWithoutLosingOwnerRenewal"
+          ]
+        },
+        {
+          "module": "server",
+          "kind": "surefire",
+          "class": "io.etcdhbase.server.config.M3RuntimeConfigurationTest",
+          "tests": [
+            "m4ActivationRequiresExplicitLeaseRevocationLimits"
+          ]
+        },
+        {
+          "module": "server",
+          "kind": "failsafe",
+          "class": "io.etcdhbase.server.M4LeaseRpcIT",
+          "tests": [
+            "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts"
+          ]
+        },
+        {
+          "module": "server",
+          "kind": "failsafe",
+          "class": "io.etcdhbase.server.M4LeaseBindingRpcIT",
+          "tests": [
+            "realGoLeaseBindingCallsMatchNativeAndSurviveRestartAcrossLayouts"
+          ]
+        }
+      ],
+      "evidence": {
+        "native": {
+          "scope": "native-etcd",
+          "layout": "",
+          "embedded_native": true
+        },
+        "targets": [
+          {
+            "scope": "target-hbase",
+            "layout": "HISTORY",
+            "embedded_native": false
+          },
+          {
+            "scope": "target-hbase",
+            "layout": "NATIVE",
+            "embedded_native": false
+          }
+        ],
+        "compare_logs": [
+          "compare-history.log",
+          "compare-native.log"
+        ]
+      }
     }
   ],
-  "pending_tasks": ["J41", "J42", "J43", "J44", "J45", "J46", "J47", "J29.4"]
+  "pending_tasks": ["J42","J43","J44","J45","J46","J47","J29.4"]
 }

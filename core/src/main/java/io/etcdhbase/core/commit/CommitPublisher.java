@@ -82,8 +82,7 @@ public final class CommitPublisher {
       }
       ControlSnapshot observed = snapshot.orElseThrow();
       CommitState state = observed.state();
-      if (manifest.auxiliaryReference().isPresent()
-          && state.formatVersion() != CommitState.AUXILIARY_FORMAT_VERSION) {
+      if (manifest.auxiliaryReference().isPresent() && !state.supportsAuxiliaryRecords()) {
         return CompletableFuture.failedFuture(new IllegalStateException(
             "auxiliary publication requires the fenced control format"));
       }

@@ -12,6 +12,7 @@ import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.kv.KvFailure;
 import io.etcdhbase.core.kv.RangeCommand;
 import io.etcdhbase.core.kv.TxnCommand;
+import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.RequestScopeInterceptor;
@@ -220,6 +221,9 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
     }
     if (reply instanceof MutationRelay.SemanticRejection semantic) {
       return CompletableFuture.failedFuture(new KvFailure(semantic.reason()));
+    }
+    if (reply instanceof MutationRelay.LeaseRejection rejection) {
+      return CompletableFuture.failedFuture(new LeaseFailure(rejection.reason()));
     }
     if (reply instanceof MutationRelay.KnownRejection rejected) {
       return CompletableFuture.failedFuture(new BackendFailure(rejected.category()));

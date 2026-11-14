@@ -42,8 +42,10 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 		return runLeaseScenario(ctx, arguments[1:], stdout, stderr)
 	case "compare":
 		return compareLeaseTraces(arguments[1:], stdout, stderr)
+	case "compare-bindings":
+		return compareLeaseBindingTraces(arguments[1:], stdout, stderr)
 	default:
-		return errors.New("M4 driver command must be run or compare")
+		return errors.New("M4 driver command must be run, compare, or compare-bindings")
 	}
 }
 
@@ -66,6 +68,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 	}
 	suite, suiteDigest, err := scenario.LoadM4LeaseSuite(options.scenario)
 	if err != nil {
+		suite, suiteDigest, err = scenario.LoadM4LeaseBindingSuite(options.scenario)
+	}
+	if err != nil {
 		return err
 	}
 	build, err := scenario.BuildMetadata(suite)
@@ -84,6 +89,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 	ctx, cancel := context.WithTimeout(parent, options.timeout)
 	defer cancel()
 	if options.nativeData != "" {
+		if suite.ID == "m4-lease-bindings-v1" {
+			return scenario.RunM4NativeLeaseBindings(ctx, options.nativeData, options.prefix, evidence.trace)
+		}
 		return scenario.RunM4NativeLease(ctx, options.nativeData, options.prefix, evidence.trace)
 	}
 	connection, err := client.New(client.Options{Endpoint: options.endpoint, Timeout: options.timeout})
@@ -91,6 +99,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 		return errors.New("M4 target client initialization failed")
 	}
 	defer func() { runErr = errors.Join(runErr, connection.Close()) }()
+	if suite.ID == "m4-lease-bindings-v1" {
+		return scenario.RunM4LeaseBindings(ctx, connection, options.scope, options.prefix, evidence.trace)
+	}
 	return scenario.RunM4Lease(ctx, connection, options.scope, options.prefix, evidence.trace)
 }
 
@@ -239,5 +250,34 @@ func compareLeaseTraces(arguments []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	_, err = fmt.Fprintln(stdout, "M4 Lease traces match the registered native comparison policy")
+	return err
+}
+
+func compareLeaseBindingTraces(arguments []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("m4driver compare-bindings", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var left, right string
+	flags.StringVar(&left, "left", "", "native binding trace JSONL")
+	flags.StringVar(&right, "right", "", "target binding trace JSONL")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || left == "" || right == "" || left == right {
+		return errors.New("M4 binding compare requires distinct left and right trace files")
+	}
+	leftFile, err := os.Open(left)
+	if err != nil {
+		return errors.New("native M4 binding trace cannot be opened")
+	}
+	defer leftFile.Close()
+	rightFile, err := os.Open(right)
+	if err != nil {
+		return errors.New("target M4 binding trace cannot be opened")
+	}
+	defer rightFile.Close()
+	if err := compare.CompareM4LeaseBindingTraces(leftFile, rightFile); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, "M4 Lease binding traces match the registered native comparison policy")
 	return err
 }

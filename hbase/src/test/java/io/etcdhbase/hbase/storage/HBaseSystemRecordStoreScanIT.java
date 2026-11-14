@@ -11,6 +11,7 @@ import io.etcdhbase.core.commit.SystemRecordPage;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.lease.LeaseBindingIdentity;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
@@ -144,8 +145,78 @@ class HBaseSystemRecordStoreScanIT {
     }
   }
 
+  @Test
+  void seeksOneKeyBindingHistoryWithoutCrossingIntoNeighborKeys() throws Exception {
+    try (M1TestEnvironment environment = M1TestEnvironment.start(1);
+        RequestScope scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
+      SystemTableBinding binding = createLeaseCapableSystemTable(environment, true);
+      SystemRecordStore records = HBaseSystemRecordStore.open(
+          environment.factory(), environment.identity(), binding, scope).join();
+      long leaseId = -17;
+      long incarnation = 2;
+      ByteKey key = ByteKey.copyOf(new byte[] {'r', (byte) 0xff});
+      ByteKey neighboringKey = ByteKey.copyOf(new byte[] {'r', (byte) 0xff, 0});
+
+      for (long sequence : new long[] {3, 8, 12}) {
+        ByteKey identity = new LeaseBindingIdentity(leaseId, incarnation, key, sequence).encode();
+        assertEquals(SystemRecordStore.CreateResult.CREATED,
+            records.createIfAbsent(SystemRecordType.LEASE_BINDING, identity,
+                ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(sequence).array()), scope).join());
+      }
+      ByteKey neighboring = new LeaseBindingIdentity(leaseId, incarnation, neighboringKey, 15).encode();
+      assertEquals(SystemRecordStore.CreateResult.CREATED,
+          records.createIfAbsent(SystemRecordType.LEASE_BINDING, neighboring,
+              ByteKey.copyOf(new byte[] {99}), scope).join());
+
+      SystemRecordEntry atTen = records.latestAtOrBefore(SystemRecordType.LEASE_BINDING,
+          LeaseBindingIdentity.keyRoutePrefix(leaseId, incarnation, key), 10, scope).join().orElseThrow();
+      assertEquals(new LeaseBindingIdentity(leaseId, incarnation, key, 8).encode(), atTen.identity());
+      assertEquals(ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(8).array()), atTen.value());
+
+      SystemRecordEntry afterHistory = records.latestAtOrBefore(SystemRecordType.LEASE_BINDING,
+          LeaseBindingIdentity.keyRoutePrefix(leaseId, incarnation, key), 100, scope).join().orElseThrow();
+      assertEquals(new LeaseBindingIdentity(leaseId, incarnation, key, 12).encode(), afterHistory.identity());
+      assertTrue(records.latestAtOrBefore(SystemRecordType.LEASE_BINDING,
+          LeaseBindingIdentity.keyRoutePrefix(leaseId, incarnation, key), 2, scope).join().isEmpty());
+    }
+  }
+
+  @Test
+  void rejectsBindingWritesUntilTheCapabilityIsPersistedAndTheStoreIsReopened() throws Exception {
+    try (M1TestEnvironment environment = M1TestEnvironment.start(1);
+        RequestScope scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
+      SystemTableBinding binding = createLeaseCapableSystemTable(environment);
+      SystemRecordStore oldSnapshot = HBaseSystemRecordStore.open(
+          environment.factory(), environment.identity(), binding, scope).join();
+      ByteKey identity = new LeaseBindingIdentity(17, 1,
+          ByteKey.copyOf(new byte[] {'r', 1}), 1).encode();
+      ByteKey value = ByteKey.copyOf(new byte[] {1});
+
+      assertThrows(IllegalStateException.class, () -> oldSnapshot.createIfAbsent(
+          SystemRecordType.LEASE_BINDING, identity, value, scope));
+
+      var admin = environment.connection().getAdmin();
+      var oldDescriptor = admin.getDescriptor(binding.table()).join();
+      admin.modifyTable(binding.withLeaseBindingCapability(oldDescriptor)).join();
+
+      assertThrows(IllegalStateException.class, () -> oldSnapshot.createIfAbsent(
+          SystemRecordType.LEASE_BINDING, identity, value, scope),
+          "an opened J40 record store must retain its conservative capability snapshot");
+      SystemRecordStore reopened = HBaseSystemRecordStore.open(
+          environment.factory(), environment.identity(), binding, scope).join();
+      assertTrue(binding.supportsLeaseBindings(admin.getDescriptor(binding.table()).join()));
+      assertEquals(SystemRecordStore.CreateResult.CREATED, reopened.createIfAbsent(
+          SystemRecordType.LEASE_BINDING, identity, value, scope).join());
+    }
+  }
+
   private static SystemTableBinding createLeaseCapableSystemTable(
       M1TestEnvironment environment) throws Exception {
+    return createLeaseCapableSystemTable(environment, false);
+  }
+
+  private static SystemTableBinding createLeaseCapableSystemTable(
+      M1TestEnvironment environment, boolean leaseBindings) throws Exception {
     String suffix = UUID.randomUUID().toString().replace("-", "");
     String group = "j40-scan-" + suffix;
     String saltProfileId = "j40-salt-" + suffix;
@@ -164,7 +235,7 @@ class HBaseSystemRecordStoreScanIT {
         .setValue("etcdhbase.m0.salt-bucket-count", Integer.toString(salt.profile().bucketCount()))
         .setValue("etcdhbase.m0.salt-width-bytes", Integer.toString(salt.profile().saltWidthBytes()))
         .setValue("etcdhbase.m0.record-categories", RECORD_CATEGORIES)
-        .setValue("etcdhbase.m4.auxiliary-format", "1")
+        .setValue("etcdhbase.m4.auxiliary-format", leaseBindings ? "2" : "1")
         .build();
     environment.create(table, descriptor, salt.splitKeys().toArray(byte[][]::new));
     return binding;

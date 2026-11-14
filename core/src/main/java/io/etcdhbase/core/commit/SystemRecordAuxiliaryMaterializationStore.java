@@ -171,7 +171,7 @@ public final class SystemRecordAuxiliaryMaterializationStore
       }
       case EXPIRY_CANDIDATE -> {
         ExpiryCandidateIdentity.decode(record.targetIdentity());
-        if (ExpiryCandidateRecord.decode(record.payload()).stateSequence() != targetSequence) {
+        if (ExpiryCandidateRecord.decode(record.payload()).stateSequence() > targetSequence) {
           throw new IllegalArgumentException("expiry candidate differs from its commit sequence");
         }
       }

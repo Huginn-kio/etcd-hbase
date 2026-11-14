@@ -45,9 +45,15 @@ class SystemTableBindingTest {
         .setValue("etcdhbase.m0.record-categories", BINDING.auxiliaryRecordCategories(withResult))
         .setValue("etcdhbase.m4.auxiliary-format", "1").build();
     assertTrue(BINDING.supportsAuxiliary(withAuxiliary));
+    assertFalse(BINDING.supportsLeaseBindings(withAuxiliary));
+    var withLeaseBindings = BINDING.withLeaseBindingCapability(withAuxiliary);
+    assertTrue(BINDING.supportsAuxiliary(withLeaseBindings));
+    assertTrue(BINDING.supportsLeaseBindings(withLeaseBindings));
     var unknownAuxiliary = TableDescriptorBuilder.newBuilder(withResult)
-        .setValue("etcdhbase.m4.auxiliary-format", "2").build();
+        .setValue("etcdhbase.m4.auxiliary-format", "3").build();
     assertFalse(BINDING.supportsAuxiliary(unknownAuxiliary));
+    assertThrows(IllegalStateException.class,
+        () -> BINDING.withAuxiliaryCapability(unknownAuxiliary));
   }
 
   @Test

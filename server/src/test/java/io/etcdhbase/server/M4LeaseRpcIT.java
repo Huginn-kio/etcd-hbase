@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.protobuf.ByteString;
 import etcdserverpb.LeaseGrpc;
 import etcdserverpb.Rpc;
 import io.etcdhbase.admin.M3TableGroupInitializer;
@@ -34,6 +35,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hbase.TableName;
@@ -44,6 +46,8 @@ import org.junit.jupiter.api.Timeout;
 @Timeout(600)
 class M4LeaseRpcIT {
   private static final int MAX_DRIVER_DIAGNOSTIC_BYTES = 8 * 1024;
+  private static final int TEST_OWNER_LEASE_MILLIS = 6_000;
+  private static final int TEST_HEARTBEAT_MILLIS = 1_000;
   private static final List<String> LAYOUT_FILES =
       List.of("history-table.json", "native-cell-versions.json");
   private static final RuntimeConfiguration.ResourceBudgets RESOURCES =
@@ -64,6 +68,21 @@ class M4LeaseRpcIT {
     }
     compare(run, "HISTORY");
     compare(run, "NATIVE");
+  }
+
+  static void verifyGoLeaseBindingsMatchNativeAndSurviveRestartAcrossLayouts() throws Exception {
+    RunContext run = prepareBindingRun();
+    prepareNativeBindingEvidence(run);
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (int index = 0; index < LAYOUT_FILES.size(); index++) {
+        String layoutFile = LAYOUT_FILES.get(index);
+        String layout = index == 0 ? "HISTORY" : "NATIVE";
+        runBindingLayout(cluster, clientPort, layoutFile, layout, run);
+      }
+    }
+    compareBindings(run, "HISTORY");
+    compareBindings(run, "NATIVE");
   }
 
   private static void runLayout(TemporaryHBaseClusterProcess cluster, int clientPort,
@@ -99,7 +118,7 @@ class M4LeaseRpcIT {
         assertTrue(first.dataReady());
         assertOldWriterCannotPublish(plan, initializer, identity, preUpgrade, staleWriterClaim);
         runTargetDriver(run, layout, first.boundListeners().getFirst().port());
-        assertControlAndTableAreAuxiliary(plan, initializer, identity);
+        assertEquals(1, assertControlAndTableAreAuxiliary(plan, initializer, identity));
         explicitId = leaseIdForPrefix(prefix, "explicit");
         assertTrue(explicitId > 0);
       } finally {
@@ -129,6 +148,57 @@ class M4LeaseRpcIT {
     }
   }
 
+  private static void runBindingLayout(TemporaryHBaseClusterProcess cluster, int clientPort,
+      String layoutFile, String layout, RunContext run) throws Exception {
+    InitializationConfiguration initialization = initialization(layoutFile, clientPort);
+    var source = TableGroupPlanFactory.create(initialization, "local", null);
+    M3TableGroupPlan plan = M3TableGroupPlan.from(source);
+    var authScope = new io.etcdhbase.spi.identity.AuthenticationScope(
+        source.tableGroupId(), source.hbaseProfile().id());
+    try (var initializer = new HBaseBackendIdentityProvider(source.identityProviderId(), authScope,
+            cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+            (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+            1, 1, Duration.ofSeconds(30));
+         var credentials = new io.etcdhbase.spi.identity.BackendCredentials("m4-initializer", new char[0])) {
+      var identity = initializer.authenticate(credentials, authScope).toCompletableFuture()
+          .get(30, TimeUnit.SECONDS);
+      M3RuntimeConfiguration firstActivation = activation("1");
+      var initialized = M3TableGroupInitializer.initializeFresh(plan,
+          "sha256:" + source.fingerprint(), identity, initializer, firstActivation.pinConfiguration());
+      RuntimeConfiguration configuration = new RuntimeConfiguration(initialization.schemaVersion(),
+          List.of(new RuntimeConfiguration.Listener("m4-local", "127.0.0.1", 0, source.tableGroupId())),
+          initialization.hbaseProfiles(), initialization.saltProfiles(), initialization.tableGroups(), RESOURCES);
+
+      long publishedRevision;
+      RuntimeServer first = RuntimeServer.startM3(configuration, firstActivation);
+      try {
+        assertTrue(first.dataReady());
+        runBindingTargetDriver(run, layout, first.boundListeners().getFirst().port());
+        publishedRevision = assertControlAndTableAreAuxiliary(plan, initializer, identity);
+        assertTrue(publishedRevision > 1, "binding scenario should advance the KV revision");
+      } finally {
+        first.close();
+      }
+
+      M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
+      long leaseB = leaseIdForPrefix(run.prefix(), "binding-b");
+      try (RuntimeServer restarted = RuntimeServer.startM3(configuration, activation("2"))) {
+        assertTrue(restarted.dataReady());
+        Rpc.LeaseTimeToLiveResponse ttl = timeToLive(restarted, leaseB, true);
+        assertEquals(leaseB, ttl.getID());
+        assertTrue(ttl.getTTL() > 0);
+        assertEquals(60, ttl.getGrantedTTL());
+        assertEquals(2, ttl.getKeysCount());
+        assertEquals(Set.of(
+            ByteString.copyFrom(run.prefix() + "survivor/registered", StandardCharsets.UTF_8),
+            ByteString.copyFrom(run.prefix() + "atomic/unselected-else", StandardCharsets.UTF_8)),
+            Set.copyOf(ttl.getKeysList()));
+        assertEquals(initialized.clusterId(), ttl.getHeader().getClusterId());
+        assertEquals(publishedRevision, ttl.getHeader().getRevision());
+      }
+    }
+  }
+
   private static ControlSnapshot controlSnapshot(M3TableGroupPlan plan,
       HBaseBackendIdentityProvider provider,
       io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity) throws Exception {
@@ -145,8 +215,7 @@ class M4LeaseRpcIT {
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
       var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
       assertFalse(control.compareAndSet(preUpgrade, staleWriterClaim, scope).join());
-      assertEquals(CommitState.AUXILIARY_FORMAT_VERSION,
-          control.read(scope).join().orElseThrow().state().formatVersion());
+      assertTrue(control.read(scope).join().orElseThrow().state().supportsAuxiliaryRecords());
     }
   }
 
@@ -165,18 +234,20 @@ class M4LeaseRpcIT {
     return false;
   }
 
-  private static void assertControlAndTableAreAuxiliary(M3TableGroupPlan plan,
+  private static long assertControlAndTableAreAuxiliary(M3TableGroupPlan plan,
       HBaseBackendIdentityProvider provider,
       io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity) throws Exception {
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
       var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
       var state = control.read(scope).join().orElseThrow().state();
-      assertEquals(io.etcdhbase.core.commit.CommitState.AUXILIARY_FORMAT_VERSION, state.formatVersion());
+      assertTrue(state.supportsAuxiliaryRecords());
+      assertTrue(state.supportsLeaseBindings());
       assertTrue(state.publishedSequence() > 0);
-      assertEquals(1, state.publishedRevision());
       var connection = provider.connectionFor(identity).toCompletableFuture().join();
       var descriptor = connection.getAdmin().getDescriptor(plan.system().table()).join();
       assertTrue(plan.system().supportsAuxiliary(descriptor));
+      assertTrue(plan.system().supportsLeaseBindings(descriptor));
+      return state.publishedRevision();
     }
   }
 
@@ -236,7 +307,9 @@ class M4LeaseRpcIT {
     ObjectMapper mapper = new ObjectMapper();
     Path path = WireProcesses.repositoryRoot().resolve("config/examples/m4/activation.json");
     ObjectNode tree = (ObjectNode) mapper.readTree(Files.readAllBytes(path));
-    tree.put("member_id", memberId).put("owner_lease_ms", 1_500).put("heartbeat_ms", 200)
+    // MiniCluster admin procedures can exceed a 400 ms heartbeat timeout under Maven load.
+    tree.put("member_id", memberId).put("owner_lease_ms", TEST_OWNER_LEASE_MILLIS)
+        .put("heartbeat_ms", TEST_HEARTBEAT_MILLIS)
         .put("m4_lease_api_enabled", enableLeaseApi);
     return new M3RuntimeConfigurationLoader()
         .load(new ByteArrayInputStream(mapper.writeValueAsBytes(tree)));
@@ -267,9 +340,27 @@ class M4LeaseRpcIT {
         "etcd-hbase-m4-test/" + runId + "/", artifacts.resolve("native-trace.jsonl"));
   }
 
+  private static RunContext prepareBindingRun() throws IOException {
+    RunContext parent = prepareRun();
+    Path artifacts = parent.artifacts().resolve("j41");
+    Files.createDirectories(artifacts);
+    return new RunContext(parent.root(), artifacts, parent.runId(),
+        parent.prefix() + "bindings/", artifacts.resolve("native-trace.jsonl"));
+  }
+
   private static void prepareNativeEvidence(RunContext run) throws Exception {
     if (!Files.exists(run.nativeTrace())) {
       runDriver(run, run.artifacts().resolve("native.log"), "run",
+          "--native-data-dir", run.artifacts().resolve("native-data").toString(),
+          "--scope", "native-etcd", "--prefix", run.prefix(),
+          "--trace", run.nativeTrace().toString(),
+          "--metadata", run.artifacts().resolve("native-metadata.json").toString());
+    }
+  }
+
+  private static void prepareNativeBindingEvidence(RunContext run) throws Exception {
+    if (!Files.exists(run.nativeTrace())) {
+      runBindingDriver(run, run.artifacts().resolve("native.log"), "run",
           "--native-data-dir", run.artifacts().resolve("native-data").toString(),
           "--scope", "native-etcd", "--prefix", run.prefix(),
           "--trace", run.nativeTrace().toString(),
@@ -285,6 +376,14 @@ class M4LeaseRpcIT {
         "--metadata", run.artifacts().resolve("target-" + suffix + "-metadata.json").toString());
   }
 
+  private static void runBindingTargetDriver(RunContext run, String layout, int port) throws Exception {
+    String suffix = layout.toLowerCase(java.util.Locale.ROOT);
+    runBindingDriver(run, run.artifacts().resolve("target-" + suffix + ".log"), "run",
+        "--endpoint", "127.0.0.1:" + port, "--scope", "target-hbase", "--layout", layout,
+        "--prefix", run.prefix(), "--trace", run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString(),
+        "--metadata", run.artifacts().resolve("target-" + suffix + "-metadata.json").toString());
+  }
+
   private static void compare(RunContext run, String layout) throws Exception {
     String suffix = layout.toLowerCase(java.util.Locale.ROOT);
     runDriver(run, run.artifacts().resolve("compare-" + suffix + ".log"), "compare",
@@ -292,13 +391,29 @@ class M4LeaseRpcIT {
         "--right", run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString());
   }
 
+  private static void compareBindings(RunContext run, String layout) throws Exception {
+    String suffix = layout.toLowerCase(java.util.Locale.ROOT);
+    runBindingDriver(run, run.artifacts().resolve("compare-" + suffix + ".log"), "compare-bindings",
+        "--left", run.nativeTrace().toString(),
+        "--right", run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString());
+  }
+
   private static void runDriver(RunContext run, Path log, String... arguments) throws Exception {
+    runDriverWithScenario(run, log, "m4-lease.yaml", arguments);
+  }
+
+  private static void runBindingDriver(RunContext run, Path log, String... arguments) throws Exception {
+    runDriverWithScenario(run, log, "m4-lease-bindings.yaml", arguments);
+  }
+
+  private static void runDriverWithScenario(RunContext run, Path log, String scenarioFile,
+      String... arguments) throws Exception {
     var command = new java.util.ArrayList<String>();
     command.add(run.root().resolve("scripts/dev/go-program.sh").toString());
     command.add("m4driver");
     if (arguments.length > 0 && arguments[0].equals("run")) {
       command.addAll(List.of("run", "--scenario",
-          run.root().resolve("testkit/scenarios/m4-lease.yaml").toString()));
+          run.root().resolve("testkit/scenarios").resolve(scenarioFile).toString()));
       command.addAll(List.of(arguments).subList(1, arguments.length));
     } else {
       command.addAll(List.of(arguments));

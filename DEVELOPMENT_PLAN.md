@@ -809,11 +809,11 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
   - 跟踪：状态=代码与公开临时验证完成；负责人=Codex；完成日期=2026-11-14；PR/commit=[PR #47](https://github.com/Reidddddd/etcd-hbase/pull/47) / `a467e99`；验证=M4 J40 public profile passed（Temurin JDK 21、Maven 105 个单测、M4LeaseRpcIT、Go 原生对照及两种布局）；评审人=Reidddddd；评审结论=等待评审；目标环境与 M4 阶段验收=未完成。
 
-- [ ] **J41｜绑定/换绑、附着与撤销顺序及多角色注册联动**
+- [x] **J41｜绑定/换绑、附着与撤销顺序及多角色注册联动**
   - 依赖：J40/J31。
   - 完成标准：Put WithLease 与提交原子性正确；A 换绑 B、删除后重建、旧 generation 和 revoke 竞争均不误删；多角色注册全有或全无。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=代码与公开临时验证完成；负责人=Codex；完成日期=2026-11-14；PR/commit=PR #48（head 见 PR）；验证=M4 J41 public profile passed（Temurin JDK 21、Go 294 项、Java 870 项、39 个原生 trace、HISTORY/NATIVE MiniCluster；最终报告保留于本地 artifact）；评审人=Reidddddd；评审结论=待评审；目标环境及 M4 阶段验收=未完成。
 
 - [ ] **J42｜KeepAlive 双向流与持久化后回复**
   - 依赖：J40/J41。

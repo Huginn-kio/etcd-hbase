@@ -37,8 +37,8 @@ public final class PinnedReadView implements AutoCloseable {
   }
 
   public ReadView view() { return view; }
-  boolean belongsTo(RequestScope requestScope) { return scope == requestScope; }
-  boolean protectsAuxiliary() { return auxiliaryProtected; }
+  public boolean belongsTo(RequestScope requestScope) { return scope == requestScope; }
+  public boolean protectsAuxiliary() { return auxiliaryProtected; }
   public Optional<ManifestRoot> selectedRoot() { return view.selectedRoot(); }
   public synchronized boolean isOpen() { return !closeRequested && !pinClosed; }
   CompletionStage<Void> cleanupCompletion() { return cleanupCompletion.minimalCompletionStage(); }
