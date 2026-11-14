@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package etcdhbase.internal.v1;
+
+option java_package = "io.etcdhbase.grpc.internal.v1";
+option java_multiple_files = true;
+option java_outer_classname = "OwnerForwardingProtocol";
+
+message ForwardMutationRequest {
+  string table_group_id = 1;
+  bytes invocation_id = 2;
+  bytes request_digest = 3;
+  bytes authorization_scope_digest = 4;
+  bytes authorization_context_reference = 5;
+  uint64 expected_owner_epoch = 6;
+  uint64 remaining_timeout_nanos = 7;
+  uint32 hop_count = 8;
+  bytes operation_bytes = 9;
+}
+
+message ForwardMutationResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    COMPLETED = 1;
+    REJECTED = 2;
+    SEMANTIC_REJECTED = 3;
+    LEASE_REJECTED = 4;
+    UNKNOWN = 5;
+  }
+
+  Outcome outcome = 1;
+  bytes operation_result = 2;
+  string failure_code = 3;
+}
+
+service InternalOwnerService {
+  rpc ForwardMutation(ForwardMutationRequest) returns (ForwardMutationResponse);
+}

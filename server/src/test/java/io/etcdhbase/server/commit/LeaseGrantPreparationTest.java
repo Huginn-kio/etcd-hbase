@@ -77,6 +77,29 @@ class LeaseGrantPreparationTest {
     }
   }
 
+  @Test
+  void persistsNoChangeResponseWithoutCreatingAnEmptyAuxiliaryManifest() throws Exception {
+    try (Fixture fixture = new Fixture()) {
+      ByteKey response = ByteKey.copyOf(new byte[] {4, 2, 1});
+      AtomicBoolean readFinished = new AtomicBoolean();
+
+      InvocationBinding completed = fixture.preparation.auxiliaryMutations().completeWithoutChanges(
+          fixture.invocation, response, () -> {
+            readFinished.set(true);
+            return CompletableFuture.completedFuture(null);
+          }, fixture.scope, fixture.account).join();
+
+      assertTrue(readFinished.get());
+      assertEquals(InvocationBinding.State.NO_CHANGES, completed.state());
+      assertEquals(completed, fixture.current.get());
+      assertEquals(response, ByteKey.copyOf(fixture.results.page.payload()));
+      assertTrue(fixture.records.isEmpty());
+      assertTrue(fixture.pages.isEmpty());
+      assertTrue(fixture.directories.isEmpty());
+      assertEquals(0, fixture.seals);
+    }
+  }
+
   private static final class Fixture implements AutoCloseable {
     private final RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
     private final InvocationBinding invocation = InvocationBinding.begin(InvocationId.create(),

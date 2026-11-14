@@ -11,6 +11,7 @@ import io.etcdhbase.core.commit.PreparedEvent;
 import io.etcdhbase.core.commit.ResultCatalog;
 import io.etcdhbase.core.commit.ResultIdentity;
 import io.etcdhbase.core.commit.ResultPage;
+import io.etcdhbase.core.commit.ResultReference;
 import io.etcdhbase.core.commit.ResultPreparation;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
@@ -20,6 +21,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /** Seals one durable RPC result together with its auxiliary-only M2 publication plan. */
@@ -58,17 +60,41 @@ public final class LeaseAuxiliaryMutationPreparation {
   public CompletableFuture<Sealed> prepare(InvocationBinding invocation, ByteKey resultPayload,
       Iterator<PreparedAuxiliaryRecord> auxiliaryRecords, Supplier<CompletableFuture<Void>> finishRead,
       RequestScope scope, BudgetManager.Account account) {
-    Objects.requireNonNull(invocation, "invocation");
-    Objects.requireNonNull(resultPayload, "resultPayload");
     Objects.requireNonNull(auxiliaryRecords, "auxiliaryRecords");
     Objects.requireNonNull(finishRead, "finishRead");
+    return prepareResult(invocation, resultPayload, scope, account, CANDIDATE_BYTES,
+        reference -> manifests.prepareWithResultAndAuxiliary(invocation,
+            List.<PreparedCandidate>of().iterator(), List.<PreparedEvent>of().iterator(),
+            reference, resultCatalog, auxiliaryRecords, finishRead, scope)
+            .thenCompose(manifest -> invocations.transition(invocation,
+                invocation.seal(manifest.systemIdentity()), scope)
+                .thenApply(sealed -> new Sealed(sealed, manifest))));
+  }
+
+  /** Persists a response-only result without creating an empty auxiliary manifest. */
+  public CompletableFuture<InvocationBinding> completeWithoutChanges(
+      InvocationBinding invocation, ByteKey resultPayload,
+      Supplier<CompletableFuture<Void>> finishRead, RequestScope scope,
+      BudgetManager.Account account) {
+    Objects.requireNonNull(finishRead, "finishRead");
+    return prepareResult(invocation, resultPayload, scope, account, 0,
+        reference -> invocations.completeWithoutChanges(invocation, reference, resultCatalog,
+            finishRead, scope));
+  }
+
+  private <T> CompletableFuture<T> prepareResult(InvocationBinding invocation,
+      ByteKey resultPayload, RequestScope scope, BudgetManager.Account account,
+      long candidateBytes, Function<ResultReference, CompletableFuture<T>> completion) {
+    Objects.requireNonNull(invocation, "invocation");
+    Objects.requireNonNull(resultPayload, "resultPayload");
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(account, "account");
+    Objects.requireNonNull(completion, "completion");
     if (invocation.state() != InvocationBinding.State.PREPARING || !account.belongsTo(scope)
         || resultPayload.length() == 0 || resultPayload.length() > ResultPage.MAX_PAYLOAD_BYTES
-        || invocation.baseSequence() == Long.MAX_VALUE) {
+        || invocation.baseSequence() == Long.MAX_VALUE || candidateBytes < 0) {
       return CompletableFuture.failedFuture(
-          new IllegalArgumentException("invalid Lease auxiliary mutation preparation"));
+          new IllegalArgumentException("invalid Lease result preparation"));
     }
 
     CompletableFuture<Void> drained = new CompletableFuture<>();
@@ -76,19 +102,16 @@ public final class LeaseAuxiliaryMutationPreparation {
       return CompletableFuture.failedFuture(new BackendFailure(scope.isDeadlineExceeded()
           ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
     }
-    CompletableFuture<Sealed> operation;
+    CompletableFuture<T> operation;
     try {
-      retain(scope, account, BudgetManager.Memory.CANDIDATE, CANDIDATE_BYTES);
+      if (candidateBytes > 0) {
+        retain(scope, account, BudgetManager.Memory.CANDIDATE, candidateBytes);
+      }
       retain(scope, account, BudgetManager.Memory.IO, RESULT_IO_BYTES);
       ResultIdentity identity = ResultIdentity.from(invocation);
       List<ResultPage> pages = ResultPreparation.split(identity, ByteBuffer.wrap(resultPayload.bytes()));
-      operation = results.prepare(identity, pages, scope)
-          .thenCompose(reference -> manifests.prepareWithResultAndAuxiliary(invocation,
-              List.<PreparedCandidate>of().iterator(), List.<PreparedEvent>of().iterator(),
-              reference, resultCatalog, auxiliaryRecords, finishRead, scope))
-          .thenCompose(manifest -> invocations.transition(invocation,
-              invocation.seal(manifest.systemIdentity()), scope)
-              .thenApply(sealed -> new Sealed(sealed, manifest)));
+      operation = results.prepare(identity, pages, scope).thenCompose(reference ->
+          Objects.requireNonNull(completion.apply(reference), "Lease result completion"));
     } catch (BackendFailure | RuntimeException failure) {
       drained.complete(null);
       return CompletableFuture.failedFuture(failure);

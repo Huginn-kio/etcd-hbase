@@ -66,6 +66,26 @@ var expectedM4LeaseBindingSteps = []Step{
 	{CaseID: "L04", ID: "binding-ttl-b-after-unselected-branch"},
 }
 
+var expectedM4LeaseKeepAliveSteps = []Step{
+	{CaseID: "L05", ID: "native-baseline"},
+	{CaseID: "L01", ID: "keepalive-grant-a"},
+	{CaseID: "L01", ID: "keepalive-grant-b"},
+	{CaseID: "L01", ID: "keepalive-grant-managed-a"},
+	{CaseID: "L01", ID: "keepalive-grant-managed-b"},
+	{CaseID: "R01", ID: "keepalive-range-before"},
+	{CaseID: "L02", ID: "keepalive-stream-a"},
+	{CaseID: "L02", ID: "keepalive-stream-b"},
+	{CaseID: "L02", ID: "keepalive-stream-missing"},
+	{CaseID: "L02", ID: "keepalive-stream-a-repeat"},
+	{CaseID: "L04", ID: "keepalive-ttl-a"},
+	{CaseID: "L04", ID: "keepalive-ttl-b"},
+	{CaseID: "L02", ID: "keepalive-managed-a-first"},
+	{CaseID: "L02", ID: "keepalive-managed-a-second"},
+	{CaseID: "L02", ID: "keepalive-managed-b-first"},
+	{CaseID: "L02", ID: "keepalive-managed-b-second"},
+	{CaseID: "R01", ID: "keepalive-range-after"},
+}
+
 // LoadM4LeaseSuite accepts only the pinned J40 public lease-query scenario.
 func LoadM4LeaseSuite(path string) (Suite, string, error) {
 	return loadM4Suite(path, "m4-lease-v1", expectedM4LeaseSteps)
@@ -74,6 +94,11 @@ func LoadM4LeaseSuite(path string) (Suite, string, error) {
 // LoadM4LeaseBindingSuite accepts only the pinned J41 lease-binding scenario.
 func LoadM4LeaseBindingSuite(path string) (Suite, string, error) {
 	return loadM4Suite(path, "m4-lease-bindings-v1", expectedM4LeaseBindingSteps)
+}
+
+// LoadM4LeaseKeepAliveSuite accepts only the pinned J42 bidi-stream scenario.
+func LoadM4LeaseKeepAliveSuite(path string) (Suite, string, error) {
+	return loadM4Suite(path, "m4-lease-keepalive-v1", expectedM4LeaseKeepAliveSteps)
 }
 
 func loadM4Suite(path, expectedID string, expectedSteps []Step) (Suite, string, error) {

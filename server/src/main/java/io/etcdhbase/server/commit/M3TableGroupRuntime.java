@@ -3,6 +3,7 @@ package io.etcdhbase.server.commit;
 import io.etcdhbase.admin.M3TableGroupPlan;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.CommitOwnerService;
+import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.CommitPlanVerifier;
 import io.etcdhbase.core.commit.CommitPublisher;
 import io.etcdhbase.core.commit.CommitState;
@@ -57,6 +58,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -112,6 +115,33 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       RuntimeConfiguration.ResourceBudgets limits, HBaseConnectionFactory connections,
       AuthorizedBackendIdentity identity, BudgetManager budgets, ScanScheduler scans,
       RequestScope startup, Optional<CacheLimits> cacheLimits) throws Exception {
+    return open(plan, activation, limits, connections, identity, budgets, scans, startup,
+        cacheLimits, null, null);
+  }
+
+  public static M3TableGroupRuntime open(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
+      RuntimeConfiguration.ResourceBudgets limits, HBaseConnectionFactory connections,
+      AuthorizedBackendIdentity identity, BudgetManager budgets, ScanScheduler scans,
+      RequestScope startup, OwnerForwardingRuntime ownerForwarding) throws Exception {
+    return open(plan, activation, limits, connections, identity, budgets, scans, startup,
+        Optional.empty(), ownerForwarding, null);
+  }
+
+  /** Opens one table-group runtime with process-shared owner routing and Lease stream timers. */
+  public static M3TableGroupRuntime open(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
+      RuntimeConfiguration.ResourceBudgets limits, HBaseConnectionFactory connections,
+      AuthorizedBackendIdentity identity, BudgetManager budgets, ScanScheduler scans,
+      RequestScope startup, OwnerForwardingRuntime ownerForwarding,
+      ScheduledExecutorService leaseTimers) throws Exception {
+    return open(plan, activation, limits, connections, identity, budgets, scans, startup,
+        Optional.empty(), ownerForwarding, leaseTimers);
+  }
+
+  private static M3TableGroupRuntime open(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
+      RuntimeConfiguration.ResourceBudgets limits, HBaseConnectionFactory connections,
+      AuthorizedBackendIdentity identity, BudgetManager budgets, ScanScheduler scans,
+      RequestScope startup, Optional<CacheLimits> cacheLimits,
+      OwnerForwardingRuntime ownerForwarding, ScheduledExecutorService leaseTimers) throws Exception {
     Objects.requireNonNull(plan, "plan");
     Objects.requireNonNull(activation, "activation");
     Objects.requireNonNull(limits, "limits");
@@ -135,27 +165,38 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       if (!activation.m4LeaseApiEnabled()) {
         verifyLeaseDisabledFormat(stores, startup);
       }
-      pending = new Pending(startup);
+      pending = new Pending(startup, leaseTimers);
       pending.initialize(plan, activation, limits, budgets);
       var invocations = new InvocationService(stores.invocations());
       var owners = new CommitOwnerService(stores.control());
       var recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
           stores.invocations(), stores.outcomes(), stores.finalizer());
-      String instance = CommitOwnerService.newInstanceId();
-      var ownerFuture = M3OwnerLease.acquire(recovery, owners, instance,
-          Duration.ofMillis(activation.ownerLeaseMs()), Duration.ofMillis(activation.heartbeatMs()),
-          Duration.ofMillis(2L * activation.heartbeatMs()), startup, pending.queue::close);
+      String instance = activation.ownerInstanceId() == null
+          ? CommitOwnerService.newInstanceId() : activation.ownerInstanceId();
+      Runnable ownerLost = activation.ownerForwarding() == null ? pending.queue::close : () -> {};
+      var ownerFuture = activation.ownerForwarding() == null
+          ? M3OwnerLease.acquire(recovery, owners, instance,
+              Duration.ofMillis(activation.ownerLeaseMs()), Duration.ofMillis(activation.heartbeatMs()),
+              Duration.ofMillis(2L * activation.heartbeatMs()), startup, ownerLost)
+          : M3OwnerLease.acquireOrStandby(recovery, owners, instance,
+              Duration.ofMillis(activation.ownerLeaseMs()), Duration.ofMillis(activation.heartbeatMs()),
+              Duration.ofMillis(2L * activation.heartbeatMs()), startup, ownerLost);
       pending.trackOwner(ownerFuture);
       var owner = await(ownerFuture, startup);
       if (activation.m4LeaseApiEnabled()) {
-        ensureM4LeaseBindingFormat(plan, connections, identity, stores, owner, startup);
-        stores = await(TableGroupStores.openConfigured(connections, identity, plan,
-            activation.pinConfiguration(), startup), startup);
-        verifyLeaseBindingFormat(stores, startup);
-        invocations = new InvocationService(stores.invocations());
-        owners = new CommitOwnerService(stores.control());
-        recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
-            stores.invocations(), stores.outcomes(), stores.finalizer());
+        if (owner.isOwner()) {
+          ensureM4LeaseBindingFormat(plan, connections, identity, stores, owner, startup);
+          stores = await(TableGroupStores.openConfigured(connections, identity, plan,
+              activation.pinConfiguration(), startup), startup);
+          verifyLeaseBindingFormat(stores, startup);
+          invocations = new InvocationService(stores.invocations());
+          owners = new CommitOwnerService(stores.control());
+          recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
+              stores.invocations(), stores.outcomes(), stores.finalizer());
+          await(owner.refreshServices(owners, recovery, startup), startup);
+        } else {
+          verifyLeaseBindingFormat(stores, startup);
+        }
       }
       ByteKey authorization = authorizationDigest(identity);
       var business = assembleBusiness(plan, activation, connections, budgets, scans, pending, stores,
@@ -165,7 +206,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
             business.lease().orElseThrow(), startup);
       }
       ServiceComponents services = assembleService(plan, activation, identity, authorization, budgets,
-          pending, stores, invocations, owner, business);
+          pending, stores, invocations, owner, business, ownerForwarding);
       startup.closeAsync(CLEANUP);
       await(CompletableFuture.allOf(startup.cleanupCompletion().toCompletableFuture(),
           startup.physicalProducersCompletion().toCompletableFuture()), startup);
@@ -313,7 +354,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       Optional<LeaseComponents> lease) {}
 
   private record LeaseComponents(LeaseGrantOwnerProcessor grantProcessor,
-      LeaseEmptyExpiryOwnerProcessor expiryProcessor,
+      LeaseRenewalOwnerProcessor renewalProcessor, LeaseEmptyExpiryOwnerProcessor expiryProcessor,
       LeaseReadView readView, LeaseEnumerationReader enumeration, LeaseBindingReader bindings,
       LeaseTimeSource time, LeaseBindingMutationPlanner bindingPlanner) {}
 
@@ -338,7 +379,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         stores.invocations(), pending.handoff, stores.finalizer());
     var metrics = new RequestMetrics();
     Optional<LeaseComponents> lease = activation.m4LeaseApiEnabled()
-        ? Optional.of(assembleLease(plan, activation, budgets, stores, invocations, owner, publisher))
+        ? Optional.of(assembleLease(
+            plan, activation, budgets, stores, invocations, owner, publisher, metrics))
         : Optional.empty();
     PutMutationExecutor executor = lease.isPresent()
         ? new PutMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
@@ -350,7 +392,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
             preparation, publisher, 5L << 20, 8L << 20, metrics);
     BudgetManager.Reservation mutationReservation = lease.isPresent()
         ? LEASE_REQUEST_MEMORY : REQUEST_MEMORY;
-    var putProcessor = new PutOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
+    var putProcessor = new PutOwnerProcessor(plan.source().tableGroupId(), owner::currentToken, budgets,
         mutationReservation, executor, stores.outcomes());
     var txnLimits = new TxnExecutionLimits(5L << 20, 8L << 20, 32L << 20, 4096, 4096);
     var txnPreparation = new TxnCommitPreparation(new ResultPreparation(stores.resultRepository()),
@@ -364,7 +406,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         : new TxnMutationExecutor(plan.source().tableGroupId(), plan.system().profileFingerprint(),
             stores.control(), stores.views(), stores.manifests(), stores.records(), stores.manifestRepository(),
             connections, plan.primary(), pending.worker, scans, txnPreparation, publisher, txnLimits, metrics);
-    var txnProcessor = new TxnOwnerProcessor(plan.source().tableGroupId(), owner.token(), budgets,
+    var txnProcessor = new TxnOwnerProcessor(plan.source().tableGroupId(), owner::currentToken, budgets,
         mutationReservation, txnExecutor, stores.outcomes(), activation.maxEtcdRequestBytes());
     if (cacheLimits.isPresent()) pending.createCache(plan, stores, budgets, cacheLimits.orElseThrow());
     var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),
@@ -374,7 +416,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
 
   private static LeaseComponents assembleLease(M3TableGroupPlan plan,
       M3RuntimeConfiguration activation, BudgetManager budgets, TableGroupStores stores,
-      InvocationService invocations, M3OwnerLease owner, CommitPublisher publisher) {
+      InvocationService invocations, M3OwnerLease owner, CommitPublisher publisher,
+      RequestMetrics metrics) {
     int maximumMutationRecords = LeaseBindingMutationPlanner.MAX_AUXILIARY_RECORDS_PER_MUTATION;
     var leaseReads = new LeaseReadView(stores.records(), stores.manifests(), LeaseStateMessages::decode,
         maximumMutationRecords, 64L << 20);
@@ -405,12 +448,19 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     var expiryExecutor = new LeaseEmptyExpiryExecutor(plan.source().tableGroupId(),
         plan.system().profileFingerprint(), stores.control(), stores.views(), leaseReads, time,
         Clock.systemUTC(), mutationPreparation, publisher);
-    var processor = new LeaseGrantOwnerProcessor(plan.source().tableGroupId(), owner.token(),
+    var renewalPreparation = new LeaseRenewalPreparation(mutationPreparation);
+    var renewalExecutor = new LeaseRenewalExecutor(plan.source().tableGroupId(),
+        plan.system().profileFingerprint(), stores.clusterId(), activation.memberIdBits(),
+        stores.control(), stores.views(), leaseReads, time, Clock.systemUTC(),
+        renewalPreparation, publisher, metrics);
+    var processor = new LeaseGrantOwnerProcessor(plan.source().tableGroupId(), owner::currentToken,
         budgets, LEASE_REQUEST_MEMORY, executor, stores.outcomes(), invocations, Clock.systemUTC());
+    var renewalProcessor = new LeaseRenewalOwnerProcessor(plan.source().tableGroupId(), owner::currentToken,
+        budgets, LEASE_REQUEST_MEMORY, renewalExecutor, stores.outcomes(), invocations, Clock.systemUTC());
     var expiryProcessor = new LeaseEmptyExpiryOwnerProcessor(plan.source().tableGroupId(),
-        owner.token(), budgets, LEASE_REQUEST_MEMORY, expiryExecutor, stores.outcomes(), invocations,
+        owner::currentToken, budgets, LEASE_REQUEST_MEMORY, expiryExecutor, stores.outcomes(), invocations,
         Clock.systemUTC());
-    return new LeaseComponents(processor, expiryProcessor, leaseReads, enumeration, bindings,
+    return new LeaseComponents(processor, renewalProcessor, expiryProcessor, leaseReads, enumeration, bindings,
         time, bindingPlanner);
   }
 
@@ -438,11 +488,23 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static ServiceComponents assembleService(M3TableGroupPlan plan,
       M3RuntimeConfiguration activation,
       AuthorizedBackendIdentity identity, ByteKey authorization, BudgetManager budgets, Pending pending,
-      TableGroupStores stores, InvocationService invocations, M3OwnerLease owner, BusinessComponents business) {
+      TableGroupStores stores, InvocationService invocations, M3OwnerLease owner,
+      BusinessComponents business, OwnerForwardingRuntime ownerForwarding) {
     var receiver = new MutationForwardReceiver(stores.control(), invocations,
-        (peer, request, scope) -> peer.equals(owner.token().instance())
-            ? CompletableFuture.completedFuture(new MutationForwardReceiver.VerifiedAuthorization(identity, authorization))
-            : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION)),
+        (peer, request, scope) -> {
+          boolean trustedPeer = ownerForwarding == null
+              ? owner.currentToken().map(token -> token.instance().equals(peer)).orElse(false)
+              : ownerForwarding.isTrustedPeerIdentity(peer);
+          if (!trustedPeer || !request.tableGroupId().equals(plan.source().tableGroupId())
+              || !authorization.equals(request.authorizationScopeDigest())
+              || !ServiceAuthorizationContextReference.matches(identity, authorization,
+                  request.authorizationContextReference())) {
+            return CompletableFuture.failedFuture(
+                new BackendFailure(BackendFailure.Category.PERMISSION));
+          }
+          return CompletableFuture.completedFuture(
+              new MutationForwardReceiver.VerifiedAuthorization(identity, authorization));
+        },
         (request, binding, principal, scope) -> switch (MutationOperationEnvelope.kind(request.operationBytes())) {
           case PUT -> business.putProcessor().process(request, binding, principal, scope);
           case TRANSACTION, DELETE_RANGE -> business.txnProcessor().process(request, binding, principal, scope);
@@ -454,20 +516,19 @@ public final class M3TableGroupRuntime implements AutoCloseable {
               ? business.lease().orElseThrow().expiryProcessor().process(request, binding, principal, scope)
               : CompletableFuture.completedFuture(
                   new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
+          case LEASE_KEEP_ALIVE -> business.lease().isPresent()
+              ? business.lease().orElseThrow().renewalProcessor().process(request, binding, principal, scope)
+              : CompletableFuture.completedFuture(
+                  new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
         });
     var lane = new MutationOwnerLane(plan.source().tableGroupId(), pending.queue, receiver, business.metrics());
-    var route = new OwnerForwarding.Route(owner.token().instance(), owner.token().epoch(),
-        owner.token().instance(), owner.token().instance());
-    // A direct same-process call has no network peer. Unknown or remote owners are rejected;
-    // authenticated cross-process forwarding remains a separate deployment capability.
-    var relay = new MutationRelay(stores.control(),
-        (group, instanceId, epoch) -> group.equals(plan.source().tableGroupId())
-            && instanceId.equals(owner.token().instance()) && epoch == owner.token().epoch()
-                ? CompletableFuture.completedFuture(route)
-                : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE)),
-        (selected, request, scope) -> selected.equals(route)
-            ? lane.receive(owner.token().instance(), request, scope)
-            : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION)));
+    MutationRelay relay;
+    if (ownerForwarding != null) {
+      ownerForwarding.register(plan.source().tableGroupId(), lane);
+      relay = new MutationRelay(stores.control(), ownerForwarding, ownerForwarding);
+    } else {
+      relay = localOwnerRelay(plan.source().tableGroupId(), stores.control(), owner, lane);
+    }
     var gateway = new PutGateway(plan.source().tableGroupId(), identity, authorization,
         stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
         stores.control(), relay, stores.invocationResults(), budgets, REQUEST_MEMORY, pending.worker, business.metrics());
@@ -480,12 +541,32 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       var leaseGateway = new LeaseGateway(plan.source().tableGroupId(), identity, authorization,
           stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
           stores.control(), relay, stores.invocationResults(), stores.views(), lease.readView(),
-          lease.enumeration(), lease.bindings(), lease.time(), budgets, LEASE_REQUEST_MEMORY, pending.worker);
+          lease.enumeration(), lease.bindings(), lease.time(), budgets, LEASE_REQUEST_MEMORY,
+          pending.worker, pending.leaseTimers, business.metrics());
       leaseService = new LeaseService(leaseGateway.grantHandler(),
-          leaseGateway.timeToLiveHandler(), leaseGateway.leasesHandler());
+          leaseGateway.timeToLiveHandler(), leaseGateway.leasesHandler(), leaseGateway.keepAliveHandler());
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
         txnGateway::range), leaseService);
+  }
+
+  private static MutationRelay localOwnerRelay(String tableGroupId, CommitControlStore control,
+      M3OwnerLease owner, MutationOwnerLane lane) {
+    return new MutationRelay(control,
+        (group, instanceId, epoch) -> owner.currentToken()
+            .filter(token -> group.equals(tableGroupId) && token.instance().equals(instanceId)
+                && token.epoch() == epoch)
+            .<CompletableFuture<OwnerForwarding.Route>>map(token -> CompletableFuture.completedFuture(
+                new OwnerForwarding.Route(token.instance(), token.epoch(), token.instance(), token.instance())))
+            .orElseGet(() -> CompletableFuture.failedFuture(
+                new BackendFailure(BackendFailure.Category.UNAVAILABLE))),
+        (route, request, scope) -> owner.currentToken()
+            .filter(token -> route.ownerInstance().equals(token.instance())
+                && route.ownerEpoch() == token.epoch())
+            .<CompletableFuture<OwnerForwarding.Reply>>map(token ->
+                lane.receive(token.instance(), request, scope))
+            .orElseGet(() -> CompletableFuture.failedFuture(
+                new BackendFailure(BackendFailure.Category.UNAVAILABLE))));
   }
 
   public KvService kvService() { return kvService; }
@@ -589,8 +670,13 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     private BoundedPublicationHandoff handoff;
     private ThreadPoolExecutor worker;
     private RangeReadCache cache;
+    private ScheduledExecutorService leaseTimers;
+    private ScheduledThreadPoolExecutor ownedLeaseTimers;
 
-    private Pending(RequestScope startup) { this.startup = startup; }
+    private Pending(RequestScope startup, ScheduledExecutorService leaseTimers) {
+      this.startup = startup;
+      this.leaseTimers = leaseTimers;
+    }
 
     private void createCache(M3TableGroupPlan plan, TableGroupStores stores, BudgetManager budgets,
         CacheLimits limits) throws BackendFailure {
@@ -607,6 +693,13 @@ public final class M3TableGroupRuntime implements AutoCloseable {
 
     private void initialize(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
         RuntimeConfiguration.ResourceBudgets limits, BudgetManager budgets) throws BackendFailure {
+      if (activation.m4LeaseApiEnabled() && leaseTimers == null) {
+        ownedLeaseTimers = new ScheduledThreadPoolExecutor(1,
+            Thread.ofPlatform().daemon().name("m4-lease-ready-timeout-", 0).factory());
+        ownedLeaseTimers.setRemoveOnCancelPolicy(true);
+        ownedLeaseTimers.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        leaseTimers = ownedLeaseTimers;
+      }
       var account = budgets.admit(plan.source().tableGroupId(), recoveryScope, RECOVERY_MEMORY);
       var slot = account.tryAcquire(new BudgetManager.Work(0, 1, 0, 1, 0))
           .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
@@ -699,6 +792,17 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         CompletableFuture.allOf(recoveryScope.cleanupCompletion().toCompletableFuture(),
             recoveryScope.physicalProducersCompletion().toCompletableFuture()).join();
       } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
+      if (ownedLeaseTimers != null) {
+        ownedLeaseTimers.shutdown();
+        try {
+          while (!ownedLeaseTimers.awaitTermination(30, TimeUnit.SECONDS)) {
+            /* wait for owned response timeout tasks to stop */
+          }
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          failure = merge(failure, interrupted);
+        }
+      }
       if (failure == null) drained.complete(null);
       else drained.completeExceptionally(failure);
     }

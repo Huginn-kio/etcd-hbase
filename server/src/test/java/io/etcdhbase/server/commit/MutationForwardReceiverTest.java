@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.CommitControlStore;
@@ -51,15 +52,28 @@ class MutationForwardReceiverTest {
   }
 
   @Test
-  void staleSealedBindingIsNotDispatchedAfterOwnerTakeover() {
-    assertStaleBindingRejected(InvocationBinding.State.SEALED);
+  void staleSealedBindingWithoutDurableSelectionIsResolvedWithoutMutation() {
+    var repository = sealedBindingRepository();
+    var processors = new AtomicInteger();
+    var fixture = receiver(currentState(), repository,
+        (peer, request, scope) -> CompletableFuture.completedFuture(verifiedAuthorization()),
+        (request, binding, identity, scope) -> {
+          processors.incrementAndGet();
+          return CompletableFuture.completedFuture(
+              new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
+        });
+
+    OwnerForwarding.Reply reply = fixture.receiver().receive(
+        "authenticated-peer", request(), RequestScope.withoutDeadline()).join();
+
+    var unknown = assertInstanceOf(OwnerForwarding.Unknown.class, reply);
+    assertEquals(BackendFailure.Category.UNAVAILABLE, unknown.category());
+    assertEquals(1, processors.get(), "sealed attempts must reach durable outcome resolution");
   }
 
   @Test
-  void staleSealedBindingAfterItsSequenceWasSelectedRemainsUnknown() {
-    var repository = new InMemoryInvocationRepository();
-    repository.binding = InvocationBinding.begin(INVOCATION, request().requestDigest(), AUTH_DIGEST,
-        TRANSACTION, 1, 0, 1).seal(MANIFEST_ROOT);
+  void staleSealedBindingAfterSelectionCanReturnItsDurableOutcome() {
+    var repository = sealedBindingRepository();
     var processors = new AtomicInteger();
     CommitState current = CommitState.initial(FINGERPRINT, 1)
         .claimOwner("owner-old", 1, 10)
@@ -68,14 +82,20 @@ class MutationForwardReceiverTest {
         .finalizePublication(TRANSACTION);
     assertEquals(1, current.publishedSequence());
     assertEquals(1, current.finalizedSequence());
-    var fixture = receiver(current, repository, processors);
+    var fixture = receiver(current, repository,
+        (peer, request, scope) -> CompletableFuture.completedFuture(verifiedAuthorization()),
+        (request, binding, identity, scope) -> {
+          processors.incrementAndGet();
+          return CompletableFuture.completedFuture(
+              new OwnerForwarding.Completed(request.invocationId().bytes()));
+        });
 
     OwnerForwarding.Reply reply = fixture.receiver().receive(
         "authenticated-peer", request(), RequestScope.withoutDeadline()).join();
 
-    var unknown = assertInstanceOf(OwnerForwarding.Unknown.class, reply);
-    assertEquals(BackendFailure.Category.UNAVAILABLE, unknown.category());
-    assertEquals(0, processors.get(), "the old attempt must not be revived at the new sequence");
+    var completed = assertInstanceOf(OwnerForwarding.Completed.class, reply);
+    assertArrayEquals(request().invocationId().bytes(), completed.operationResult());
+    assertEquals(1, processors.get(), "the selected attempt must be resolved, not re-executed");
   }
 
   @Test
@@ -245,6 +265,13 @@ class MutationForwardReceiverTest {
     var unknown = assertInstanceOf(OwnerForwarding.Unknown.class, reply);
     assertEquals(BackendFailure.Category.UNAVAILABLE, unknown.category());
     assertEquals(0, processors.get());
+  }
+
+  private static InMemoryInvocationRepository sealedBindingRepository() {
+    var repository = new InMemoryInvocationRepository();
+    repository.binding = InvocationBinding.begin(INVOCATION, request().requestDigest(), AUTH_DIGEST,
+        TRANSACTION, 1, 0, 1).seal(MANIFEST_ROOT);
+    return repository;
   }
 
   private static Fixture receiver(InMemoryInvocationRepository repository, AtomicInteger processors) {

@@ -205,7 +205,7 @@ public final class BoundedPublicationHandoff implements PublicationHandoff, Auto
     private void run() {
       RequestScope serviceScope;
       try {
-        serviceScope = RequestScope.withTimeout(serviceDeadline);
+        serviceScope = requestScope.forkWithTimeout(serviceDeadline);
       } catch (RuntimeException failure) {
         reject(failure);
         return;

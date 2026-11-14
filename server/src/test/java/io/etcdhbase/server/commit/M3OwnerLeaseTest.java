@@ -200,6 +200,57 @@ class M3OwnerLeaseTest {
     }
   }
 
+  @Test
+  void standbyStartsReadyAndClaimsOwnerAfterActiveOwnerExpires() throws Exception {
+    var clock = new MutableClock(1_000);
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    var activeLost = new CountDownLatch(1);
+    try (var activeStartup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         var standbyStartup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var active = M3OwnerLease.acquire(recovery(store, owners), owners, "owner-a",
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400),
+          activeStartup, activeLost::countDown, clock).join();
+      var standby = M3OwnerLease.acquireOrStandby(recovery(store, owners), owners, "owner-b",
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400),
+          standbyStartup, () -> {}, clock).join();
+      try {
+        long activeEpoch = active.token().epoch();
+        assertTrue(standby.isReady(), "a recovered follower can serve its ready read path");
+        assertFalse(standby.isOwner());
+        store.expectedOwnerClaim = "owner-b";
+
+        clock.advance(1200);
+
+        assertTrue(activeLost.await(5, TimeUnit.SECONDS), "the expired owner must fence its lane");
+        assertTrue(store.expectedOwnerClaimed.await(5, TimeUnit.SECONDS),
+            "the standby must claim only after the durable owner deadline expires");
+        assertTrue(awaitOwner(standby, Duration.ofSeconds(5)),
+            "the standby publishes its local owner token after verifying the durable claim");
+        assertTrue(standby.isReady());
+        assertTrue(standby.isOwner());
+        assertTrue(standby.token().epoch() > activeEpoch);
+        assertEquals("owner-b", store.currentState().ownerInstance().orElseThrow());
+        active.drained().get(5, TimeUnit.SECONDS);
+      } finally {
+        active.close();
+        standby.close();
+        active.drained().get(5, TimeUnit.SECONDS);
+        standby.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  private static boolean awaitOwner(M3OwnerLease lease, Duration timeout) throws InterruptedException {
+    long deadline = System.nanoTime() + timeout.toNanos();
+    while (!lease.isOwner()) {
+      long remaining = deadline - System.nanoTime();
+      if (remaining <= 0) return false;
+      TimeUnit.NANOSECONDS.sleep(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(1)));
+    }
+    return true;
+  }
+
   private static RecoveryManager recovery(MemoryControl store, CommitOwnerService owners) {
     InvocationRepository invocations = new InvocationRepository() {
       @Override public CompletableFuture<Optional<InvocationBinding>> read(InvocationId id, RequestScope scope) {
@@ -227,8 +278,10 @@ class M3OwnerLeaseTest {
   private static final class MemoryControl implements CommitControlStore {
     private CommitState state = CommitState.initial(PROFILE, 1);
     private final CountDownLatch heartbeat = new CountDownLatch(1);
+    private final CountDownLatch expectedOwnerClaimed = new CountDownLatch(1);
     private volatile boolean failHeartbeat;
     private volatile boolean blockHeartbeat;
+    private volatile String expectedOwnerClaim;
     private boolean failVerificationRead;
     private boolean delayVerificationRead;
     private final CompletableFuture<Optional<ControlSnapshot>> delayedVerification = new CompletableFuture<>();
@@ -253,6 +306,7 @@ class M3OwnerLeaseTest {
     @Override public synchronized CompletableFuture<Boolean> compareAndSet(
         ControlSnapshot observed, CommitState replacement, RequestScope scope) {
       if (observed.state().stateVersion() != state.stateVersion()) return CompletableFuture.completedFuture(false);
+      long previousEpoch = state.ownerEpoch();
       if (replacement.ownerEpoch() == state.ownerEpoch()) {
         if (blockHeartbeat && reads > 4) {
           var reply = new CompletableFuture<Boolean>();
@@ -268,6 +322,10 @@ class M3OwnerLeaseTest {
         }
       }
       state = replacement;
+      if (replacement.ownerEpoch() > previousEpoch && expectedOwnerClaim != null
+          && replacement.ownerInstance().filter(expectedOwnerClaim::equals).isPresent()) {
+        expectedOwnerClaimed.countDown();
+      }
       return CompletableFuture.completedFuture(true);
     }
     private synchronized CommitState currentState() { return state; }

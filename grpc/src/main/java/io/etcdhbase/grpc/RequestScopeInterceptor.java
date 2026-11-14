@@ -108,8 +108,10 @@ public final class RequestScopeInterceptor implements ServerInterceptor, AutoClo
     RequestLifecycle<RequestT, ResponseT> lifecycle = null;
     Context.CancellableContext context = null;
     try {
-      context =
-          Context.current().withDeadlineAfter(timeout.toNanos(), TimeUnit.NANOSECONDS, scheduler);
+      context = call.getMethodDescriptor().getType()
+              == io.grpc.MethodDescriptor.MethodType.BIDI_STREAMING
+          ? Context.current().withCancellation()
+          : Context.current().withDeadlineAfter(timeout.toNanos(), TimeUnit.NANOSECONDS, scheduler);
       lifecycle = new RequestLifecycle<>(call, context, methodClass, maxRequestBytes, this);
       return lifecycle.start(headers, next);
     } catch (RuntimeException failure) {

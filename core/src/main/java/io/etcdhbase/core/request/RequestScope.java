@@ -14,10 +14,44 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongSupplier;
 
 /** Owns request resources; stopping new work and completing cleanup are separate transitions. */
 public final class RequestScope implements AutoCloseable {
+  /** Logical backend-call cost measured at the storage adapter boundary. */
+  public record StorageCostSnapshot(long logicalOperations, long logicalRequestPayloadBytes) {
+    public StorageCostSnapshot {
+      if (logicalOperations < 0 || logicalRequestPayloadBytes < 0) {
+        throw new IllegalArgumentException("backend cost counters must not be negative");
+      }
+    }
+
+    public StorageCostSnapshot minus(StorageCostSnapshot earlier) {
+      Objects.requireNonNull(earlier, "earlier");
+      if (logicalOperations < earlier.logicalOperations
+          || logicalRequestPayloadBytes < earlier.logicalRequestPayloadBytes) {
+        throw new IllegalArgumentException("backend cost snapshot moved backwards");
+      }
+      return new StorageCostSnapshot(logicalOperations - earlier.logicalOperations,
+          logicalRequestPayloadBytes - earlier.logicalRequestPayloadBytes);
+    }
+  }
+
+  private static final class StorageCostLedger {
+    private final LongAdder logicalOperations = new LongAdder();
+    private final LongAdder logicalRequestPayloadBytes = new LongAdder();
+
+    private void record(long requestPayloadBytes) {
+      logicalOperations.increment();
+      logicalRequestPayloadBytes.add(requestPayloadBytes);
+    }
+
+    private StorageCostSnapshot snapshot() {
+      return new StorageCostSnapshot(logicalOperations.sum(), logicalRequestPayloadBytes.sum());
+    }
+  }
+
   private final boolean hasDeadline;
   private final long deadlineNanos;
   private final LongSupplier nanoTime;
@@ -26,6 +60,7 @@ public final class RequestScope implements AutoCloseable {
   private final Set<AutoCloseable> registrations =
       Collections.newSetFromMap(new IdentityHashMap<>());
   private final AtomicInteger cleanupFailureCount = new AtomicInteger();
+  private final StorageCostLedger storageCostLedger;
   private final CompletableFuture<Void> cleanupCompletion = new CompletableFuture<>();
   private final CompletableFuture<Void> physicalProducersCompletion = new CompletableFuture<>();
   private boolean cancelled;
@@ -68,7 +103,24 @@ public final class RequestScope implements AutoCloseable {
     }
     long now = nanoTime.getAsLong();
     long parentRemaining = hasDeadline ? Math.max(0, deadlineNanos - now) : Long.MAX_VALUE;
-    return new RequestScope(true, now + Math.min(maximumTimeoutNanos, parentRemaining), nanoTime);
+    return new RequestScope(true, now + Math.min(maximumTimeoutNanos, parentRemaining),
+        nanoTime, storageCostLedger);
+  }
+
+  /**
+   * Creates an independently cancellable service continuation with a fresh deadline while
+   * retaining this operation's storage-cost accounting.
+   */
+  public RequestScope forkWithTimeout(Duration timeout) {
+    Objects.requireNonNull(timeout, "timeout");
+    if (timeout.isNegative()) throw new IllegalArgumentException("timeout must not be negative");
+    long timeoutNanos;
+    try {
+      timeoutNanos = timeout.toNanos();
+    } catch (ArithmeticException overflow) {
+      timeoutNanos = Long.MAX_VALUE;
+    }
+    return new RequestScope(true, deadline(timeoutNanos, nanoTime), nanoTime, storageCostLedger);
   }
 
   RequestScope(long timeoutNanos, LongSupplier nanoTime) {
@@ -76,9 +128,15 @@ public final class RequestScope implements AutoCloseable {
   }
 
   private RequestScope(boolean hasDeadline, long deadlineNanos, LongSupplier nanoTime) {
+    this(hasDeadline, deadlineNanos, nanoTime, new StorageCostLedger());
+  }
+
+  private RequestScope(boolean hasDeadline, long deadlineNanos, LongSupplier nanoTime,
+      StorageCostLedger storageCostLedger) {
     this.hasDeadline = hasDeadline;
     this.deadlineNanos = deadlineNanos;
     this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
+    this.storageCostLedger = Objects.requireNonNull(storageCostLedger, "storageCostLedger");
   }
 
   public long remainingDeadlineNanos() {
@@ -121,6 +179,18 @@ public final class RequestScope implements AutoCloseable {
 
   public int cleanupFailureCount() {
     return cleanupFailureCount.get();
+  }
+
+  /** Records one adapter-level operation and its counted row/cell/range payload bytes. */
+  public void recordStorageOperation(long logicalRequestPayloadBytes) {
+    if (logicalRequestPayloadBytes < 0) {
+      throw new IllegalArgumentException("storage request payload bytes must not be negative");
+    }
+    storageCostLedger.record(logicalRequestPayloadBytes);
+  }
+
+  public StorageCostSnapshot storageCostSnapshot() {
+    return storageCostLedger.snapshot();
   }
 
   /** Read-only completion of all resources registered before or during the closing batch. */

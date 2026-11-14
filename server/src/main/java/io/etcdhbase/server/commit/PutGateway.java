@@ -22,7 +22,6 @@ import io.etcdhbase.hbase.codec.ResultMessages;
 import io.etcdhbase.server.observability.RequestMetrics;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.grpc.stub.StreamObserver;
-import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -147,7 +146,8 @@ public final class PutGateway implements BiConsumer<Rpc.PutRequest, StreamObserv
                   ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.UNAVAILABLE));
             }
             var envelope = new MutationForwardRequest(tableGroup, invocation, digest,
-                authorizationDigest, ByteKey.copyOf(identity.contextRef().getBytes(StandardCharsets.UTF_8)),
+                authorizationDigest,
+                ServiceAuthorizationContextReference.create(identity, authorizationDigest),
                 state.ownerEpoch(), remaining, 0, operation);
             return relay.forward(envelope, scope);
           }).thenCompose(reply -> resolveReply(reply, invocation, digest, scope, account));

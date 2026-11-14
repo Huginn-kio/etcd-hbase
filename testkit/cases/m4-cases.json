@@ -577,7 +577,112 @@
           "compare-native.log"
         ]
       }
+    },
+    {
+      "id": "J42",
+      "artifact_subdir": "j42",
+      "api_ids": ["L01", "L02", "L04", "L05", "R01"],
+      "scenario": "m4-lease-keepalive-v1",
+      "manifest": "m4-lease-keepalive.yaml",
+      "trace_cases": [
+        {"id": "native-baseline", "api_id": "L05", "method": "etcdserverpb.Lease/LeaseLeases"},
+        {"id": "keepalive-grant-a", "api_id": "L01", "method": "etcdserverpb.Lease/LeaseGrant"},
+        {"id": "keepalive-grant-b", "api_id": "L01", "method": "etcdserverpb.Lease/LeaseGrant"},
+        {"id": "keepalive-grant-managed-a", "api_id": "L01", "method": "etcdserverpb.Lease/LeaseGrant"},
+        {"id": "keepalive-grant-managed-b", "api_id": "L01", "method": "etcdserverpb.Lease/LeaseGrant"},
+        {"id": "keepalive-range-before", "api_id": "R01", "method": "etcdserverpb.KV/Range"},
+        {"id": "keepalive-stream-a", "api_id": "L02", "method": "etcdserverpb.Lease/LeaseKeepAlive"},
+        {"id": "keepalive-stream-b", "api_id": "L02", "method": "etcdserverpb.Lease/LeaseKeepAlive"},
+        {"id": "keepalive-stream-missing", "api_id": "L02", "method": "etcdserverpb.Lease/LeaseKeepAlive"},
+        {"id": "keepalive-stream-a-repeat", "api_id": "L02", "method": "etcdserverpb.Lease/LeaseKeepAlive", "stream_terminal": {"kind": "eof"}},
+        {"id": "keepalive-ttl-a", "api_id": "L04", "method": "etcdserverpb.Lease/LeaseTimeToLive"},
+        {"id": "keepalive-ttl-b", "api_id": "L04", "method": "etcdserverpb.Lease/LeaseTimeToLive"},
+        {"id": "keepalive-managed-a-first", "api_id": "L02", "method": "etcdserverpb.Lease/LeaseKeepAlive"},
+        {"id": "keepalive-managed-a-second", "api_id": "L02", "method": "etcdserverpb.Lease/LeaseKeepAlive"},
+        {"id": "keepalive-managed-b-first", "api_id": "L02", "method": "etcdserverpb.Lease/LeaseKeepAlive"},
+        {"id": "keepalive-managed-b-second", "api_id": "L02", "method": "etcdserverpb.Lease/LeaseKeepAlive"},
+        {"id": "keepalive-range-after", "api_id": "R01", "method": "etcdserverpb.KV/Range"}
+      ],
+      "go_tests": [
+        {"package": "cmd/m4driver", "tests": [
+          "TestRunNativeLeaseKeepAliveWritesFreshTraceAndVerifiableMetadata",
+          "TestCompareKeepAliveRejectsCorruptOrMismatchedTrace"
+        ]},
+        {"package": "internal/scenario", "tests": [
+          "TestM4LeaseKeepAliveScenarioMatchesItsPinnedNativeOracle",
+          "TestLoadM4LeaseKeepAliveSuiteRejectsMissingOrChangedCoverage"
+        ]},
+        {"package": "internal/compare", "tests": [
+          "TestCompareM4LeaseKeepAliveRejectsMissingTerminal",
+          "TestCompareM4LeaseKeepAliveRejectsChangedRevisionOrUnknownTtl"
+        ]},
+        {"package": "internal/trace", "tests": [
+          "TestSnapshotProtoPreservesWatchAndLeaseStreamValues"
+        ]}
+      ],
+      "maven_tests": [
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.InvocationResultResolverTest", "tests": [
+          "resolvesEitherDurableInvocationOutcomeForProtocolProjection"
+        ]},
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.MutationOperationEnvelopeTest", "tests": [
+          "distinguishesVersionedTxnFromExistingRawPutBytes"
+        ]},
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.request.RequestScopeTest", "tests": [
+          "snapshotsLogicalStorageCostsAndRejectsBackwardsDeltas",
+          "serviceContinuationSharesStorageAccountingButNotCancellation"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.BoundedPublicationHandoffTest", "tests": [
+          "attributesServiceOwnedStorageCostToTheTransferredOperation"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.LeaseGrantPreparationTest", "tests": [
+          "persistsNoChangeResponseWithoutCreatingAnEmptyAuxiliaryManifest"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.LeaseKeepAliveStreamTest", "tests": [
+          "serializesResponsesAndRequestsOneInboundMessageAtATime",
+          "doesNotSendUntilReadyAndReleasesPendingDeliveryOnCancellation",
+          "halfCloseWaitsForCurrentOperationBeforeCompleting",
+          "observerFailureReleasesDeliveryAndStopsFurtherInput",
+          "timesOutAStalledOutboundResponseAndReleasesItsDelivery"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.SerialMutationQueueTest", "tests": [
+          "zeroQueuedCapacityRejectsConcurrentRequestsWithoutDisplacingTheActiveMutation"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.M3OwnerLeaseTest", "tests": [
+          "standbyStartsReadyAndClaimsOwnerAfterActiveOwnerExpires"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.MutationForwardReceiverTest", "tests": [
+          "staleSealedBindingWithoutDurableSelectionIsResolvedWithoutMutation",
+          "staleSealedBindingAfterSelectionCanReturnItsDurableOutcome"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.OwnerPeerIdentityInterceptorTest", "tests": [
+          "acceptsOnlyOneConfiguredDnsSan",
+          "rejectsUnregisteredDnsSanEvenWhenItsCertificateIsTrusted",
+          "rejectsCertificatesWithoutDnsSanInsteadOfFallingBackToCommonName",
+          "rejectsCertificatesWithMultipleDnsSansEvenWhenBothAreConfigured"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.observability.RequestMetricsTest", "tests": [
+          "snapshotsBoundedKeepAliveStagesAndLogicalPayloadBytes"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.TestTlsCertificateTest", "tests": [
+          "createsCertificatesWithNoAndMultipleDnsNames"
+        ]},
+        {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseKeepAliveRpcIT", "tests": [
+          "realGoKeepAliveMatchesNativeAcrossLayouts",
+          "expiredActiveLeaseIsRejectedUntilDurableRevocation",
+          "dualRuntimeForwardsKeepAliveOverMtlsAndFencesTheOldOwner",
+          "persistedKeepAliveSurvivesLostOwnerReplyAndRestart",
+          "persistedKeepAliveSurvivesClientCancellationBeforeResponse"
+        ]}
+      ],
+      "evidence": {
+        "native": {"scope": "native-etcd", "layout": "", "embedded_native": true},
+        "targets": [
+          {"scope": "target-hbase", "layout": "HISTORY", "embedded_native": false},
+          {"scope": "target-hbase", "layout": "NATIVE", "embedded_native": false}
+        ],
+        "compare_logs": ["keepalive-history.log", "keepalive-native.log"]
+      }
     }
   ],
-  "pending_tasks": ["J42","J43","J44","J45","J46","J47","J29.4"]
+  "pending_tasks": ["J43","J44","J45","J46","J47","J29.4"]
 }

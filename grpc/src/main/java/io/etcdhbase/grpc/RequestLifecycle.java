@@ -39,10 +39,11 @@ final class RequestLifecycle<RequestT, ResponseT> {
     this.owner = owner;
     this.methodClass = methodClass;
     this.maxRequestBytes = maxRequestBytes;
-    this.scope =
-        RequestScope.withTimeout(
-            Duration.ofNanos(
-                Math.max(0, context.getDeadline().timeRemaining(TimeUnit.NANOSECONDS))));
+    var deadline = context.getDeadline();
+    this.scope = deadline == null
+        ? RequestScope.withoutDeadline()
+        : RequestScope.withTimeout(Duration.ofNanos(
+            Math.max(0, deadline.timeRemaining(TimeUnit.NANOSECONDS))));
     this.observedCall =
         new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
           @Override
@@ -68,18 +69,13 @@ final class RequestLifecycle<RequestT, ResponseT> {
             .withValue(RequestScopeInterceptor.TRACE, traceId);
     var listener = Contexts.interceptCall(requestContext, observedCall, headers, next);
     return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(listener) {
-      private long receivedBytes;
-
       @Override
       public void onMessage(RequestT message) {
-        if (message instanceof MessageLite wire) {
-          receivedBytes += wire.getSerializedSize();
-          if (receivedBytes > maxRequestBytes) {
-            observedCall.close(
-                Status.RESOURCE_EXHAUSTED.withDescription("request byte budget exceeded"),
-                new Metadata());
-            return;
-          }
+        if (message instanceof MessageLite wire && wire.getSerializedSize() > maxRequestBytes) {
+          observedCall.close(
+              Status.RESOURCE_EXHAUSTED.withDescription("request byte budget exceeded"),
+              new Metadata());
+          return;
         }
         run(() -> super.onMessage(message));
       }
@@ -179,7 +175,9 @@ final class RequestLifecycle<RequestT, ResponseT> {
   }
 
   private Status cancelledStatus() {
-    return context.getDeadline().isExpired() ? Status.DEADLINE_EXCEEDED : Status.CANCELLED;
+    var deadline = context.getDeadline();
+    return deadline != null && deadline.isExpired()
+        ? Status.DEADLINE_EXCEEDED : Status.CANCELLED;
   }
 
   static RequestCompletionRecorder.MethodClass classifyMethod(String method) {

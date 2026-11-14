@@ -1,6 +1,7 @@
 package io.etcdhbase.server;
 
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.server.commit.OwnerForwardingRuntime;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import java.util.LinkedHashMap;
@@ -14,6 +15,19 @@ final class M3RuntimeBudgets {
   static BudgetManager create(RuntimeConfiguration configuration, M3RuntimeConfiguration activation) {
     Objects.requireNonNull(configuration, "configuration");
     Objects.requireNonNull(activation, "activation");
+    long ownerTransportMemory = activation.ownerForwarding() == null ? 0
+        : OwnerForwardingRuntime.requestLimits(activation.memoryBytes(), activation.maxEtcdRequestBytes(),
+            configuration.resources().maxConcurrentRequests()).reservedMemoryBytes();
+    return create(configuration, activation, ownerTransportMemory);
+  }
+
+  static BudgetManager create(RuntimeConfiguration configuration, M3RuntimeConfiguration activation,
+      long ownerTransportMemoryBytes) {
+    Objects.requireNonNull(configuration, "configuration");
+    Objects.requireNonNull(activation, "activation");
+    if (ownerTransportMemoryBytes < 0 || ownerTransportMemoryBytes >= activation.memoryBytes()) {
+      throw new IllegalArgumentException("invalid owner transport memory reservation");
+    }
     var resources = configuration.resources();
     var groups = configuration.listeners().stream().map(RuntimeConfiguration.Listener::tableGroupId)
         .distinct().toList();
@@ -27,7 +41,7 @@ final class M3RuntimeBudgets {
         Math.multiplyExact(groups.size(), 2));
     int scanners = Math.multiplyExact(resources.maxScannersPerTable(), groups.size());
     int cleanup = Math.addExact(operations, scanners);
-    long memory = activation.memoryBytes();
+    long memory = activation.memoryBytes() - ownerTransportMemoryBytes;
     // This queue belongs to finite-page scans within already admitted requests. It does not
     // enable an external mutation request queue (which remains disabled for this runtime).
     long scanQueueBytes = Math.min(memory, Math.multiplyExact((long) requests,

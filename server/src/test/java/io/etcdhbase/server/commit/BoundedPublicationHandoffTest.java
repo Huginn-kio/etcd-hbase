@@ -146,6 +146,28 @@ class BoundedPublicationHandoffTest {
   }
 
   @Test
+  void attributesServiceOwnedStorageCostToTheTransferredOperation() throws Exception {
+    var handoff = handoff();
+    var requestScope = RequestScope.withoutDeadline();
+    var before = requestScope.storageCostSnapshot();
+    try {
+      CompletableFuture<String> result = handoff.transfer(invocation(), requestScope, serviceScope -> {
+        serviceScope.recordStorageOperation(41);
+        return CompletableFuture.completedFuture(PUBLISHED_OBSERVATION);
+      });
+
+      assertEquals(PUBLISHED_OBSERVATION, result.get(5, TimeUnit.SECONDS));
+      assertEquals(new RequestScope.StorageCostSnapshot(1, 41),
+          requestScope.storageCostSnapshot().minus(before));
+    } finally {
+      requestScope.close();
+      handoff.close();
+      handoff.drained().get(5, TimeUnit.SECONDS);
+      assertTrue(handoff.awaitTermination(Duration.ofSeconds(5)));
+    }
+  }
+
+  @Test
   void serviceDeadlineCancelsWorkButRetainsCapacityUntilItsPhysicalProducerStops() throws Exception {
     var handoff = new BoundedPublicationHandoff(1, 1, Duration.ofMillis(500));
     var requestScope = RequestScope.withoutDeadline();

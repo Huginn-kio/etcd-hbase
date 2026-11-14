@@ -35,6 +35,13 @@ class MutationOperationEnvelopeTest {
     assertArrayEquals(expiry, MutationOperationEnvelope.leaseExpireEmptyBytes(expiryOperation));
     assertThrows(IllegalArgumentException.class,
         () -> MutationOperationEnvelope.leaseExpireEmpty(new byte[Long.BYTES]));
+    var keepAlivePayload = new byte[] {8, 3};
+    ByteKey keepAlive = MutationOperationEnvelope.leaseKeepAlive(keepAlivePayload);
+    assertEquals(MutationOperationEnvelope.Kind.LEASE_KEEP_ALIVE,
+        MutationOperationEnvelope.kind(keepAlive));
+    assertArrayEquals(keepAlivePayload, MutationOperationEnvelope.leaseKeepAliveBytes(keepAlive));
+    assertThrows(IllegalArgumentException.class,
+        () -> MutationOperationEnvelope.leaseKeepAliveBytes(grant));
   }
 
   @Test

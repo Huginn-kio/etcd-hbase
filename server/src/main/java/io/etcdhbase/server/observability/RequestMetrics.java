@@ -27,8 +27,19 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   private final Map<Series, Counter> counters;
   private final Map<PutStage, StageCounter> putStages;
   private final Map<TxnStage, StageCounter> txnStages;
+  private final Map<LeaseRenewalStage, StageCounter> leaseRenewalStages;
   private final LongAdder putOutputBytes = new LongAdder();
   private final LongAdder txnOutputBytes = new LongAdder();
+  private final LongAdder leaseRenewalRequests = new LongAdder();
+  private final LongAdder leaseRenewalResponses = new LongAdder();
+  private final LongAdder leaseRenewalSelected = new LongAdder();
+  private final LongAdder leaseRenewalUnknownOutcomes = new LongAdder();
+  private final LongAdder leaseRenewalRequestBytes = new LongAdder();
+  private final LongAdder leaseRenewalResponseBytes = new LongAdder();
+  private final LongAdder leaseRenewalAuxiliaryRecords = new LongAdder();
+  private final LongAdder leaseRenewalAuxiliaryPayloadBytes = new LongAdder();
+  private final LongAdder leaseRenewalHBaseClientOperations = new LongAdder();
+  private final LongAdder leaseRenewalLogicalHBaseRequestPayloadBytes = new LongAdder();
   private final LongSupplier nanoTime;
   private final Consumer<FailureSummary> warnings;
   private final AtomicLong lastWarningNanos;
@@ -53,6 +64,9 @@ public final class RequestMetrics implements RequestCompletionRecorder {
     Map<TxnStage, StageCounter> transactions = new EnumMap<>(TxnStage.class);
     for (TxnStage stage : TxnStage.values()) transactions.put(stage, new StageCounter());
     txnStages = Map.copyOf(transactions);
+    Map<LeaseRenewalStage, StageCounter> renewals = new EnumMap<>(LeaseRenewalStage.class);
+    for (LeaseRenewalStage stage : LeaseRenewalStage.values()) renewals.put(stage, new StageCounter());
+    leaseRenewalStages = Map.copyOf(renewals);
   }
 
   /** Bounded stages that J30 actually observes; publication includes M2 finalization. */
@@ -60,6 +74,11 @@ public final class RequestMetrics implements RequestCompletionRecorder {
 
   /** Bounded stages measured for transaction requests. */
   public enum TxnStage { QUEUE, COMPARE_AND_PREPARE, PUBLISH_AND_FINALIZE, RESULT_RESOLUTION, RESPONSE }
+
+  /** Bounded stages and payload counters for Lease KeepAlive; no Lease ID or user label is kept. */
+  public enum LeaseRenewalStage {
+    QUEUE, PREPARE, PUBLISH_AND_FINALIZE, RESULT_RESOLUTION, OUTBOUND_READY_WAIT
+  }
 
   public void recordTxnStage(TxnStage stage, long elapsedNanos) {
     Objects.requireNonNull(stage, "stage");
@@ -82,6 +101,64 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   }
 
   public long txnOutputBytes() { return txnOutputBytes.sum(); }
+
+  public void recordLeaseRenewalStage(LeaseRenewalStage stage, long elapsedNanos) {
+    Objects.requireNonNull(stage, "stage");
+    if (elapsedNanos < 0) throw new IllegalArgumentException("elapsedNanos must not be negative");
+    var counter = leaseRenewalStages.get(stage);
+    counter.count.increment();
+    counter.totalNanos.add(elapsedNanos);
+  }
+
+  /** Records one accepted KeepAlive protobuf request, excluding HTTP/2 framing bytes. */
+  public void recordLeaseRenewalRequest(int serializedBytes) {
+    if (serializedBytes < 0) throw new IllegalArgumentException("request bytes must not be negative");
+    leaseRenewalRequests.increment();
+    leaseRenewalRequestBytes.add(serializedBytes);
+  }
+
+  /** Records one KeepAlive response accepted by the gRPC observer, not a physical socket write. */
+  public void recordLeaseRenewalResponse(int serializedBytes) {
+    if (serializedBytes < 0) throw new IllegalArgumentException("response bytes must not be negative");
+    leaseRenewalResponses.increment();
+    leaseRenewalResponseBytes.add(serializedBytes);
+  }
+
+  /** Records the auxiliary Lease records in a fully selected and finalized renewal. */
+  public void recordLeaseRenewalSelected(int auxiliaryRecords, long payloadBytes) {
+    if (auxiliaryRecords < 0 || payloadBytes < 0) {
+      throw new IllegalArgumentException("selected Lease storage totals must not be negative");
+    }
+    leaseRenewalSelected.increment();
+    leaseRenewalAuxiliaryRecords.add(auxiliaryRecords);
+    leaseRenewalAuxiliaryPayloadBytes.add(payloadBytes);
+  }
+
+  /**
+   * Records owner-side logical HBase client operations and counted row/cell/range payload bytes.
+   * The values exclude retries, RPC envelopes, compression, TLS, and transport framing.
+   */
+  public void recordLeaseRenewalStorageCost(RequestScope.StorageCostSnapshot cost) {
+    Objects.requireNonNull(cost, "cost");
+    leaseRenewalHBaseClientOperations.add(cost.logicalOperations());
+    leaseRenewalLogicalHBaseRequestPayloadBytes.add(cost.logicalRequestPayloadBytes());
+  }
+
+  public void recordLeaseRenewalUnknownOutcome() {
+    leaseRenewalUnknownOutcomes.increment();
+  }
+
+  public LeaseRenewalSnapshot leaseRenewals() {
+    Map<LeaseRenewalStage, StageSnapshot> stages = new EnumMap<>(LeaseRenewalStage.class);
+    leaseRenewalStages.forEach((stage, counter) -> stages.put(stage,
+        new StageSnapshot(counter.count.sum(), counter.totalNanos.sum())));
+    return new LeaseRenewalSnapshot(leaseRenewalRequests.sum(), leaseRenewalResponses.sum(),
+        leaseRenewalSelected.sum(), leaseRenewalUnknownOutcomes.sum(),
+        leaseRenewalRequestBytes.sum(), leaseRenewalResponseBytes.sum(),
+        leaseRenewalAuxiliaryRecords.sum(), leaseRenewalAuxiliaryPayloadBytes.sum(),
+        leaseRenewalHBaseClientOperations.sum(),
+        leaseRenewalLogicalHBaseRequestPayloadBytes.sum(), stages);
+  }
 
   public void recordPutStage(PutStage stage, long elapsedNanos) {
     Objects.requireNonNull(stage, "stage");
@@ -191,6 +268,16 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   public record Snapshot(long completed, long totalElapsedNanos, long cleanupFailures) {}
 
   public record StageSnapshot(long count, long totalNanos) {}
+
+  public record LeaseRenewalSnapshot(long requests, long responses, long selected,
+      long unknownOutcomes, long requestBytes, long responseBytes, long auxiliaryRecords,
+      long auxiliaryPayloadBytes, long hbaseClientOperations,
+      long logicalHBaseRequestPayloadBytes,
+      Map<LeaseRenewalStage, StageSnapshot> stages) {
+    public LeaseRenewalSnapshot {
+      stages = Map.copyOf(Objects.requireNonNull(stages, "stages"));
+    }
+  }
 
   record FailureSummary(
       MethodClass methodClass,

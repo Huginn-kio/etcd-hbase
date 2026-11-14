@@ -794,7 +794,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
 
 ### M4：Lease、注册监听与 Watch
 
-**状态：进行中｜已完成 1 / 8｜未完成 7｜负责人：Codex｜计划/实际日期：— / 2026-11-14**
+**状态：进行中｜已完成 3 / 8｜未完成 5｜负责人：Codex｜计划/实际日期：— / 2026-11-14**
 
 **进入条件：** M2 内核已验收，M3 对应 Put/Txn/Delete 和事件准备可用。
 
@@ -815,11 +815,11 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
   - 跟踪：状态=代码与公开临时验证完成；负责人=Codex；完成日期=2026-11-14；PR/commit=PR #48（head 见 PR）；验证=M4 J41 public profile passed（Temurin JDK 21、Go 294 项、Java 870 项、39 个原生 trace、HISTORY/NATIVE MiniCluster；最终报告保留于本地 artifact）；评审人=Reidddddd；评审结论=待评审；目标环境及 M4 阶段验收=未完成。
 
-- [ ] **J42｜KeepAlive 双向流与持久化后回复**
+- [x] **J42｜KeepAlive 双向流与持久化后回复**
   - 依赖：J40/J41。
   - 完成标准：成功回复后的 TTL 承诺在故障/切换下成立；纯续约不增长 KV revision 或产生 session PUT；记录每次续约写放大，合并窗口先证明。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=代码与公开临时验证完成；负责人=Codex；完成日期=2026-11-14；PR/commit=[PR #49](https://github.com/Reidddddd/etcd-hbase/pull/49)；验证入口=`scripts/verify/m4.sh --scope public --task J42`；报告保留于本地 `.artifacts/m4/j42-pr-head-final-20261114`；作者自审=完成；独立复核=完成（两项问题已修正并加入回归测试）；评审人/结论=`Reidddddd` / 待评审；目标环境与 M4 阶段验收=未完成。
 
 - [ ] **J43｜ExpiryWorker、时间窗口索引、Revoke 与撤销恢复**
   - 依赖：J33/J41/J42。

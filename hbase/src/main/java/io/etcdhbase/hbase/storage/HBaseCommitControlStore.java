@@ -61,7 +61,8 @@ public final class HBaseCommitControlStore implements CommitControlStore {
 
   @Override
   public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
-    return execute(scope, table -> {
+    long requestPayloadBytes = (long) binding.controlRow().length + binding.family().length;
+    return execute(scope, requestPayloadBytes, table -> {
       var get = new Get(binding.controlRow()).setConsistency(Consistency.STRONG)
           .addFamily(binding.family());
       return table.get(get).thenApply(this::snapshot);
@@ -80,7 +81,10 @@ public final class HBaseCommitControlStore implements CommitControlStore {
       return CompletableFuture.failedFuture(new IllegalArgumentException(
           "control initialization requires a fenced empty initial state"));
     }
-    return execute(scope, table -> {
+    byte[] encodedState = CommitControlMessages.encode(initialState);
+    long requestPayloadBytes = (long) binding.controlRow().length + binding.family().length
+        + STATE.length + encodedState.length;
+    return execute(scope, requestPayloadBytes, table -> {
       Put put = controlPut(initialState);
       var check = CheckAndMutate.newBuilder(binding.controlRow())
           .ifNotExists(binding.family(), STATE).build(put);
@@ -119,7 +123,10 @@ public final class HBaseCommitControlStore implements CommitControlStore {
         return CompletableFuture.failedFuture(failure);
       }
     }
-    return execute(scope, table -> {
+    byte[] encodedReplacement = CommitControlMessages.encode(replacement);
+    long requestPayloadBytes = (long) binding.controlRow().length + binding.family().length
+        + STATE.length + observed.comparisonToken().length + encodedReplacement.length;
+    return execute(scope, requestPayloadBytes, table -> {
       var condition = CheckAndMutate.newBuilder(binding.controlRow())
           .ifEquals(binding.family(), STATE, observed.comparisonToken())
           .build(controlPut(replacement));
@@ -152,12 +159,17 @@ public final class HBaseCommitControlStore implements CommitControlStore {
 
   private <T> CompletableFuture<T> execute(RequestScope scope,
       java.util.function.Function<AsyncTable<?>, CompletableFuture<T>> operation) {
-    return executeRequest(scope, operation);
+    return executeRequest(scope, 0, operation);
   }
 
-  private <T> CompletableFuture<T> executeRequest(RequestScope scope,
+  private <T> CompletableFuture<T> execute(RequestScope scope, long logicalRequestPayloadBytes,
       java.util.function.Function<AsyncTable<?>, CompletableFuture<T>> operation) {
-    return startRequest(scope, () -> {
+    return executeRequest(scope, logicalRequestPayloadBytes, operation);
+  }
+
+  private <T> CompletableFuture<T> executeRequest(RequestScope scope, long logicalRequestPayloadBytes,
+      java.util.function.Function<AsyncTable<?>, CompletableFuture<T>> operation) {
+    return startRequest(scope, logicalRequestPayloadBytes, () -> {
       long timeout = Math.max(1, Math.min(TimeUnit.SECONDS.toNanos(30), scope.remainingDeadlineNanos()));
       AsyncTable<?> table = connection.getTableBuilder(binding.table())
           .setOperationTimeout(timeout, TimeUnit.NANOSECONDS)
@@ -169,6 +181,11 @@ public final class HBaseCommitControlStore implements CommitControlStore {
   private static <T> CompletableFuture<T> startRequest(
       RequestScope scope, Supplier<CompletableFuture<T>> operation) {
     return HBaseRequestCompletion.startRequest(scope, operation);
+  }
+
+  private static <T> CompletableFuture<T> startRequest(RequestScope scope,
+      long logicalRequestPayloadBytes, Supplier<CompletableFuture<T>> operation) {
+    return HBaseRequestCompletion.startRequest(scope, logicalRequestPayloadBytes, operation);
   }
 
   private static <T> CompletableFuture<T> failed(Throwable failure) {

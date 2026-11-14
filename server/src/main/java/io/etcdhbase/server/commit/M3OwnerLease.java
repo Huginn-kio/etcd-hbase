@@ -13,6 +13,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.Optional;
 import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,8 +25,11 @@ final class M3OwnerLease implements AutoCloseable {
       Thread.ofVirtual().name("m3-owner-cleanup").start(task);
 
   private final Object lock = new Object();
+  private final String instance;
+  private RecoveryManager recovery;
   private CommitOwnerService owners;
   private CommitOwnerService.OwnerToken token;
+  private final boolean standbyEnabled;
   private final long leaseMillis;
   private final long heartbeatTimeoutMillis;
   private final Clock clock;
@@ -42,11 +46,15 @@ final class M3OwnerLease implements AutoCloseable {
   private Throwable stopFailure;
   private long verifiedDeadlineMillis;
 
-  private M3OwnerLease(CommitOwnerService owners, CommitOwnerService.OwnerToken token,
+  private M3OwnerLease(RecoveryManager recovery, CommitOwnerService owners, String instance,
+      CommitOwnerService.OwnerToken token, boolean standbyEnabled,
       long leaseMillis, long heartbeatMillis, long heartbeatTimeoutMillis, long verifiedDeadlineMillis,
       Runnable onLost, Clock clock) {
+    this.recovery = recovery;
     this.owners = owners;
+    this.instance = instance;
     this.token = token;
+    this.standbyEnabled = standbyEnabled;
     this.leaseMillis = leaseMillis;
     this.heartbeatTimeoutMillis = heartbeatTimeoutMillis;
     this.verifiedDeadlineMillis = verifiedDeadlineMillis;
@@ -75,6 +83,29 @@ final class M3OwnerLease implements AutoCloseable {
   static CompletableFuture<M3OwnerLease> acquire(RecoveryManager recovery, CommitOwnerService owners,
       String instance, Duration lease, Duration heartbeat, Duration heartbeatTimeout,
       RequestScope startup, Runnable onLost, Clock clock) {
+    return acquire(recovery, owners, instance, lease, heartbeat, heartbeatTimeout,
+        startup, onLost, clock, false);
+  }
+
+  /** Starts as a ready follower when another process currently owns the table group. */
+  static CompletableFuture<M3OwnerLease> acquireOrStandby(RecoveryManager recovery,
+      CommitOwnerService owners, String instance, Duration lease, Duration heartbeat,
+      Duration heartbeatTimeout, RequestScope startup, Runnable onLost) {
+    return acquire(recovery, owners, instance, lease, heartbeat, heartbeatTimeout,
+        startup, onLost, Clock.systemUTC(), true);
+  }
+
+  static CompletableFuture<M3OwnerLease> acquireOrStandby(RecoveryManager recovery,
+      CommitOwnerService owners, String instance, Duration lease, Duration heartbeat,
+      Duration heartbeatTimeout, RequestScope startup, Runnable onLost, Clock clock) {
+    return acquire(recovery, owners, instance, lease, heartbeat, heartbeatTimeout,
+        startup, onLost, clock, true);
+  }
+
+  private static CompletableFuture<M3OwnerLease> acquire(RecoveryManager recovery,
+      CommitOwnerService owners, String instance, Duration lease, Duration heartbeat,
+      Duration heartbeatTimeout, RequestScope startup, Runnable onLost, Clock clock,
+      boolean standbyEnabled) {
     Objects.requireNonNull(recovery, "recovery");
     Objects.requireNonNull(owners, "owners");
     Objects.requireNonNull(instance, "instance");
@@ -91,7 +122,11 @@ final class M3OwnerLease implements AutoCloseable {
     long deadline = Math.addExact(now, leaseMillis);
     return recovery.recover(instance, now, deadline, startup).thenCompose(result -> {
       if (result.state() == RecoveryManager.State.OWNER_ACTIVE) {
-        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        if (!standbyEnabled) {
+          return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        }
+        return CompletableFuture.completedFuture(new M3OwnerLease(recovery, owners, instance,
+            null, true, leaseMillis, heartbeatMillis, timeoutMillis, Long.MAX_VALUE, onLost, clock));
       }
       if (clock.millis() >= deadline) {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
@@ -105,19 +140,37 @@ final class M3OwnerLease implements AutoCloseable {
               ? BackendFailure.Category.TIMEOUT : startup.isClosed()
                   ? BackendFailure.Category.CANCELLED : BackendFailure.Category.UNAVAILABLE));
         }
-        return new M3OwnerLease(owners, token, leaseMillis, heartbeatMillis, timeoutMillis,
-            verifiedDeadline, onLost, clock);
+        return new M3OwnerLease(recovery, owners, instance, token, standbyEnabled,
+            leaseMillis, heartbeatMillis, timeoutMillis, verifiedDeadline, onLost, clock);
       });
     });
   }
 
   CommitOwnerService.OwnerToken token() {
-    synchronized (lock) { return token; }
+    synchronized (lock) {
+      if (token == null || !ready || stopping || clock.millis() >= verifiedDeadlineMillis) {
+        throw new IllegalStateException("table-group runtime is not the active owner");
+      }
+      return token;
+    }
+  }
+
+  Optional<CommitOwnerService.OwnerToken> currentToken() {
+    synchronized (lock) {
+      if (token == null || !ready || stopping || fenceTransition
+          || clock.millis() >= verifiedDeadlineMillis) return Optional.empty();
+      return Optional.of(token);
+    }
+  }
+
+  boolean isOwner() {
+    return currentToken().isPresent();
   }
 
   boolean isReady() {
     synchronized (lock) {
-      return ready && !fenceTransition && clock.millis() < verifiedDeadlineMillis;
+      return ready && !stopping && !fenceTransition
+          && (standbyEnabled || clock.millis() < verifiedDeadlineMillis);
     }
   }
 
@@ -130,6 +183,13 @@ final class M3OwnerLease implements AutoCloseable {
       CommitOwnerService nextOwners,
       Function<CommitOwnerService.OwnerToken, CompletableFuture<CommitOwnerService.OwnerToken>> transition,
       RequestScope scope) {
+    return transitionFence(nextOwners, null, transition, scope);
+  }
+
+  CompletableFuture<CommitOwnerService.OwnerToken> transitionFence(
+      CommitOwnerService nextOwners, RecoveryManager nextRecovery,
+      Function<CommitOwnerService.OwnerToken, CompletableFuture<CommitOwnerService.OwnerToken>> transition,
+      RequestScope scope) {
     Objects.requireNonNull(nextOwners, "nextOwners");
     Objects.requireNonNull(transition, "transition");
     Objects.requireNonNull(scope, "scope");
@@ -138,7 +198,7 @@ final class M3OwnerLease implements AutoCloseable {
     CommitOwnerService.OwnerToken previousToken;
     CompletableFuture<Void> previousHeartbeat;
     synchronized (lock) {
-      if (stopping || !ready || fenceTransition || clock.millis() >= verifiedDeadlineMillis
+      if (stopping || !ready || token == null || fenceTransition || clock.millis() >= verifiedDeadlineMillis
           || scope.isClosed() || scope.isDeadlineExceeded()) {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       }
@@ -206,6 +266,7 @@ final class M3OwnerLease implements AutoCloseable {
         fenceTransition = false;
         if (failure == null && !stopping) {
           owners = nextOwners;
+          if (nextRecovery != null) recovery = nextRecovery;
           token = result.token();
           verifiedDeadlineMillis = result.deadlineMillis();
         }
@@ -225,6 +286,30 @@ final class M3OwnerLease implements AutoCloseable {
     }).copy();
   }
 
+  CompletableFuture<Void> refreshServices(CommitOwnerService nextOwners,
+      RecoveryManager nextRecovery, RequestScope scope) {
+    Objects.requireNonNull(nextOwners, "nextOwners");
+    Objects.requireNonNull(nextRecovery, "nextRecovery");
+    Objects.requireNonNull(scope, "scope");
+    if (currentToken().isPresent()) {
+      return transitionFence(nextOwners, nextRecovery, CompletableFuture::completedFuture, scope)
+          .thenApply(ignored -> null);
+    }
+    CompletableFuture<Void> heartbeat;
+    synchronized (lock) {
+      if (stopping || !standbyEnabled || token != null) {
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      }
+      heartbeat = inFlight == null ? null : heartbeatCompletion;
+      if (heartbeat == null) {
+        owners = nextOwners;
+        recovery = nextRecovery;
+        return CompletableFuture.completedFuture(null);
+      }
+    }
+    return heartbeat.thenCompose(ignored -> refreshServices(nextOwners, nextRecovery, scope));
+  }
+
   CompletableFuture<Void> drained() { return drained.copy(); }
 
   boolean awaitTermination(Duration timeout) throws InterruptedException {
@@ -241,31 +326,48 @@ final class M3OwnerLease implements AutoCloseable {
     RequestScope scope;
     long previousDeadline;
     boolean expired;
+    boolean attemptClaim;
     CommitOwnerService activeOwners;
+    RecoveryManager activeRecovery;
     CommitOwnerService.OwnerToken activeToken;
     CompletableFuture<Void> completion;
     synchronized (lock) {
       if (stopping || fenceTransition || inFlight != null) return;
       previousDeadline = verifiedDeadlineMillis;
-      expired = clock.millis() >= previousDeadline;
-      scope = expired ? null : RequestScope.withTimeout(Duration.ofMillis(heartbeatTimeoutMillis));
-      if (!expired) {
+      expired = token != null && clock.millis() >= previousDeadline;
+      if (expired && !standbyEnabled) {
+        scope = null;
+        completion = null;
+        activeOwners = null;
+        activeRecovery = null;
+        activeToken = null;
+        attemptClaim = false;
+      } else {
+        if (expired) clearOwnerLocked();
+        scope = RequestScope.withTimeout(Duration.ofMillis(heartbeatTimeoutMillis));
         inFlight = scope;
         completion = new CompletableFuture<>();
         heartbeatCompletion = completion;
         activeOwners = owners;
+        activeRecovery = recovery;
         activeToken = token;
-      } else {
-        completion = null;
-        activeOwners = null;
-        activeToken = null;
+        attemptClaim = activeToken == null;
       }
     }
-    if (expired) { stop(LossReason.LEASE_EXPIRED_BEFORE_RENEWAL); return; }
+    if (expired && !standbyEnabled) {
+      stop(LossReason.LEASE_EXPIRED_BEFORE_RENEWAL);
+      return;
+    }
+    if (expired) notifyOwnerLost(LossReason.LEASE_EXPIRED_BEFORE_RENEWAL);
+    if (attemptClaim) {
+      attemptClaim(activeRecovery, activeOwners, scope, completion);
+      return;
+    }
     ScheduledFuture<?> timeout;
     try {
       timeout = timer.schedule(() -> {
-        stop(LossReason.HEARTBEAT_TIMEOUT);
+        if (standbyEnabled) loseOwnership(activeToken, LossReason.HEARTBEAT_TIMEOUT);
+        else stop(LossReason.HEARTBEAT_TIMEOUT);
         scope.cancelAsync(CLEANUP);
       }, heartbeatTimeoutMillis, TimeUnit.MILLISECONDS);
       long deadline = Math.addExact(clock.millis(), leaseMillis);
@@ -274,21 +376,83 @@ final class M3OwnerLease implements AutoCloseable {
         long now = clock.millis();
         if (failure != null || !Boolean.TRUE.equals(renewed)
             || now >= previousDeadline || now >= deadline) {
-          stop(renewalFailure(failure, renewed, now, previousDeadline, deadline));
+          LossReason reason = renewalFailure(failure, renewed, now, previousDeadline, deadline);
+          if (standbyEnabled) loseOwnership(activeToken, reason);
+          else stop(reason);
         } else {
           synchronized (lock) {
-            if (!stopping) verifiedDeadlineMillis = Math.max(verifiedDeadlineMillis, deadline);
+            if (!stopping && activeToken.equals(token)) {
+              verifiedDeadlineMillis = Math.max(verifiedDeadlineMillis, deadline);
+            }
           }
         }
         finishHeartbeat(scope, completion);
       });
     } catch (RuntimeException failure) {
-      stop(LossReason.HEARTBEAT_SCHEDULING_FAILED);
+      if (standbyEnabled) loseOwnership(activeToken, LossReason.HEARTBEAT_SCHEDULING_FAILED);
+      else stop(LossReason.HEARTBEAT_SCHEDULING_FAILED);
       finishHeartbeat(scope, completion);
     } catch (Error fatal) {
-      stop(LossReason.HEARTBEAT_SCHEDULING_FAILED);
+      if (standbyEnabled) loseOwnership(activeToken, LossReason.HEARTBEAT_SCHEDULING_FAILED);
+      else stop(LossReason.HEARTBEAT_SCHEDULING_FAILED);
       finishHeartbeat(scope, completion);
       throw fatal;
+    }
+  }
+
+  private void attemptClaim(RecoveryManager activeRecovery, CommitOwnerService activeOwners,
+      RequestScope scope, CompletableFuture<Void> completion) {
+    long now = clock.millis();
+    long proposedDeadline = Math.addExact(now, leaseMillis);
+    activeRecovery.recover(instance, now, proposedDeadline, scope)
+        .thenCompose(result -> {
+          if (result.state() == RecoveryManager.State.OWNER_ACTIVE) {
+            return CompletableFuture.completedFuture(null);
+          }
+          CommitOwnerService.OwnerToken candidate = result.owner().orElseThrow();
+          long verifiedDeadline = Math.addExact(clock.millis(), leaseMillis);
+          if (clock.millis() >= proposedDeadline) {
+            return CompletableFuture.completedFuture(null);
+          }
+          return activeOwners.heartbeat(candidate, verifiedDeadline, scope)
+              .thenApply(verified -> Boolean.TRUE.equals(verified)
+                  && clock.millis() < verifiedDeadline ? new OwnerClaim(candidate, verifiedDeadline) : null);
+        }).whenComplete((claim, failure) -> {
+          if (failure != null) {
+            LOGGER.debug("M3 standby owner claim did not complete; the runtime remains a follower",
+                failure);
+          } else if (claim != null) {
+            synchronized (lock) {
+              if (!stopping && token == null && clock.millis() < claim.deadlineMillis()) {
+                token = claim.token();
+                verifiedDeadlineMillis = claim.deadlineMillis();
+              }
+            }
+          }
+          finishHeartbeat(scope, completion);
+        });
+  }
+
+  private void loseOwnership(CommitOwnerService.OwnerToken lostToken, LossReason reason) {
+    boolean lost;
+    synchronized (lock) {
+      lost = !stopping && lostToken != null && lostToken.equals(token);
+      if (lost) clearOwnerLocked();
+    }
+    if (lost) notifyOwnerLost(reason);
+  }
+
+  private void clearOwnerLocked() {
+    token = null;
+    verifiedDeadlineMillis = 0;
+  }
+
+  private void notifyOwnerLost(LossReason reason) {
+    LOGGER.warn("M3 table-group owner lease lost; reason={}", reason);
+    try {
+      onLost.run();
+    } catch (RuntimeException | Error failure) {
+      recordFailure(failure);
     }
   }
 
@@ -390,6 +554,8 @@ final class M3OwnerLease implements AutoCloseable {
   }
 
   private record TransitionResult(CommitOwnerService.OwnerToken token, long deadlineMillis) {}
+
+  private record OwnerClaim(CommitOwnerService.OwnerToken token, long deadlineMillis) {}
 
   private void completeDrain(DrainStatus status) {
     if (status == null) return;

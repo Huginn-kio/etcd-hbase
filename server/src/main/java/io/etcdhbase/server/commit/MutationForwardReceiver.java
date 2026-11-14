@@ -13,9 +13,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
-import java.nio.charset.StandardCharsets;
 import java.time.Clock;
-import java.util.Arrays;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -203,10 +201,12 @@ public final class MutationForwardReceiver {
 
   private static boolean bindingBelongsToObservedAttempt(
       InvocationBinding binding, CommitState observed) {
-    if (binding.state() != InvocationBinding.State.PREPARING
-        && binding.state() != InvocationBinding.State.SEALED) {
+    if (binding.state() != InvocationBinding.State.PREPARING) {
       return true;
     }
+    // A SEALED invocation may already have been selected and archived before its reply was lost.
+    // Let the operation processor resolve that durable outcome; it must not prepare the old base
+    // again. Only PREPARING bindings can still be dispatched as new work under the observed base.
     return binding.preparedOwnerEpoch() == observed.ownerEpoch()
         && binding.baseSequence() == observed.publishedSequence()
         && binding.baseRevision() == observed.publishedRevision();
@@ -260,11 +260,12 @@ public final class MutationForwardReceiver {
       MutationForwardRequest request, VerifiedAuthorization verified) {
     if (verified == null) return false;
     AuthorizedBackendIdentity identity = verified.identity();
-    byte[] contextReference = identity.contextRef().getBytes(StandardCharsets.UTF_8);
+    // The reference belongs to the caller's process-local auth context. A receiving replica
+    // resolves it through its trusted peer/provider boundary; comparing it with this process's
+    // local reference would reject the same authorized identity on every other replica.
     return identity.scope().tableGroupId().equals(request.tableGroupId())
         && identity.allowedTableGroupIds().contains(request.tableGroupId())
-        && verified.authorizationScopeDigest().equals(request.authorizationScopeDigest())
-        && Arrays.equals(contextReference, request.authorizationContextReference().bytes());
+        && verified.authorizationScopeDigest().equals(request.authorizationScopeDigest());
   }
 
   private static boolean validPeerIdentity(String identity) {

@@ -26,6 +26,7 @@ RUN_SCHEMA = "etcd-hbase-m4-run/v1"
 TRACE_SCHEMA = "etcd-hbase-trace/v1"
 COMPARE_SUCCESS = "M4 Lease traces match the registered native comparison policy"
 J41_COMPARE_SUCCESS = "M4 Lease binding traces match the registered native comparison policy"
+J42_COMPARE_SUCCESS = "M4 KeepAlive traces match the registered native comparison policy"
 REQUIRED_COMMANDS = {"go-module-lock", "go-tests", "maven-verify", "collect-maven-reports"}
 
 J40_TRACE_CASES = (
@@ -82,6 +83,30 @@ J41_TRACE_CASES = (
     ("binding-unselected-else-visible", "etcdserverpb.KV/Range"),
     ("binding-ttl-b-after-unselected-branch", "etcdserverpb.Lease/LeaseTimeToLive"),
 )
+J42_TRACE_CASES = (
+    ("native-baseline", "etcdserverpb.Lease/LeaseLeases", "L05"),
+    ("keepalive-grant-a", "etcdserverpb.Lease/LeaseGrant", "L01"),
+    ("keepalive-grant-b", "etcdserverpb.Lease/LeaseGrant", "L01"),
+    ("keepalive-grant-managed-a", "etcdserverpb.Lease/LeaseGrant", "L01"),
+    ("keepalive-grant-managed-b", "etcdserverpb.Lease/LeaseGrant", "L01"),
+    ("keepalive-range-before", "etcdserverpb.KV/Range", "R01"),
+    ("keepalive-stream-a", "etcdserverpb.Lease/LeaseKeepAlive", "L02"),
+    ("keepalive-stream-b", "etcdserverpb.Lease/LeaseKeepAlive", "L02"),
+    ("keepalive-stream-missing", "etcdserverpb.Lease/LeaseKeepAlive", "L02"),
+    ("keepalive-stream-a-repeat", "etcdserverpb.Lease/LeaseKeepAlive", "L02"),
+    ("keepalive-ttl-a", "etcdserverpb.Lease/LeaseTimeToLive", "L04"),
+    ("keepalive-ttl-b", "etcdserverpb.Lease/LeaseTimeToLive", "L04"),
+    ("keepalive-managed-a-first", "etcdserverpb.Lease/LeaseKeepAlive", "L02"),
+    ("keepalive-managed-a-second", "etcdserverpb.Lease/LeaseKeepAlive", "L02"),
+    ("keepalive-managed-b-first", "etcdserverpb.Lease/LeaseKeepAlive", "L02"),
+    ("keepalive-managed-b-second", "etcdserverpb.Lease/LeaseKeepAlive", "L02"),
+    ("keepalive-range-after", "etcdserverpb.KV/Range", "R01"),
+)
+M4_STREAM_METHODS = {
+    "etcdserverpb.Lease/LeaseKeepAlive",
+    "etcdserverpb.Watch/Watch",
+}
+J42_STREAM_TERMINALS = {"keepalive-stream-a-repeat": {"kind": "eof"}}
 J40_GO_TESTS = {
     "cmd/m4driver": {
         "TestRunNativeLeaseWritesFreshTraceAndVerifiableMetadata",
@@ -204,6 +229,93 @@ J41_CRITICAL_JAVA_TESTS = {
         "m4ActivationRequiresExplicitLeaseRevocationLimits"
     },
 }
+J42_GO_TESTS = {
+    "cmd/m4driver": {
+        "TestRunNativeLeaseKeepAliveWritesFreshTraceAndVerifiableMetadata",
+        "TestCompareKeepAliveRejectsCorruptOrMismatchedTrace",
+    },
+    "internal/scenario": {
+        "TestM4LeaseKeepAliveScenarioMatchesItsPinnedNativeOracle",
+        "TestLoadM4LeaseKeepAliveSuiteRejectsMissingOrChangedCoverage",
+    },
+    "internal/compare": {
+        "TestCompareM4LeaseKeepAliveRejectsMissingTerminal",
+        "TestCompareM4LeaseKeepAliveRejectsChangedRevisionOrUnknownTtl",
+    },
+    "internal/trace": {
+        "TestSnapshotProtoPreservesWatchAndLeaseStreamValues",
+    },
+}
+J42_JAVA_CLASS_MODULES = {
+    "io.etcdhbase.core.commit.InvocationResultResolverTest": "core",
+    "io.etcdhbase.core.commit.MutationOperationEnvelopeTest": "core",
+    "io.etcdhbase.core.request.RequestScopeTest": "core",
+    "io.etcdhbase.server.commit.BoundedPublicationHandoffTest": "server",
+    "io.etcdhbase.server.commit.LeaseGrantPreparationTest": "server",
+    "io.etcdhbase.server.commit.LeaseKeepAliveStreamTest": "server",
+    "io.etcdhbase.server.commit.M3OwnerLeaseTest": "server",
+    "io.etcdhbase.server.commit.MutationForwardReceiverTest": "server",
+    "io.etcdhbase.server.commit.OwnerPeerIdentityInterceptorTest": "server",
+    "io.etcdhbase.server.commit.SerialMutationQueueTest": "server",
+    "io.etcdhbase.server.observability.RequestMetricsTest": "server",
+    "io.etcdhbase.server.TestTlsCertificateTest": "server",
+    "io.etcdhbase.server.M4LeaseKeepAliveRpcIT": "server",
+}
+J42_JAVA_CLASSES = set(J42_JAVA_CLASS_MODULES)
+J42_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.core.commit.InvocationResultResolverTest": {
+        "resolvesEitherDurableInvocationOutcomeForProtocolProjection",
+    },
+    "io.etcdhbase.core.commit.MutationOperationEnvelopeTest": {
+        "distinguishesVersionedTxnFromExistingRawPutBytes",
+    },
+    "io.etcdhbase.core.request.RequestScopeTest": {
+        "snapshotsLogicalStorageCostsAndRejectsBackwardsDeltas",
+        "serviceContinuationSharesStorageAccountingButNotCancellation",
+    },
+    "io.etcdhbase.server.commit.BoundedPublicationHandoffTest": {
+        "attributesServiceOwnedStorageCostToTheTransferredOperation",
+    },
+    "io.etcdhbase.server.commit.LeaseKeepAliveStreamTest": {
+        "serializesResponsesAndRequestsOneInboundMessageAtATime",
+        "doesNotSendUntilReadyAndReleasesPendingDeliveryOnCancellation",
+        "halfCloseWaitsForCurrentOperationBeforeCompleting",
+        "observerFailureReleasesDeliveryAndStopsFurtherInput",
+        "timesOutAStalledOutboundResponseAndReleasesItsDelivery",
+    },
+    "io.etcdhbase.server.commit.LeaseGrantPreparationTest": {
+        "persistsNoChangeResponseWithoutCreatingAnEmptyAuxiliaryManifest",
+    },
+    "io.etcdhbase.server.commit.M3OwnerLeaseTest": {
+        "standbyStartsReadyAndClaimsOwnerAfterActiveOwnerExpires",
+    },
+    "io.etcdhbase.server.commit.MutationForwardReceiverTest": {
+        "staleSealedBindingWithoutDurableSelectionIsResolvedWithoutMutation",
+        "staleSealedBindingAfterSelectionCanReturnItsDurableOutcome",
+    },
+    "io.etcdhbase.server.commit.SerialMutationQueueTest": {
+        "zeroQueuedCapacityRejectsConcurrentRequestsWithoutDisplacingTheActiveMutation",
+    },
+    "io.etcdhbase.server.commit.OwnerPeerIdentityInterceptorTest": {
+        "acceptsOnlyOneConfiguredDnsSan",
+        "rejectsUnregisteredDnsSanEvenWhenItsCertificateIsTrusted",
+        "rejectsCertificatesWithoutDnsSanInsteadOfFallingBackToCommonName",
+        "rejectsCertificatesWithMultipleDnsSansEvenWhenBothAreConfigured",
+    },
+    "io.etcdhbase.server.TestTlsCertificateTest": {
+        "createsCertificatesWithNoAndMultipleDnsNames",
+    },
+    "io.etcdhbase.server.observability.RequestMetricsTest": {
+        "snapshotsBoundedKeepAliveStagesAndLogicalPayloadBytes",
+    },
+    "io.etcdhbase.server.M4LeaseKeepAliveRpcIT": {
+        "realGoKeepAliveMatchesNativeAcrossLayouts",
+        "expiredActiveLeaseIsRejectedUntilDurableRevocation",
+        "dualRuntimeForwardsKeepAliveOverMtlsAndFencesTheOldOwner",
+        "persistedKeepAliveSurvivesLostOwnerReplyAndRestart",
+        "persistedKeepAliveSurvivesClientCancellationBeforeResponse",
+    },
+}
 
 
 class ReportError(ValueError):
@@ -260,6 +372,9 @@ def validate_registry_document(document: object) -> dict[str, object]:
     j41 = task_map.get("J41")
     if j41 is not None:
         _validate_j41_registration(j41)
+    j42 = task_map.get("J42")
+    if j42 is not None:
+        _validate_j42_registration(j42)
     return document
 
 
@@ -408,6 +523,81 @@ def _validate_j41_registration(task: dict[str, object]) -> None:
         raise ReportError("J41 must compare native etcd with both HBase layouts")
     if evidence.get("compare_logs") != ["compare-history.log", "compare-native.log"]:
         raise ReportError("J41 comparison log registration changed")
+
+
+def _validate_j42_registration(task: dict[str, object]) -> None:
+    if (task.get("api_ids") != ["L01", "L02", "L04", "L05", "R01"]
+            or task.get("scenario") != "m4-lease-keepalive-v1"
+            or task.get("manifest") != "m4-lease-keepalive.yaml"
+            or task.get("artifact_subdir") != "j42"):
+        raise ReportError("J42 API, scenario, or evidence directory changed")
+    traces = task["trace_cases"]
+    if any(not isinstance(item, dict) for item in traces):
+        raise ReportError("J42 KeepAlive trace case is malformed")
+    if [(item.get("id"), item.get("method"), item.get("api_id")) for item in traces] != list(J42_TRACE_CASES):
+        raise ReportError("J42 KeepAlive trace coverage is missing, reordered, or changed")
+    registered_terminals = {
+        item["id"]: item["stream_terminal"]
+        for item in traces if item.get("stream_terminal") is not None
+    }
+    if registered_terminals != J42_STREAM_TERMINALS:
+        raise ReportError("J42 stream terminal coverage is missing or changed")
+
+    go_tests: dict[str, set[str]] = {}
+    for package in task["go_tests"]:
+        if not isinstance(package, dict) or not isinstance(package.get("package"), str):
+            raise ReportError("J42 Go test registration is malformed")
+        names = package.get("tests")
+        if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
+            raise ReportError("J42 Go package has no named required tests")
+        if package["package"] in go_tests:
+            raise ReportError("J42 Go package is registered more than once")
+        go_tests[package["package"]] = set(names)
+    if any(not expected.issubset(go_tests.get(package, set()))
+           for package, expected in J42_GO_TESTS.items()):
+        raise ReportError("J42 Go KeepAlive regression coverage is incomplete")
+
+    java_classes: set[str] = set()
+    java_methods: dict[str, set[str]] = {}
+    java_modules: dict[str, str] = {}
+    for suite in task["maven_tests"]:
+        if not isinstance(suite, dict):
+            raise ReportError("J42 Maven test registration is malformed")
+        module, kind, class_name, tests = (
+            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
+        )
+        if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
+            raise ReportError("J42 Maven test registration has an invalid module, kind, or class")
+        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
+            raise ReportError("J42 Maven suite has no named required tests")
+        java_classes.add(class_name)
+        previous_module = java_modules.setdefault(class_name, module)
+        if previous_module != module:
+            raise ReportError("J42 Maven suite is registered in multiple modules")
+        java_methods.setdefault(class_name, set()).update(tests)
+    if not J42_JAVA_CLASSES.issubset(java_classes):
+        raise ReportError("J42 stream, standby-owner, or real dual-runtime suites are not registered")
+    if any(java_modules.get(class_name) != module
+           for class_name, module in J42_JAVA_CLASS_MODULES.items()):
+        raise ReportError("J42 Java suites must be collected from their declared modules")
+    if any(not methods.issubset(java_methods.get(class_name, set()))
+           for class_name, methods in J42_CRITICAL_JAVA_TESTS.items()):
+        raise ReportError("J42 stream backpressure, owner failover, or persistence tests are not registered")
+
+    evidence = task["evidence"]
+    native = evidence["native"]
+    target_layouts = {
+        (target.get("scope"), target.get("layout"), target.get("embedded_native"))
+        for target in evidence["targets"] if isinstance(target, dict)
+    }
+    if (native.get("scope"), native.get("layout"), native.get("embedded_native")) != (
+        "native-etcd", "", True
+    ) or target_layouts != {
+        ("target-hbase", "HISTORY", False), ("target-hbase", "NATIVE", False)
+    }:
+        raise ReportError("J42 must compare native KeepAlive with both HBase layouts")
+    if evidence.get("compare_logs") != ["keepalive-history.log", "keepalive-native.log"]:
+        raise ReportError("J42 comparison log registration changed")
 
 
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, object]:
@@ -677,8 +867,11 @@ def _read_trace(path: Path, expected_cases: list[dict[str, object]], scope: str)
                 raise ReportError("M4 trace did not preserve its required native error")
         elif record["error"] is not None or not isinstance(record["response"], dict):
             raise ReportError("M4 successful Lease case has no response or has an error")
-        if record["stream_terminal"] is not None:
-            raise ReportError("M4 unary Lease trace unexpectedly has a stream terminal")
+        expected_terminal = expected.get("stream_terminal")
+        if record["method"] not in M4_STREAM_METHODS and expected_terminal is not None:
+            raise ReportError("M4 unary trace registration unexpectedly has a stream terminal")
+        if record["stream_terminal"] != expected_terminal:
+            raise ReportError("M4 trace terminal does not match its registered stream contract")
     return raw
 
 
@@ -740,6 +933,8 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
     prefix = f"etcd-hbase-m4-test/{run_id}/"
     if task_id == "J41":
         prefix += "bindings/"
+    elif task_id == "J42":
+        prefix += "keepalive/"
     prefix_hash = hashlib.sha256(prefix.encode()).hexdigest()
 
     expected_cases = task["trace_cases"]
@@ -769,7 +964,10 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
             raise ReportError(f"target Go Lease run for {layout} has no success record")
         layouts.append(layout)
 
-    compare_success = J41_COMPARE_SUCCESS if task_id == "J41" else COMPARE_SUCCESS
+    compare_success = {
+        "J41": J41_COMPARE_SUCCESS,
+        "J42": J42_COMPARE_SUCCESS,
+    }.get(task_id, COMPARE_SUCCESS)
     for compare_log in task["evidence"]["compare_logs"]:
         path = evidence_root / compare_log
         if not path.is_file() or compare_success not in path.read_text(encoding="utf-8"):

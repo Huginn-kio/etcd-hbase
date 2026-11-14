@@ -1,6 +1,7 @@
 package io.etcdhbase.server.commit;
 
 import etcdserverpb.Rpc;
+import com.google.protobuf.InvalidProtocolBufferException;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.InvocationId;
@@ -29,24 +30,28 @@ import io.etcdhbase.grpc.protocol.LeaseGrantResponseMapper;
 import io.etcdhbase.grpc.protocol.LeaseTimeToLiveResponseMapper;
 import io.etcdhbase.grpc.protocol.ResponseHeaderFactory;
 import io.etcdhbase.hbase.codec.LeaseGrantResultMessages;
+import io.etcdhbase.server.observability.RequestMetrics;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.grpc.stub.StreamObserver;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 
 /** Adapts the implemented Lease unary methods to one table group's bounded runtime. */
 public final class LeaseGateway {
   private static final int MAX_EXAMINED_LEASES = 100_000;
   private static final long MAX_METADATA_BYTES = 64L << 20;
   private static final long OUTPUT_OBJECT_ALLOWANCE = 256;
+  private static final java.util.concurrent.Executor CLEANUP =
+      task -> Thread.ofVirtual().name("m4-keepalive-cleanup").start(task);
   static final int BINDING_PAGE_ENTRIES = 128;
   private static final long BINDING_PAGE_OVERHEAD_BYTES = 64L << 10;
 
@@ -68,13 +73,16 @@ public final class LeaseGateway {
   private final BudgetManager.Reservation reservation;
   private final BudgetManager.Reservation bindingReadReservation;
   private final Executor worker;
+  private final ScheduledExecutorService timers;
+  private final RequestMetrics metrics;
 
   public LeaseGateway(String tableGroup, AuthorizedBackendIdentity identity, ByteKey authorizationDigest,
       long clusterId, long memberId, int maximumEtcdRequestBytes, CommitControlStore control,
       MutationRelay relay, InvocationResultResolver results, ReadViewService views,
       LeaseReadView leaseReads, LeaseEnumerationReader leaseEnumeration,
       LeaseBindingReader leaseBindings, LeaseTimeSource time,
-      BudgetManager budgets, BudgetManager.Reservation reservation, Executor worker) {
+      BudgetManager budgets, BudgetManager.Reservation reservation, Executor worker,
+      ScheduledExecutorService timers, RequestMetrics metrics) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
     this.identity = Objects.requireNonNull(identity, "identity");
     this.authorizationDigest = Objects.requireNonNull(authorizationDigest, "authorizationDigest");
@@ -89,6 +97,7 @@ public final class LeaseGateway {
     this.budgets = Objects.requireNonNull(budgets, "budgets");
     this.reservation = Objects.requireNonNull(reservation, "reservation");
     this.worker = Objects.requireNonNull(worker, "worker");
+    this.timers = Objects.requireNonNull(timers, "timers");
     if (tableGroup.isBlank() || authorizationDigest.length() != 32 || clusterId == 0 || memberId == 0
         || maximumEtcdRequestBytes < 1
         || maximumEtcdRequestBytes > MutationForwardRequest.MAX_OPERATION_BYTES
@@ -100,6 +109,7 @@ public final class LeaseGateway {
     this.memberId = memberId;
     this.maximumEtcdRequestBytes = maximumEtcdRequestBytes;
     this.bindingReadReservation = bindingReadReservation(reservation, maximumEtcdRequestBytes);
+    this.metrics = Objects.requireNonNull(metrics, "metrics");
   }
 
   static long bindingPageBytes(int maximumEtcdRequestBytes) {
@@ -130,6 +140,15 @@ public final class LeaseGateway {
     return this::leases;
   }
 
+  public Function<StreamObserver<Rpc.LeaseKeepAliveResponse>,
+      StreamObserver<Rpc.LeaseKeepAliveRequest>> keepAliveHandler() {
+    return observer -> {
+      RequestScope streamScope = RequestScopeInterceptor.currentScope();
+      return new LeaseKeepAliveStream(observer, streamScope, worker, timers,
+          request -> keepAlive(request, streamScope), metrics);
+    };
+  }
+
   private void grant(Rpc.LeaseGrantRequest request, StreamObserver<Rpc.LeaseGrantResponse> observer) {
     Objects.requireNonNull(request, "request");
     Objects.requireNonNull(observer, "observer");
@@ -155,6 +174,197 @@ public final class LeaseGateway {
     }
   }
 
+  private CompletableFuture<LeaseKeepAliveStream.Delivery> keepAlive(
+      Rpc.LeaseKeepAliveRequest request, RequestScope streamScope) {
+    Objects.requireNonNull(request, "request");
+    Objects.requireNonNull(streamScope, "streamScope");
+    RequestScope operationScope = streamScope.childWithTimeoutNanos(
+        MutationForwardRequest.MAX_TIMEOUT_NANOS);
+    CompletableFuture<Void> deliveryComplete = new CompletableFuture<>();
+    operationScope.trackPhysicalProducer(deliveryComplete);
+    CompletableFuture<Void> operationDrained = CompletableFuture.allOf(
+        operationScope.cleanupCompletion().toCompletableFuture(),
+        operationScope.physicalProducersCompletion().toCompletableFuture());
+    var parentRegistration = streamScope.registerScopedCleanup(
+        () -> {
+          if (streamScope.isCancelled()) operationScope.cancelAsync(CLEANUP);
+          else operationScope.closeAsync(CLEANUP);
+        }, operationDrained);
+    var finished = new AtomicBoolean();
+    Runnable finish = () -> {
+      if (!finished.compareAndSet(false, true)) return;
+      deliveryComplete.complete(null);
+      operationScope.closeAsync(CLEANUP);
+      try {
+        parentRegistration.close();
+      } catch (Exception failure) {
+        // The child scope owns cleanup; the interceptor retains its drain registration.
+      }
+    };
+
+    CompletableFuture<LeaseKeepAliveStream.Delivery> result = new CompletableFuture<>();
+    BudgetManager.Account account = null;
+    try {
+      account = budgets.admit(tableGroup, operationScope, reservation);
+      retainInput(operationScope, account, request.getSerializedSize());
+      if (request.getSerializedSize() > maximumEtcdRequestBytes) {
+        throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+      }
+      metrics.recordLeaseRenewalRequest(request.getSerializedSize());
+    } catch (BackendFailure | RuntimeException failure) {
+      if (account != null) account.close();
+      finish.run();
+      result.completeExceptionally(failure);
+      return result;
+    } catch (Error fatal) {
+      if (account != null) account.close();
+      finish.run();
+      throw fatal;
+    }
+
+    BudgetManager.Account admitted = account;
+    try {
+      worker.execute(() -> beginKeepAlive(request, operationScope, admitted, result, finish));
+    } catch (RuntimeException rejected) {
+      admitted.close();
+      finish.run();
+      result.completeExceptionally(
+          new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT, rejected));
+    } catch (Error fatal) {
+      admitted.close();
+      finish.run();
+      throw fatal;
+    }
+    return result;
+  }
+
+  private void beginKeepAlive(Rpc.LeaseKeepAliveRequest request, RequestScope scope,
+      BudgetManager.Account account, CompletableFuture<LeaseKeepAliveStream.Delivery> result,
+      Runnable finish) {
+    InvocationId invocation = InvocationId.create();
+    ByteKey operation = MutationOperationEnvelope.leaseKeepAlive(request.toByteArray());
+    ByteKey digest = MutationForwardRequest.digest(tableGroup, operation);
+    try {
+      control.read(scope).thenCompose(snapshot -> {
+        var state = snapshot.orElseThrow(() ->
+            new IllegalStateException("authoritative commit control state is missing")).state();
+        long remaining = Math.min(scope.remainingDeadlineNanos(), MutationForwardRequest.MAX_TIMEOUT_NANOS);
+        if (state.ownerInstance().isEmpty() || remaining <= 0) {
+          return CompletableFuture.failedFuture(new BackendFailure(remaining <= 0
+              ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.UNAVAILABLE));
+        }
+        var forwarded = new MutationForwardRequest(tableGroup, invocation, digest, authorizationDigest,
+            ServiceAuthorizationContextReference.create(identity, authorizationDigest), state.ownerEpoch(),
+            remaining, 0, operation);
+        return relay.forward(forwarded, scope);
+      }).thenCompose(reply -> resolveKeepAliveReply(reply, invocation, digest, scope, account))
+          .whenComplete((resolved, failure) -> {
+            if (!scope.startIfOpen(() -> {})) {
+              if (resolved != null) resolved.close();
+              account.close();
+              finish.run();
+              result.completeExceptionally(new BackendFailure(scope.isDeadlineExceeded()
+                  ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
+              return;
+            }
+            if (failure != null) {
+              account.close();
+              finish.run();
+              result.completeExceptionally(CompletionFailures.unwrapCompletion(failure));
+              return;
+            }
+            projectKeepAliveResponse(request, resolved, account, result, finish);
+          });
+    } catch (RuntimeException | Error failure) {
+      account.close();
+      finish.run();
+      result.completeExceptionally(failure);
+      if (failure instanceof Error fatal) throw fatal;
+    }
+  }
+
+  private CompletableFuture<InvocationResultResolver.ResolvedInvocation> resolveKeepAliveReply(
+      MutationRelay.Result reply, InvocationId invocation, ByteKey digest, RequestScope scope,
+      BudgetManager.Account account) {
+    if (reply instanceof MutationRelay.KnownResult known) {
+      if (!java.util.Arrays.equals(known.responseBytes(), invocation.bytes())) {
+        metrics.recordLeaseRenewalUnknownOutcome();
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+      }
+      return resolveKeepAliveOriginal(invocation, digest, scope, account, false);
+    }
+    if (reply instanceof MutationRelay.LeaseRejection rejection) {
+      return CompletableFuture.failedFuture(new LeaseFailure(rejection.reason()));
+    }
+    if (reply instanceof MutationRelay.KnownRejection rejection) {
+      return CompletableFuture.failedFuture(new BackendFailure(rejection.category()));
+    }
+    if (reply instanceof MutationRelay.SemanticRejection) {
+      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+    }
+    MutationRelay.ResultUnknown unknown = reply instanceof MutationRelay.ResultUnknown value
+        ? value : new MutationRelay.ResultUnknown(BackendFailure.Category.UNKNOWN);
+    return resolveKeepAliveOriginal(invocation, digest, scope, account, true).exceptionallyCompose(failure ->
+        CompletableFuture.failedFuture(new BackendFailure(unknown.category(),
+            CompletionFailures.unwrapCompletion(failure))));
+  }
+
+  private CompletableFuture<InvocationResultResolver.ResolvedInvocation> resolveKeepAliveOriginal(
+      InvocationId invocation, ByteKey digest, RequestScope scope,
+      BudgetManager.Account account, boolean outcomeUnknown) {
+    if (outcomeUnknown) metrics.recordLeaseRenewalUnknownOutcome();
+    long started = System.nanoTime();
+    return results.resolveInvocation(invocation, digest, authorizationDigest, scope, account)
+        .whenComplete((resolved, failure) -> {
+      metrics.recordLeaseRenewalStage(RequestMetrics.LeaseRenewalStage.RESULT_RESOLUTION,
+          Math.max(0, System.nanoTime() - started));
+      if (failure != null && !outcomeUnknown) metrics.recordLeaseRenewalUnknownOutcome();
+    });
+  }
+
+  private void projectKeepAliveResponse(Rpc.LeaseKeepAliveRequest request,
+      InvocationResultResolver.ResolvedInvocation resolved, BudgetManager.Account account,
+      CompletableFuture<LeaseKeepAliveStream.Delivery> result, Runnable finish) {
+    try (resolved) {
+      var buffer = resolved.payload().buffer();
+      var bytes = new byte[buffer.remaining()];
+      buffer.get(bytes);
+      Rpc.LeaseKeepAliveResponse response = Rpc.LeaseKeepAliveResponse.parseFrom(bytes);
+      if (!response.hasHeader() || response.getID() != request.getID() || response.getTTL() < 0
+          || response.getTTL() > LeaseTimeRules.MAX_TTL_SECONDS
+          || response.getHeader().getClusterId() != clusterId
+          || response.getHeader().getMemberId() == 0
+          || response.getHeader().getRevision() != resolved.revision()
+          || resolved.containsKeyChanges()) {
+        throw new BackendFailure(BackendFailure.Category.UNKNOWN);
+      }
+      // etcd fills this header at the serving RPC endpoint before renewing through its lessor.
+      // The durable owner result supplies the revision, while a forwarded response must identify
+      // the member that accepted this public stream.
+      response = response.toBuilder().setHeader(response.getHeader().toBuilder()
+          .setMemberId(memberId)).build();
+      int responseBytes = response.getSerializedSize();
+      BudgetManager.Lease output = account.tryRetain(BudgetManager.Memory.OUTPUT, responseBytes)
+          .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+      var released = new AtomicBoolean();
+      Runnable release = () -> {
+        if (!released.compareAndSet(false, true)) return;
+        output.close();
+        account.close();
+        finish.run();
+      };
+      if (!result.complete(new LeaseKeepAliveStream.Delivery(response, release))) release.run();
+    } catch (BackendFailure | InvalidProtocolBufferException | RuntimeException failure) {
+      account.close();
+      finish.run();
+      result.completeExceptionally(failure);
+    } catch (Error fatal) {
+      account.close();
+      finish.run();
+      throw fatal;
+    }
+  }
+
   private void beginGrant(Rpc.LeaseGrantRequest request, StreamObserver<Rpc.LeaseGrantResponse> observer,
       RequestScope scope, BudgetManager.Account account, AtomicBoolean terminal,
       CompletableFuture<Void> gatewayDrained) {
@@ -171,7 +381,7 @@ public final class LeaseGateway {
               ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.UNAVAILABLE));
         }
         var forwarded = new MutationForwardRequest(tableGroup, invocation, digest, authorizationDigest,
-            ByteKey.copyOf(identity.contextRef().getBytes(StandardCharsets.UTF_8)), state.ownerEpoch(),
+            ServiceAuthorizationContextReference.create(identity, authorizationDigest), state.ownerEpoch(),
             remaining, 0, operation);
         return relay.forward(forwarded, scope);
       }).thenCompose(reply -> resolveGrantReply(reply, request, invocation, digest, scope, account))
@@ -382,7 +592,7 @@ public final class LeaseGateway {
             ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.UNAVAILABLE));
       }
       var forwarded = new MutationForwardRequest(tableGroup, invocation, digest, authorizationDigest,
-          ByteKey.copyOf(identity.contextRef().getBytes(StandardCharsets.UTF_8)),
+          ServiceAuthorizationContextReference.create(identity, authorizationDigest),
           controlState.ownerEpoch(), remaining, 0, operation);
       return relay.forward(forwarded, scope).thenCompose(reply ->
           resolveExpiryReply(reply, invocation, digest, scope, account));

@@ -75,6 +75,21 @@ class InvocationResultResolverTest {
   }
 
   @Test
+  void resolvesEitherDurableInvocationOutcomeForProtocolProjection() throws Exception {
+    try (Fixture fixture = new Fixture()) {
+      fixture.completeWithoutChanges();
+      try (var resolved = fixture.resolver.resolveInvocation(fixture.id, fixture.digest,
+          fixture.digest, fixture.scope, fixture.account).join()) {
+        assertEquals(1, resolved.revision());
+        assertFalse(resolved.containsKeyChanges());
+        assertArrayEquals(new byte[] {1, 2, 3}, bytes(resolved.payload()));
+      }
+      assertEquals(0, fixture.controlReads);
+      assertEquals(0, fixture.budgets.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
   void noChangeReplayRejectsMissingPagesAndAWindowClosedDuringLoad() throws Exception {
     try (Fixture fixture = new Fixture()) {
       fixture.completeWithoutChanges();

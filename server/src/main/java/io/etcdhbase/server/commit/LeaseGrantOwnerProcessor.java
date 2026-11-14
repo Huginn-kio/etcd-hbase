@@ -15,14 +15,16 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.util.Objects;
+import java.util.Optional;
 import java.time.Clock;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /** Processes one Grant on the serialized owner lane or resolves its original decision. */
 public final class LeaseGrantOwnerProcessor implements MutationForwardReceiver.MutationProcessor {
   private final String tableGroup;
-  private final CommitOwnerService.OwnerToken owner;
+  private final Supplier<Optional<CommitOwnerService.OwnerToken>> owner;
   private final BudgetManager budgets;
   private final BudgetManager.Reservation reservation;
   private final LeaseGrantExecutor executor;
@@ -30,6 +32,14 @@ public final class LeaseGrantOwnerProcessor implements MutationForwardReceiver.M
   private final LeaseOwnerRejectionRecorder rejections;
 
   public LeaseGrantOwnerProcessor(String tableGroup, CommitOwnerService.OwnerToken owner,
+      BudgetManager budgets, BudgetManager.Reservation reservation, LeaseGrantExecutor executor,
+      CommitOutcomeResolver outcomes, InvocationService invocations, Clock clock) {
+    this(tableGroup, () -> Optional.of(Objects.requireNonNull(owner, "owner")), budgets,
+        reservation, executor, outcomes, invocations, clock);
+  }
+
+  public LeaseGrantOwnerProcessor(String tableGroup,
+      Supplier<Optional<CommitOwnerService.OwnerToken>> owner,
       BudgetManager budgets, BudgetManager.Reservation reservation, LeaseGrantExecutor executor,
       CommitOutcomeResolver outcomes, InvocationService invocations, Clock clock) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
@@ -49,7 +59,10 @@ public final class LeaseGrantOwnerProcessor implements MutationForwardReceiver.M
     Objects.requireNonNull(binding, "binding");
     Objects.requireNonNull(identity, "identity");
     Objects.requireNonNull(scope, "scope");
-    if (!tableGroup.equals(request.tableGroupId()) || request.expectedOwnerEpoch() != owner.epoch()
+    Optional<CommitOwnerService.OwnerToken> currentOwner = owner.get();
+    if (currentOwner.isEmpty()) return unknown(BackendFailure.Category.UNAVAILABLE);
+    CommitOwnerService.OwnerToken activeOwner = currentOwner.orElseThrow();
+    if (!tableGroup.equals(request.tableGroupId()) || request.expectedOwnerEpoch() != activeOwner.epoch()
         || !request.invocationId().equals(binding.invocationId())
         || !request.requestDigest().equals(binding.requestDigest())
         || !request.authorizationScopeDigest().equals(binding.authorizationScopeDigest())
@@ -81,7 +94,7 @@ public final class LeaseGrantOwnerProcessor implements MutationForwardReceiver.M
     } catch (BackendFailure failure) {
       return unknown(failure.category());
     }
-    return executor.executeNew(command.getID(), command.getTTL(), binding, owner, identity, scope, account)
+    return executor.executeNew(command.getID(), command.getTTL(), binding, activeOwner, identity, scope, account)
         .handle((id, failure) -> handleGrantOutcome(request, binding, id, failure, scope))
         .thenCompose(result -> result);
   }

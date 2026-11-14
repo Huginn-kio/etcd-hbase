@@ -1,0 +1,38 @@
+schema_version: 1
+id: m4-lease-keepalive-v1
+protocol: etcd-v3.5.23
+steps:
+  - case_id: L05
+    id: native-baseline
+  - case_id: L01
+    id: keepalive-grant-a
+  - case_id: L01
+    id: keepalive-grant-b
+  - case_id: L01
+    id: keepalive-grant-managed-a
+  - case_id: L01
+    id: keepalive-grant-managed-b
+  - case_id: R01
+    id: keepalive-range-before
+  - case_id: L02
+    id: keepalive-stream-a
+  - case_id: L02
+    id: keepalive-stream-b
+  - case_id: L02
+    id: keepalive-stream-missing
+  - case_id: L02
+    id: keepalive-stream-a-repeat
+  - case_id: L04
+    id: keepalive-ttl-a
+  - case_id: L04
+    id: keepalive-ttl-b
+  - case_id: L02
+    id: keepalive-managed-a-first
+  - case_id: L02
+    id: keepalive-managed-a-second
+  - case_id: L02
+    id: keepalive-managed-b-first
+  - case_id: L02
+    id: keepalive-managed-b-second
+  - case_id: R01
+    id: keepalive-range-after

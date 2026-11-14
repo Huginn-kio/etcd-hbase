@@ -29,7 +29,7 @@ while (($#)); do
       artifact_request="$2"; seen_artifact=true; shift 2 ;;
     --help)
       cat <<'USAGE'
-用法：scripts/verify/m4.sh --scope public --task J40|J41 --artifact-root .artifacts/m4/<fresh-run-id>
+用法：scripts/verify/m4.sh --scope public --task J40|J41|J42 --artifact-root .artifacts/m4/<fresh-run-id>
      或 scripts/verify/m4.sh --scope public --all --artifact-root .artifacts/m4/<fresh-run-id>
 USAGE
       exit 0 ;;
@@ -50,7 +50,7 @@ if [[ "$run_all" == true ]]; then
   echo 'M4 bulk execution is unavailable until every registered task has an execution profile.' >&2
   exit 2
 fi
-if [[ "$task" != J40 && "$task" != J41 ]]; then
+if [[ "$task" != J40 && "$task" != J41 && "$task" != J42 ]]; then
   echo "M4 task is not registered for public execution: $task" >&2
   exit 2
 fi
@@ -223,6 +223,8 @@ run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json
 maven_profile=m4-j40-public
 if [[ "$task" == J41 ]]; then
   maven_profile=m4-j41-public
+elif [[ "$task" == J42 ]]; then
+  maven_profile=m4-j42-public
 fi
 run_logged maven-verify maven.log maven.stderr.log scripts/dev/mvn21.sh -B -ntp \
   -pl server -am clean verify -P"$maven_profile"

@@ -141,7 +141,8 @@ func grantObservation(request, response map[string]any, callError *trace.Error,
 func projectM4LeaseTerm(left, right map[string]any, leftScope string) error {
 	method, ok := left["method"].(string)
 	if !ok || right["method"] != method || method != "etcdserverpb.Lease/LeaseGrant" &&
-		method != "etcdserverpb.Lease/LeaseTimeToLive" && method != "etcdserverpb.Lease/LeaseLeases" {
+		method != "etcdserverpb.Lease/LeaseTimeToLive" && method != "etcdserverpb.Lease/LeaseLeases" &&
+		method != "etcdserverpb.Lease/LeaseKeepAlive" && method != "etcdserverpb.KV/Range" {
 		return errors.New("method is not registered for the M4 Lease policy")
 	}
 	native, target := left, right
@@ -197,7 +198,8 @@ func projectM4LeaseResponseWindow(left, right map[string]any, leftScope, rightSc
 		}
 		return replaceResponseField(right, "ttl", "configured-minimum")
 	}
-	if caseID != "auto-ttl" && caseID != "explicit-ttl" {
+	dynamicKeepAliveTTL := caseID == "keepalive-ttl-a" || caseID == "keepalive-ttl-b"
+	if caseID != "auto-ttl" && caseID != "explicit-ttl" && !dynamicKeepAliveTTL {
 		return nil
 	}
 	leftTTL, err := normalizedResponseInt64(left, "ttl")
@@ -207,6 +209,9 @@ func projectM4LeaseResponseWindow(left, right map[string]any, leftScope, rightSc
 	rightTTL, err := normalizedResponseInt64(right, "ttl")
 	if err != nil {
 		return err
+	}
+	if dynamicKeepAliveTTL && (leftTTL <= 0 || rightTTL <= 0) {
+		return errors.New("active KeepAlive and TimeToLive responses must retain a positive TTL")
 	}
 	if difference := leftTTL - rightTTL; difference < -1 || difference > 1 {
 		return fmt.Errorf("remaining TTL differs by %d seconds, maximum allowed skew is one second", difference)

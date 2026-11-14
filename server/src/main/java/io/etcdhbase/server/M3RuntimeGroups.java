@@ -15,6 +15,7 @@ import io.etcdhbase.grpc.service.LeaseService;
 import io.etcdhbase.hbase.identity.HBaseAuthenticators;
 import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.server.commit.M3TableGroupRuntime;
+import io.etcdhbase.server.commit.OwnerForwardingRuntime;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.observability.RequestMetrics;
@@ -31,6 +32,7 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -40,20 +42,37 @@ final class M3RuntimeGroups implements AutoCloseable {
   private static final Executor CLEANUP = task -> Thread.ofVirtual().name("m3-group-cleanup").start(task);
   private final Map<String, ManagedGroup> groups;
   private final ScanScheduler scans;
+  private final OwnerForwardingRuntime ownerForwarding;
+  private final ScheduledThreadPoolExecutor leaseTimers;
   private final AtomicBoolean closing = new AtomicBoolean();
   private final CompletableFuture<Void> drained = new CompletableFuture<>();
 
-  private M3RuntimeGroups(Map<String, ManagedGroup> groups, ScanScheduler scans) {
+  private M3RuntimeGroups(Map<String, ManagedGroup> groups, ScanScheduler scans,
+      OwnerForwardingRuntime ownerForwarding, ScheduledThreadPoolExecutor leaseTimers) {
     this.groups = Map.copyOf(groups);
     this.scans = scans;
+    this.ownerForwarding = ownerForwarding;
+    this.leaseTimers = leaseTimers;
   }
 
   static M3RuntimeGroups open(RuntimeConfiguration configuration, M3RuntimeConfiguration activation)
       throws IOException {
-    var budgets = M3RuntimeBudgets.create(configuration, activation);
+    OwnerForwardingRuntime.RequestLimits ownerRequestLimits = activation.ownerForwarding() == null ? null
+        : OwnerForwardingRuntime.requestLimits(activation.memoryBytes(), activation.maxEtcdRequestBytes(),
+            configuration.resources().maxConcurrentRequests());
+    long ownerTransportMemory = ownerRequestLimits == null ? 0 : ownerRequestLimits.reservedMemoryBytes();
+    var budgets = M3RuntimeBudgets.create(configuration, activation, ownerTransportMemory);
     var scans = new ScanScheduler(budgets, Duration.ofMillis(configuration.resources().requestDeadlineMs()));
+    ScheduledThreadPoolExecutor leaseTimers = activation.m4LeaseApiEnabled()
+        ? leaseTimers() : null;
     Map<String, ManagedGroup> opened = new LinkedHashMap<>();
+    OwnerForwardingRuntime ownerForwarding = null;
     try {
+      if (activation.ownerForwarding() != null) {
+        ownerForwarding = new OwnerForwardingRuntime(activation.ownerInstanceId(),
+            activation.ownerForwarding(), ownerRequestLimits,
+            configuration.resources().requestDeadlineMs(), activation.shutdownTimeoutMs());
+      }
       for (String group : configuration.listeners().stream()
           .map(RuntimeConfiguration.Listener::tableGroupId).distinct().toList()) {
         var source = TableGroupPlanFactory.create(configuration.initialization(), group, null);
@@ -62,7 +81,8 @@ final class M3RuntimeGroups implements AutoCloseable {
             || !source.identityProviderId().equals(DEVELOPMENT_NO_AUTH_PROVIDER_ID)) {
           throw new IllegalArgumentException("configured target identity activation is not available");
         }
-        ManagedGroup managed = openGroup(plan, configuration, activation, budgets, scans);
+        ManagedGroup managed = openGroup(plan, configuration, activation, budgets, scans,
+            ownerForwarding, leaseTimers);
         try {
           opened.put(group, managed);
         } catch (RuntimeException | Error failure) {
@@ -73,9 +93,10 @@ final class M3RuntimeGroups implements AutoCloseable {
           throw failure;
         }
       }
-      return new M3RuntimeGroups(opened, scans);
+      if (ownerForwarding != null) ownerForwarding.start();
+      return new M3RuntimeGroups(opened, scans, ownerForwarding, leaseTimers);
     } catch (Exception | Error failure) {
-      var rollback = new M3RuntimeGroups(opened, scans);
+      var rollback = new M3RuntimeGroups(opened, scans, ownerForwarding, leaseTimers);
       try { rollback.close(); }
       catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
       awaitCleanup(rollback.drained, activation.shutdownTimeoutMs(), failure);
@@ -87,7 +108,8 @@ final class M3RuntimeGroups implements AutoCloseable {
   }
 
   private static ManagedGroup openGroup(M3TableGroupPlan plan, RuntimeConfiguration configuration,
-      M3RuntimeConfiguration activation, BudgetManager budgets, ScanScheduler scans) throws Exception {
+      M3RuntimeConfiguration activation, BudgetManager budgets, ScanScheduler scans,
+      OwnerForwardingRuntime ownerForwarding, ScheduledThreadPoolExecutor leaseTimers) throws Exception {
     var source = plan.source();
     var provider = createProvider(source, activation);
     boolean providerCloseDeferred = false;
@@ -95,7 +117,8 @@ final class M3RuntimeGroups implements AutoCloseable {
       M3TableGroupRuntime runtime;
       try (var startup = RequestScope.withTimeout(Duration.ofMillis(activation.startupTimeoutMs()))) {
         AuthorizedBackendIdentity identity = authenticate(provider, source, activation);
-        runtime = startRuntime(plan, configuration, activation, budgets, scans, provider, identity, startup);
+        runtime = startRuntime(plan, configuration, activation, budgets, scans, provider, identity,
+            startup, ownerForwarding, leaseTimers);
       } catch (M3TableGroupRuntime.StartupException failure) {
         providerCloseDeferred = true;
         awaitCleanup(closeAfter(failure.cleanup(), provider), activation.shutdownTimeoutMs(), failure);
@@ -141,9 +164,18 @@ final class M3RuntimeGroups implements AutoCloseable {
   private static M3TableGroupRuntime startRuntime(M3TableGroupPlan plan,
       RuntimeConfiguration configuration, M3RuntimeConfiguration activation,
       BudgetManager budgets, ScanScheduler scans, HBaseBackendIdentityProvider provider,
-      AuthorizedBackendIdentity identity, RequestScope startup) throws Exception {
+      AuthorizedBackendIdentity identity, RequestScope startup,
+      OwnerForwardingRuntime ownerForwarding, ScheduledThreadPoolExecutor leaseTimers) throws Exception {
     return M3TableGroupRuntime.open(plan, activation, configuration.resources(),
-        provider, identity, budgets, scans, startup);
+        provider, identity, budgets, scans, startup, ownerForwarding, leaseTimers);
+  }
+
+  private static ScheduledThreadPoolExecutor leaseTimers() {
+    var timers = new ScheduledThreadPoolExecutor(1,
+        Thread.ofPlatform().daemon().name("m4-lease-ready-timeout-", 0).factory());
+    timers.setRemoveOnCancelPolicy(true);
+    timers.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+    return timers;
   }
 
   private static boolean awaitFatalStartupCleanup(Error fatal, HBaseBackendIdentityProvider provider,
@@ -210,6 +242,16 @@ final class M3RuntimeGroups implements AutoCloseable {
     catch (RuntimeException | Error failure) { cleanup.add(CompletableFuture.failedFuture(failure)); }
     var scansDrained = scans.termination().toCompletableFuture();
     cleanup.add(scansDrained);
+    var runtimesDrained = CompletableFuture.allOf(groups.values().stream()
+        .map(group -> group.runtime().drained())
+        .toArray(CompletableFuture[]::new));
+    if (ownerForwarding != null) {
+      cleanup.add(closeWhenDrained(runtimesDrained, scansDrained, requestsDrained, ownerForwarding::close));
+    }
+    if (leaseTimers != null) {
+      cleanup.add(closeWhenDrained(runtimesDrained, scansDrained, requestsDrained,
+          () -> closeLeaseTimers(leaseTimers)));
+    }
     for (ManagedGroup group : groups.values()) {
       cleanup.add(closeWhenDrained(group.runtime().drained(), scansDrained, requestsDrained,
           group.provider()::close));
@@ -224,6 +266,18 @@ final class M3RuntimeGroups implements AutoCloseable {
       CompletionStage<Void> scans, CompletionStage<Void> requests, Runnable close) {
     return CompletableFuture.allOf(runtime.toCompletableFuture(), scans.toCompletableFuture(),
         requests.toCompletableFuture()).thenRunAsync(close, CLEANUP);
+  }
+
+  private static void closeLeaseTimers(ScheduledThreadPoolExecutor timers) {
+    timers.shutdown();
+    try {
+      if (!timers.awaitTermination(30, TimeUnit.SECONDS)) {
+        throw new IllegalStateException("M4 lease response timers did not terminate");
+      }
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("M4 lease response timer shutdown interrupted", interrupted);
+    }
   }
 
   private static CompletableFuture<Void> closeAfter(CompletionStage<Void> completion,
