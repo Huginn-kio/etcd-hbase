@@ -98,6 +98,7 @@ public final class HBaseCommitControlStore implements CommitControlStore {
         CommitState state = observed.state();
         if (state.formatVersion() != CommitState.FORMAT_VERSION
             || replacement.formatVersion() != CommitState.AUXILIARY_FORMAT_VERSION
+            || !auxiliarySupported
             || state.ownerInstance().isEmpty()
             || !Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
                 state.upgradeAuxiliaryFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0)))) {

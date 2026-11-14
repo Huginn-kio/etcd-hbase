@@ -37,7 +37,7 @@ class J20CommitControlStoreIT {
   void initializesAndComparesTheFullControlValueAtomicallyOnDisposableHBase() throws Exception {
     TableName table = TableName.valueOf("j20_" + UUID.randomUUID().toString().replace("-", ""));
     var binding = new SystemTableBinding(table, FAMILY, TABLE_GROUP, SALT_PROFILE, SALT);
-    var descriptor = TableDescriptorBuilder.newBuilder(table)
+    var descriptor = binding.withAuxiliaryCapability(TableDescriptorBuilder.newBuilder(table)
         .setColumnFamily(ColumnFamilyDescriptorBuilder.newBuilder(FAMILY)
             .setTimeToLive(HConstants.FOREVER).setMaxVersions(1).build())
         .setDurability(Durability.SYNC_WAL)
@@ -52,14 +52,14 @@ class J20CommitControlStoreIT {
             Integer.toString(SALT.profile().saltWidthBytes()))
         .setValue("etcdhbase.m0.record-categories",
             "CONTROL,INVOCATION,CANDIDATE,MANIFEST,DECISION,SNAPSHOT_PIN,RESULT")
-        .setValue("etcdhbase.m4.auxiliary-format", "1")
-        .build();
+        .build());
 
     try (var environment = M1TestEnvironment.start(1);
          var scope = RequestScope.withTimeout(Duration.ofSeconds(180))) {
       environment.create(table, descriptor, SALT.splitKeys().toArray(byte[][]::new));
       var store = M1TestEnvironment.await(HBaseCommitControlStore.open(
           environment.factory(), environment.identity(), binding, scope));
+      assertTrue(store.supportsAuxiliary());
       CommitState initial = CommitState.initial(binding.profileFingerprint(), 1);
 
       byte[] wrongInitialFingerprint = new byte[32];
@@ -124,11 +124,14 @@ class J20CommitControlStoreIT {
 
       TableName legacyTable = TableName.valueOf("j20_legacy_" + UUID.randomUUID().toString().replace("-", ""));
       var legacyDescriptor = TableDescriptorBuilder.newBuilder(TableDescriptorBuilder.copy(legacyTable, descriptor))
+          .setValue("etcdhbase.m0.record-categories",
+              "CONTROL,INVOCATION,CANDIDATE,MANIFEST,DECISION,SNAPSHOT_PIN,RESULT")
           .removeValue("etcdhbase.m4.auxiliary-format").build();
       var legacyBinding = new SystemTableBinding(legacyTable, FAMILY, TABLE_GROUP, SALT_PROFILE, SALT);
       environment.create(legacyTable, legacyDescriptor, SALT.splitKeys().toArray(byte[][]::new));
       var legacyStore = M1TestEnvironment.await(HBaseCommitControlStore.open(
           environment.factory(), environment.identity(), legacyBinding, scope));
+      assertFalse(legacyStore.supportsAuxiliary());
       assertTrue(M1TestEnvironment.await(legacyStore.initializeIfAbsent(
           CommitState.initial(legacyBinding.profileFingerprint(), 1), scope)));
       var legacyInitial = M1TestEnvironment.await(legacyStore.read(scope)).orElseThrow();
