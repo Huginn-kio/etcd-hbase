@@ -20,6 +20,34 @@ import org.junit.jupiter.api.Test;
 
 class RequestScopeTest {
   @Test
+  void snapshotsLogicalStorageCostsAndRejectsBackwardsDeltas() {
+    RequestScope scope = RequestScope.withoutDeadline();
+    RequestScope.StorageCostSnapshot before = scope.storageCostSnapshot();
+    scope.recordStorageOperation(17);
+    scope.recordStorageOperation(23);
+
+    RequestScope.StorageCostSnapshot total = scope.storageCostSnapshot();
+    assertEquals(new RequestScope.StorageCostSnapshot(2, 40), total.minus(before));
+    assertThrows(IllegalArgumentException.class, () -> total.minus(
+        new RequestScope.StorageCostSnapshot(3, 40)));
+    assertThrows(IllegalArgumentException.class, () -> scope.recordStorageOperation(-1));
+  }
+
+  @Test
+  void serviceContinuationSharesStorageAccountingButNotCancellation() {
+    RequestScope requestScope = RequestScope.withoutDeadline();
+    RequestScope serviceScope = requestScope.forkWithTimeout(Duration.ofSeconds(1));
+
+    serviceScope.recordStorageOperation(29);
+
+    assertEquals(new RequestScope.StorageCostSnapshot(1, 29), requestScope.storageCostSnapshot());
+    requestScope.cancel();
+    assertTrue(requestScope.isCancelled());
+    assertFalse(serviceScope.isCancelled());
+    serviceScope.close();
+  }
+
+  @Test
   void cancellationCannotOvertakeTheSendOwnershipHandoff() throws Exception {
     RequestScope scope = RequestScope.withoutDeadline();
     var starterEntered = new CountDownLatch(1);

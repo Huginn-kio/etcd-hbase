@@ -17,19 +17,29 @@ import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.protocol.PutRequestMapper;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /** Executes an authorized owner-bound Put and returns a small durable-invocation receipt. */
 public final class PutOwnerProcessor implements MutationForwardReceiver.MutationProcessor {
   private final String tableGroup;
-  private final CommitOwnerService.OwnerToken owner;
+  private final Supplier<Optional<CommitOwnerService.OwnerToken>> owner;
   private final BudgetManager budgets;
   private final BudgetManager.Reservation reservation;
   private final PutMutationExecutor executor;
   private final CommitOutcomeResolver outcomes;
 
   public PutOwnerProcessor(String tableGroup, CommitOwnerService.OwnerToken owner,
+      BudgetManager budgets, BudgetManager.Reservation reservation,
+      PutMutationExecutor executor, CommitOutcomeResolver outcomes) {
+    this(tableGroup, () -> Optional.of(Objects.requireNonNull(owner, "owner")),
+        budgets, reservation, executor, outcomes);
+  }
+
+  public PutOwnerProcessor(String tableGroup,
+      Supplier<Optional<CommitOwnerService.OwnerToken>> owner,
       BudgetManager budgets, BudgetManager.Reservation reservation,
       PutMutationExecutor executor, CommitOutcomeResolver outcomes) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
@@ -48,7 +58,10 @@ public final class PutOwnerProcessor implements MutationForwardReceiver.Mutation
     Objects.requireNonNull(binding, "binding");
     Objects.requireNonNull(identity, "identity");
     Objects.requireNonNull(scope, "scope");
-    if (!tableGroup.equals(request.tableGroupId()) || request.expectedOwnerEpoch() != owner.epoch()
+    Optional<CommitOwnerService.OwnerToken> currentOwner = owner.get();
+    if (currentOwner.isEmpty()) return unknown(BackendFailure.Category.UNAVAILABLE);
+    CommitOwnerService.OwnerToken activeOwner = currentOwner.orElseThrow();
+    if (!tableGroup.equals(request.tableGroupId()) || request.expectedOwnerEpoch() != activeOwner.epoch()
         || !request.invocationId().equals(binding.invocationId())
         || !request.requestDigest().equals(binding.requestDigest())
         || !request.authorizationScopeDigest().equals(binding.authorizationScopeDigest())) {
@@ -78,7 +91,7 @@ public final class PutOwnerProcessor implements MutationForwardReceiver.Mutation
     } catch (BackendFailure failure) {
       return unknown(failure.category());
     }
-    return executor.executeNew(command, binding, owner, identity, scope, account)
+    return executor.executeNew(command, binding, activeOwner, identity, scope, account)
         .<OwnerForwarding.Reply>handle((id, failure) -> {
           if (failure == null && id.equals(request.invocationId())) return receipt(request);
           if (failure != null) {

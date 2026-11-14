@@ -124,6 +124,65 @@ func TestRunNativeLeaseBindingWritesFreshTraceAndVerifiableMetadata(t *testing.T
 	}
 }
 
+func TestRunNativeLeaseKeepAliveWritesFreshTraceAndVerifiableMetadata(t *testing.T) {
+	root := repositoryRoot(t)
+	artifact := t.TempDir()
+	tracePath := filepath.Join(artifact, "native-keepalive.jsonl")
+	metadataPath := filepath.Join(artifact, "native-keepalive.json")
+	scenarioPath := filepath.Join(root, "testkit/scenarios/m4-lease-keepalive.yaml")
+	suite, suiteDigest, err := scenario.LoadM4LeaseKeepAliveSuite(scenarioPath)
+	if err != nil {
+		t.Fatalf("load registered M4 KeepAlive scenario: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	args := []string{"run", "--scenario", scenarioPath,
+		"--native-data-dir", filepath.Join(artifact, "native-keepalive-data"),
+		"--scope", "native-etcd", "--prefix", "etcd-hbase-m4-test/driver/keepalive/",
+		"--trace", tracePath, "--metadata", metadataPath}
+	if err := run(ctx, args, io.Discard, io.Discard); err != nil {
+		t.Fatalf("run native M4 KeepAlive scenario: %v", err)
+	}
+	traceBytes, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := trace.ReadJSONL(bytes.NewReader(traceBytes))
+	if err != nil || len(records) != len(suite.Steps) {
+		t.Fatalf("native M4 KeepAlive trace has %d records, want %d, err=%v",
+			len(records), len(suite.Steps), err)
+	}
+	for index, step := range suite.Steps {
+		if records[index].CaseID != step.ID || records[index].EvidenceScope != "native-etcd" {
+			t.Fatalf("native M4 KeepAlive record %d does not match its registered step: %#v",
+				index+1, records[index])
+		}
+	}
+	var metadata runMetadata
+	encoded, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(traceBytes)
+	if metadata.Schema != "etcd-hbase-m4-run/v1" || metadata.Status != "passed" ||
+		metadata.EvidenceScope != "native-etcd" || !metadata.EmbeddedNative || metadata.Layout != "" ||
+		metadata.SuiteSHA256 != suiteDigest || metadata.TraceSHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("M4 native KeepAlive metadata does not describe the trace: %#v", metadata)
+	}
+
+	copyPath := filepath.Join(artifact, "native-keepalive-copy.jsonl")
+	if err := os.WriteFile(copyPath, traceBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := compareLeaseKeepAliveTraces(
+		[]string{"--left", tracePath, "--right", copyPath}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("compare equivalent native M4 KeepAlive traces: %v", err)
+	}
+}
+
 func TestParseRunOptionsRejectsMissingLayoutAndUnscopedPrefix(t *testing.T) {
 	base := []string{"--scenario", "suite.yaml", "--scope", "target-hbase",
 		"--prefix", "etcd-hbase-m4-test/run/", "--endpoint", "127.0.0.1:2379",
@@ -135,6 +194,31 @@ func TestParseRunOptionsRejectsMissingLayoutAndUnscopedPrefix(t *testing.T) {
 	base = append(base, "--layout", "HISTORY")
 	if _, err := parseRunOptions(base, io.Discard); err == nil {
 		t.Fatal("unscoped M4 prefix was accepted")
+	}
+}
+
+func TestKeepAliveOnceRejectsInvalidLeaseIDBeforeDial(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		leaseID string
+	}{
+		{name: "missing", leaseID: ""},
+		{name: "zero", leaseID: "0"},
+		{name: "malformed", leaseID: "not-a-number"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args := []string{"keepalive-once", "--endpoint", "127.0.0.1:1", "--lease-id", test.leaseID}
+			if err := run(context.Background(), args, io.Discard, io.Discard); err == nil {
+				t.Fatal("invalid Lease ID was accepted")
+			}
+		})
+	}
+}
+
+func TestKeepAliveOnceRequiresAnExplicitEndpoint(t *testing.T) {
+	args := []string{"keepalive-once", "--lease-id", "1"}
+	if err := run(context.Background(), args, io.Discard, io.Discard); err == nil {
+		t.Fatal("missing endpoint was accepted")
 	}
 }
 
@@ -176,6 +260,22 @@ func TestCompareBindingsRejectsCorruptOrEmptyTrace(t *testing.T) {
 				t.Fatal("incomplete M4 binding traces were accepted")
 			}
 		})
+	}
+}
+
+func TestCompareKeepAliveRejectsCorruptOrMismatchedTrace(t *testing.T) {
+	directory := t.TempDir()
+	left := filepath.Join(directory, "left.jsonl")
+	right := filepath.Join(directory, "right.jsonl")
+	if err := os.WriteFile(left, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(right, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := compareLeaseKeepAliveTraces(
+		[]string{"--left", left, "--right", right}, io.Discard, io.Discard); err == nil {
+		t.Fatal("corrupt M4 KeepAlive traces were accepted")
 	}
 }
 

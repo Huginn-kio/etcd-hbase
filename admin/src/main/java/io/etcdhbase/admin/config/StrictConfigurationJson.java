@@ -1,5 +1,6 @@
 package io.etcdhbase.admin.config;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.core.StreamReadFeature;
@@ -78,9 +79,7 @@ public final class StrictConfigurationJson {
     }
     for (RecordComponent component : recordType.getRecordComponents()) {
       String name = snakeCase(component.getName());
-      boolean optional =
-          recordType == InitializationConfiguration.HBaseProfile.class
-              && component.getName().equals("credentialReference");
+      boolean optional = isOptional(recordType, component);
       JsonNode value = node.get(name);
       if (value == null && optional) {
         continue;
@@ -93,6 +92,15 @@ public final class StrictConfigurationJson {
       if (elementType == null) requireValue(value, component.getType());
       else requireArray(value, elementType);
     }
+  }
+
+  private static boolean isOptional(Class<?> recordType, RecordComponent component) {
+    if (recordType == InitializationConfiguration.HBaseProfile.class
+        && component.getName().equals("credentialReference")) {
+      return true;
+    }
+    JsonProperty property = component.getAccessor().getAnnotation(JsonProperty.class);
+    return property != null && !property.required();
   }
 
   private static Class<?> listElementType(RecordComponent component) {

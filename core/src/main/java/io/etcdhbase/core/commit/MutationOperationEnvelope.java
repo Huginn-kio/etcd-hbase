@@ -11,8 +11,9 @@ public final class MutationOperationEnvelope {
   private static final byte[] DELETE_V1 = {0, 'D', 'L', 1};
   private static final byte[] LEASE_GRANT_V1 = {0, 'L', 'G', 1};
   private static final byte[] LEASE_EXPIRE_EMPTY_V1 = {0, 'L', 'E', 1};
+  private static final byte[] LEASE_KEEP_ALIVE_V1 = {0, 'L', 'K', 1};
 
-  public enum Kind { PUT, TRANSACTION, DELETE_RANGE, LEASE_GRANT, LEASE_EXPIRE_EMPTY }
+  public enum Kind { PUT, TRANSACTION, DELETE_RANGE, LEASE_GRANT, LEASE_EXPIRE_EMPTY, LEASE_KEEP_ALIVE }
 
   private MutationOperationEnvelope() {}
 
@@ -26,6 +27,10 @@ public final class MutationOperationEnvelope {
 
   public static ByteKey leaseGrant(byte[] payload) {
     return tagged(LEASE_GRANT_V1, payload);
+  }
+
+  public static ByteKey leaseKeepAlive(byte[] payload) {
+    return tagged(LEASE_KEEP_ALIVE_V1, payload);
   }
 
   /** Encodes an internal empty-Lease expiry candidate identity, not an etcd wire RPC. */
@@ -68,6 +73,7 @@ public final class MutationOperationEnvelope {
       }
       return Kind.LEASE_EXPIRE_EMPTY;
     }
+    if (Arrays.equals(LEASE_KEEP_ALIVE_V1, prefix)) return Kind.LEASE_KEEP_ALIVE;
     throw new IllegalArgumentException("unsupported mutation operation envelope");
   }
 
@@ -95,5 +101,13 @@ public final class MutationOperationEnvelope {
     }
     byte[] bytes = operation.bytes();
     return Arrays.copyOfRange(bytes, LEASE_EXPIRE_EMPTY_V1.length, bytes.length);
+  }
+
+  public static byte[] leaseKeepAliveBytes(ByteKey operation) {
+    if (kind(operation) != Kind.LEASE_KEEP_ALIVE) {
+      throw new IllegalArgumentException("operation is not a Lease KeepAlive");
+    }
+    byte[] bytes = operation.bytes();
+    return Arrays.copyOfRange(bytes, LEASE_KEEP_ALIVE_V1.length, bytes.length);
   }
 }

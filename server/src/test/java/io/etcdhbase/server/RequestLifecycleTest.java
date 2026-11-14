@@ -111,7 +111,7 @@ class RequestLifecycleTest {
   }
 
   @Test
-  void streamingRequestByteBudgetRejectsTheSecondMessageBeforeTheHandlerSeesIt() throws Exception {
+  void streamingRequestByteBudgetRejectsAnOversizedMessageBeforeTheHandlerSeesIt() throws Exception {
     try (var fixture = new Fixture(Duration.ofSeconds(5), RequestCompletionRecorder.NOOP)) {
       var call =
           fixture.channel.newCall(etcdserverpb.WatchGrpc.getWatchMethod(), CallOptions.DEFAULT);
@@ -127,20 +127,18 @@ class RequestLifecycleTest {
           },
           new Metadata());
       call.request(1);
-      var message =
+      var oversizedMessage =
           Rpc.WatchRequest.newBuilder()
               .setCreateRequest(
                   Rpc.WatchCreateRequest.newBuilder()
-                      .setKey(com.google.protobuf.ByteString.copyFrom(new byte[600])))
+                      .setKey(com.google.protobuf.ByteString.copyFrom(new byte[1_100])))
               .build();
-      call.sendMessage(message);
-      assertTrue(fixture.firstMessage.await(2, TimeUnit.SECONDS));
-      call.sendMessage(message);
+      call.sendMessage(oversizedMessage);
       assertTrue(terminal.await(3, TimeUnit.SECONDS));
       assertEquals(Status.Code.RESOURCE_EXHAUSTED, status.get().getCode());
       assertTrue(fixture.cleaned.await(2, TimeUnit.SECONDS));
       assertTrue(fixture.completed.await(2, TimeUnit.SECONDS));
-      assertEquals(1, fixture.receivedMessages.get());
+      assertEquals(0, fixture.receivedMessages.get(), "oversized stream messages are rejected before dispatch");
       assertEquals(0, fixture.interceptor.activeRequests());
     }
   }

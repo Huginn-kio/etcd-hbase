@@ -58,6 +58,26 @@ func CompareM4LeaseRecords(left, right []trace.Record) error {
 	return compare(left, right, m4LeasePolicy)
 }
 
+// CompareM4LeaseKeepAliveTraces compares the J42 bidi KeepAlive scenario with
+// only transport identity and non-Raft header term projected.
+func CompareM4LeaseKeepAliveTraces(left, right io.Reader) error {
+	leftRecords, err := trace.ReadJSONL(left)
+	if err != nil {
+		return fmt.Errorf("read native M4 KeepAlive trace: %w", err)
+	}
+	rightRecords, err := trace.ReadJSONL(right)
+	if err != nil {
+		return fmt.Errorf("read target M4 KeepAlive trace: %w", err)
+	}
+	return CompareM4LeaseKeepAliveRecords(leftRecords, rightRecords)
+}
+
+// CompareM4LeaseKeepAliveRecords keeps stream order, terminal state, Lease
+// identity/TTL, and KV revision strict across the native and target traces.
+func CompareM4LeaseKeepAliveRecords(left, right []trace.Record) error {
+	return compare(left, right, m4KeepAlivePolicy)
+}
+
 type tracePolicy int
 
 const (
@@ -67,6 +87,7 @@ const (
 	m3DeletePolicy
 	m3RangePolicy
 	m4LeasePolicy
+	m4KeepAlivePolicy
 )
 
 func compareTraces(left, right io.Reader, policy tracePolicy) error {
@@ -114,22 +135,31 @@ func compare(left, right []trace.Record, policy tracePolicy) error {
 	if err != nil {
 		return err
 	}
-	if policy != standardPolicy && policy != m4LeasePolicy && (leftScope == rightScope ||
+	if policy != standardPolicy && policy != m4LeasePolicy && policy != m4KeepAlivePolicy && (leftScope == rightScope ||
 		(leftScope != "native-etcd" && rightScope != "native-etcd") ||
 		(leftScope != "target-hbase" && rightScope != "target-hbase")) {
 		return errors.New("M3 comparison requires native and target traces")
 	}
-	if policy == m4LeasePolicy {
+	if policy == m4LeasePolicy || policy == m4KeepAlivePolicy {
 		if (leftScope != "native-etcd" && leftScope != "target-hbase") ||
 			(leftScope != rightScope && leftScope != "native-etcd" && rightScope != "native-etcd") ||
 			(leftScope != rightScope && leftScope != "target-hbase" && rightScope != "target-hbase") {
 			return errors.New("M4 comparison requires native or target Lease traces")
 		}
-		if err := validateM4LeaseTrace(left); err != nil {
-			return fmt.Errorf("validate left M4 trace: %w", err)
-		}
-		if err := validateM4LeaseTrace(right); err != nil {
-			return fmt.Errorf("validate right M4 trace: %w", err)
+		if policy == m4LeasePolicy {
+			if err := validateM4LeaseTrace(left); err != nil {
+				return fmt.Errorf("validate left M4 trace: %w", err)
+			}
+			if err := validateM4LeaseTrace(right); err != nil {
+				return fmt.Errorf("validate right M4 trace: %w", err)
+			}
+		} else {
+			if err := validateM4LeaseKeepAliveTrace(left); err != nil {
+				return fmt.Errorf("validate left M4 KeepAlive trace: %w", err)
+			}
+			if err := validateM4LeaseKeepAliveTrace(right); err != nil {
+				return fmt.Errorf("validate right M4 KeepAlive trace: %w", err)
+			}
 		}
 	}
 	leftNormalized, err := normalize(left)
@@ -146,18 +176,21 @@ func compare(left, right []trace.Record, policy tracePolicy) error {
 	for index := range leftNormalized {
 		// Evidence provenance is checked above; it is not a wire field.
 		rightNormalized[index]["evidence_scope"] = leftNormalized[index]["evidence_scope"]
+		cleanKeepAliveTerminal := policy == m4KeepAlivePolicy &&
+			left[index].StreamTerminal != nil && right[index].StreamTerminal != nil &&
+			left[index].StreamTerminal.Kind == "eof" && right[index].StreamTerminal.Kind == "eof"
 		bothSucceeded := left[index].Error == nil && right[index].Error == nil &&
-			left[index].StreamTerminal == nil && right[index].StreamTerminal == nil
-		if policy == m4LeasePolicy && leftScope != rightScope && bothSucceeded {
+			(left[index].StreamTerminal == nil && right[index].StreamTerminal == nil || cleanKeepAliveTerminal)
+		if (policy == m4LeasePolicy || policy == m4KeepAlivePolicy) && leftScope != rightScope && bothSucceeded {
 			if err := projectM4LeaseTerm(leftNormalized[index], rightNormalized[index], leftScope); err != nil {
 				return fmt.Errorf("trace record %d has invalid M4 response header: %w", index+1, err)
 			}
-		} else if policy != standardPolicy && policy != m4LeasePolicy {
+		} else if policy != standardPolicy && policy != m4LeasePolicy && policy != m4KeepAlivePolicy {
 			if err := projectM3Term(leftNormalized[index], rightNormalized[index], leftScope, bothSucceeded, policy); err != nil {
 				return fmt.Errorf("trace record %d has invalid M3 header: %w", index+1, err)
 			}
 		}
-		if policy == m4LeasePolicy {
+		if policy == m4LeasePolicy || policy == m4KeepAlivePolicy {
 			if err := projectM4LeaseResponseWindow(leftNormalized[index], rightNormalized[index], leftScope, rightScope); err != nil {
 				return fmt.Errorf("trace record %d violates the M4 Lease timing or ordering contract: %w", index+1, err)
 			}
@@ -171,7 +204,7 @@ func compare(left, right []trace.Record, policy tracePolicy) error {
 			}
 		}
 		count := strictCount
-		if leftScope != rightScope && bothSucceeded {
+		if leftScope != rightScope && bothSucceeded && policy != m4KeepAlivePolicy {
 			count = countPolicyForRequest(leftNormalized[index])
 		}
 		// A successful target Count must satisfy its contract even when both

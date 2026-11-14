@@ -12,6 +12,38 @@ import org.junit.jupiter.api.Test;
 
 class RequestMetricsTest {
   @Test
+  void snapshotsBoundedKeepAliveStagesAndLogicalPayloadBytes() {
+    var metrics = new RequestMetrics();
+    metrics.recordLeaseRenewalRequest(17);
+    metrics.recordLeaseRenewalResponse(23);
+    metrics.recordLeaseRenewalSelected(3, 41);
+    metrics.recordLeaseRenewalStorageCost(new RequestScope.StorageCostSnapshot(7, 113));
+    metrics.recordLeaseRenewalUnknownOutcome();
+    metrics.recordLeaseRenewalStage(RequestMetrics.LeaseRenewalStage.QUEUE, 5);
+    metrics.recordLeaseRenewalStage(RequestMetrics.LeaseRenewalStage.OUTBOUND_READY_WAIT, 7);
+
+    var snapshot = metrics.leaseRenewals();
+    assertEquals(1, snapshot.requests());
+    assertEquals(1, snapshot.responses());
+    assertEquals(1, snapshot.selected());
+    assertEquals(1, snapshot.unknownOutcomes());
+    assertEquals(17, snapshot.requestBytes());
+    assertEquals(23, snapshot.responseBytes());
+    assertEquals(3, snapshot.auxiliaryRecords());
+    assertEquals(41, snapshot.auxiliaryPayloadBytes());
+    assertEquals(7, snapshot.hbaseClientOperations());
+    assertEquals(113, snapshot.logicalHBaseRequestPayloadBytes());
+    assertEquals(5, snapshot.stages().get(RequestMetrics.LeaseRenewalStage.QUEUE).totalNanos());
+    assertEquals(7, snapshot.stages()
+        .get(RequestMetrics.LeaseRenewalStage.OUTBOUND_READY_WAIT).totalNanos());
+    assertThrows(IllegalArgumentException.class, () -> metrics.recordLeaseRenewalStage(
+        RequestMetrics.LeaseRenewalStage.PREPARE, -1));
+    assertThrows(IllegalArgumentException.class, () -> metrics.recordLeaseRenewalRequest(-1));
+    assertThrows(IllegalArgumentException.class, () -> metrics.recordLeaseRenewalResponse(-1));
+    assertThrows(IllegalArgumentException.class, () -> metrics.recordLeaseRenewalSelected(-1, 0));
+  }
+
+  @Test
   void recordsOnlyObservedPutStagesAndAcceptedOutputBytes() {
     var metrics = new RequestMetrics();
     metrics.recordPutStage(RequestMetrics.PutStage.QUEUE, 7);

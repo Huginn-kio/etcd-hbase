@@ -16,10 +16,23 @@ final class HBaseRequestCompletion {
 
   static <T> CompletableFuture<T> startRequest(
       RequestScope scope, Supplier<CompletableFuture<T>> startProducer) {
+    return startRequest(scope, 0, startProducer);
+  }
+
+  /** Starts one logical HBase client operation with counted row, range and cell payload bytes. */
+  static <T> CompletableFuture<T> startRequest(
+      RequestScope scope, long logicalRequestPayloadBytes,
+      Supplier<CompletableFuture<T>> startProducer) {
+    Objects.requireNonNull(scope, "scope");
+    Objects.requireNonNull(startProducer, "startProducer");
+    if (logicalRequestPayloadBytes < 0) {
+      return CompletableFuture.failedFuture(
+          new IllegalArgumentException("logical request payload bytes must not be negative"));
+    }
     try {
       if (scope.isDeadlineExceeded()) throw new TimeoutException();
       if (scope.isClosed()) throw new CancellationException();
-      return bindRequestToProducer(scope, startProducer);
+      return bindRequestToProducer(scope, logicalRequestPayloadBytes, startProducer);
     } catch (Exception failure) {
       return CompletableFuture.failedFuture(HBaseFailures.classify(failure));
     }
@@ -27,6 +40,12 @@ final class HBaseRequestCompletion {
 
   static <T> CompletableFuture<T> bindRequestToProducer(
       RequestScope scope, Supplier<CompletableFuture<T>> startProducer) {
+    return bindRequestToProducer(scope, 0, startProducer);
+  }
+
+  private static <T> CompletableFuture<T> bindRequestToProducer(
+      RequestScope scope, long logicalRequestPayloadBytes,
+      Supplier<CompletableFuture<T>> startProducer) {
     var request = new CompletableFuture<T>();
     var actualCompletion = new CompletableFuture<Void>();
     scope.trackPhysicalProducer(actualCompletion);
@@ -37,8 +56,10 @@ final class HBaseRequestCompletion {
     AtomicReference<CompletableFuture<T>> producerReference = new AtomicReference<>();
     boolean started;
     try {
-      started = scope.startIfOpen(() -> producerReference.set(
-          Objects.requireNonNull(startProducer.get(), "producer")));
+      started = scope.startIfOpen(() -> {
+        scope.recordStorageOperation(logicalRequestPayloadBytes);
+        producerReference.set(Objects.requireNonNull(startProducer.get(), "producer"));
+      });
     } catch (Exception failure) {
       request.completeExceptionally(HBaseFailures.classify(failure));
       actualCompletion.complete(null);

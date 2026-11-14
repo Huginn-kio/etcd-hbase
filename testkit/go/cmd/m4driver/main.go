@@ -13,12 +13,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/Reidddddd/etcd-hbase/testkit/go/internal/client"
 	"github.com/Reidddddd/etcd-hbase/testkit/go/internal/compare"
 	"github.com/Reidddddd/etcd-hbase/testkit/go/internal/scenario"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 func main() {
@@ -44,9 +46,57 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 		return compareLeaseTraces(arguments[1:], stdout, stderr)
 	case "compare-bindings":
 		return compareLeaseBindingTraces(arguments[1:], stdout, stderr)
+	case "compare-keepalive":
+		return compareLeaseKeepAliveTraces(arguments[1:], stdout, stderr)
+	case "keepalive-once":
+		return runLeaseKeepAliveOnce(ctx, arguments[1:], stdout, stderr)
 	default:
-		return errors.New("M4 driver command must be run, compare, or compare-bindings")
+		return errors.New("M4 driver command must be run, compare, compare-bindings, compare-keepalive, or keepalive-once")
 	}
+}
+
+func runLeaseKeepAliveOnce(parent context.Context, arguments []string, stdout, stderr io.Writer) (runErr error) {
+	if parent == nil || stdout == nil || stderr == nil {
+		return errors.New("M4 KeepAliveOnce requires context and process streams")
+	}
+	flags := flag.NewFlagSet("m4driver keepalive-once", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var endpoint string
+	var leaseIDText string
+	var timeout time.Duration
+	flags.StringVar(&endpoint, "endpoint", "", "explicit etcd-compatible endpoint")
+	flags.StringVar(&leaseIDText, "lease-id", "", "existing non-zero Lease ID")
+	flags.DurationVar(&timeout, "timeout", 30*time.Second, "KeepAliveOnce deadline")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	leaseID, err := strconv.ParseInt(leaseIDText, 10, 64)
+	if flags.NArg() != 0 || endpoint == "" || leaseIDText == "" || err != nil || leaseID == 0 || timeout <= 0 || timeout > 5*time.Minute {
+		return errors.New("M4 KeepAliveOnce requires an endpoint, non-zero Lease ID, and deadline up to five minutes")
+	}
+	connection, err := client.New(client.Options{Endpoint: endpoint, Timeout: timeout})
+	if err != nil {
+		return errors.New("M4 KeepAliveOnce client initialization failed")
+	}
+	defer func() { runErr = errors.Join(runErr, connection.Close()) }()
+	requestContext, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	response, err := connection.KeepAliveOnce(requestContext, clientv3.LeaseID(leaseID))
+	if err != nil {
+		return errors.New("M4 KeepAliveOnce request failed")
+	}
+	if response == nil || response.ResponseHeader == nil || response.TTL <= 0 ||
+		response.ID != clientv3.LeaseID(leaseID) {
+		return errors.New("M4 KeepAliveOnce response did not confirm a live Lease")
+	}
+	result := struct {
+		TTL      int64 `json:"ttl"`
+		Revision int64 `json:"revision"`
+	}{TTL: response.TTL, Revision: response.ResponseHeader.Revision}
+	if err := json.NewEncoder(stdout).Encode(result); err != nil {
+		return errors.New("M4 KeepAliveOnce result could not be written")
+	}
+	return nil
 }
 
 type runOptions struct {
@@ -71,6 +121,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 		suite, suiteDigest, err = scenario.LoadM4LeaseBindingSuite(options.scenario)
 	}
 	if err != nil {
+		suite, suiteDigest, err = scenario.LoadM4LeaseKeepAliveSuite(options.scenario)
+	}
+	if err != nil {
 		return err
 	}
 	build, err := scenario.BuildMetadata(suite)
@@ -92,6 +145,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 		if suite.ID == "m4-lease-bindings-v1" {
 			return scenario.RunM4NativeLeaseBindings(ctx, options.nativeData, options.prefix, evidence.trace)
 		}
+		if suite.ID == "m4-lease-keepalive-v1" {
+			return scenario.RunM4NativeLeaseKeepAlive(ctx, options.nativeData, options.prefix, evidence.trace)
+		}
 		return scenario.RunM4NativeLease(ctx, options.nativeData, options.prefix, evidence.trace)
 	}
 	connection, err := client.New(client.Options{Endpoint: options.endpoint, Timeout: options.timeout})
@@ -101,6 +157,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 	defer func() { runErr = errors.Join(runErr, connection.Close()) }()
 	if suite.ID == "m4-lease-bindings-v1" {
 		return scenario.RunM4LeaseBindings(ctx, connection, options.scope, options.prefix, evidence.trace)
+	}
+	if suite.ID == "m4-lease-keepalive-v1" {
+		return scenario.RunM4LeaseKeepAlive(ctx, connection, options.scope, options.prefix, evidence.trace)
 	}
 	return scenario.RunM4Lease(ctx, connection, options.scope, options.prefix, evidence.trace)
 }
@@ -279,5 +338,34 @@ func compareLeaseBindingTraces(arguments []string, stdout, stderr io.Writer) err
 		return err
 	}
 	_, err = fmt.Fprintln(stdout, "M4 Lease binding traces match the registered native comparison policy")
+	return err
+}
+
+func compareLeaseKeepAliveTraces(arguments []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("m4driver compare-keepalive", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var left, right string
+	flags.StringVar(&left, "left", "", "native KeepAlive trace JSONL")
+	flags.StringVar(&right, "right", "", "target KeepAlive trace JSONL")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || left == "" || right == "" || left == right {
+		return errors.New("M4 KeepAlive compare requires distinct native and target trace files")
+	}
+	leftFile, err := os.Open(left)
+	if err != nil {
+		return errors.New("native M4 KeepAlive trace cannot be opened")
+	}
+	defer leftFile.Close()
+	rightFile, err := os.Open(right)
+	if err != nil {
+		return errors.New("target M4 KeepAlive trace cannot be opened")
+	}
+	defer rightFile.Close()
+	if err := compare.CompareM4LeaseKeepAliveTraces(leftFile, rightFile); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, "M4 KeepAlive traces match the registered native comparison policy")
 	return err
 }

@@ -135,6 +135,69 @@ class M4ReportTest(unittest.TestCase):
             with self.assertRaisesRegex(m4_report.ReportError, "required M4 trace"):
                 m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
 
+    def test_j42_registry_requires_keepalive_cases_and_their_actual_maven_module(self) -> None:
+        required = m4_report.J42_CRITICAL_JAVA_TESTS
+        task = next(item for item in self.registry["tasks"] if item["id"] == "J42")
+        for class_name, methods in required.items():
+            for method_name in methods:
+                with self.subTest(class_name=class_name, method_name=method_name):
+                    changed = copy.deepcopy(self.registry)
+                    changed_task = next(item for item in changed["tasks"] if item["id"] == "J42")
+                    changed_suite = next(item for item in changed_task["maven_tests"]
+                                         if item["class"] == class_name)
+                    changed_suite["tests"].remove(method_name)
+                    with self.assertRaises(m4_report.ReportError):
+                        m4_report.validate_registry_document(changed)
+
+        self.assertEqual({"core", "server"}, {suite["module"] for suite in task["maven_tests"]})
+        actual_modules = {suite["class"]: suite["module"] for suite in task["maven_tests"]}
+        self.assertEqual(m4_report.J42_JAVA_CLASS_MODULES, actual_modules)
+        wrong_module = copy.deepcopy(self.registry)
+        wrong_task = next(item for item in wrong_module["tasks"] if item["id"] == "J42")
+        stream_suite = next(item for item in wrong_task["maven_tests"]
+                            if item["class"] == "io.etcdhbase.server.commit.LeaseKeepAliveStreamTest")
+        stream_suite["module"] = "grpc"
+        with self.assertRaisesRegex(m4_report.ReportError, "collected from their declared modules"):
+            m4_report.validate_registry_document(wrong_module)
+
+        missing_terminal = copy.deepcopy(self.registry)
+        missing_task = next(item for item in missing_terminal["tasks"] if item["id"] == "J42")
+        terminal_case = next(item for item in missing_task["trace_cases"]
+                             if item["id"] == "keepalive-stream-a-repeat")
+        terminal_case.pop("stream_terminal")
+        with self.assertRaisesRegex(m4_report.ReportError, "stream terminal coverage"):
+            m4_report.validate_registry_document(missing_terminal)
+
+    def test_complete_j42_artifact_is_read_from_its_registered_subdirectory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J42")
+            summary = m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+            self.assertEqual(summary["task"], "J42")
+            self.assertEqual(summary["target_layouts"], ["HISTORY", "NATIVE"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J42")
+            evidence = artifact / "j42"
+            (evidence / "keepalive-history.log").unlink()
+            with self.assertRaisesRegex(m4_report.ReportError, "comparison"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+    def test_j42_trace_terminals_match_registered_stream_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J42")
+            trace_path = artifact / "j42/native-trace.jsonl"
+            records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual({"kind": "eof"}, records[9]["stream_terminal"])
+            records[0]["stream_terminal"] = {"kind": "eof"}
+            trace_path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(m4_report.ReportError, "registered stream contract"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
     def test_j41_registration_rejects_unsafe_evidence_subdirectories(self) -> None:
         for subdirectory in ("../outside", "/tmp/evidence", "j41\\nested"):
             with self.subTest(subdirectory=subdirectory):
@@ -500,6 +563,8 @@ class M4ReportTest(unittest.TestCase):
     ) -> list[dict[str, object]]:
         if task["id"] == "J41":
             return M4ReportTest._valid_binding_trace_records(task, descriptor)
+        if task["id"] == "J42":
+            return M4ReportTest._valid_keepalive_trace_records(task, descriptor)
         records: list[dict[str, object]] = []
         case_ordinals: dict[str, int] = {}
         for expected in task["trace_cases"]:
@@ -549,6 +614,29 @@ class M4ReportTest(unittest.TestCase):
                 "response": None if error else M4ReportTest._snapshot({}),
                 "error": error,
                 "stream_terminal": None,
+                "evidence_scope": descriptor["scope"],
+                "elapsed_ns": "1",
+            })
+        return records
+
+    @staticmethod
+    def _valid_keepalive_trace_records(
+        task: dict[str, object], descriptor: dict[str, object],
+    ) -> list[dict[str, object]]:
+        case_ordinals: dict[str, int] = {}
+        records: list[dict[str, object]] = []
+        for expected in task["trace_cases"]:
+            case_id = expected["id"]
+            case_ordinals[case_id] = case_ordinals.get(case_id, 0) + 1
+            records.append({
+                "schema": "etcd-hbase-trace/v1",
+                "case_id": case_id,
+                "ordinal": case_ordinals[case_id],
+                "method": expected["method"],
+                "request": M4ReportTest._snapshot({}),
+                "response": M4ReportTest._snapshot({}),
+                "error": None,
+                "stream_terminal": expected.get("stream_terminal"),
                 "evidence_scope": descriptor["scope"],
                 "elapsed_ns": "1",
             })
@@ -650,8 +738,10 @@ class M4ReportTest(unittest.TestCase):
 
     @staticmethod
     def _write_comparison_logs(evidence_root: Path, task: dict[str, object]) -> None:
-        success = (m4_report.J41_COMPARE_SUCCESS if task["id"] == "J41"
-                   else m4_report.COMPARE_SUCCESS)
+        success = {
+            "J41": m4_report.J41_COMPARE_SUCCESS,
+            "J42": m4_report.J42_COMPARE_SUCCESS,
+        }.get(task["id"], m4_report.COMPARE_SUCCESS)
         for name in task["evidence"]["compare_logs"]:
             (evidence_root / name).write_text(success + "\n", encoding="utf-8")
 

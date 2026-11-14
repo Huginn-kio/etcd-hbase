@@ -9,8 +9,17 @@ import java.util.concurrent.CompletableFuture;
 
 /** Resolves a finalized invocation's original result without rereading current business data. */
 public final class InvocationResultResolver {
+  /** One durable invocation result, selected or completed without changes. */
+  public sealed interface ResolvedInvocation extends AutoCloseable
+      permits ResolvedResult, ResolvedNoChanges {
+    long revision();
+    boolean containsKeyChanges();
+    ResultCatalog.RetainedResult payload();
+    @Override void close();
+  }
+
   /** The selected decision accompanies the bytes so protocol projection can verify its revision. */
-  public static final class ResolvedResult implements AutoCloseable {
+  public static final class ResolvedResult implements ResolvedInvocation {
     private final CommitDecision decision;
     private final ResultCatalog.RetainedResult payload;
 
@@ -19,12 +28,14 @@ public final class InvocationResultResolver {
       this.payload = Objects.requireNonNull(payload, "payload");
     }
     public CommitDecision decision() { return decision; }
-    public ResultCatalog.RetainedResult payload() { return payload; }
+    @Override public long revision() { return decision.revision(); }
+    @Override public boolean containsKeyChanges() { return decision.containsKeyChanges(); }
+    @Override public ResultCatalog.RetainedResult payload() { return payload; }
     @Override public void close() { payload.close(); }
   }
 
   /** A no-change result has a read revision but no commit decision or publication sequence. */
-  public static final class ResolvedNoChanges implements AutoCloseable {
+  public static final class ResolvedNoChanges implements ResolvedInvocation {
     private final long revision;
     private final ResultCatalog.RetainedResult payload;
 
@@ -32,8 +43,9 @@ public final class InvocationResultResolver {
       this.revision = revision;
       this.payload = Objects.requireNonNull(payload, "payload");
     }
-    public long revision() { return revision; }
-    public ResultCatalog.RetainedResult payload() { return payload; }
+    @Override public long revision() { return revision; }
+    @Override public boolean containsKeyChanges() { return false; }
+    @Override public ResultCatalog.RetainedResult payload() { return payload; }
     @Override public void close() { payload.close(); }
   }
 
@@ -73,10 +85,27 @@ public final class InvocationResultResolver {
       InvocationId id, ByteKey requestDigest, ByteKey authorizationDigest,
       RequestScope scope, BudgetManager.Account account) {
     return readSelectedBinding(id, requestDigest, authorizationDigest, scope, account)
-        .thenCompose(binding -> resolveSelectedInvocation(binding, scope))
-        .thenCompose(selected -> readVerifiedResult(selected, scope))
-        .thenCompose(verified -> loadAndMark(verified.binding(), verified.decision(),
-            verified.reference(), scope, account));
+        .thenCompose(binding -> resolveSelectedBinding(binding, scope, account));
+  }
+
+  /** Resolves either kind of durable invocation outcome without consulting current KV data. */
+  public CompletableFuture<ResolvedInvocation> resolveInvocation(
+      InvocationId id, ByteKey requestDigest, ByteKey authorizationDigest,
+      RequestScope scope, BudgetManager.Account account) {
+    return readMatching(id, requestDigest, authorizationDigest, scope, account)
+        .thenCompose(binding -> {
+          if (binding.state() == InvocationBinding.State.NO_CHANGES) {
+            return loadNoChanges(binding, scope, account)
+                .thenApply(result -> (ResolvedInvocation) result);
+          }
+          if (binding.state() != InvocationBinding.State.SEALED
+              && binding.state() != InvocationBinding.State.SELECTED) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("invocation result is not queryable"));
+          }
+          return resolveSelectedBinding(binding, scope, account)
+              .thenApply(result -> (ResolvedInvocation) result);
+        });
   }
 
   private CompletableFuture<InvocationBinding> readSelectedBinding(InvocationId id, ByteKey requestDigest,
@@ -99,6 +128,14 @@ public final class InvocationResultResolver {
       return CompletableFuture.completedFuture(new SelectedInvocation(
           binding, outcome.decision().orElseThrow()));
     });
+  }
+
+  private CompletableFuture<ResolvedResult> resolveSelectedBinding(
+      InvocationBinding binding, RequestScope scope, BudgetManager.Account account) {
+    return resolveSelectedInvocation(binding, scope)
+        .thenCompose(selected -> readVerifiedResult(selected, scope))
+        .thenCompose(verified -> loadAndMark(verified.binding(), verified.decision(),
+            verified.reference(), scope, account));
   }
 
   private CompletableFuture<VerifiedResult> readVerifiedResult(

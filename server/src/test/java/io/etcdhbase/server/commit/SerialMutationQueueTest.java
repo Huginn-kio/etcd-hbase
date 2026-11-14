@@ -123,6 +123,42 @@ class SerialMutationQueueTest {
   }
 
   @Test
+  void zeroQueuedCapacityRejectsConcurrentRequestsWithoutDisplacingTheActiveMutation() throws Exception {
+    var queue = new SerialMutationQueue(0, 100, Duration.ofSeconds(10));
+    var activeScope = RequestScope.withoutDeadline();
+    var rejectedScope = RequestScope.withoutDeadline();
+    var activeWork = new CompletableFuture<String>();
+    var started = new CountDownLatch(1);
+    var rejectedWorkStarts = new AtomicInteger();
+    try {
+      var active = queue.submit(10, activeScope, ignored -> {
+        started.countDown();
+        return activeWork;
+      });
+      assertTrue(started.await(5, TimeUnit.SECONDS));
+
+      assertCategory(BackendFailure.Category.RESOURCE_LIMIT,
+          queue.submit(10, rejectedScope, ignored -> {
+            rejectedWorkStarts.incrementAndGet();
+            return CompletableFuture.completedFuture("must not run");
+          }));
+      assertTrue(queue.snapshot().active());
+      assertEquals(0, queue.snapshot().waiting());
+      assertEquals(10, queue.snapshot().retainedBytes());
+      assertEquals(0, rejectedWorkStarts.get());
+
+      activeWork.complete("active");
+      assertEquals("active", active.get(5, TimeUnit.SECONDS));
+      assertEquals(0, queue.snapshot().retainedBytes());
+    } finally {
+      activeWork.complete("finish");
+      activeScope.close();
+      rejectedScope.close();
+      closeAndAssertDrained(queue);
+    }
+  }
+
+  @Test
   void dispatchedCancellationDoesNotReleaseLaneUntilProducerDrains() throws Exception {
     var queue = new SerialMutationQueue(1, 100, Duration.ofSeconds(10));
     var firstScope = RequestScope.withoutDeadline();

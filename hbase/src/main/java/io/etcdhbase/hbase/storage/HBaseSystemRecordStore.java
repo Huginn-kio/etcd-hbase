@@ -89,7 +89,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
       SystemRecordType type, ByteKey identity, RequestScope scope) {
     requireTypeSupported(type);
     byte[] row = binding.row(type, identity);
-    return execute(scope, table -> table.get(
+    return execute(scope, logicalReadPayloadBytes(row), table -> table.get(
         new Get(row).setConsistency(Consistency.STRONG).addFamily(binding.family())))
         .thenApply(result -> decode(result, binding.family()));
   }
@@ -101,7 +101,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
     byte[] row = binding.row(type, identity);
     byte[] bytes = checkedValue(value);
     Put put = put(row, bytes);
-    return execute(scope, table -> table.checkAndMutate(
+    return execute(scope, logicalMutationPayloadBytes(row, bytes.length), table -> table.checkAndMutate(
         CheckAndMutate.newBuilder(row).ifNotExists(binding.family(), VALUE).build(put)))
         .thenCompose(result -> result.isSuccess()
             ? CompletableFuture.completedFuture(CreateResult.CREATED)
@@ -122,13 +122,15 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
     requireTypeSupported(type);
     byte[] row = binding.row(type, identity);
     byte[] bytes = checkedValue(replacement);
+    long payloadBytes = logicalMutationPayloadBytes(row, bytes.length
+        + expected.map(ByteKey::length).orElse(0));
     var builder = CheckAndMutate.newBuilder(row);
     if (expected.isPresent()) {
       builder.ifEquals(binding.family(), VALUE, checkedValue(expected.orElseThrow()));
     } else {
       builder.ifNotExists(binding.family(), VALUE);
     }
-    return execute(scope, table -> table.checkAndMutate(builder.build(put(row, bytes))))
+    return execute(scope, payloadBytes, table -> table.checkAndMutate(builder.build(put(row, bytes))))
         .thenApply(result -> result.isSuccess());
   }
 
@@ -224,7 +226,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
 
   private <T> CompletableFuture<T> scan(Scan scan, RequestScope scope,
       ScanCollector<T> collector) {
-    return execute(scope, table -> {
+    return execute(scope, logicalScanPayloadBytes(scan), table -> {
       var completion = new CompletableFuture<T>();
       var stoppedByCollector = new AtomicReference<Throwable>();
       table.scan(scan, new AdvancedScanResultConsumer() {
@@ -451,7 +453,13 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
   private <T> CompletableFuture<T> execute(
       RequestScope scope,
       Function<AsyncTable<AdvancedScanResultConsumer>, CompletableFuture<T>> operation) {
-    return HBaseRequestCompletion.startRequest(scope, () -> {
+    return execute(scope, 0, operation);
+  }
+
+  private <T> CompletableFuture<T> execute(
+      RequestScope scope, long logicalRequestPayloadBytes,
+      Function<AsyncTable<AdvancedScanResultConsumer>, CompletableFuture<T>> operation) {
+    return HBaseRequestCompletion.startRequest(scope, logicalRequestPayloadBytes, () -> {
       long timeout = Math.max(1, Math.min(TimeUnit.SECONDS.toNanos(30), scope.remainingDeadlineNanos()));
       AsyncTable<AdvancedScanResultConsumer> table = connection.getTableBuilder(binding.table())
           .setOperationTimeout(timeout, TimeUnit.NANOSECONDS)
@@ -461,6 +469,19 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
           .build();
       return operation.apply(table);
     });
+  }
+
+  private long logicalReadPayloadBytes(byte[] row) {
+    return (long) row.length + binding.family().length;
+  }
+
+  private long logicalMutationPayloadBytes(byte[] row, long valueBytes) {
+    return (long) row.length + binding.family().length + VALUE.length + valueBytes;
+  }
+
+  private long logicalScanPayloadBytes(Scan scan) {
+    return (long) scan.getStartRow().length + scan.getStopRow().length
+        + binding.family().length + VALUE.length;
   }
 
   private static byte[] checkedValue(ByteKey value) {

@@ -72,6 +72,9 @@ public final class MutationOwnerLane {
         long elapsed = nanoTime.getAsLong() - entered;
         if (operationKind == MutationOperationEnvelope.Kind.PUT) {
           metrics.recordPutStage(RequestMetrics.PutStage.QUEUE, Math.max(0, elapsed));
+        } else if (operationKind == MutationOperationEnvelope.Kind.LEASE_KEEP_ALIVE) {
+          metrics.recordLeaseRenewalStage(
+              RequestMetrics.LeaseRenewalStage.QUEUE, Math.max(0, elapsed));
         } else if (operationKind != MutationOperationEnvelope.Kind.LEASE_GRANT
             && operationKind != MutationOperationEnvelope.Kind.LEASE_EXPIRE_EMPTY) {
           metrics.recordTxnStage(RequestMetrics.TxnStage.QUEUE, Math.max(0, elapsed));
