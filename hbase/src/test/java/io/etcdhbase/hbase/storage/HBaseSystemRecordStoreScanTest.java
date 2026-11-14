@@ -52,7 +52,7 @@ class HBaseSystemRecordStoreScanTest {
       return null;
     }).when(table).scan(any(Scan.class), any(AdvancedScanResultConsumer.class));
 
-    var store = new HBaseSystemRecordStore(connection, binding, true, false);
+    var store = new HBaseSystemRecordStore(connection, binding, true, false, false);
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofMinutes(1))) {
       ByteKey identity = ByteKey.copyOf(new byte[] {1});
       int bucket = binding.keyCodec().bucket(SystemRecordType.WORKSET, identity);
@@ -79,11 +79,27 @@ class HBaseSystemRecordStoreScanTest {
   void rejectsAuxiliaryAccessBeforeTouchingAnOlderSystemTable() {
     var binding = new SystemTableBinding(TableName.valueOf("j40_legacy"), new byte[] {'s'},
         "j40-legacy", "j40-salt", new HashSaltStrategy());
-    var store = new HBaseSystemRecordStore(mock(AsyncConnection.class), binding, true, false);
+    var store = new HBaseSystemRecordStore(mock(AsyncConnection.class), binding, true, false, false);
     ByteKey identity = io.etcdhbase.core.lease.LeaseRecordIdentity.enumeration(-7);
     assertThrows(IllegalStateException.class, () -> store.bucket(SystemRecordType.LEASE_ENUMERATION, identity));
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(1))) {
       assertThrows(IllegalStateException.class, () -> store.read(SystemRecordType.LEASE_ENUMERATION, identity, scope));
+    }
+  }
+
+  @Test
+  void rejectsLeaseBindingsWhenOnlyJ40AuxiliaryCapabilityIsPresent() {
+    var binding = new SystemTableBinding(TableName.valueOf("j40_auxiliary_only"), new byte[] {'s'},
+        "j40-auxiliary-only", "j40-salt", new HashSaltStrategy());
+    var store = new HBaseSystemRecordStore(mock(AsyncConnection.class), binding, true, true, false);
+    ByteKey identity = new io.etcdhbase.core.lease.LeaseBindingIdentity(
+        1, 1, ByteKey.copyOf(new byte[] {1}), 1).encode();
+
+    assertThrows(IllegalStateException.class,
+        () -> store.bucket(SystemRecordType.LEASE_BINDING, identity));
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(1))) {
+      assertThrows(IllegalStateException.class,
+          () -> store.read(SystemRecordType.LEASE_BINDING, identity, scope));
     }
   }
 }

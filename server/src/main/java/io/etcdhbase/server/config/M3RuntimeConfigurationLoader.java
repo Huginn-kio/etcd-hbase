@@ -2,6 +2,7 @@ package io.etcdhbase.server.config;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.etcdhbase.admin.config.StrictConfigurationJson;
+import io.etcdhbase.core.lease.LeaseCostAdmission;
 import java.io.InputStream;
 
 /** Loads the explicit M3 activation file without resolving credentials or contacting HBase. */
@@ -31,6 +32,25 @@ public final class M3RuntimeConfigurationLoader {
           throw new IllegalArgumentException("M4 Lease activation requires lease_clock_uncertainty_ms");
         }
         object.put("lease_clock_uncertainty_ms", 1_000);
+      }
+      if (!object.has("lease_maximum_bindings")) {
+        if (m4LeaseApiEnabled) {
+          throw new IllegalArgumentException("M4 Lease activation requires lease_maximum_bindings");
+        }
+        object.put("lease_maximum_bindings", LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings());
+      }
+      if (!object.has("lease_maximum_key_bytes")) {
+        if (m4LeaseApiEnabled) {
+          throw new IllegalArgumentException("M4 Lease activation requires lease_maximum_key_bytes");
+        }
+        object.put("lease_maximum_key_bytes", LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes());
+      }
+      if (!object.has("lease_maximum_revoke_cost_bytes")) {
+        if (m4LeaseApiEnabled) {
+          throw new IllegalArgumentException("M4 Lease activation requires lease_maximum_revoke_cost_bytes");
+        }
+        object.put("lease_maximum_revoke_cost_bytes",
+            LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
       }
     }
     return json.bind(tree, M3RuntimeConfiguration.class);

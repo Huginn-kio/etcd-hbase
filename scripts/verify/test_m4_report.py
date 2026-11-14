@@ -87,6 +87,68 @@ class M4ReportTest(unittest.TestCase):
             self.assertEqual(summary["target_layouts"], ["HISTORY", "NATIVE"])
             self.assertGreater(summary["go_test_count"], 0)
 
+    def test_complete_j41_artifact_is_read_from_its_registered_subdirectory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J41")
+            summary = m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+            self.assertEqual(summary["task"], "J41")
+            self.assertEqual(summary["target_layouts"], ["HISTORY", "NATIVE"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J41")
+            evidence = artifact / "j41"
+            (evidence / "native-trace.jsonl").replace(artifact / "native-trace.jsonl")
+            with self.assertRaisesRegex(m4_report.ReportError, "required M4 trace"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+    def test_j41_registration_rejects_unsafe_evidence_subdirectories(self) -> None:
+        for subdirectory in ("../outside", "/tmp/evidence", "j41\\nested"):
+            with self.subTest(subdirectory=subdirectory):
+                changed = copy.deepcopy(self.registry)
+                task = next(item for item in changed["tasks"] if item["id"] == "J41")
+                task["artifact_subdir"] = subdirectory
+                with self.assertRaises(m4_report.ReportError):
+                    m4_report.validate_registry_document(changed)
+
+    def test_j41_registry_requires_binding_plan_and_owner_fence_regressions(self) -> None:
+        required = {
+            "io.etcdhbase.server.commit.LeaseBindingMutationPlannerTest":
+                "revokedStateUpdatesDoNotWriteNewExpiryCandidates",
+            "io.etcdhbase.server.commit.M3OwnerLeaseTest":
+                "startupFormatUpgradeRotatesTheFenceWithoutLosingOwnerRenewal",
+        }
+        for class_name, method_name in required.items():
+            with self.subTest(class_name=class_name):
+                without_class = copy.deepcopy(self.registry)
+                task = next(item for item in without_class["tasks"] if item["id"] == "J41")
+                task["maven_tests"] = [item for item in task["maven_tests"]
+                                        if item["class"] != class_name]
+                with self.assertRaises(m4_report.ReportError):
+                    m4_report.validate_registry_document(without_class)
+
+                without_method = copy.deepcopy(self.registry)
+                task = next(item for item in without_method["tasks"] if item["id"] == "J41")
+                suite = next(item for item in task["maven_tests"] if item["class"] == class_name)
+                suite["tests"].remove(method_name)
+                with self.assertRaises(m4_report.ReportError):
+                    m4_report.validate_registry_document(without_method)
+
+    def test_j41_registry_requires_each_go_binding_regression(self) -> None:
+        for package, required_tests in m4_report.J41_GO_TESTS.items():
+            for test_name in required_tests:
+                with self.subTest(package=package, test_name=test_name):
+                    changed = copy.deepcopy(self.registry)
+                    task = next(item for item in changed["tasks"] if item["id"] == "J41")
+                    suite = next(item for item in task["go_tests"]
+                                 if item["package"] == package)
+                    suite["tests"].remove(test_name)
+                    with self.assertRaisesRegex(
+                        m4_report.ReportError, "Go binding regression coverage is incomplete"
+                    ):
+                        m4_report.validate_registry_document(changed)
+
     def test_missing_or_skipped_required_maven_case_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)
@@ -238,24 +300,23 @@ class M4ReportTest(unittest.TestCase):
             with self.assertRaisesRegex(m4_report.ReportError, "unknown action"):
                 m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
 
-    def _write_valid_artifact(self, artifact: Path) -> None:
-        task = self.registry["tasks"][0]
+    def _write_valid_artifact(self, artifact: Path, task_id: str = "J40") -> None:
+        task = next(item for item in self.registry["tasks"] if item["id"] == task_id)
         run_id = artifact.name
         source_commit = "a" * 40
         base_commit = "b" * 40
+        evidence_root = artifact / task.get("artifact_subdir", "")
+        evidence_root.mkdir(parents=True, exist_ok=True)
         command_logs = self._write_command_logs(artifact)
         commands = self._command_records(command_logs)
         self._write_run_manifest(artifact, task["id"], run_id, source_commit, base_commit, commands)
         self._write_go_test_events(artifact, task)
         self._write_maven_test_reports(artifact, task)
-        suite_hash = hashlib.sha256(
-            (m4_report.REPO / "testkit/scenarios/m4-lease.yaml").read_bytes()
-        ).hexdigest()
-        prefix_hash = hashlib.sha256(f"etcd-hbase-m4-test/{run_id}/".encode()).hexdigest()
+        suite_hash, prefix_hash = m4_report._scenario_hashes(m4_report.REPO, task, run_id)
         self._write_trace_artifacts(
-            artifact, task, run_id, source_commit, suite_hash, prefix_hash
+            evidence_root, task, run_id, source_commit, suite_hash, prefix_hash
         )
-        self._write_comparison_logs(artifact, task)
+        self._write_comparison_logs(evidence_root, task)
 
     @staticmethod
     def _refresh_trace_digest(artifact: Path, trace_path: Path, metadata_name: str) -> None:
@@ -359,18 +420,18 @@ class M4ReportTest(unittest.TestCase):
         return trace_variants
 
     def _write_trace_artifacts(
-        self, artifact: Path, task: dict[str, object], run_id: str, source_commit: str,
+        self, evidence_root: Path, task: dict[str, object], run_id: str, source_commit: str,
         suite_hash: str, prefix_hash: str,
     ) -> None:
         for descriptor, suffix, trace_name, metadata_name in self._trace_variants(task):
             self._write_trace_artifact(
-                artifact, task, descriptor, suffix, trace_name, metadata_name,
+                evidence_root, task, descriptor, suffix, trace_name, metadata_name,
                 run_id, source_commit, suite_hash, prefix_hash,
             )
 
     @staticmethod
     def _write_trace_artifact(
-        artifact: Path, task: dict[str, object], descriptor: dict[str, object],
+        evidence_root: Path, task: dict[str, object], descriptor: dict[str, object],
         suffix: str, trace_name: str, metadata_name: str, run_id: str,
         source_commit: str, suite_hash: str, prefix_hash: str,
     ) -> None:
@@ -378,7 +439,7 @@ class M4ReportTest(unittest.TestCase):
         trace_bytes = "".join(
             json.dumps(record, separators=(",", ":")) + "\n" for record in records
         ).encode()
-        (artifact / trace_name).write_bytes(trace_bytes)
+        (evidence_root / trace_name).write_bytes(trace_bytes)
         embedded_native = descriptor["embedded_native"]
         layout = descriptor.get("layout", "")
         metadata = {
@@ -393,14 +454,16 @@ class M4ReportTest(unittest.TestCase):
             "layout": layout,
             "status": "passed",
         }
-        (artifact / metadata_name).write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        (evidence_root / metadata_name).write_text(json.dumps(metadata) + "\n", encoding="utf-8")
         log_name = "native.log" if embedded_native else f"target-{suffix}.log"
-        (artifact / log_name).write_text("M4 Lease scenario passed\n", encoding="utf-8")
+        (evidence_root / log_name).write_text("M4 Lease scenario passed\n", encoding="utf-8")
 
     @staticmethod
     def _valid_trace_records(
         task: dict[str, object], descriptor: dict[str, object],
     ) -> list[dict[str, object]]:
+        if task["id"] == "J41":
+            return M4ReportTest._valid_binding_trace_records(task, descriptor)
         records: list[dict[str, object]] = []
         case_ordinals: dict[str, int] = {}
         for expected in task["trace_cases"]:
@@ -414,6 +477,40 @@ class M4ReportTest(unittest.TestCase):
                 "method": expected["method"],
                 "request": request,
                 "response": response,
+                "error": error,
+                "stream_terminal": None,
+                "evidence_scope": descriptor["scope"],
+                "elapsed_ns": "1",
+            })
+        return records
+
+    @staticmethod
+    def _valid_binding_trace_records(
+        task: dict[str, object], descriptor: dict[str, object],
+    ) -> list[dict[str, object]]:
+        errors = {
+            "binding-invalid-lease-atomicity": {
+                "grpc_code": "NotFound", "consumer_kind": "grpc-status",
+                "semantic_kind": "LEASE_NOT_FOUND",
+            },
+            "binding-invalid-lease-put": {
+                "grpc_code": "NotFound", "consumer_kind": "grpc-status",
+                "semantic_kind": "LEASE_NOT_FOUND",
+            },
+        }
+        records = []
+        case_ordinals: dict[str, int] = {}
+        for expected in task["trace_cases"]:
+            case_id = expected["id"]
+            case_ordinals[case_id] = case_ordinals.get(case_id, 0) + 1
+            error = errors.get(case_id)
+            records.append({
+                "schema": "etcd-hbase-trace/v1",
+                "case_id": case_id,
+                "ordinal": case_ordinals[case_id],
+                "method": expected["method"],
+                "request": M4ReportTest._snapshot({}),
+                "response": None if error else M4ReportTest._snapshot({}),
                 "error": error,
                 "stream_terminal": None,
                 "evidence_scope": descriptor["scope"],
@@ -516,11 +613,11 @@ class M4ReportTest(unittest.TestCase):
         }
 
     @staticmethod
-    def _write_comparison_logs(artifact: Path, task: dict[str, object]) -> None:
+    def _write_comparison_logs(evidence_root: Path, task: dict[str, object]) -> None:
+        success = (m4_report.J41_COMPARE_SUCCESS if task["id"] == "J41"
+                   else m4_report.COMPARE_SUCCESS)
         for name in task["evidence"]["compare_logs"]:
-            (artifact / name).write_text(
-                "M4 Lease traces match the registered native comparison policy\n", encoding="utf-8"
-            )
+            (evidence_root / name).write_text(success + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

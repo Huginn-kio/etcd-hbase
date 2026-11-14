@@ -31,15 +31,18 @@ public final class HBaseCommitControlStore implements CommitControlStore {
   private final AsyncConnection connection;
   private final SystemTableBinding binding;
   private final boolean auxiliarySupported;
+  private final boolean leaseBindingsSupported;
 
   private HBaseCommitControlStore(AsyncConnection connection, SystemTableBinding binding,
-      boolean auxiliarySupported) {
+      boolean auxiliarySupported, boolean leaseBindingsSupported) {
     this.connection = connection;
     this.binding = binding;
     this.auxiliarySupported = auxiliarySupported;
+    this.leaseBindingsSupported = leaseBindingsSupported;
   }
 
   public boolean supportsAuxiliary() { return auxiliarySupported; }
+  public boolean supportsLeaseBindings() { return leaseBindingsSupported; }
 
   public static CompletableFuture<HBaseCommitControlStore> open(
       HBaseConnectionFactory factory,
@@ -51,7 +54,8 @@ public final class HBaseCommitControlStore implements CommitControlStore {
         startRequest(scope, () -> connection.getAdmin().getDescriptor(binding.table())
             .thenApply(descriptor -> {
               binding.validate(descriptor);
-              return new HBaseCommitControlStore(connection, binding, binding.supportsAuxiliary(descriptor));
+              return new HBaseCommitControlStore(connection, binding,
+                  binding.supportsAuxiliary(descriptor), binding.supportsLeaseBindings(descriptor));
             }))).exceptionallyCompose(failure -> failed(failure));
   }
 
@@ -70,7 +74,8 @@ public final class HBaseCommitControlStore implements CommitControlStore {
         || initialState.ownerEpoch() != 0 || initialState.ownerLeaseDeadlineEpochMillis() != 0
         || initialState.stateVersion() != 1 || initialState.publishedSequence() != 0
         || initialState.finalizedSequence() != 0 || initialState.compactRevision() != 0
-        || initialState.formatVersion() == CommitState.AUXILIARY_FORMAT_VERSION && !auxiliarySupported
+        || initialState.supportsAuxiliaryRecords() && !auxiliarySupported
+        || initialState.supportsLeaseBindings() && !leaseBindingsSupported
         || initialState.publication().isPresent()) {
       return CompletableFuture.failedFuture(new IllegalArgumentException(
           "control initialization requires a fenced empty initial state"));
@@ -96,12 +101,18 @@ public final class HBaseCommitControlStore implements CommitControlStore {
     if (replacement.formatVersion() != observed.state().formatVersion()) {
       try {
         CommitState state = observed.state();
-        if (state.formatVersion() != CommitState.FORMAT_VERSION
-            || replacement.formatVersion() != CommitState.AUXILIARY_FORMAT_VERSION
-            || !auxiliarySupported
-            || state.ownerInstance().isEmpty()
-            || !Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
-                state.upgradeAuxiliaryFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0)))) {
+        boolean auxiliaryUpgrade = state.formatVersion() == CommitState.FORMAT_VERSION
+            && replacement.formatVersion() == CommitState.AUXILIARY_FORMAT_VERSION
+            && auxiliarySupported
+            && state.ownerInstance().isPresent()
+            && Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
+                state.upgradeAuxiliaryFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0)));
+        boolean leaseBindingUpgrade = state.formatVersion() == CommitState.AUXILIARY_FORMAT_VERSION
+            && replacement.formatVersion() == CommitState.LEASE_BINDING_FORMAT_VERSION
+            && auxiliarySupported && leaseBindingsSupported && state.ownerInstance().isPresent()
+            && Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
+                state.upgradeLeaseBindingFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0)));
+        if (!auxiliaryUpgrade && !leaseBindingUpgrade) {
           return CompletableFuture.failedFuture(new IllegalArgumentException("invalid control format upgrade"));
         }
       } catch (IllegalArgumentException | IllegalStateException | ArithmeticException failure) {

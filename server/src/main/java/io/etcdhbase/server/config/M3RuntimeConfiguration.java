@@ -2,6 +2,7 @@ package io.etcdhbase.server.config;
 
 import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
+import io.etcdhbase.core.lease.LeaseCostAdmission;
 import java.time.Duration;
 
 /**
@@ -29,7 +30,10 @@ public record M3RuntimeConfiguration(
     boolean readCacheEnabled,
     boolean m4LeaseApiEnabled,
     long leaseMinTtlSeconds,
-    long leaseClockUncertaintyMs) {
+    long leaseClockUncertaintyMs,
+    int leaseMaximumBindings,
+    long leaseMaximumKeyBytes,
+    long leaseMaximumRevokeCostBytes) {
   private static final long MIN_MEMORY = 256L << 20;
   private static final long MAX_MEMORY = 1L << 40;
 
@@ -45,7 +49,10 @@ public record M3RuntimeConfiguration(
       int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
       int pinShards, int pinSlotsPerShard, int pinLeaseMs) {
     this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
-        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, false, false, 1, 1_000);
+        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, false, false, 1, 1_000,
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
   }
 
   /** Preserve callers that explicitly set the disabled-cache state. */
@@ -54,7 +61,22 @@ public record M3RuntimeConfiguration(
       int pinShards, int pinSlotsPerShard, int pinLeaseMs, boolean readCacheEnabled) {
     this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
         maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
-        false, 1, 1_000);
+        false, 1, 1_000, LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
+  }
+
+  /** Preserve callers that predate the explicit J41 Lease revocation limits. */
+  public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
+      int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
+      int pinShards, int pinSlotsPerShard, int pinLeaseMs, boolean readCacheEnabled,
+      boolean m4LeaseApiEnabled, long leaseMinTtlSeconds, long leaseClockUncertaintyMs) {
+    this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
+        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
+        m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs,
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
   }
 
   public M3RuntimeConfiguration {
@@ -84,6 +106,8 @@ public record M3RuntimeConfiguration(
       throw new IllegalArgumentException("M4 memory_bytes must be at least " + minimumLeaseMemory
           + " for one group recovery account and one Lease request/owner pair");
     }
+    new LeaseCostAdmission.Limits(leaseMaximumBindings, leaseMaximumKeyBytes,
+        leaseMaximumRevokeCostBytes);
     new SnapshotPinConfiguration(pinShards, pinSlotsPerShard, Duration.ofMillis(pinLeaseMs));
   }
 
@@ -92,5 +116,10 @@ public record M3RuntimeConfiguration(
 
   public SnapshotPinConfiguration pinConfiguration() {
     return new SnapshotPinConfiguration(pinShards, pinSlotsPerShard, Duration.ofMillis(pinLeaseMs));
+  }
+
+  public LeaseCostAdmission.Limits leaseCostLimits() {
+    return new LeaseCostAdmission.Limits(leaseMaximumBindings, leaseMaximumKeyBytes,
+        leaseMaximumRevokeCostBytes);
   }
 }

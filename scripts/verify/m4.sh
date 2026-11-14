@@ -29,7 +29,7 @@ while (($#)); do
       artifact_request="$2"; seen_artifact=true; shift 2 ;;
     --help)
       cat <<'USAGE'
-用法：scripts/verify/m4.sh --scope public --task J40 --artifact-root .artifacts/m4/<fresh-run-id>
+用法：scripts/verify/m4.sh --scope public --task J40|J41 --artifact-root .artifacts/m4/<fresh-run-id>
      或 scripts/verify/m4.sh --scope public --all --artifact-root .artifacts/m4/<fresh-run-id>
 USAGE
       exit 0 ;;
@@ -50,7 +50,7 @@ if [[ "$run_all" == true ]]; then
   echo 'M4 bulk execution is unavailable until every registered task has an execution profile.' >&2
   exit 2
 fi
-if [[ "$task" != J40 ]]; then
+if [[ "$task" != J40 && "$task" != J41 ]]; then
   echo "M4 task is not registered for public execution: $task" >&2
   exit 2
 fi
@@ -94,16 +94,16 @@ if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
   worktree_clean=false
 fi
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-python3 - "$run_file" "$run_id" "$source_commit" "$base_commit" "$worktree_clean" "$started_at" <<'PY'
+python3 - "$run_file" "$run_id" "$source_commit" "$base_commit" "$worktree_clean" "$started_at" "$task" <<'PY'
 import json
 import sys
 
-path, run_id, source, base, clean, started = sys.argv[1:]
+path, run_id, source, base, clean, started, task = sys.argv[1:]
 record = {
     "schema": "etcd-hbase-m4-run/v1",
     "run_id": run_id,
     "scope": "public-local-minicluster",
-    "tasks": ["J40"],
+    "tasks": [task],
     "status": "running",
     "source_commit": source,
     "checkout": source,
@@ -220,8 +220,12 @@ run_logged report-tests report-tests.log report-tests.stderr python3 scripts/ver
 run_logged go-module-lock go-module-lock.log go-module-lock.stderr python3 scripts/verify/go-module-lock.py
 run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
   ./internal/trace ./internal/scenario ./internal/compare ./cmd/m4driver
+maven_profile=m4-j40-public
+if [[ "$task" == J41 ]]; then
+  maven_profile=m4-j41-public
+fi
 run_logged maven-verify maven.log maven.stderr.log scripts/dev/mvn21.sh -B -ntp \
-  -pl server -am clean verify -Pm4-j40-public
+  -pl server -am clean verify -P"$maven_profile"
 
 collection_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set +e

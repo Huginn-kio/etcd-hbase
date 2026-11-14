@@ -60,7 +60,7 @@ public final class ReadViewService {
     return readControl(scope).thenCompose(snapshot -> {
       CommitState state = snapshot.state();
       requireProfile(state);
-      if (auxiliary && state.formatVersion() != CommitState.AUXILIARY_FORMAT_VERSION) {
+      if (auxiliary && !state.supportsAuxiliaryRecords()) {
         return CompletableFuture.failedFuture(new IllegalStateException(
             "auxiliary read requires the fenced control format"));
       }
@@ -73,6 +73,17 @@ public final class ReadViewService {
   /** Captures one barrier, then independently pins each distinct revision required by a transaction. */
   CompletableFuture<TransactionViews> openForTransaction(List<Long> revisions,
       ByteKey authorizationScopeDigest, RequestScope scope) {
+    return openForTransaction(revisions, authorizationScopeDigest, scope, false);
+  }
+
+  /** Captures transaction KV and auxiliary reads under the same control barrier and pin. */
+  CompletableFuture<TransactionViews> openAuxiliaryForTransaction(List<Long> revisions,
+      ByteKey authorizationScopeDigest, RequestScope scope) {
+    return openForTransaction(revisions, authorizationScopeDigest, scope, true);
+  }
+
+  private CompletableFuture<TransactionViews> openForTransaction(List<Long> revisions,
+      ByteKey authorizationScopeDigest, RequestScope scope, boolean auxiliary) {
     Objects.requireNonNull(revisions, "revisions");
     Objects.requireNonNull(authorizationScopeDigest, "authorizationScopeDigest");
     Objects.requireNonNull(scope, "scope");
@@ -94,7 +105,7 @@ public final class ReadViewService {
       if (targets.size() > MAX_TRANSACTION_TARGETS) {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
       }
-      return pinTargets(state, List.copyOf(targets), authorizationScopeDigest, scope)
+      return pinTargets(state, List.copyOf(targets), authorizationScopeDigest, scope, auxiliary)
           .thenApply(opened -> new TransactionViews(current, state.publishedSequence(), state, opened));
     });
   }
@@ -102,6 +113,11 @@ public final class ReadViewService {
   /** Adds selected historical targets without reading a new transaction barrier. */
   CompletableFuture<Map<Long, PinnedReadView>> pinTargets(CommitState barrier, List<Long> targets,
       ByteKey authorizationScopeDigest, RequestScope scope) {
+    return pinTargets(barrier, targets, authorizationScopeDigest, scope, false);
+  }
+
+  private CompletableFuture<Map<Long, PinnedReadView>> pinTargets(CommitState barrier, List<Long> targets,
+      ByteKey authorizationScopeDigest, RequestScope scope, boolean auxiliary) {
     Objects.requireNonNull(barrier, "barrier");
     Objects.requireNonNull(targets, "targets");
     Objects.requireNonNull(authorizationScopeDigest, "authorizationScopeDigest");
@@ -114,7 +130,7 @@ public final class ReadViewService {
     CompletableFuture<Void> pending = CompletableFuture.completedFuture(null);
     for (long target : targets) {
       pending = pending.thenCompose(ignored -> captureSelection(barrier, target, authorizationScopeDigest, scope)
-          .thenCompose(capture -> registerAndRecheck(capture, scope, false))
+          .thenCompose(capture -> registerAndRecheck(capture, scope, auxiliary))
           .thenAccept(pinned -> opened.put(target, pinned)));
     }
     return pending.thenApply(ignored -> Map.copyOf(opened)).whenComplete((ignored, failure) -> {

@@ -28,6 +28,18 @@ public record LeaseBindingIdentity(long leaseId, long incarnation, ByteKey key, 
     return routePrefix(leaseId, incarnation);
   }
 
+  /** Prefix used for one key's ordered immutable binding history. */
+  public static ByteKey keyRoutePrefix(long leaseId, long incarnation, ByteKey key) {
+    Objects.requireNonNull(key, "key");
+    if (leaseId == 0 || incarnation <= 0 || key.length() == 0) {
+      throw new IllegalArgumentException("invalid Lease binding key route");
+    }
+    byte[] route = routePrefix(leaseId, incarnation).bytes();
+    byte[] orderedKey = OrderedByteKeyEncoding.encode(key.bytes());
+    return ByteKey.copyOf(ByteBuffer.allocate(Math.addExact(route.length, orderedKey.length))
+        .put(route).put(orderedKey).array());
+  }
+
   public static ByteKey routePrefix(long leaseId, long incarnation) {
     if (leaseId == 0 || incarnation <= 0) {
       throw new IllegalArgumentException("invalid Lease binding route");

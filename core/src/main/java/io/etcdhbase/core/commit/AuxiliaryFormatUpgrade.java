@@ -43,8 +43,8 @@ public final class AuxiliaryFormatUpgrade {
               }
               if (after.isPresent()) {
                 CommitState state = after.orElseThrow().state();
-                if (state.formatVersion() == CommitState.AUXILIARY_FORMAT_VERSION
-                    && state.ownerEpoch() == upgraded.epoch()
+                if (state.supportsAuxiliaryRecords()
+                    && state.ownerEpoch() >= upgraded.epoch()
                     && state.ownerInstance().filter(upgraded.instance()::equals).isPresent()) {
                   return upgraded;
                 }

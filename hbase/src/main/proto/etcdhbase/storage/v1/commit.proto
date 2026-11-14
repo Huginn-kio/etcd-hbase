@@ -328,6 +328,8 @@ message LeaseState {
   optional int64 bound_key_count = 9;
   optional int64 bound_key_bytes = 10;
   optional int64 revoke_cost_bytes = 11;
+  optional int64 expiry_candidate_sequence = 12;
+  optional int64 binding_history_bytes = 13;
 }
 
 // Stored in the existing invocation-bound result pages, not on the public etcd wire.

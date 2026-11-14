@@ -36,6 +36,28 @@ class CommitStateTest {
   }
 
   @Test
+  void leaseBindingUpgradeFencesTheAuxiliaryOwnerBeforeChangingCapabilities() {
+    var auxiliary = CommitState.initial(FINGERPRINT, 7).claimOwner("owner-a", 10, 100)
+        .upgradeAuxiliaryFormat("owner-a", 1, 11);
+    var bindingEnabled = auxiliary.upgradeLeaseBindingFormat("owner-a", 2, 12);
+
+    assertEquals(CommitState.LEASE_BINDING_FORMAT_VERSION, bindingEnabled.formatVersion());
+    assertTrue(bindingEnabled.supportsAuxiliaryRecords());
+    assertTrue(bindingEnabled.supportsLeaseBindings());
+    assertEquals(3, bindingEnabled.ownerEpoch());
+    assertEquals(auxiliary.stateVersion() + 1, bindingEnabled.stateVersion());
+    assertEquals(auxiliary.publishedSequence(), bindingEnabled.publishedSequence());
+    assertEquals(auxiliary.publishedRevision(), bindingEnabled.publishedRevision());
+    assertThrows(IllegalStateException.class,
+        () -> bindingEnabled.heartbeat("owner-a", 2, 200));
+    assertThrows(IllegalStateException.class,
+        () -> auxiliary.upgradeLeaseBindingFormat("owner-a", 1, 12));
+    assertThrows(IllegalStateException.class,
+        () -> auxiliary.publish(slot(0, 7, false, 2))
+            .upgradeLeaseBindingFormat("owner-a", 2, 12));
+  }
+
+  @Test
   void metadataOnlyPublicationDoesNotAdvanceRevisionAndKeyChangesAdvanceItOnce() {
     CommitState owned = CommitState.initial(FINGERPRINT, 7).claimOwner("owner-a", 1, 100);
 

@@ -98,6 +98,28 @@ class SystemRecordKeyCodecTest {
   }
 
   @Test
+  void leaseBindingVersionSeekStopsAtOneExactKeyRoute() {
+    long leaseId = -7;
+    long incarnation = 3;
+    ByteKey key = ByteKey.copyOf(new byte[] {'a', 0});
+    ByteKey route = LeaseBindingIdentity.keyRoutePrefix(leaseId, incarnation, key);
+    ByteKey requested = new LeaseBindingIdentity(leaseId, incarnation, key, 19).encode();
+    byte[] requestedRow = CODEC.encode(SystemRecordType.LEASE_BINDING, requested);
+    int keyPrefixLength = 2 + 1 + route.length();
+    byte[] exactKeyPrefix = Arrays.copyOf(requestedRow, keyPrefixLength);
+
+    var bounds = CODEC.leaseBindingVersionBounds(route, 19);
+
+    assertTrue(bounds.reversed());
+    assertTrue(bounds.startInclusive());
+    assertFalse(bounds.stopInclusive());
+    assertArrayEquals(requestedRow, bounds.startRow());
+    assertArrayEquals(exactKeyPrefix, bounds.stopRow());
+    assertTrue(Arrays.compareUnsigned(bounds.stopRow(), bounds.startRow()) < 0,
+        "a reverse seek must stop below its inclusive sequence row");
+  }
+
+  @Test
   void expiryCandidatesSortByDeadlineAndExposeHalfOpenWindowBounds() {
     long firstLeaseId = -7;
     ByteKey first = new ExpiryCandidateIdentity(100, firstLeaseId, 1, 0).encode();

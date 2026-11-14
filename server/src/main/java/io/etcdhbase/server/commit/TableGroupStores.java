@@ -15,6 +15,7 @@ import io.etcdhbase.core.commit.TableGroupIdentityService;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
+import io.etcdhbase.hbase.codec.LeaseBindingMessages;
 import io.etcdhbase.hbase.codec.LeaseStateMessages;
 import io.etcdhbase.hbase.connection.HBaseRequestContext;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
@@ -206,8 +207,8 @@ public final class TableGroupStores {
     var results = new ResultCatalog(resultRepository);
     var decisions = new HBaseCommitDecisionRepository(records);
     var outcomes = new CommitOutcomeResolver(control, decisions);
-    var auxiliaryMaterialization =
-        new SystemRecordAuxiliaryMaterializationStore(records, LeaseStateMessages::decode);
+    var auxiliaryMaterialization = new SystemRecordAuxiliaryMaterializationStore(records,
+        LeaseStateMessages::decode, LeaseBindingMessages::decode);
     var finalizer = new CommitFinalizationService(control, outcomes, decisions, manifests,
         materialization, results, auxiliaryMaterialization);
     var views = new ReadViewService(control, manifests, pins, system.profileFingerprint());
