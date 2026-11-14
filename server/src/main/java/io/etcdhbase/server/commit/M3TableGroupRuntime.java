@@ -34,6 +34,7 @@ import io.etcdhbase.hbase.codec.LeaseStateMessages;
 import io.etcdhbase.hbase.codec.LeaseBindingMessages;
 import io.etcdhbase.hbase.connection.HBaseRequestContext;
 import io.etcdhbase.hbase.error.HBaseFailures;
+import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
 import io.etcdhbase.hbase.storage.HBaseSystemRecordStore;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration;
@@ -193,14 +194,23 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
     }
     CommitOwnerService.OwnerToken owner = recovered.owner().orElseThrow();
-    CommitState state = await(stores.control().read(startup), startup)
+    // Declare the additive table capability before the control-row format transition. The CAS
+    // adapter intentionally refuses to upgrade a table whose descriptor does not advertise the
+    // auxiliary records, so a failed startup can safely retry this idempotent descriptor change.
+    await(ensureAuxiliaryDescriptor(plan, connections, identity, startup), startup);
+    // Stores were opened before the descriptor mutation and retain the old capability snapshot.
+    HBaseCommitControlStore upgradedControl = await(
+        HBaseCommitControlStore.open(connections, identity, plan.system(), startup), startup);
+    if (!upgradedControl.supportsAuxiliary()) {
+      throw new IllegalStateException("M4 auxiliary descriptor capability is not available");
+    }
+    CommitState state = await(upgradedControl.read(startup), startup)
         .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized")).state();
     if (state.formatVersion() == CommitState.FORMAT_VERSION) {
-      await(new AuxiliaryFormatUpgrade(stores.control()).upgrade(owner, now, startup), startup);
+      await(new AuxiliaryFormatUpgrade(upgradedControl).upgrade(owner, now, startup), startup);
     } else if (state.formatVersion() != CommitState.AUXILIARY_FORMAT_VERSION) {
       throw new IllegalStateException("table-group control format cannot be activated for M4");
     }
-    await(ensureAuxiliaryDescriptor(plan, connections, identity, startup), startup);
   }
 
   private static CompletableFuture<Void> ensureAuxiliaryDescriptor(M3TableGroupPlan plan,
