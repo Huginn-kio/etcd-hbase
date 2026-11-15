@@ -4,7 +4,10 @@ import io.etcdhbase.core.lease.LeaseTimeObservation;
 import io.etcdhbase.core.lease.LeaseTimeSource;
 import java.time.Clock;
 import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.function.LongSupplier;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Applies an operator-supplied wall-clock uncertainty bound and fails closed after a detected
@@ -16,10 +19,12 @@ import java.util.function.LongSupplier;
  */
 final class BoundedSystemLeaseTimeSource implements LeaseTimeSource {
   private static final long NANOS_PER_MILLI = 1_000_000L;
+  private static final Logger LOGGER = LoggerFactory.getLogger(BoundedSystemLeaseTimeSource.class);
 
   private final Clock clock;
   private final LongSupplier monotonicNanos;
   private final long uncertaintyMillis;
+  private final Consumer<UnhealthyReason> unhealthyReporter;
   private final Sample baselineSample;
   private Sample lastSample;
   private boolean healthy = true;
@@ -29,8 +34,15 @@ final class BoundedSystemLeaseTimeSource implements LeaseTimeSource {
   }
 
   BoundedSystemLeaseTimeSource(Clock clock, long uncertaintyMillis, LongSupplier monotonicNanos) {
+    this(clock, uncertaintyMillis, monotonicNanos,
+        BoundedSystemLeaseTimeSource::logUnhealthyTransition);
+  }
+
+  BoundedSystemLeaseTimeSource(Clock clock, long uncertaintyMillis, LongSupplier monotonicNanos,
+      Consumer<UnhealthyReason> unhealthyReporter) {
     this.clock = Objects.requireNonNull(clock, "clock");
     this.monotonicNanos = Objects.requireNonNull(monotonicNanos, "monotonicNanos");
+    this.unhealthyReporter = Objects.requireNonNull(unhealthyReporter, "unhealthyReporter");
     if (uncertaintyMillis <= 0 || uncertaintyMillis > 60_000) {
       throw new IllegalArgumentException("lease clock uncertainty must be between 1 and 60000 ms");
     }
@@ -38,8 +50,12 @@ final class BoundedSystemLeaseTimeSource implements LeaseTimeSource {
     Sample initialSample = null;
     try {
       initialSample = sample();
-    } catch (RuntimeException unhealthyClock) {
-      this.healthy = false;
+    } catch (ClockSampleFailure failure) {
+      markUnhealthy(failure.reason());
+    } catch (ArithmeticException overflow) {
+      markUnhealthy(UnhealthyReason.TIME_ARITHMETIC_OVERFLOW);
+    } catch (RuntimeException unexpectedFailure) {
+      markUnhealthy(UnhealthyReason.INITIALIZATION_FAILED);
     }
     this.baselineSample = initialSample;
     this.lastSample = initialSample;
@@ -50,9 +66,11 @@ final class BoundedSystemLeaseTimeSource implements LeaseTimeSource {
     if (!healthy || lastSample == null) return unhealthy();
     try {
       Sample current = sample();
-      if (!monotonicProgressed(lastSample, current)
-          || !withinDriftBound(baselineSample, current)) {
-        return markUnhealthy();
+      if (!monotonicProgressed(lastSample, current)) {
+        return markUnhealthy(UnhealthyReason.MONOTONIC_CLOCK_REGRESSED);
+      }
+      if (!withinDriftBound(baselineSample, current)) {
+        return markUnhealthy(UnhealthyReason.WALL_MONOTONIC_DISCONTINUITY);
       }
 
       long lower = Math.max(0, Math.subtractExact(current.wallMillis(), uncertaintyMillis));
@@ -60,22 +78,42 @@ final class BoundedSystemLeaseTimeSource implements LeaseTimeSource {
           current.wallMillis(), Math.addExact(uncertaintyMillis, ceilMillis(current.readWindowNanos())));
       lastSample = current;
       return new LeaseTimeObservation(lower, upper, true);
-    } catch (RuntimeException unhealthyClock) {
-      return markUnhealthy();
+    } catch (ClockSampleFailure failure) {
+      return markUnhealthy(failure.reason());
+    } catch (ArithmeticException overflow) {
+      return markUnhealthy(UnhealthyReason.TIME_ARITHMETIC_OVERFLOW);
+    } catch (RuntimeException unexpectedFailure) {
+      return markUnhealthy(UnhealthyReason.SAMPLE_FAILED);
     }
   }
 
   private Sample sample() {
-    long startNanos = monotonicNanos.getAsLong();
-    long wallMillis = clock.millis();
-    long endNanos = monotonicNanos.getAsLong();
+    long startNanos = readMonotonicNanos();
+    long wallMillis = readWallClockMillis();
+    long endNanos = readMonotonicNanos();
     long readWindowNanos = endNanos - startNanos;
     if (wallMillis < 0 || readWindowNanos < 0
         || ceilMillis(readWindowNanos) > uncertaintyMillis) {
-      throw new IllegalStateException("lease clock sample is outside its configured bound");
+      throw new ClockSampleFailure(UnhealthyReason.SAMPLE_OUT_OF_BOUNDS);
     }
     long midpointNanos = startNanos + readWindowNanos / 2;
     return new Sample(wallMillis, midpointNanos, readWindowNanos);
+  }
+
+  private long readMonotonicNanos() {
+    try {
+      return monotonicNanos.getAsLong();
+    } catch (RuntimeException unavailable) {
+      throw new ClockSampleFailure(UnhealthyReason.MONOTONIC_CLOCK_READ_FAILED);
+    }
+  }
+
+  private long readWallClockMillis() {
+    try {
+      return clock.millis();
+    } catch (RuntimeException unavailable) {
+      throw new ClockSampleFailure(UnhealthyReason.WALL_CLOCK_READ_FAILED);
+    }
   }
 
   private boolean monotonicProgressed(Sample previous, Sample current) {
@@ -97,10 +135,52 @@ final class BoundedSystemLeaseTimeSource implements LeaseTimeSource {
     return Math.abs(differenceMillis) <= maximumDifference;
   }
 
-  private LeaseTimeObservation markUnhealthy() {
-    healthy = false;
-    lastSample = null;
+  private LeaseTimeObservation markUnhealthy(UnhealthyReason reason) {
+    if (healthy) {
+      healthy = false;
+      lastSample = null;
+      unhealthyReporter.accept(reason);
+    }
     return unhealthy();
+  }
+
+  private static void logUnhealthyTransition(UnhealthyReason reason) {
+    LOGGER.warn("Lease time source became unhealthy; reason={}", reason.code());
+  }
+
+  enum UnhealthyReason {
+    INITIALIZATION_FAILED("initialization_failed"),
+    WALL_CLOCK_READ_FAILED("wall_clock_read_failed"),
+    MONOTONIC_CLOCK_READ_FAILED("monotonic_clock_read_failed"),
+    SAMPLE_OUT_OF_BOUNDS("sample_out_of_bounds"),
+    MONOTONIC_CLOCK_REGRESSED("monotonic_clock_regressed"),
+    WALL_MONOTONIC_DISCONTINUITY("wall_monotonic_discontinuity"),
+    TIME_ARITHMETIC_OVERFLOW("time_arithmetic_overflow"),
+    SAMPLE_FAILED("sample_failed");
+
+    private final String code;
+
+    UnhealthyReason(String code) {
+      this.code = code;
+    }
+
+    String code() {
+      return code;
+    }
+  }
+
+  private static final class ClockSampleFailure extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+    private final UnhealthyReason reason;
+
+    private ClockSampleFailure(UnhealthyReason reason) {
+      super(reason.code());
+      this.reason = reason;
+    }
+
+    private UnhealthyReason reason() {
+      return reason;
+    }
   }
 
   private static long ceilMillis(long nanos) {

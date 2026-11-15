@@ -10,6 +10,8 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
@@ -97,6 +99,39 @@ class BoundedSystemLeaseTimeSourceTest {
     clocks.wall().setFailing(false);
     clocks.advance(5_000);
     assertFalse(source.observe().healthy());
+  }
+
+  @Test
+  void reportsInitializationClockFailureOnceWithAStableReason() {
+    var clocks = new MutableClocks(10_000);
+    clocks.wall().setFailing(true);
+    var reportedReasons = new ArrayList<BoundedSystemLeaseTimeSource.UnhealthyReason>();
+    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
+        clocks.monotonicNanos()::get, reportedReasons::add);
+
+    assertFalse(source.observe().healthy());
+    clocks.wall().setFailing(false);
+    clocks.advance(5_000);
+    assertFalse(source.observe().healthy());
+    assertEquals(List.of(BoundedSystemLeaseTimeSource.UnhealthyReason.WALL_CLOCK_READ_FAILED),
+        reportedReasons);
+  }
+
+  @Test
+  void reportsObservedClockDiscontinuityOnlyOnTheFirstUnhealthyTransition() {
+    var clocks = new MutableClocks(10_000);
+    var reportedReasons = new ArrayList<BoundedSystemLeaseTimeSource.UnhealthyReason>();
+    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
+        clocks.monotonicNanos()::get, reportedReasons::add);
+
+    assertTrue(source.observe().healthy());
+    clocks.jumpWallClock(60_000);
+
+    assertFalse(source.observe().healthy());
+    assertFalse(source.observe().healthy());
+    assertEquals(List.of(
+        BoundedSystemLeaseTimeSource.UnhealthyReason.WALL_MONOTONIC_DISCONTINUITY),
+        reportedReasons);
   }
 
   @Test

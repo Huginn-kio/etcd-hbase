@@ -18,7 +18,7 @@ public final class LeaseRecordIdentity {
         .putLong(leaseId ^ Long.MIN_VALUE).putLong(sequence).array());
   }
 
-  /** Stable enumeration row; the value is append-only and the identity is the wire ID. */
+  /** Stable enumeration row identified by wire ID; its value locates immutable state versions. */
   public static ByteKey enumeration(long leaseId) {
     return ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES)
         .putLong(leaseId ^ Long.MIN_VALUE).array());
