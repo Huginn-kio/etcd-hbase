@@ -125,6 +125,18 @@
           "sealsOriginalResultAndAllThreeStateRecordsAfterReadValidation",
           "failedReadProtectionDoesNotSealOrAdvanceInvocation"
         ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest", "tests": [
+          "returnsConservativeBoundsWhileWallAndMonotonicClocksAdvanceTogether",
+          "failsClosedAndStaysUnhealthyAfterForwardWallClockJump",
+          "failsClosedAfterBackwardWallClockJump",
+          "detectsCumulativeDriftAcrossManySmallWallClockChanges",
+          "failsClosedWhenClockReadThrowsAndDoesNotRecoverWithoutRevalidation",
+          "failsClosedWhenUpperBoundOverflows",
+          "includesClockReadWindowInUpperBoundAtConfiguredLimit",
+          "allowsOnlyDriftExplainedByMonotonicSamplingWindows",
+          "rejectsClockReadWindowBeyondConfiguredLimit",
+          "runtimeReadinessBecomesFalseAfterLeaseClockDiscontinuity"
+        ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.config.M3RuntimeConfigurationTest", "tests": [
           "m4ExampleUsesExplicitLeaseTimingInputs",
           "m4ActivationRequiresExplicitMinimumTtlAndClockBound"

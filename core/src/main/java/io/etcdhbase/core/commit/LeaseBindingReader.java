@@ -163,26 +163,35 @@ public final class LeaseBindingReader {
       } catch (BackendFailure | RuntimeException failure) {
         return CompletableFuture.failedFuture(failure);
       }
-      return manifests.forEachAuxiliary(root.orElseThrow(), scope, budget, record -> {
-        active();
-        overlayRecords = Math.addExact(overlayRecords, 1);
-        overlayBytes = Math.addExact(overlayBytes, record.encodedBytes());
-        if (overlayRecords > maximumOverlayRecords || overlayBytes > maximumOverlayBytes) {
-          return CompletableFuture.failedFuture(resourceLimit());
-        }
-        if (record.targetType() == SystemRecordType.LEASE_BINDING) {
-          LeaseBindingIdentity.Decoded identity = LeaseBindingIdentity.decode(record.targetIdentity());
-          if (identity.leaseId() == lease.identity().leaseId()
-              && identity.incarnation() == lease.identity().incarnation()) {
-            LeaseBindingVersion binding = validate(record.targetIdentity(), record.payload(),
-                pin.view().barrierSequence());
-            if (selected.putIfAbsent(binding.key(), binding) != null) {
-              throw new IllegalStateException("duplicate selected Lease binding for one key");
-            }
-          }
-        }
+      return manifests.forEachAuxiliary(
+          root.orElseThrow(), scope, budget, this::acceptOverlayRecord).thenApply(ignored -> null);
+    }
+
+    private CompletableFuture<Void> acceptOverlayRecord(PreparedAuxiliaryRecord record) {
+      active();
+      overlayRecords = Math.addExact(overlayRecords, 1);
+      overlayBytes = Math.addExact(overlayBytes, record.encodedBytes());
+      if (overlayRecords > maximumOverlayRecords || overlayBytes > maximumOverlayBytes) {
+        return CompletableFuture.failedFuture(resourceLimit());
+      }
+      if (record.targetType() != SystemRecordType.LEASE_BINDING) {
         return CompletableFuture.completedFuture(null);
-      }).thenApply(ignored -> null);
+      }
+      LeaseBindingIdentity.Decoded identity = LeaseBindingIdentity.decode(record.targetIdentity());
+      if (identity.leaseId() != lease.identity().leaseId()
+          || identity.incarnation() != lease.identity().incarnation()) {
+        return CompletableFuture.completedFuture(null);
+      }
+      return acceptSelectedBinding(record);
+    }
+
+    private CompletableFuture<Void> acceptSelectedBinding(PreparedAuxiliaryRecord record) {
+      LeaseBindingVersion binding = validate(record.targetIdentity(), record.payload(),
+          pin.view().barrierSequence());
+      if (selected.putIfAbsent(binding.key(), binding) != null) {
+        throw new IllegalStateException("duplicate selected Lease binding for one key");
+      }
+      return CompletableFuture.completedFuture(null);
     }
 
     private CompletableFuture<Void> scan(Optional<ByteKey> after) {

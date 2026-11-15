@@ -4,7 +4,17 @@ import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
 import java.time.Duration;
 
-/** Explicit activation settings; member identity and budgets are never invented at startup. */
+/**
+ * Explicit activation settings; member identity and budgets are never invented at startup.
+ *
+ * <p>When M4 Lease support is enabled, the configured clock uncertainty is an operator-provided
+ * absolute UTC error bound for the runtime lifetime. The runtime detects wall-clock discontinuity
+ * against its local monotonic clock, but deployment must establish the initial synchronization
+ * bound before startup and after restart.
+ *
+ * @param leaseClockUncertaintyMs absolute wall-clock uncertainty in milliseconds; zero disables
+ *     M4 Lease activation
+ */
 public record M3RuntimeConfiguration(
     String memberId,
     int ownerLeaseMs,

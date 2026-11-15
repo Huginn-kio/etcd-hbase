@@ -34,83 +34,143 @@ var m4LeaseCases = []struct {
 }
 
 func validateM4LeaseTrace(records []trace.Record) error {
-	if len(records) != len(m4LeaseCases) {
-		return fmt.Errorf("M4 trace has %d records, expected %d", len(records), len(m4LeaseCases))
+	decoded, err := decodeM4LeaseTrace(records)
+	if err != nil {
+		return err
 	}
-	requests := make([]map[string]any, len(records))
-	responses := make([]map[string]any, len(records))
+	validators := []func(m4LeaseTrace) error{
+		validateM4LeaseBaseline,
+		validateM4AutomaticLease,
+		validateM4ExplicitLease,
+		validateM4DuplicateAndMissingLease,
+		validateM4NegativeLeaseAndListing,
+		validateM4BoundaryLeaseCases,
+	}
+	for _, validate := range validators {
+		if err := validate(decoded); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type m4LeaseTrace struct {
+	requests  []map[string]any
+	responses []map[string]any
+	errors    []*trace.Error
+}
+
+func decodeM4LeaseTrace(records []trace.Record) (m4LeaseTrace, error) {
+	if len(records) != len(m4LeaseCases) {
+		return m4LeaseTrace{}, fmt.Errorf("M4 trace has %d records, expected %d", len(records), len(m4LeaseCases))
+	}
+	decoded := m4LeaseTrace{
+		requests:  make([]map[string]any, len(records)),
+		responses: make([]map[string]any, len(records)),
+		errors:    make([]*trace.Error, len(records)),
+	}
 	for index, expected := range m4LeaseCases {
 		record := records[index]
 		if record.CaseID != expected.id || record.Method != expected.method || record.Error != nil &&
 			record.Error.GRPCCode == "Unknown" {
-			return fmt.Errorf("M4 trace record %d is not the pinned %s step", index+1, expected.id)
+			return m4LeaseTrace{}, fmt.Errorf("M4 trace record %d is not the pinned %s step", index+1, expected.id)
 		}
 		request, err := m4SnapshotFields(record.Request)
 		if err != nil {
-			return fmt.Errorf("decode %s request: %w", expected.id, err)
+			return m4LeaseTrace{}, fmt.Errorf("decode %s request: %w", expected.id, err)
 		}
 		response, err := m4SnapshotFields(record.Response)
 		if err != nil && record.Error == nil {
-			return fmt.Errorf("decode %s response: %w", expected.id, err)
+			return m4LeaseTrace{}, fmt.Errorf("decode %s response: %w", expected.id, err)
 		}
-		requests[index] = request
-		responses[index] = response
+		decoded.requests[index] = request
+		decoded.responses[index] = response
+		decoded.errors[index] = record.Error
 	}
+	return decoded, nil
+}
 
-	if records[0].Error != nil || responseInt64(responses[0], "header.revision") < 1 ||
-		len(responseList(responses[0], "leases")) != 0 {
+func validateM4LeaseBaseline(trace m4LeaseTrace) error {
+	if trace.errors[0] != nil || responseInt64(trace.responses[0], "header.revision") < 1 ||
+		len(responseList(trace.responses[0], "leases")) != 0 {
 		return errors.New("native baseline is not a successful empty Lease listing")
 	}
-	autoID, autoTTL, err := grantObservation(requests[1], responses[1], records[1].Error, true)
+	return nil
+}
+
+func validateM4AutomaticLease(trace m4LeaseTrace) error {
+	autoID, autoTTL, err := grantObservation(
+		trace.requests[1], trace.responses[1], trace.errors[1], true)
 	if err != nil {
 		return fmt.Errorf("automatic Grant observation is invalid: %w", err)
 	}
 	if autoID <= 0 || autoTTL <= 0 {
 		return fmt.Errorf("automatic Grant returned ID=%d TTL=%d; both must be positive", autoID, autoTTL)
 	}
-	autoRequestID, err := requestInt64(requests[2], "id")
-	if err != nil || autoRequestID != autoID || records[2].Error != nil ||
-		responseInt64(responses[2], "id") != autoID || responseInt64(responses[2], "ttl") <= 0 ||
-		responseInt64(responses[2], "ttl") > responseInt64(responses[2], "grantedTTL") ||
-		responseInt64(responses[2], "grantedTTL") != autoTTL || len(responseList(responses[2], "keys")) != 0 {
+	autoRequestID, err := requestInt64(trace.requests[2], "id")
+	if err != nil || autoRequestID != autoID || trace.errors[2] != nil ||
+		responseInt64(trace.responses[2], "id") != autoID || responseInt64(trace.responses[2], "ttl") <= 0 ||
+		responseInt64(trace.responses[2], "ttl") > responseInt64(trace.responses[2], "grantedTTL") ||
+		responseInt64(trace.responses[2], "grantedTTL") != autoTTL || len(responseList(trace.responses[2], "keys")) != 0 {
 		return errors.New("automatic TTL response differs from its active empty Lease")
 	}
-	explicitID, explicitTTL, err := grantObservation(requests[3], responses[3], records[3].Error, false)
+	return nil
+}
+
+func validateM4ExplicitLease(trace m4LeaseTrace) error {
+	explicitID, explicitTTL, err := grantObservation(
+		trace.requests[3], trace.responses[3], trace.errors[3], false)
 	if err != nil || explicitID == 0 || explicitTTL != 30 {
 		return errors.New("explicit Grant changed its signed Lease ID or requested TTL")
 	}
-	if requestInt64Unchecked(requests[4], "id") != explicitID || records[4].Error != nil ||
-		responseInt64(responses[4], "id") != explicitID || responseInt64(responses[4], "ttl") <= 0 ||
-		responseInt64(responses[4], "ttl") > explicitTTL || responseInt64(responses[4], "grantedTTL") != explicitTTL ||
-		len(responseList(responses[4], "keys")) != 0 {
+	if requestInt64Unchecked(trace.requests[4], "id") != explicitID || trace.errors[4] != nil ||
+		responseInt64(trace.responses[4], "id") != explicitID || responseInt64(trace.responses[4], "ttl") <= 0 ||
+		responseInt64(trace.responses[4], "ttl") > explicitTTL || responseInt64(trace.responses[4], "grantedTTL") != explicitTTL ||
+		len(responseList(trace.responses[4], "keys")) != 0 {
 		return errors.New("explicit TTL response differs from its active empty Lease")
 	}
-	if requestInt64Unchecked(requests[5], "id") != explicitID || records[5].Error == nil ||
-		records[5].Error.GRPCCode != codes.FailedPrecondition.String() || responses[5] != nil {
+	return nil
+}
+
+func validateM4DuplicateAndMissingLease(trace m4LeaseTrace) error {
+	explicitID := responseInt64(trace.responses[3], "id")
+	if requestInt64Unchecked(trace.requests[5], "id") != explicitID || trace.errors[5] == nil ||
+		trace.errors[5].GRPCCode != codes.FailedPrecondition.String() || trace.responses[5] != nil {
 		return errors.New("duplicate ID did not retain the native FailedPrecondition result")
 	}
-	missingID, err := requestInt64(requests[6], "id")
-	if err != nil || missingID == 0 || missingID == explicitID || missingID == autoID || records[6].Error != nil ||
-		responseInt64(responses[6], "id") != missingID || responseInt64(responses[6], "ttl") != -1 ||
-		responseInt64(responses[6], "grantedTTL") != 0 || len(responseList(responses[6], "keys")) != 0 {
+	missingID, err := requestInt64(trace.requests[6], "id")
+	autoID := responseInt64(trace.responses[1], "id")
+	if err != nil || missingID == 0 || missingID == explicitID || missingID == autoID || trace.errors[6] != nil ||
+		responseInt64(trace.responses[6], "id") != missingID || responseInt64(trace.responses[6], "ttl") != -1 ||
+		responseInt64(trace.responses[6], "grantedTTL") != 0 || len(responseList(trace.responses[6], "keys")) != 0 {
 		return errors.New("missing ID did not return TTL=-1 without a partial key list")
 	}
-	negativeID, negativeTTL, err := grantObservation(requests[7], responses[7], records[7].Error, false)
+	return nil
+}
+
+func validateM4NegativeLeaseAndListing(trace m4LeaseTrace) error {
+	negativeID, negativeTTL, err := grantObservation(
+		trace.requests[7], trace.responses[7], trace.errors[7], false)
 	if err != nil || negativeID >= 0 || negativeTTL != 30 {
 		return errors.New("negative explicit Lease ID was not preserved as signed int64")
 	}
-	if records[8].Error != nil || len(responseList(responses[8], "leases")) != 3 ||
-		!containsResponseID(responses[8], autoID) || !containsResponseID(responses[8], explicitID) ||
-		!containsResponseID(responses[8], negativeID) {
+	if trace.errors[8] != nil || len(responseList(trace.responses[8], "leases")) != 3 ||
+		!containsResponseID(trace.responses[8], responseInt64(trace.responses[1], "id")) ||
+		!containsResponseID(trace.responses[8], responseInt64(trace.responses[3], "id")) ||
+		!containsResponseID(trace.responses[8], negativeID) {
 		return errors.New("LeaseLeases omitted an active Lease")
 	}
-	if requestInt64Unchecked(requests[9], "ttl") != m4MaximumLeaseTTL+1 || records[9].Error == nil ||
-		records[9].Error.GRPCCode != codes.OutOfRange.String() || responses[9] != nil {
+	return nil
+}
+
+func validateM4BoundaryLeaseCases(trace m4LeaseTrace) error {
+	if requestInt64Unchecked(trace.requests[9], "ttl") != m4MaximumLeaseTTL+1 || trace.errors[9] == nil ||
+		trace.errors[9].GRPCCode != codes.OutOfRange.String() || trace.responses[9] != nil {
 		return errors.New("oversized TTL did not preserve the native OutOfRange result")
 	}
-	if requestInt64Unchecked(requests[10], "id") != 0 || records[10].Error != nil ||
-		responseInt64(responses[10], "id") != 0 || responseInt64(responses[10], "ttl") != -1 ||
-		responseInt64(responses[10], "grantedTTL") != 0 || len(responseList(responses[10], "keys")) != 0 {
+	if requestInt64Unchecked(trace.requests[10], "id") != 0 || trace.errors[10] != nil ||
+		responseInt64(trace.responses[10], "id") != 0 || responseInt64(trace.responses[10], "ttl") != -1 ||
+		responseInt64(trace.responses[10], "grantedTTL") != 0 || len(responseList(trace.responses[10], "keys")) != 0 {
 		return errors.New("zero-ID TTL did not preserve the native missing-lease projection")
 	}
 	return nil

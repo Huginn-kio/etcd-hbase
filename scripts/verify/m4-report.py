@@ -76,6 +76,7 @@ J40_JAVA_CLASSES = {
     "io.etcdhbase.grpc.protocol.LeaseTimeToLiveResponseMapperTest",
     "io.etcdhbase.grpc.RequestLifecycleOutcomeTest",
     "io.etcdhbase.server.commit.LeaseGrantPreparationTest",
+    "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest",
     "io.etcdhbase.server.config.M3RuntimeConfigurationTest",
     "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT",
     "io.etcdhbase.server.M4LeaseRpcIT",
@@ -93,6 +94,18 @@ J40_CRITICAL_JAVA_TESTS = {
     },
     "io.etcdhbase.server.M4LeaseRpcIT": {
         "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts"
+    },
+    "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest": {
+        "returnsConservativeBoundsWhileWallAndMonotonicClocksAdvanceTogether",
+        "failsClosedAndStaysUnhealthyAfterForwardWallClockJump",
+        "failsClosedAfterBackwardWallClockJump",
+        "detectsCumulativeDriftAcrossManySmallWallClockChanges",
+        "failsClosedWhenClockReadThrowsAndDoesNotRecoverWithoutRevalidation",
+        "failsClosedWhenUpperBoundOverflows",
+        "includesClockReadWindowInUpperBoundAtConfiguredLimit",
+        "allowsOnlyDriftExplainedByMonotonicSamplingWindows",
+        "rejectsClockReadWindowBeyondConfiguredLimit",
+        "runtimeReadinessBecomesFalseAfterLeaseClockDiscontinuity",
     },
 }
 
@@ -346,51 +359,81 @@ def _validate_go_tests(artifact: Path, task: dict[str, object]) -> int:
     passed: dict[str, set[str]] = {}
     event_count = 0
     for line_number, line in enumerate(lines, start=1):
-        if not line or len(line.encode("utf-8")) > 2 << 20:
-            raise ReportError(f"M4 Go test JSONL line {line_number} is empty or oversized")
-        try:
-            event = json.loads(line, object_pairs_hook=_unique_object)
-        except (json.JSONDecodeError, ReportError) as error:
-            raise ReportError(f"M4 Go test JSONL line {line_number} is invalid") from error
-        if not isinstance(event, dict):
-            raise ReportError("M4 Go test JSONL contains a non-object event")
-        action = event.get("Action")
-        package = event.get("Package")
-        test_name = event.get("Test")
-        if action in {"fail", "skip"}:
-            raise ReportError("M4 Go tests contain a failure or skip")
-        if action not in {"start", "run", "output", "pass"}:
-            raise ReportError("M4 Go test JSONL contains an unknown action")
-        if not isinstance(package, str) or not package.startswith(GO_MODULE):
-            raise ReportError("M4 Go test JSONL package is outside the pinned module")
-        package = package.removeprefix(GO_MODULE)
-        if package not in required:
-            raise ReportError("M4 Go test JSONL contains an unregistered package")
+        event = _parse_go_test_event(line, line_number)
+        action, package, test_name = _validate_go_test_event(event, required)
         event_count += 1
-        if action == "start":
-            if test_name is not None or package in started_packages:
-                raise ReportError("M4 Go package start event is malformed or duplicated")
-            started_packages.add(package)
-        elif action == "run" and not isinstance(test_name, str):
-            raise ReportError("M4 Go test run event has no test name")
-        elif action == "output" and test_name is not None and not isinstance(test_name, str):
-            raise ReportError("M4 Go test output event has a malformed test name")
-        elif action == "pass":
-            if test_name is None:
-                if package in observed_packages:
-                    raise ReportError("M4 Go package pass appears more than once")
-                observed_packages.add(package)
-            elif isinstance(test_name, str):
-                passed.setdefault(package, set()).add(test_name)
-            else:
-                raise ReportError("M4 Go test event has a malformed test name")
+        _record_go_test_event(action, package, test_name, started_packages, observed_packages, passed)
+    _validate_go_test_completion(required, started_packages, observed_packages, passed, event_count)
+    return sum(len(tests) for tests in passed.values())
+
+
+def _parse_go_test_event(line: str, line_number: int) -> dict[str, object]:
+    if not line or len(line.encode("utf-8")) > 2 << 20:
+        raise ReportError(f"M4 Go test JSONL line {line_number} is empty or oversized")
+    try:
+        event = json.loads(line, object_pairs_hook=_unique_object)
+    except (json.JSONDecodeError, ReportError) as error:
+        raise ReportError(f"M4 Go test JSONL line {line_number} is invalid") from error
+    if not isinstance(event, dict):
+        raise ReportError("M4 Go test JSONL contains a non-object event")
+    return event
+
+
+def _validate_go_test_event(
+    event: dict[str, object], required: dict[str, set[str]],
+) -> tuple[str, str, object]:
+    action = event.get("Action")
+    package = event.get("Package")
+    test_name = event.get("Test")
+    if not isinstance(action, str):
+        raise ReportError("M4 Go test JSONL contains an unknown action")
+    if action in {"fail", "skip"}:
+        raise ReportError("M4 Go tests contain a failure or skip")
+    if action not in {"start", "run", "output", "pass"}:
+        raise ReportError("M4 Go test JSONL contains an unknown action")
+    if not isinstance(package, str) or not package.startswith(GO_MODULE):
+        raise ReportError("M4 Go test JSONL package is outside the pinned module")
+    package = package.removeprefix(GO_MODULE)
+    if package not in required:
+        raise ReportError("M4 Go test JSONL contains an unregistered package")
+    if action == "run" and not isinstance(test_name, str):
+        raise ReportError("M4 Go test run event has no test name")
+    if action == "output" and test_name is not None and not isinstance(test_name, str):
+        raise ReportError("M4 Go test output event has a malformed test name")
+    return action, package, test_name
+
+
+def _record_go_test_event(
+    action: str, package: str, test_name: object, started_packages: set[str],
+    observed_packages: set[str], passed: dict[str, set[str]],
+) -> None:
+    if action == "start":
+        if test_name is not None or package in started_packages:
+            raise ReportError("M4 Go package start event is malformed or duplicated")
+        started_packages.add(package)
+        return
+    if action != "pass":
+        return
+    if test_name is None:
+        if package in observed_packages:
+            raise ReportError("M4 Go package pass appears more than once")
+        observed_packages.add(package)
+        return
+    if not isinstance(test_name, str):
+        raise ReportError("M4 Go test event has a malformed test name")
+    passed.setdefault(package, set()).add(test_name)
+
+
+def _validate_go_test_completion(
+    required: dict[str, set[str]], started_packages: set[str],
+    observed_packages: set[str], passed: dict[str, set[str]], event_count: int,
+) -> None:
     if (event_count == 0 or started_packages != set(required)
             or observed_packages != set(required)):
         raise ReportError("M4 Go package completion evidence is missing")
     for package, tests in required.items():
         if not tests.issubset(passed.get(package, set())):
             raise ReportError(f"M4 required Go tests did not pass in {package}")
-    return sum(len(tests) for tests in passed.values())
 
 
 def _testsuite_elements(path: Path) -> list[ET.Element]:
@@ -448,7 +491,9 @@ def _validate_java_tests(artifact: Path, task: dict[str, object]) -> int:
     return sum(len(item[2]) for item in suites.values())
 
 
-def _read_trace(path: Path, expected_cases: list[dict[str, object]], scope: str) -> bytes:
+def _read_trace(
+    path: Path, expected_cases: list[dict[str, object]], scope: str,
+) -> tuple[bytes, list[dict[str, object]]]:
     try:
         raw = path.read_bytes()
     except OSError as error:
@@ -459,6 +504,7 @@ def _read_trace(path: Path, expected_cases: list[dict[str, object]], scope: str)
     if len(lines) != len(expected_cases):
         raise ReportError(f"M4 trace {path.name} does not contain every registered case")
     expected_ordinals: dict[str, int] = {}
+    records: list[dict[str, object]] = []
     for line_number, (line, expected) in enumerate(zip(lines, expected_cases), start=1):
         try:
             record = json.loads(line, object_pairs_hook=_unique_object)
@@ -487,7 +533,201 @@ def _read_trace(path: Path, expected_cases: list[dict[str, object]], scope: str)
             raise ReportError("M4 successful Lease case has no response or has an error")
         if record["stream_terminal"] is not None:
             raise ReportError("J40 unary Lease trace unexpectedly has a stream terminal")
-    return raw
+        records.append(record)
+    if [(item.get("id"), item.get("method")) for item in expected_cases] == list(J40_TRACE_CASES):
+        _validate_j40_lease_trace(records)
+    return raw, records
+
+
+def _snapshot_fields(snapshot: object, label: str) -> dict[str, object]:
+    if not isinstance(snapshot, dict) or set(snapshot) != {"fields", "oneofs"}:
+        raise ReportError(f"J40 {label} snapshot is incomplete")
+    fields = snapshot.get("fields")
+    oneofs = snapshot.get("oneofs")
+    if not isinstance(fields, dict) or not isinstance(oneofs, dict):
+        raise ReportError(f"J40 {label} snapshot is malformed")
+    return fields
+
+
+def _trace_int64(value: object, label: str) -> int:
+    if not isinstance(value, str) or not re.fullmatch(r"(?:0|-?[1-9][0-9]*)", value):
+        raise ReportError(f"J40 {label} is missing or is not a canonical int64")
+    parsed = int(value)
+    if parsed < -(1 << 63) or parsed > (1 << 63) - 1:
+        raise ReportError(f"J40 {label} is outside the int64 range")
+    return parsed
+
+
+def _successful_lease_response(
+    record: dict[str, object], label: str,
+) -> dict[str, object]:
+    if record.get("error") is not None or not isinstance(record.get("response"), dict):
+        raise ReportError(f"J40 {label} did not return a successful response")
+    response_fields = _snapshot_fields(record["response"], f"{label} response")
+    if _lease_response_revision(response_fields, label) < 1:
+        raise ReportError(f"J40 {label} has no valid response revision")
+    return response_fields
+
+
+def _lease_response_revision(response_fields: dict[str, object], label: str) -> int:
+    header_fields = _snapshot_fields(response_fields.get("header"), f"{label} header")
+    return _trace_int64(header_fields.get("revision"), f"{label} header revision")
+
+
+def _validate_grant_trace(
+    record: dict[str, object], label: str, *, automatic: bool,
+) -> tuple[int, int]:
+    request_fields = _snapshot_fields(record.get("request"), f"{label} request")
+    response_fields = _successful_lease_response(record, label)
+    requested_id = _trace_int64(request_fields.get("ID"), f"{label} request ID")
+    requested_ttl = _trace_int64(request_fields.get("TTL"), f"{label} request TTL")
+    response_id = _trace_int64(response_fields.get("ID"), f"{label} response ID")
+    granted_ttl = _trace_int64(response_fields.get("TTL"), f"{label} response TTL")
+    if response_fields.get("error") != "" or granted_ttl <= 0 or response_id == 0:
+        raise ReportError(f"J40 {label} has an invalid granted ID or TTL")
+    if automatic:
+        if requested_id != 0 or requested_ttl != 0 or response_id < 1:
+            raise ReportError("J40 automatic Grant request or response is invalid")
+    elif requested_id == 0 or response_id != requested_id or granted_ttl != requested_ttl:
+        raise ReportError(f"J40 {label} changed its explicit ID or TTL")
+    return response_id, granted_ttl
+
+
+def _validate_ttl_trace(
+    record: dict[str, object], label: str, expected_id: int, granted_ttl: int,
+) -> None:
+    request_fields = _snapshot_fields(record.get("request"), f"{label} request")
+    response_fields = _successful_lease_response(record, label)
+    request_id = _trace_int64(request_fields.get("ID"), f"{label} request ID")
+    response_id = _trace_int64(response_fields.get("ID"), f"{label} response ID")
+    ttl = _trace_int64(response_fields.get("TTL"), f"{label} response TTL")
+    actual_granted_ttl = _trace_int64(
+        response_fields.get("grantedTTL"), f"{label} granted TTL"
+    )
+    keys = response_fields.get("keys")
+    if (request_id != expected_id or request_fields.get("keys") is not True
+            or response_id != expected_id or not 0 < ttl <= granted_ttl
+            or actual_granted_ttl != granted_ttl or keys != []):
+        raise ReportError(f"J40 {label} does not match the active empty Lease")
+
+
+def _validate_missing_ttl_trace(
+    record: dict[str, object], label: str, expected_id: int,
+) -> None:
+    request_fields = _snapshot_fields(record.get("request"), f"{label} request")
+    response_fields = _successful_lease_response(record, label)
+    if (_trace_int64(request_fields.get("ID"), f"{label} request ID") != expected_id
+            or request_fields.get("keys") is not True
+            or _trace_int64(response_fields.get("ID"), f"{label} response ID") != expected_id
+            or _trace_int64(response_fields.get("TTL"), f"{label} response TTL") != -1
+            or _trace_int64(response_fields.get("grantedTTL"), f"{label} granted TTL") != 0
+            or response_fields.get("keys") != []):
+        raise ReportError(f"J40 {label} does not preserve the missing-Lease response")
+
+
+def _validate_lease_listing_trace(
+    record: dict[str, object], label: str, expected_ids: set[int],
+) -> None:
+    response_fields = _successful_lease_response(record, label)
+    leases = response_fields.get("leases")
+    if not isinstance(leases, list):
+        raise ReportError(f"J40 {label} has no Lease list")
+    observed_ids = {
+        _trace_int64(_snapshot_fields(item, f"{label} Lease").get("ID"), f"{label} Lease ID")
+        for item in leases
+    }
+    if observed_ids != expected_ids or len(leases) != len(expected_ids):
+        raise ReportError(f"J40 {label} is incomplete or contains duplicate Leases")
+
+
+def _require_lease_error(
+    record: dict[str, object], label: str, expected_code: str,
+) -> dict[str, object]:
+    error = record.get("error")
+    if (not isinstance(error, dict) or error.get("grpc_code") != expected_code
+            or record.get("response") is not None):
+        raise ReportError(f"J40 {label} did not preserve {expected_code}")
+    return error
+
+
+def _validate_j40_successful_leases(cases: dict[str, dict[str, object]]) -> set[int]:
+    baseline = _successful_lease_response(cases["native-baseline"], "native baseline")
+    if baseline.get("leases") != []:
+        raise ReportError("J40 native baseline is not an empty Lease list")
+
+    automatic_id, automatic_ttl = _validate_grant_trace(
+        cases["auto-grant"], "automatic Grant", automatic=True
+    )
+    _validate_ttl_trace(cases["auto-ttl"], "automatic TTL", automatic_id, automatic_ttl)
+    explicit_id, explicit_ttl = _validate_grant_trace(
+        cases["explicit-grant"], "explicit Grant", automatic=False
+    )
+    if explicit_id <= 0 or explicit_id == automatic_id or explicit_ttl != 30:
+        raise ReportError("J40 explicit Grant does not identify its distinct 30-second Lease")
+    _validate_ttl_trace(cases["explicit-ttl"], "explicit TTL", explicit_id, explicit_ttl)
+
+    negative_id, negative_ttl = _validate_grant_trace(
+        cases["negative-id"], "negative-ID Grant", automatic=False
+    )
+    negative_request = _snapshot_fields(cases["negative-id"].get("request"), "negative-ID request")
+    if (negative_id >= 0 or negative_ttl != 30
+            or _trace_int64(negative_request.get("TTL"), "negative-ID request TTL") != 30):
+        raise ReportError("J40 negative-ID Grant did not preserve the signed ID and TTL")
+    _validate_lease_listing_trace(
+        cases["leases-list"], "Lease listing", {automatic_id, explicit_id, negative_id}
+    )
+    _validate_j40_revision_stability(cases)
+    return {automatic_id, explicit_id, negative_id}
+
+
+def _validate_j40_failed_and_missing_leases(
+    cases: dict[str, dict[str, object]], allocated_ids: set[int],
+) -> None:
+    duplicate_request = _snapshot_fields(cases["duplicate-id"].get("request"), "duplicate ID request")
+    duplicate_id = _trace_int64(duplicate_request.get("ID"), "duplicate ID request ID")
+    explicit_response = _successful_lease_response(cases["explicit-grant"], "explicit Grant")
+    explicit_id = _trace_int64(explicit_response.get("ID"), "explicit Grant response ID")
+    if duplicate_id != explicit_id or duplicate_id not in allocated_ids:
+        raise ReportError("J40 duplicate Grant did not reuse the explicit ID")
+    _require_lease_error(cases["duplicate-id"], "duplicate Grant", "FailedPrecondition")
+
+    missing_request = _snapshot_fields(cases["missing-ttl"].get("request"), "missing TTL request")
+    missing_id = _trace_int64(missing_request.get("ID"), "missing TTL request ID")
+    if missing_id <= 0 or missing_id in allocated_ids:
+        raise ReportError("J40 missing TTL case does not use an unallocated ID")
+    _validate_missing_ttl_trace(cases["missing-ttl"], "missing TTL", missing_id)
+
+    oversized_request = _snapshot_fields(cases["oversized-ttl"].get("request"), "oversized TTL request")
+    if (_trace_int64(oversized_request.get("ID"), "oversized TTL request ID") != 0
+            or _trace_int64(oversized_request.get("TTL"), "oversized TTL request TTL") != 9_000_000_001):
+        raise ReportError("J40 oversized TTL case did not use the registered boundary")
+    _require_lease_error(cases["oversized-ttl"], "oversized TTL Grant", "OutOfRange")
+
+    zero_request = _snapshot_fields(cases["zero-id-ttl"].get("request"), "zero-ID TTL request")
+    if _trace_int64(zero_request.get("ID"), "zero-ID TTL request ID") != 0:
+        raise ReportError("J40 zero-ID TTL case changed its request")
+    _validate_missing_ttl_trace(cases["zero-id-ttl"], "zero-ID TTL", 0)
+
+
+def _validate_j40_revision_stability(cases: dict[str, dict[str, object]]) -> None:
+    baseline = _successful_lease_response(cases["native-baseline"], "native baseline")
+    baseline_revision = _lease_response_revision(baseline, "native baseline")
+    successful_cases = (
+        "auto-grant", "auto-ttl", "explicit-grant", "explicit-ttl", "missing-ttl",
+        "negative-id", "leases-list", "zero-id-ttl",
+    )
+    for case_id in successful_cases:
+        response = _successful_lease_response(cases[case_id], case_id)
+        if _lease_response_revision(response, case_id) != baseline_revision:
+            raise ReportError("J40 Lease management RPC changed the KV revision")
+
+
+def _validate_j40_lease_trace(records: list[dict[str, object]]) -> None:
+    if len(records) != len(J40_TRACE_CASES):
+        raise ReportError("J40 trace does not contain the complete Lease scenario")
+    cases = {record["case_id"]: record for record in records}
+    allocated_ids = _validate_j40_successful_leases(cases)
+    _validate_j40_failed_and_missing_leases(cases, allocated_ids)
 
 
 def _validate_run_metadata(
@@ -562,7 +802,9 @@ def _validate_native_evidence(
 ) -> None:
     expected_cases = task["trace_cases"]
     descriptor = task["evidence"]["native"]
-    trace_bytes = _read_trace(artifact / "native-trace.jsonl", expected_cases, descriptor["scope"])
+    trace_bytes, _ = _read_trace(
+        artifact / "native-trace.jsonl", expected_cases, descriptor["scope"]
+    )
     _validate_run_metadata(
         artifact / "native-metadata.json", run=run, descriptor=descriptor, trace_bytes=trace_bytes,
         suite_hash=suite_hash, prefix_hash=prefix_hash, layout="",
@@ -581,7 +823,7 @@ def _validate_target_evidence(
     for descriptor in task["evidence"]["targets"]:
         layout = descriptor["layout"]
         suffix = layout.lower()
-        trace_bytes = _read_trace(
+        trace_bytes, _ = _read_trace(
             artifact / f"target-{suffix}-trace.jsonl", expected_cases, descriptor["scope"]
         )
         _validate_run_metadata(

@@ -58,6 +58,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongFunction;
 
 /** Owns the local KV runtime for one validated table group; the caller owns its HBase factory. */
 public final class M3TableGroupRuntime implements AutoCloseable {
@@ -72,19 +73,23 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static final BudgetManager.Reservation RECOVERY_MEMORY =
       new BudgetManager.Reservation(64L << 10, 64L << 10, 2L << 20, 8L << 20, 48L << 20);
   private static final Executor CLEANUP = task -> Thread.ofVirtual().name("m3-runtime-cleanup").start(task);
+  private static final LongFunction<LeaseTimeSource> SYSTEM_LEASE_TIME_SOURCE =
+      uncertaintyMillis -> new BoundedSystemLeaseTimeSource(Clock.systemUTC(), uncertaintyMillis);
 
   private final Pending resources;
   private final KvService kvService;
   private final LeaseService leaseService;
+  private final Optional<LeaseTimeSource> leaseTime;
   private final long clusterId;
   private final long memberId;
   private final RequestMetrics metrics;
 
   private M3TableGroupRuntime(Pending resources, KvService kvService, LeaseService leaseService,
-      long clusterId, long memberId, RequestMetrics metrics) {
+      Optional<LeaseTimeSource> leaseTime, long clusterId, long memberId, RequestMetrics metrics) {
     this.resources = resources;
     this.kvService = kvService;
     this.leaseService = leaseService;
+    this.leaseTime = Objects.requireNonNull(leaseTime, "leaseTime");
     this.clusterId = clusterId;
     this.memberId = memberId;
     this.metrics = metrics;
@@ -99,7 +104,23 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       RuntimeConfiguration.ResourceBudgets limits, HBaseConnectionFactory connections,
       AuthorizedBackendIdentity identity, BudgetManager budgets, ScanScheduler scans,
       RequestScope startup) throws Exception {
-    return open(plan, activation, limits, connections, identity, budgets, scans, startup, Optional.empty());
+    return openInternal(plan, activation, limits, connections, identity, budgets, scans, startup,
+        Optional.empty(), SYSTEM_LEASE_TIME_SOURCE);
+  }
+
+  /**
+   * Opens the runtime with an explicitly supplied Lease time source factory.
+   *
+   * <p>The runtime facade uses this assembly seam to exercise readiness changes against the real
+   * HBase-backed runtime. Public configuration continues to use the system clock by default.
+   */
+  public static M3TableGroupRuntime openWithLeaseTimeSource(M3TableGroupPlan plan,
+      M3RuntimeConfiguration activation, RuntimeConfiguration.ResourceBudgets limits,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity, BudgetManager budgets,
+      ScanScheduler scans, RequestScope startup,
+      LongFunction<LeaseTimeSource> leaseTimeSourceFactory) throws Exception {
+    return openInternal(plan, activation, limits, connections, identity, budgets, scans, startup,
+        Optional.empty(), leaseTimeSourceFactory);
   }
 
   /** Internal assembly path; public configuration still rejects cache activation. */
@@ -107,6 +128,15 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       RuntimeConfiguration.ResourceBudgets limits, HBaseConnectionFactory connections,
       AuthorizedBackendIdentity identity, BudgetManager budgets, ScanScheduler scans,
       RequestScope startup, Optional<CacheLimits> cacheLimits) throws Exception {
+    return openInternal(plan, activation, limits, connections, identity, budgets, scans, startup,
+        cacheLimits, SYSTEM_LEASE_TIME_SOURCE);
+  }
+
+  private static M3TableGroupRuntime openInternal(M3TableGroupPlan plan,
+      M3RuntimeConfiguration activation, RuntimeConfiguration.ResourceBudgets limits,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity, BudgetManager budgets,
+      ScanScheduler scans, RequestScope startup, Optional<CacheLimits> cacheLimits,
+      LongFunction<LeaseTimeSource> leaseTimeSourceFactory) throws Exception {
     Objects.requireNonNull(plan, "plan");
     Objects.requireNonNull(activation, "activation");
     Objects.requireNonNull(limits, "limits");
@@ -116,6 +146,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     Objects.requireNonNull(scans, "scans");
     Objects.requireNonNull(startup, "startup");
     Objects.requireNonNull(cacheLimits, "cacheLimits");
+    Objects.requireNonNull(leaseTimeSourceFactory, "leaseTimeSourceFactory");
     if (limits.maxConcurrentRequests() < 1 || limits.maxConcurrentRequests() > 100_000
         || limits.requestDeadlineMs() < 1 || limits.requestDeadlineMs() > 600_000
         || limits.maxScannersPerTable() < 1 || limits.maxScannersPerTable() > 1024
@@ -154,15 +185,18 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       var owner = await(ownerFuture, startup);
       ByteKey authorization = authorizationDigest(identity);
       var business = assembleBusiness(plan, activation, connections, budgets, scans, pending, stores,
-          invocations, owner, cacheLimits);
+          invocations, owner, cacheLimits, leaseTimeSourceFactory);
+      Optional<LeaseTimeSource> leaseTime = business.lease().map(LeaseComponents::time);
       ServiceComponents services = assembleService(plan, activation, identity, authorization, budgets,
           pending, stores, invocations, owner, business);
       startup.closeAsync(CLEANUP);
       await(CompletableFuture.allOf(startup.cleanupCompletion().toCompletableFuture(),
           startup.physicalProducersCompletion().toCompletableFuture()), startup);
-      if (!owner.isReady()) throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+      if (!runtimeReady(owner.isReady(), leaseTime)) {
+        throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+      }
       return new M3TableGroupRuntime(pending, services.kvService(), services.leaseService(),
-          stores.clusterId(), activation.memberIdBits(), business.metrics());
+          leaseTime, stores.clusterId(), activation.memberIdBits(), business.metrics());
     } catch (Exception failure) {
       throw new StartupException(failure, abort(startup, pending, failure));
     } catch (Error fatal) {
@@ -241,8 +275,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   }
 
   private record BusinessComponents(PutOwnerProcessor putProcessor, TxnOwnerProcessor txnProcessor,
-      TxnReadExecutor txnReads, RequestMetrics metrics, CommitPublisher publisher,
-      Optional<LeaseComponents> lease) {}
+      TxnReadExecutor txnReads, RequestMetrics metrics, Optional<LeaseComponents> lease) {}
 
   private record LeaseComponents(LeaseGrantOwnerProcessor grantProcessor,
       LeaseEmptyExpiryOwnerProcessor expiryProcessor,
@@ -259,7 +292,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static BusinessComponents assembleBusiness(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
       HBaseConnectionFactory connections, BudgetManager budgets, ScanScheduler scans, Pending pending,
       TableGroupStores stores, InvocationService invocations, M3OwnerLease owner,
-      Optional<CacheLimits> cacheLimits) throws BackendFailure {
+      Optional<CacheLimits> cacheLimits, LongFunction<LeaseTimeSource> leaseTimeSourceFactory)
+      throws BackendFailure {
     var preparation = new PutCommitPreparation(new ResultPreparation(stores.resultRepository()),
         stores.results(), new ManifestPreparation(stores.manifestRepository(),
             new ManifestPreparation.Limits(1, 4L << 20, 1, 8L << 20)), invocations);
@@ -287,14 +321,16 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),
         connections, plan.primary(), pending.worker, scans, txnLimits, metrics, Optional.ofNullable(pending.cache));
     Optional<LeaseComponents> lease = activation.m4LeaseApiEnabled()
-        ? Optional.of(assembleLease(plan, activation, budgets, stores, invocations, owner, publisher))
+        ? Optional.of(assembleLease(plan, activation, budgets, stores, invocations, owner, publisher,
+            leaseTimeSourceFactory))
         : Optional.empty();
-    return new BusinessComponents(putProcessor, txnProcessor, txnReads, metrics, publisher, lease);
+    return new BusinessComponents(putProcessor, txnProcessor, txnReads, metrics, lease);
   }
 
   private static LeaseComponents assembleLease(M3TableGroupPlan plan,
       M3RuntimeConfiguration activation, BudgetManager budgets, TableGroupStores stores,
-      InvocationService invocations, M3OwnerLease owner, CommitPublisher publisher) {
+      InvocationService invocations, M3OwnerLease owner, CommitPublisher publisher,
+      LongFunction<LeaseTimeSource> leaseTimeSourceFactory) {
     var leaseReads = new LeaseReadView(stores.records(), stores.manifests(), LeaseStateMessages::decode,
         1_024, 64L << 20);
     var enumeration = new LeaseEnumerationReader(stores.records(), stores.manifests(),
@@ -304,8 +340,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         LeaseBindingMessages::decode, LeaseGateway.BINDING_PAGE_ENTRIES,
         LeaseGateway.bindingPageBytes(activation.maxEtcdRequestBytes()), 100_000, 64L << 20,
         100_000, activation.maxEtcdRequestBytes(), 1_024, 64L << 20);
-    LeaseTimeSource time = new BoundedSystemLeaseTimeSource(
-        Clock.systemUTC(), activation.leaseClockUncertaintyMs());
+    LeaseTimeSource time = Objects.requireNonNull(
+        leaseTimeSourceFactory.apply(activation.leaseClockUncertaintyMs()), "Lease time source");
     var allocator = new LeaseIdAllocator(
         () -> ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE), 16);
     var mutationPreparation = new LeaseAuxiliaryMutationPreparation(
@@ -387,7 +423,12 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   public long memberId() { return memberId; }
   public RequestMetrics metrics() { return metrics; }
   long cacheHitCount() { return resources.cache == null ? 0 : resources.cache.hitCount(); }
-  public boolean isReady() { return resources.isReady(); }
+  static boolean runtimeReady(boolean ownerReady, Optional<LeaseTimeSource> leaseTime) {
+    Objects.requireNonNull(leaseTime, "leaseTime");
+    return ownerReady && leaseTime.map(source -> source.observe().healthy()).orElse(true);
+  }
+
+  public boolean isReady() { return runtimeReady(resources.isReady(), leaseTime); }
   public CompletableFuture<Void> drained() { return resources.drained.copy(); }
   @Override public void close() { resources.close(); }
 

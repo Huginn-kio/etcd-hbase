@@ -21,6 +21,11 @@ SPEC.loader.exec_module(m4_report)
 
 
 class M4ReportTest(unittest.TestCase):
+    AUTO_LEASE_ID = 101
+    EXPLICIT_LEASE_ID = 202
+    NEGATIVE_LEASE_ID = -303
+    MISSING_LEASE_ID = 404
+
     def setUp(self) -> None:
         self.registry = m4_report.load_registry()
 
@@ -123,6 +128,39 @@ class M4ReportTest(unittest.TestCase):
             with self.assertRaises(m4_report.ReportError):
                 m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
 
+    def test_empty_successful_response_is_rejected_even_with_a_matching_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact)
+            trace_path = artifact / "native-trace.jsonl"
+            records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            records[1]["response"] = {"fields": {}, "oneofs": {}}
+            trace_path.write_text(
+                "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            self._refresh_trace_digest(artifact, trace_path, "native-metadata.json")
+
+            with self.assertRaisesRegex(m4_report.ReportError, "J40 automatic Grant"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+    def test_lease_listing_must_contain_every_previously_granted_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact)
+            trace_path = artifact / "target-history-trace.jsonl"
+            records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            records[8]["response"]["fields"]["leases"].pop()
+            trace_path.write_text(
+                "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            self._refresh_trace_digest(artifact, trace_path, "target-history-metadata.json")
+
+            with self.assertRaisesRegex(m4_report.ReportError, "Lease listing is incomplete"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+    def test_missing_target_trace_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)
             self._write_valid_artifact(artifact)
@@ -199,6 +237,29 @@ class M4ReportTest(unittest.TestCase):
         run_id = artifact.name
         source_commit = "a" * 40
         base_commit = "b" * 40
+        command_logs = self._write_command_logs(artifact)
+        commands = self._command_records(command_logs)
+        self._write_run_manifest(artifact, task["id"], run_id, source_commit, base_commit, commands)
+        self._write_go_test_events(artifact, task)
+        self._write_maven_test_reports(artifact, task)
+        suite_hash = hashlib.sha256(
+            (m4_report.REPO / "testkit/scenarios/m4-lease.yaml").read_bytes()
+        ).hexdigest()
+        prefix_hash = hashlib.sha256(f"etcd-hbase-m4-test/{run_id}/".encode()).hexdigest()
+        self._write_trace_artifacts(
+            artifact, task, run_id, source_commit, suite_hash, prefix_hash
+        )
+        self._write_comparison_logs(artifact, task)
+
+    @staticmethod
+    def _refresh_trace_digest(artifact: Path, trace_path: Path, metadata_name: str) -> None:
+        metadata_path = artifact / metadata_name
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["trace_sha256"] = hashlib.sha256(trace_path.read_bytes()).hexdigest()
+        metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _write_command_logs(artifact: Path) -> dict[str, str]:
         command_logs = {
             "go-module-lock": "go-module-lock.log",
             "go-tests": "go-test.jsonl",
@@ -210,8 +271,11 @@ class M4ReportTest(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("completed\n", encoding="utf-8")
         (artifact / "go-test.stderr").write_text("", encoding="utf-8")
+        return command_logs
 
-        commands = [
+    @staticmethod
+    def _command_records(command_logs: dict[str, str]) -> list[dict[str, object]]:
+        return [
             {
                 "name": name,
                 "argv": ["test-command", name],
@@ -223,11 +287,17 @@ class M4ReportTest(unittest.TestCase):
             }
             for name, path in command_logs.items()
         ]
+
+    @staticmethod
+    def _write_run_manifest(
+        artifact: Path, task_id: str, run_id: str, source_commit: str,
+        base_commit: str, commands: list[dict[str, object]],
+    ) -> None:
         run = {
             "schema": "etcd-hbase-m4-run/v1",
             "run_id": run_id,
             "scope": "public-local-minicluster",
-            "tasks": [task["id"]],
+            "tasks": [task_id],
             "status": "passed",
             "source_commit": source_commit,
             "checkout": source_commit,
@@ -239,6 +309,8 @@ class M4ReportTest(unittest.TestCase):
         }
         (artifact / "run.json").write_text(json.dumps(run) + "\n", encoding="utf-8")
 
+    @staticmethod
+    def _write_go_test_events(artifact: Path, task: dict[str, object]) -> None:
         go_events = []
         for package in task["go_tests"]:
             module = f"github.com/Reidddddd/etcd-hbase/testkit/go/{package['package']}"
@@ -250,6 +322,8 @@ class M4ReportTest(unittest.TestCase):
             "".join(json.dumps(event) + "\n" for event in go_events), encoding="utf-8"
         )
 
+    @staticmethod
+    def _write_maven_test_reports(artifact: Path, task: dict[str, object]) -> None:
         grouped: dict[tuple[str, str, str], set[str]] = {}
         for suite in task["maven_tests"]:
             grouped.setdefault((suite["module"], suite["kind"], suite["class"]), set()).update(suite["tests"])
@@ -269,61 +343,175 @@ class M4ReportTest(unittest.TestCase):
                 report_dir / f"TEST-{class_name}.xml", encoding="utf-8", xml_declaration=True
             )
 
+    @staticmethod
+    def _trace_variants(task: dict[str, object]) -> list[tuple[dict[str, object], str, str, str]]:
         evidence = task["evidence"]
         trace_variants = [(evidence["native"], "native", "native-trace.jsonl", "native-metadata.json")]
         for target in evidence["targets"]:
             suffix = target["layout"].lower()
             trace_variants.append((target, suffix, f"target-{suffix}-trace.jsonl", f"target-{suffix}-metadata.json"))
-        prefix_hash = hashlib.sha256(f"etcd-hbase-m4-test/{run_id}/".encode()).hexdigest()
-        suite_path = m4_report.REPO / "testkit/scenarios/m4-lease.yaml"
-        suite_hash = hashlib.sha256(suite_path.read_bytes()).hexdigest()
-        for descriptor, suffix, trace_name, metadata_name in trace_variants:
-            records = []
-            case_ordinals: dict[str, int] = {}
-            for expected in task["trace_cases"]:
-                case_ordinals[expected["id"]] = case_ordinals.get(expected["id"], 0) + 1
-                error = None
-                response = {"fields": {}, "oneofs": {}}
-                if expected["id"] == "duplicate-id":
-                    error = {"grpc_code": "FailedPrecondition", "consumer_kind": "grpc-status", "semantic_kind": "LEASE_EXISTS"}
-                    response = None
-                elif expected["id"] == "oversized-ttl":
-                    error = {"grpc_code": "OutOfRange", "consumer_kind": "grpc-status", "semantic_kind": "OUT_OF_RANGE"}
-                    response = None
-                records.append({
-                    "schema": "etcd-hbase-trace/v1",
-                    "case_id": expected["id"],
-                    "ordinal": case_ordinals[expected["id"]],
-                    "method": expected["method"],
-                    "request": {"fields": {}, "oneofs": {}},
-                    "response": response,
-                    "error": error,
-                    "stream_terminal": None,
-                    "evidence_scope": descriptor["scope"],
-                    "elapsed_ns": "1",
-                })
-            trace_bytes = "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records).encode()
-            (artifact / trace_name).write_bytes(trace_bytes)
-            embedded_native = descriptor["embedded_native"]
-            layout = descriptor.get("layout", "")
-            metadata = {
-                "schema": "etcd-hbase-m4-run/v1",
-                "run_id": run_id,
-                "source_commit": source_commit,
-                "suite_sha256": suite_hash,
-                "evidence_scope": descriptor["scope"],
-                "prefix_sha256": prefix_hash,
-                "trace_sha256": hashlib.sha256(trace_bytes).hexdigest(),
-                "embedded_native": embedded_native,
-                "layout": layout,
-                "status": "passed",
-            }
-            (artifact / metadata_name).write_text(json.dumps(metadata) + "\n", encoding="utf-8")
-            log_name = (
-                "native.log" if embedded_native else f"target-{suffix}.log"
+        return trace_variants
+
+    def _write_trace_artifacts(
+        self, artifact: Path, task: dict[str, object], run_id: str, source_commit: str,
+        suite_hash: str, prefix_hash: str,
+    ) -> None:
+        for descriptor, suffix, trace_name, metadata_name in self._trace_variants(task):
+            self._write_trace_artifact(
+                artifact, task, descriptor, suffix, trace_name, metadata_name,
+                run_id, source_commit, suite_hash, prefix_hash,
             )
-            (artifact / log_name).write_text("M4 Lease scenario passed\n", encoding="utf-8")
-        for name in evidence["compare_logs"]:
+
+    @staticmethod
+    def _write_trace_artifact(
+        artifact: Path, task: dict[str, object], descriptor: dict[str, object],
+        suffix: str, trace_name: str, metadata_name: str, run_id: str,
+        source_commit: str, suite_hash: str, prefix_hash: str,
+    ) -> None:
+        records = M4ReportTest._valid_trace_records(task, descriptor)
+        trace_bytes = "".join(
+            json.dumps(record, separators=(",", ":")) + "\n" for record in records
+        ).encode()
+        (artifact / trace_name).write_bytes(trace_bytes)
+        embedded_native = descriptor["embedded_native"]
+        layout = descriptor.get("layout", "")
+        metadata = {
+            "schema": "etcd-hbase-m4-run/v1",
+            "run_id": run_id,
+            "source_commit": source_commit,
+            "suite_sha256": suite_hash,
+            "evidence_scope": descriptor["scope"],
+            "prefix_sha256": prefix_hash,
+            "trace_sha256": hashlib.sha256(trace_bytes).hexdigest(),
+            "embedded_native": embedded_native,
+            "layout": layout,
+            "status": "passed",
+        }
+        (artifact / metadata_name).write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        log_name = "native.log" if embedded_native else f"target-{suffix}.log"
+        (artifact / log_name).write_text("M4 Lease scenario passed\n", encoding="utf-8")
+
+    @staticmethod
+    def _valid_trace_records(
+        task: dict[str, object], descriptor: dict[str, object],
+    ) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        case_ordinals: dict[str, int] = {}
+        for expected in task["trace_cases"]:
+            case_id = expected["id"]
+            case_ordinals[case_id] = case_ordinals.get(case_id, 0) + 1
+            request, response, error = M4ReportTest._trace_step(case_id)
+            records.append({
+                "schema": "etcd-hbase-trace/v1",
+                "case_id": case_id,
+                "ordinal": case_ordinals[case_id],
+                "method": expected["method"],
+                "request": request,
+                "response": response,
+                "error": error,
+                "stream_terminal": None,
+                "evidence_scope": descriptor["scope"],
+                "elapsed_ns": "1",
+            })
+        return records
+
+    @staticmethod
+    def _snapshot(fields: dict[str, object]) -> dict[str, object]:
+        return {"fields": fields, "oneofs": {}}
+
+    @classmethod
+    def _lease_header(cls) -> dict[str, object]:
+        return cls._snapshot({
+            "clusterId": "1", "memberId": "2", "raftTerm": "1", "revision": "1",
+        })
+
+    @classmethod
+    def _lease_response(cls, **fields: object) -> dict[str, object]:
+        return cls._snapshot({"header": cls._lease_header(), **fields})
+
+    @classmethod
+    def _lease_statuses(cls, *lease_ids: int) -> list[dict[str, object]]:
+        return [cls._snapshot({"ID": str(lease_id)}) for lease_id in lease_ids]
+
+    @classmethod
+    def _trace_step(
+        cls, case_id: str,
+    ) -> tuple[dict[str, object], dict[str, object] | None, dict[str, str] | None]:
+        steps = cls._successful_lease_steps()
+        steps.update(cls._lease_edge_steps())
+        return steps[case_id]
+
+    @classmethod
+    def _successful_lease_steps(
+        cls,
+    ) -> dict[str, tuple[dict[str, object], dict[str, object] | None, dict[str, str] | None]]:
+        empty_request = cls._snapshot({})
+        return {
+            "native-baseline": (
+                empty_request, cls._lease_response(leases=[]), None,
+            ),
+            "auto-grant": (
+                cls._snapshot({"ID": "0", "TTL": "0"}),
+                cls._lease_response(ID=str(cls.AUTO_LEASE_ID), TTL="5", error=""), None,
+            ),
+            "auto-ttl": (
+                cls._snapshot({"ID": str(cls.AUTO_LEASE_ID), "keys": True}),
+                cls._lease_response(
+                    ID=str(cls.AUTO_LEASE_ID), TTL="4", grantedTTL="5", keys=[]
+                ), None,
+            ),
+            "explicit-grant": (
+                cls._snapshot({"ID": str(cls.EXPLICIT_LEASE_ID), "TTL": "30"}),
+                cls._lease_response(ID=str(cls.EXPLICIT_LEASE_ID), TTL="30", error=""), None,
+            ),
+            "explicit-ttl": (
+                cls._snapshot({"ID": str(cls.EXPLICIT_LEASE_ID), "keys": True}),
+                cls._lease_response(
+                    ID=str(cls.EXPLICIT_LEASE_ID), TTL="29", grantedTTL="30", keys=[]
+                ), None,
+            ),
+            "leases-list": (
+                empty_request,
+                cls._lease_response(leases=cls._lease_statuses(
+                    cls.AUTO_LEASE_ID, cls.EXPLICIT_LEASE_ID, cls.NEGATIVE_LEASE_ID
+                )), None,
+            ),
+        }
+
+    @classmethod
+    def _lease_edge_steps(
+        cls,
+    ) -> dict[str, tuple[dict[str, object], dict[str, object] | None, dict[str, str] | None]]:
+        return {
+            "duplicate-id": (
+                cls._snapshot({"ID": str(cls.EXPLICIT_LEASE_ID), "TTL": "30"}), None,
+                {"grpc_code": "FailedPrecondition", "consumer_kind": "grpc-status",
+                 "semantic_kind": "LEASE_EXISTS"},
+            ),
+            "missing-ttl": (
+                cls._snapshot({"ID": str(cls.MISSING_LEASE_ID), "keys": True}),
+                cls._lease_response(
+                    ID=str(cls.MISSING_LEASE_ID), TTL="-1", grantedTTL="0", keys=[]
+                ), None,
+            ),
+            "negative-id": (
+                cls._snapshot({"ID": str(cls.NEGATIVE_LEASE_ID), "TTL": "30"}),
+                cls._lease_response(ID=str(cls.NEGATIVE_LEASE_ID), TTL="30", error=""), None,
+            ),
+            "oversized-ttl": (
+                cls._snapshot({"ID": "0", "TTL": "9000000001"}), None,
+                {"grpc_code": "OutOfRange", "consumer_kind": "grpc-status",
+                 "semantic_kind": "OUT_OF_RANGE"},
+            ),
+            "zero-id-ttl": (
+                cls._snapshot({"ID": "0", "keys": True}),
+                cls._lease_response(ID="0", TTL="-1", grantedTTL="0", keys=[]), None,
+            ),
+        }
+
+    @staticmethod
+    def _write_comparison_logs(artifact: Path, task: dict[str, object]) -> None:
+        for name in task["evidence"]["compare_logs"]:
             (artifact / name).write_text(
                 "M4 Lease traces match the registered native comparison policy\n", encoding="utf-8"
             )

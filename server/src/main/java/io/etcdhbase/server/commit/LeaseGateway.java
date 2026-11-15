@@ -355,12 +355,12 @@ public final class LeaseGateway {
   private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readTimeToLive(
       Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account) {
     if (request.getID() == 0) {
-      return readAllLeaseTimeToLive(request, scope);
+      return readMissingLeaseTimeToLive(request, scope);
     }
     return readLeaseTimeToLive(request, scope, account, true);
   }
 
-  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readAllLeaseTimeToLive(
+  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readMissingLeaseTimeToLive(
       Rpc.LeaseTimeToLiveRequest request, RequestScope scope) {
     return views.openAuxiliary(authorizationDigest, scope).thenCompose(pin ->
         leaseReads.finish(pin, scope).thenApply(ignored ->
@@ -373,39 +373,45 @@ public final class LeaseGateway {
     var proof = new ManifestCatalog.ProofReadBudget(scope, account, 64, MAX_METADATA_BYTES);
     return views.openAuxiliary(authorizationDigest, scope).thenCompose(pin ->
         leaseReads.find(pin, request.getID(), scope, proof)
-            .thenCompose(found -> projectLeaseTimeToLive(
-                request, scope, account, pin, proof, found, resolveExpiredEmpty))
+            .thenCompose(found -> resolveExpiryBeforeTimeToLive(request, scope, account, pin,
+                proof, found, resolveExpiredEmpty))
             .thenCompose(response -> leaseReads.finish(pin, scope).thenApply(ignored -> response)));
+  }
+
+  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> resolveExpiryBeforeTimeToLive(
+      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
+      PinnedReadView pin, ManifestCatalog.ProofReadBudget proof, Optional<LeaseState> found,
+      boolean resolveExpiredEmpty) {
+    var clock = time.observe();
+    return resolveExpiredLease(found, clock, resolveExpiredEmpty, scope, account).thenCompose(resolved -> {
+      if (resolved) return readLeaseTimeToLive(request, scope, account, false);
+      return projectLeaseTimeToLive(request, scope, account, pin, proof, found, clock);
+    });
+  }
+
+  private CompletableFuture<Boolean> resolveExpiredLease(Optional<LeaseState> found,
+      io.etcdhbase.core.lease.LeaseTimeObservation clock, boolean resolveExpiredEmpty,
+      RequestScope scope, BudgetManager.Account account) {
+    if (found.isEmpty()) return CompletableFuture.completedFuture(false);
+    LeaseState state = found.orElseThrow();
+    if (state.status() != LeaseState.Status.ACTIVE || !LeaseTimeRules.isExpired(state, clock)) {
+      return CompletableFuture.completedFuture(false);
+    }
+    if (state.boundKeyCount() != 0 || state.boundKeyBytes() != 0 || state.revokeCostBytes() != 0) {
+      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
+    if (!resolveExpiredEmpty) {
+      return CompletableFuture.completedFuture(false);
+    }
+    return expireEmptyLease(state, scope, account)
+        .thenApply(ignored -> true);
   }
 
   private CompletableFuture<Rpc.LeaseTimeToLiveResponse> projectLeaseTimeToLive(
       Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
       PinnedReadView pin, ManifestCatalog.ProofReadBudget proof, Optional<LeaseState> found,
-      boolean resolveExpiredEmpty) {
-    var clock = time.observe();
-    if (found.isPresent()) {
-      LeaseState state = found.orElseThrow();
-      if (state.status() == LeaseState.Status.ACTIVE && LeaseTimeRules.isExpired(state, clock)) {
-        return resolveExpiredEmptyLeaseTimeToLive(
-            request, scope, account, pin, proof, found, clock, state, resolveExpiredEmpty);
-      }
-    }
+      io.etcdhbase.core.lease.LeaseTimeObservation clock) {
     return projectLeaseKeys(request, scope, account, pin, proof, found, clock);
-  }
-
-  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> resolveExpiredEmptyLeaseTimeToLive(
-      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
-      PinnedReadView pin, ManifestCatalog.ProofReadBudget proof, Optional<LeaseState> found,
-      io.etcdhbase.core.lease.LeaseTimeObservation clock, LeaseState expired,
-      boolean resolveExpiredEmpty) {
-    if (expired.boundKeyCount() != 0 || expired.boundKeyBytes() != 0 || expired.revokeCostBytes() != 0) {
-      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-    }
-    if (!resolveExpiredEmpty) {
-      return projectLeaseKeys(request, scope, account, pin, proof, found, clock);
-    }
-    return expireEmptyLease(expired, scope, account)
-        .thenCompose(ignored -> readLeaseTimeToLive(request, scope, account, false));
   }
 
   private CompletableFuture<Rpc.LeaseTimeToLiveResponse> projectLeaseKeys(

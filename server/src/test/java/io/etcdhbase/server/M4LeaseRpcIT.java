@@ -16,6 +16,8 @@ import io.etcdhbase.admin.config.InitializationConfiguration;
 import io.etcdhbase.admin.config.InitializationConfigurationLoader;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.lease.LeaseTimeObservation;
+import io.etcdhbase.core.lease.LeaseTimeSource;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.identity.HBaseAuthenticators;
 import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
@@ -36,6 +38,8 @@ import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongFunction;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -77,56 +81,109 @@ class M4LeaseRpcIT {
             (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
             1, 1, Duration.ofSeconds(30));
          var credentials = new io.etcdhbase.spi.identity.BackendCredentials("m4-initializer", new char[0])) {
-      var identity = initializer.authenticate(credentials, authScope).toCompletableFuture()
-          .get(30, TimeUnit.SECONDS);
+      var identity = authenticate(initializer, credentials, authScope);
       M3RuntimeConfiguration firstActivation = activation("1");
-      var initialized = M3TableGroupInitializer.initializeFresh(plan,
-          "sha256:" + source.fingerprint(), identity, initializer, firstActivation.pinConfiguration());
-      ControlSnapshot preUpgrade = controlSnapshot(plan, initializer, identity);
-      assertEquals(CommitState.FORMAT_VERSION, preUpgrade.state().formatVersion());
-      long staleWriterNow = System.currentTimeMillis();
-      CommitState staleWriterClaim = preUpgrade.state().claimOwner("pre-m4-writer", staleWriterNow,
-          Math.addExact(staleWriterNow, 60_000));
+      LayoutBaseline baseline = initializeM4Layout(
+          plan, source.fingerprint(), identity, initializer, firstActivation);
       RuntimeConfiguration configuration = new RuntimeConfiguration(initialization.schemaVersion(),
           List.of(new RuntimeConfiguration.Listener("m4-local", "127.0.0.1", 0, source.tableGroupId())),
           initialization.hbaseProfiles(), initialization.saltProfiles(), initialization.tableGroups(), RESOURCES);
-
-      RuntimeServer first = RuntimeServer.startM3(configuration, firstActivation);
-      String prefix = run.prefix();
-      long explicitId;
-      try {
-        assertTrue(first.dataReady());
-        assertOldWriterCannotPublish(plan, initializer, identity, preUpgrade, staleWriterClaim);
-        runTargetDriver(run, layout, first.boundListeners().getFirst().port());
-        assertControlAndTableAreAuxiliary(plan, initializer, identity);
-        explicitId = leaseIdForPrefix(prefix, "explicit");
-        assertTrue(explicitId > 0);
-      } finally {
-        first.close();
-      }
-
-      M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
-      if (layout.equals("HISTORY")) {
-        assertM4CannotBeDisabledAfterFormatUpgrade(configuration, activation("3", false));
-      }
-      M3RuntimeConfiguration secondActivation = activation("2");
-      try (RuntimeServer restarted = RuntimeServer.startM3(configuration, secondActivation)) {
-        assertTrue(restarted.dataReady());
-        Rpc.LeaseTimeToLiveResponse ttl = timeToLive(restarted, explicitId, true);
-        assertEquals(explicitId, ttl.getID());
-        assertTrue(ttl.getTTL() > 0);
-        assertEquals(30, ttl.getGrantedTTL());
-        assertEquals(0, ttl.getKeysCount());
-        assertEquals(initialized.clusterId(), ttl.getHeader().getClusterId());
-        assertEquals(1, ttl.getHeader().getRevision());
-        Rpc.LeaseLeasesResponse leases = leases(restarted);
-        assertTrue(leases.getLeasesList().stream().anyMatch(value -> value.getID() == explicitId));
-        assertEquals(initialized.clusterId(), leases.getHeader().getClusterId());
-        assertEquals(1, leases.getHeader().getRevision());
-        assertEquals(2, leases.getHeader().getMemberId());
-      }
+      long explicitId = runFirstActivation(
+          plan, initializer, identity, configuration, firstActivation, baseline, layout, run);
+      verifyRestartedLeaseState(plan, initializer, identity, configuration, baseline.clusterId(),
+          explicitId, layout);
+      verifyClockReadiness(plan, initializer, identity, configuration, activation("3"));
     }
   }
+
+  private static io.etcdhbase.spi.identity.AuthorizedBackendIdentity authenticate(
+      HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.BackendCredentials credentials,
+      io.etcdhbase.spi.identity.AuthenticationScope authScope) throws Exception {
+    return initializer.authenticate(credentials, authScope).toCompletableFuture()
+        .get(30, TimeUnit.SECONDS);
+  }
+
+  private static LayoutBaseline initializeM4Layout(M3TableGroupPlan plan, String fingerprint,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      HBaseBackendIdentityProvider initializer, M3RuntimeConfiguration activation) throws Exception {
+    var initialized = M3TableGroupInitializer.initializeFresh(
+        plan, "sha256:" + fingerprint, identity, initializer, activation.pinConfiguration());
+    ControlSnapshot preUpgrade = controlSnapshot(plan, initializer, identity);
+    assertEquals(CommitState.FORMAT_VERSION, preUpgrade.state().formatVersion());
+    long staleWriterNow = System.currentTimeMillis();
+    CommitState staleWriterClaim = preUpgrade.state().claimOwner("pre-m4-writer", staleWriterNow,
+        Math.addExact(staleWriterNow, 60_000));
+    return new LayoutBaseline(initialized.clusterId(), preUpgrade, staleWriterClaim);
+  }
+
+  private static long runFirstActivation(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      RuntimeConfiguration configuration, M3RuntimeConfiguration activation,
+      LayoutBaseline baseline, String layout, RunContext run) throws Exception {
+    RuntimeServer first = RuntimeServer.startM3(configuration, activation);
+    try {
+      assertTrue(first.dataReady());
+      assertOldWriterCannotPublish(plan, initializer, identity,
+          baseline.controlSnapshot(), baseline.staleWriterClaim());
+      runTargetDriver(run, layout, first.boundListeners().getFirst().port());
+      assertControlAndTableAreAuxiliary(plan, initializer, identity);
+    } finally {
+      first.close();
+    }
+    long explicitId = leaseIdForPrefix(run.prefix(), "explicit");
+    assertTrue(explicitId > 0);
+    return explicitId;
+  }
+
+  private static void verifyRestartedLeaseState(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      RuntimeConfiguration configuration, long clusterId, long explicitId, String layout)
+      throws Exception {
+    M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
+    if (layout.equals("HISTORY")) {
+      assertM4CannotBeDisabledAfterFormatUpgrade(configuration, activation("3", false));
+    }
+    try (RuntimeServer restarted = RuntimeServer.startM3(configuration, activation("2"))) {
+      assertTrue(restarted.dataReady());
+      Rpc.LeaseTimeToLiveResponse ttl = timeToLive(restarted, explicitId, true);
+      assertEquals(explicitId, ttl.getID());
+      assertTrue(ttl.getTTL() > 0);
+      assertEquals(30, ttl.getGrantedTTL());
+      assertEquals(0, ttl.getKeysCount());
+      assertEquals(clusterId, ttl.getHeader().getClusterId());
+      assertEquals(1, ttl.getHeader().getRevision());
+      Rpc.LeaseLeasesResponse leases = leases(restarted);
+      assertTrue(leases.getLeasesList().stream().anyMatch(value -> value.getID() == explicitId));
+      assertEquals(clusterId, leases.getHeader().getClusterId());
+      assertEquals(1, leases.getHeader().getRevision());
+      assertEquals(2, leases.getHeader().getMemberId());
+    }
+  }
+
+  private static void verifyClockReadiness(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      RuntimeConfiguration configuration, M3RuntimeConfiguration activation) throws Exception {
+    M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
+    var clockHealthy = new AtomicBoolean(true);
+    LeaseTimeSource timeSource = () -> clockHealthy.get()
+        ? new LeaseTimeObservation(10_000, 12_000, true)
+        : new LeaseTimeObservation(0, 0, false);
+    LongFunction<LeaseTimeSource> factory = ignored -> timeSource;
+
+    try (RuntimeServer runtime = RuntimeServer.startM3WithLeaseTimeSource(
+        configuration, activation, factory)) {
+      assertTrue(runtime.dataReady());
+      clockHealthy.set(false);
+      assertFalse(runtime.dataReady());
+    }
+  }
+
+  private record LayoutBaseline(long clusterId, ControlSnapshot controlSnapshot,
+      CommitState staleWriterClaim) {}
 
   private static ControlSnapshot controlSnapshot(M3TableGroupPlan plan,
       HBaseBackendIdentityProvider provider,

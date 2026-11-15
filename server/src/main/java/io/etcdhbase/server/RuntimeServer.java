@@ -1,6 +1,7 @@
 package io.etcdhbase.server;
 
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
+import io.etcdhbase.core.lease.LeaseTimeSource;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.M3RuntimeConfigurationLoader;
 import io.etcdhbase.server.config.RuntimeConfiguration;
@@ -12,8 +13,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongFunction;
 
 /** Owns all configured listeners and rolls back earlier binds when startup partially fails. */
 public final class RuntimeServer implements AutoCloseable {
@@ -35,9 +39,25 @@ public final class RuntimeServer implements AutoCloseable {
   /** Activates the configured local-development groups only after recovery and resource checks. */
   public static RuntimeServer startM3(RuntimeConfiguration configuration,
       M3RuntimeConfiguration activation) throws IOException {
+    return startM3Internal(configuration, activation, Optional.empty());
+  }
+
+  static RuntimeServer startM3WithLeaseTimeSource(RuntimeConfiguration configuration,
+      M3RuntimeConfiguration activation, LongFunction<LeaseTimeSource> leaseTimeSourceFactory)
+      throws IOException {
+    return startM3Internal(configuration, activation,
+        Optional.of(Objects.requireNonNull(leaseTimeSourceFactory, "leaseTimeSourceFactory")));
+  }
+
+  private static RuntimeServer startM3Internal(RuntimeConfiguration configuration,
+      M3RuntimeConfiguration activation,
+      Optional<LongFunction<LeaseTimeSource>> leaseTimeSourceFactory) throws IOException {
     RuntimeConfigurationValidator.validate(configuration, 1);
     requireDevelopmentActivation(configuration);
-    var groups = M3RuntimeGroups.open(configuration, activation);
+    var groups = leaseTimeSourceFactory.isPresent()
+        ? M3RuntimeGroups.openWithLeaseTimeSource(
+            configuration, activation, leaseTimeSourceFactory.orElseThrow())
+        : M3RuntimeGroups.open(configuration, activation);
     List<Bootstrap> opened = new ArrayList<>();
     try {
       for (var listener : configuration.listeners()) {
