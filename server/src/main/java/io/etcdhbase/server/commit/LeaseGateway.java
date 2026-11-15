@@ -395,8 +395,10 @@ public final class LeaseGateway {
         || state.grantedTtlSeconds() != responseTtlSeconds) {
       throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
-    if (LeaseTimeRules.remainingTtlSeconds(state, time.observe()) <= 0) throw new CompletionException(
-        new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    long remainingMillis = LeaseTimeRules.remainingTtlMillis(state, time.observe());
+    if (!LeaseKeepAliveTiming.canSendPositiveResponse(responseTtlSeconds, remainingMillis)) {
+      throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
   }
 
   private void completeKeepAliveDelivery(Rpc.LeaseKeepAliveResponse response,

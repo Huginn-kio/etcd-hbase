@@ -15,8 +15,8 @@ class M4LeaseKeepAliveRpcIT {
   }
 
   @Test
-  void expiredActiveLeaseIsRejectedUntilDurableRevocation() throws Exception {
-    M4LeaseRpcIT.verifyExpiredActiveLeaseIsRejectedUntilDurableRevocation();
+  void expiredActiveLeaseCannotRenewBeforeDurableRevocation() throws Exception {
+    M4LeaseRpcIT.verifyExpiredActiveLeaseCannotRenewBeforeDurableRevocation();
   }
 
   @Test

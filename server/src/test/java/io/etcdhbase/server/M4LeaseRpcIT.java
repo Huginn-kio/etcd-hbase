@@ -834,9 +834,42 @@ class M4LeaseRpcIT {
       assertTrue(metrics.stages().get(stage).count() > 0,
           "missing KeepAlive metric stage " + stage);
     }
+    reportKeepAliveMetrics(metrics);
   }
 
-  static void verifyExpiredActiveLeaseIsRejectedUntilDurableRevocation() throws Exception {
+  private static void reportKeepAliveMetrics(
+      io.etcdhbase.server.observability.RequestMetrics.LeaseRenewalSnapshot metrics) {
+    StringBuilder report = new StringBuilder("M4_KEEPALIVE_METRICS_V1");
+    appendMetric(report, "sampling_method", "per-runtime-cumulative-counter-snapshot");
+    appendMetric(report, "requests", metrics.requests());
+    appendMetric(report, "responses", metrics.responses());
+    appendMetric(report, "selected", metrics.selected());
+    appendMetric(report, "unknown_outcomes", metrics.unknownOutcomes());
+    appendMetric(report, "request_bytes", metrics.requestBytes());
+    appendMetric(report, "response_bytes", metrics.responseBytes());
+    appendMetric(report, "auxiliary_records", metrics.auxiliaryRecords());
+    appendMetric(report, "auxiliary_payload_bytes", metrics.auxiliaryPayloadBytes());
+    appendMetric(report, "hbase_client_operations", metrics.hbaseClientOperations());
+    appendMetric(report, "logical_hbase_request_payload_bytes",
+        metrics.logicalHBaseRequestPayloadBytes());
+    for (var stage : io.etcdhbase.server.observability.RequestMetrics.LeaseRenewalStage.values()) {
+      var sample = metrics.stages().get(stage);
+      String stageName = stage.name().toLowerCase(java.util.Locale.ROOT);
+      appendMetric(report, stageName + "_samples", sample.count());
+      appendMetric(report, stageName + "_total_nanos", sample.totalNanos());
+    }
+    System.out.println(report);
+  }
+
+  private static void appendMetric(StringBuilder report, String name, String value) {
+    report.append(' ').append(name).append('=').append(value);
+  }
+
+  private static void appendMetric(StringBuilder report, String name, long value) {
+    report.append(' ').append(name).append('=').append(value);
+  }
+
+  static void verifyExpiredActiveLeaseCannotRenewBeforeDurableRevocation() throws Exception {
     RunContext run = prepareRun();
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
       int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
@@ -871,7 +904,7 @@ class M4LeaseRpcIT {
           TimeUnit.SECONDS.sleep(7);
 
           assertEquals(Status.Code.NOT_FOUND, keepAliveFailureCode(server, leaseId),
-              "an expired ACTIVE record must wait for durable revocation instead of returning TTL=0");
+              "an expired ACTIVE Lease must fail instead of returning a KeepAlive success");
           CommitState after = controlSnapshot(plan, initializer, identity).state();
           assertEquals(before.publishedSequence(), after.publishedSequence(),
               "a rejected renewal must not select an empty auxiliary commit");

@@ -17,6 +17,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** Reads the authoritative owner and forwards at most once; a post-send failure remains unknown. */
 public final class MutationRelay {
+  private static final int MAX_PRE_SEND_OWNER_RELOCATIONS = 1;
+
   public sealed interface Result permits KnownResult, KnownRejection, SemanticRejection, LeaseRejection, ResultUnknown {}
   public record KnownResult(byte[] responseBytes) implements Result {
     public KnownResult { responseBytes = responseBytes.clone(); }
@@ -55,20 +57,18 @@ public final class MutationRelay {
       return CompletableFuture.failedFuture(new IllegalStateException("mutation forward hop limit exceeded"));
     }
     return control.read(scope)
-        .thenCompose(snapshot -> requireCurrentOwner(snapshot, request))
-        .thenCompose(owner -> resolveRouteAndSend(owner, request, scope));
+        .thenCompose(this::requireCurrentOwner)
+        .thenCompose(owner -> resolveRouteAndSend(owner, request, scope, 0));
   }
 
   private CompletableFuture<CurrentOwner> requireCurrentOwner(
-      Optional<ControlSnapshot> snapshot,
-      MutationForwardRequest request) {
+      Optional<ControlSnapshot> snapshot) {
     if (snapshot.isEmpty()) {
       return CompletableFuture.failedFuture(
           new IllegalStateException("authoritative M2 control state is missing"));
     }
     CommitState state = snapshot.orElseThrow().state();
-    if (state.ownerInstance().isEmpty()
-        || state.ownerEpoch() != request.expectedOwnerEpoch()) {
+    if (state.ownerInstance().isEmpty()) {
       return CompletableFuture.failedFuture(
           new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
@@ -77,9 +77,21 @@ public final class MutationRelay {
   }
 
   private CompletableFuture<Result> resolveRouteAndSend(
-      CurrentOwner owner, MutationForwardRequest request, RequestScope scope) {
+      CurrentOwner owner, MutationForwardRequest request, RequestScope scope,
+      int ownerRelocations) {
     return directory.resolve(request.tableGroupId(), owner.instance(), owner.epoch())
-        .thenCompose(route -> sendToVerifiedRoute(owner, route, request, scope));
+        .thenCompose(route -> control.read(scope)
+            .thenCompose(this::requireCurrentOwner)
+            .thenCompose(current -> {
+              if (!current.equals(owner)) {
+                if (ownerRelocations >= MAX_PRE_SEND_OWNER_RELOCATIONS) {
+                  return CompletableFuture.failedFuture(
+                      new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+                }
+                return resolveRouteAndSend(current, request, scope, ownerRelocations + 1);
+              }
+              return sendToVerifiedRoute(owner, route, request, scope);
+            }));
   }
 
   private CompletableFuture<Result> sendToVerifiedRoute(

@@ -175,6 +175,10 @@ class M4ReportTest(unittest.TestCase):
             summary = m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
             self.assertEqual(summary["task"], "J42")
             self.assertEqual(summary["target_layouts"], ["HISTORY", "NATIVE"])
+            self.assertEqual(summary["keepalive_sampling_method"],
+                             "per-runtime-cumulative-counter-snapshot")
+            self.assertGreater(summary["keepalive_rpc_requests"], 0)
+            self.assertGreater(summary["keepalive_queue_wait_samples"], 0)
 
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)
@@ -197,6 +201,28 @@ class M4ReportTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(m4_report.ReportError, "registered stream contract"):
                 m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+    def test_j42_report_rejects_missing_or_malformed_runtime_metrics(self) -> None:
+        for replacement, message in (
+            (None, "do not cover both HBase layouts"),
+            ("M4_KEEPALIVE_METRICS_V1 requests=8", "metric sample method is missing"),
+        ):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as temporary:
+                artifact = Path(temporary)
+                self._write_valid_artifact(artifact, "J42")
+                report_path = artifact / (
+                    "server/target/failsafe-reports/TEST-io.etcdhbase.server.M4LeaseKeepAliveRpcIT.xml"
+                )
+                report_tree = ET.parse(report_path)
+                output = report_tree.getroot().find("system-out")
+                assert output is not None
+                if replacement is None:
+                    report_tree.getroot().remove(output)
+                else:
+                    output.text = f"{replacement}\n{replacement}\n"
+                report_tree.write(report_path, encoding="utf-8", xml_declaration=True)
+                with self.assertRaisesRegex(m4_report.ReportError, message):
+                    m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
 
     def test_j41_registration_rejects_unsafe_evidence_subdirectories(self) -> None:
         for subdirectory in ("../outside", "/tmp/evidence", "j41\\nested"):
@@ -505,6 +531,26 @@ class M4ReportTest(unittest.TestCase):
             })
             for name in sorted(test_names):
                 ET.SubElement(root, "testcase", {"name": name, "classname": class_name})
+            if (task.get("id") == "J42"
+                    and class_name == "io.etcdhbase.server.M4LeaseKeepAliveRpcIT"):
+                metrics = {
+                    "sampling_method": "per-runtime-cumulative-counter-snapshot",
+                    "requests": "8", "responses": "8", "selected": "8", "unknown_outcomes": "0",
+                    "request_bytes": "64", "response_bytes": "64", "auxiliary_records": "8",
+                    "auxiliary_payload_bytes": "256", "hbase_client_operations": "16",
+                    "logical_hbase_request_payload_bytes": "512",
+                    "queue_samples": "8", "queue_total_nanos": "8000",
+                    "prepare_samples": "8", "prepare_total_nanos": "16000",
+                    "publish_and_finalize_samples": "8", "publish_and_finalize_total_nanos": "24000",
+                    "result_resolution_samples": "8", "result_resolution_total_nanos": "8000",
+                    "delivery_validation_samples": "8", "delivery_validation_total_nanos": "4000",
+                    "outbound_ready_wait_samples": "8", "outbound_ready_wait_total_nanos": "12000",
+                }
+                output = ET.SubElement(root, "system-out")
+                sample = "M4_KEEPALIVE_METRICS_V1 " + " ".join(
+                    f"{name}={value}" for name, value in metrics.items()
+                )
+                output.text = f"{sample}\n{sample}\n"
             ET.ElementTree(root).write(
                 report_dir / f"TEST-{class_name}.xml", encoding="utf-8", xml_declaration=True
             )

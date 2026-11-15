@@ -303,9 +303,12 @@ J42_JAVA_CLASS_MODULES = {
     "io.etcdhbase.core.commit.InvocationResultResolverTest": "core",
     "io.etcdhbase.core.commit.MutationOperationEnvelopeTest": "core",
     "io.etcdhbase.core.request.RequestScopeTest": "core",
+    "io.etcdhbase.core.lease.LeaseTimeRulesTest": "core",
     "io.etcdhbase.server.commit.BoundedPublicationHandoffTest": "server",
     "io.etcdhbase.server.commit.LeaseGrantPreparationTest": "server",
     "io.etcdhbase.server.commit.LeaseKeepAliveStreamTest": "server",
+    "io.etcdhbase.server.commit.LeaseKeepAliveTimingTest": "server",
+    "io.etcdhbase.server.commit.MutationRelayTest": "server",
     "io.etcdhbase.server.commit.M3OwnerLeaseTest": "server",
     "io.etcdhbase.server.commit.MutationForwardReceiverTest": "server",
     "io.etcdhbase.server.commit.OwnerPeerIdentityInterceptorTest": "server",
@@ -326,21 +329,37 @@ J42_CRITICAL_JAVA_TESTS = {
         "snapshotsLogicalStorageCostsAndRejectsBackwardsDeltas",
         "serviceContinuationSharesStorageAccountingButNotCancellation",
     },
+    "io.etcdhbase.core.lease.LeaseTimeRulesTest": {
+        "reportsConservativeRemainingTtlInMillisAndCapsAtGrantedTtl",
+    },
     "io.etcdhbase.server.commit.BoundedPublicationHandoffTest": {
         "attributesServiceOwnedStorageCostToTheTransferredOperation",
     },
     "io.etcdhbase.server.commit.LeaseKeepAliveStreamTest": {
         "serializesResponsesAndRequestsOneInboundMessageAtATime",
         "doesNotSendUntilReadyAndReleasesPendingDeliveryOnCancellation",
+        "preservesGrantedKeepAliveTtlWhenTheNextRenewalWindowStillFits",
+        "terminatesInsteadOfPromisingAFullTtlWhenTheClientCannotRenewBeforeExpiry",
         "halfCloseWaitsForCurrentOperationBeforeCompleting",
         "observerFailureReleasesDeliveryAndStopsFurtherInput",
         "timesOutAStalledOutboundResponseAndReleasesItsDelivery",
+    },
+    "io.etcdhbase.server.commit.LeaseKeepAliveTimingTest": {
+        "preservesTheClientScheduleAndResponseSafetyMargin",
+        "capsTheMarginForShortTtlsWithoutMakingAResponseWindowImpossible",
+        "rejectsNonPositiveOrUnsupportedTtls",
+    },
+    "io.etcdhbase.server.commit.MutationRelayTest": {
+        "staleGatewayOwnerSampleIsRelocatedBeforeAnyRequestIsSent",
+        "ownerChangeDuringRouteLookupDiscardsTheStaleRouteAndKeepsInvocation",
+        "unknownReplyAfterSendIsNotRelocatedEvenWhenOwnerChanges",
     },
     "io.etcdhbase.server.commit.LeaseGrantPreparationTest": {
         "persistsNoChangeResponseWithoutCreatingAnEmptyAuxiliaryManifest",
     },
     "io.etcdhbase.server.commit.M3OwnerLeaseTest": {
         "standbyStartsReadyAndClaimsOwnerAfterActiveOwnerExpires",
+        "standbyClaimTimeoutCancelsStalledRecoveryAndAllowsRetry",
     },
     "io.etcdhbase.server.commit.MutationForwardReceiverTest": {
         "staleSealedBindingWithoutDurableSelectionIsResolvedWithoutMutation",
@@ -363,8 +382,9 @@ J42_CRITICAL_JAVA_TESTS = {
     },
     "io.etcdhbase.server.M4LeaseKeepAliveRpcIT": {
         "realGoKeepAliveMatchesNativeAcrossLayouts",
-        "expiredActiveLeaseIsRejectedUntilDurableRevocation",
+        "expiredActiveLeaseCannotRenewBeforeDurableRevocation",
         "dualRuntimeForwardsKeepAliveOverMtlsAndFencesTheOldOwner",
+        "dualProcessKeepAliveSurvivesOwnerFailureAndFencesStaleEpoch",
         "persistedKeepAliveSurvivesLostOwnerReplyAndRestart",
         "persistedKeepAliveSurvivesClientCancellationBeforeResponse",
     },
@@ -927,6 +947,90 @@ def _validate_java_tests(artifact: Path, task: dict[str, object]) -> int:
     return sum(len(item[2]) for item in suites.values())
 
 
+def _validate_j42_runtime_metrics(artifact: Path) -> dict[str, object]:
+    report_path = artifact / "server/target/failsafe-reports/TEST-io.etcdhbase.server.M4LeaseKeepAliveRpcIT.xml"
+    if not report_path.is_file() or report_path.is_symlink():
+        raise ReportError("J42 KeepAlive runtime metric test report is missing or unsafe")
+    suites = _testsuite_elements(report_path)
+    metric_lines = [
+        line.removeprefix("M4_KEEPALIVE_METRICS_V1 ")
+        for suite in suites
+        for output in suite.iter("system-out")
+        for line in (output.text or "").splitlines()
+        if line.startswith("M4_KEEPALIVE_METRICS_V1 ")
+    ]
+    if len(metric_lines) != 2:
+        raise ReportError("J42 KeepAlive metric samples do not cover both HBase layouts")
+
+    stage_names = (
+        "queue", "prepare", "publish_and_finalize", "result_resolution",
+        "delivery_validation", "outbound_ready_wait",
+    )
+    required_fields = {
+        "sampling_method", "requests", "responses", "selected", "unknown_outcomes",
+        "request_bytes", "response_bytes", "auxiliary_records", "auxiliary_payload_bytes",
+        "hbase_client_operations", "logical_hbase_request_payload_bytes",
+    }
+    for stage in stage_names:
+        required_fields.update({f"{stage}_samples", f"{stage}_total_nanos"})
+
+    totals = {field: 0 for field in required_fields if field != "sampling_method"}
+    for metric_line in metric_lines:
+        if len(metric_line) > 4096:
+            raise ReportError("J42 KeepAlive metric sample exceeds its size limit")
+        fields: dict[str, str] = {}
+        for token in metric_line.split():
+            name, separator, value = token.partition("=")
+            if not separator or name in fields:
+                raise ReportError("J42 KeepAlive metric sample is malformed")
+            fields[name] = value
+        if fields.get("sampling_method") != "per-runtime-cumulative-counter-snapshot":
+            raise ReportError("J42 KeepAlive metric sample method is missing or changed")
+        if set(fields) != required_fields:
+            raise ReportError("J42 KeepAlive metric sample is missing required counters")
+        for name in required_fields - {"sampling_method"}:
+            raw_value = fields[name]
+            if not re.fullmatch(r"[0-9]{1,20}", raw_value):
+                raise ReportError("J42 KeepAlive metric sample contains a non-numeric counter")
+            totals[name] += int(raw_value)
+        if (int(fields["requests"]) < 8 or int(fields["responses"]) < 1
+                or int(fields["selected"]) < 1 or int(fields["auxiliary_records"]) < 1
+                or int(fields["auxiliary_payload_bytes"]) < 1
+                or int(fields["request_bytes"]) < 1 or int(fields["response_bytes"]) < 1
+                or int(fields["hbase_client_operations"]) < 1
+                or int(fields["logical_hbase_request_payload_bytes"]) < 1):
+            raise ReportError("J42 KeepAlive metric sample does not contain the exercised RPC and storage counters")
+        if any(int(fields[f"{stage}_samples"]) < 1 for stage in stage_names):
+            raise ReportError("J42 KeepAlive metric sample is missing a stage-duration population")
+
+    queue_samples = totals["queue_samples"]
+    return {
+        "keepalive_sampling_method": "per-runtime-cumulative-counter-snapshot",
+        "keepalive_metric_snapshots": len(metric_lines),
+        "keepalive_rpc_requests": totals["requests"],
+        "keepalive_rpc_responses": totals["responses"],
+        "keepalive_selected_renewals": totals["selected"],
+        "keepalive_unknown_outcomes": totals["unknown_outcomes"],
+        "keepalive_proto_request_bytes": totals["request_bytes"],
+        "keepalive_proto_response_bytes": totals["response_bytes"],
+        "keepalive_auxiliary_records": totals["auxiliary_records"],
+        "keepalive_auxiliary_payload_bytes": totals["auxiliary_payload_bytes"],
+        "keepalive_logical_hbase_client_operations": totals["hbase_client_operations"],
+        "keepalive_logical_hbase_request_payload_bytes": totals["logical_hbase_request_payload_bytes"],
+        "keepalive_queue_wait_samples": queue_samples,
+        "keepalive_queue_wait_total_nanos": totals["queue_total_nanos"],
+        "keepalive_queue_wait_mean_nanos": totals["queue_total_nanos"] // queue_samples,
+        "keepalive_stages": {
+            stage: {
+                "samples": totals[f"{stage}_samples"],
+                "total_nanos": totals[f"{stage}_total_nanos"],
+                "mean_nanos": totals[f"{stage}_total_nanos"] // totals[f"{stage}_samples"],
+            }
+            for stage in stage_names
+        },
+    }
+
+
 def _task_artifact_root(artifact: Path, task: dict[str, object]) -> Path:
     subdirectory = task.get("artifact_subdir", "")
     if not isinstance(subdirectory, str):
@@ -1332,7 +1436,7 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
     _validate_native_evidence(evidence_root, run, task, suite_hash, prefix_hash)
     layouts = _validate_target_evidence(evidence_root, run, task, suite_hash, prefix_hash)
     _validate_comparison_evidence(evidence_root, task)
-    return {
+    summary = {
         "task": run["tasks"][0],
         "run_id": run_id,
         "source_commit": source_commit,
@@ -1343,6 +1447,9 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
         "native_trace_cases": len(task["trace_cases"]),
         "target_layouts": sorted(layouts),
     }
+    if task["id"] == "J42":
+        summary.update(_validate_j42_runtime_metrics(artifact))
+    return summary
 
 
 def main(argv: list[str] | None = None) -> int:

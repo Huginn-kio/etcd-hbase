@@ -42,14 +42,21 @@ public final class LeaseTimeRules {
         && time.nowLowerEpochMillis() >= state.deadlineEpochMillis();
   }
 
-  /** Returns a conservative, non-negative whole-second estimate without extending the lease. */
+  /** Returns a conservative whole-second estimate, or {@code -1} when the lease is inactive. */
   public static long remainingTtlSeconds(LeaseState state, LeaseTimeObservation time) {
+    long remainingMillis = remainingTtlMillis(state, time);
+    return remainingMillis <= 0 ? remainingMillis
+        : remainingMillis / MILLIS_PER_SECOND;
+  }
+
+  /** Returns remaining milliseconds, or {@code -1} when the lease is inactive. */
+  public static long remainingTtlMillis(LeaseState state, LeaseTimeObservation time) {
     Objects.requireNonNull(state, "state");
     requireHealthy(time);
     if (state.status() != LeaseState.Status.ACTIVE) return -1;
     long remainingMillis = state.deadlineEpochMillis() - time.nowUpperEpochMillis();
     return remainingMillis <= 0 ? 0
-        : Math.min(state.grantedTtlSeconds(), remainingMillis / MILLIS_PER_SECOND);
+        : Math.min(Math.multiplyExact(state.grantedTtlSeconds(), MILLIS_PER_SECOND), remainingMillis);
   }
 
   private static void requireHealthy(LeaseTimeObservation time) {

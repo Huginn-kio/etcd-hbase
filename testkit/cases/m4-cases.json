@@ -690,6 +690,9 @@
           "snapshotsLogicalStorageCostsAndRejectsBackwardsDeltas",
           "serviceContinuationSharesStorageAccountingButNotCancellation"
         ]},
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.lease.LeaseTimeRulesTest", "tests": [
+          "reportsConservativeRemainingTtlInMillisAndCapsAtGrantedTtl"
+        ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.BoundedPublicationHandoffTest", "tests": [
           "attributesServiceOwnedStorageCostToTheTransferredOperation"
         ]},
@@ -699,9 +702,21 @@
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.LeaseKeepAliveStreamTest", "tests": [
           "serializesResponsesAndRequestsOneInboundMessageAtATime",
           "doesNotSendUntilReadyAndReleasesPendingDeliveryOnCancellation",
+          "preservesGrantedKeepAliveTtlWhenTheNextRenewalWindowStillFits",
+          "terminatesInsteadOfPromisingAFullTtlWhenTheClientCannotRenewBeforeExpiry",
           "halfCloseWaitsForCurrentOperationBeforeCompleting",
           "observerFailureReleasesDeliveryAndStopsFurtherInput",
           "timesOutAStalledOutboundResponseAndReleasesItsDelivery"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.LeaseKeepAliveTimingTest", "tests": [
+          "preservesTheClientScheduleAndResponseSafetyMargin",
+          "capsTheMarginForShortTtlsWithoutMakingAResponseWindowImpossible",
+          "rejectsNonPositiveOrUnsupportedTtls"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.MutationRelayTest", "tests": [
+          "staleGatewayOwnerSampleIsRelocatedBeforeAnyRequestIsSent",
+          "ownerChangeDuringRouteLookupDiscardsTheStaleRouteAndKeepsInvocation",
+          "unknownReplyAfterSendIsNotRelocatedEvenWhenOwnerChanges"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.SerialMutationQueueTest", "tests": [
           "zeroQueuedCapacityRejectsConcurrentRequestsWithoutDisplacingTheActiveMutation"
@@ -728,7 +743,7 @@
         ]},
         {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseKeepAliveRpcIT", "tests": [
           "realGoKeepAliveMatchesNativeAcrossLayouts",
-          "expiredActiveLeaseIsRejectedUntilDurableRevocation",
+          "expiredActiveLeaseCannotRenewBeforeDurableRevocation",
           "dualRuntimeForwardsKeepAliveOverMtlsAndFencesTheOldOwner",
           "dualProcessKeepAliveSurvivesOwnerFailureAndFencesStaleEpoch",
           "persistedKeepAliveSurvivesLostOwnerReplyAndRestart",

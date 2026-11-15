@@ -16,10 +16,14 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.kv.KvFailure;
 import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.request.RequestScope;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class MutationRelayTest {
@@ -162,15 +166,104 @@ class MutationRelayTest {
     assertEquals(0, sends.get());
   }
 
+  @Test
+  void staleGatewayOwnerSampleIsRelocatedBeforeAnyRequestIsSent() {
+    AtomicReference<CommitState> state = new AtomicReference<>(ownerBState());
+    List<MutationForwardRequest> sentRequests = new CopyOnWriteArrayList<>();
+    List<OwnerForwarding.Route> sentRoutes = new CopyOnWriteArrayList<>();
+    MutationRelay relay = new MutationRelay(control(state),
+        (group, owner, epoch) -> CompletableFuture.completedFuture(route(owner, epoch)),
+        (selected, forwarded, scope) -> {
+          sentRoutes.add(selected);
+          sentRequests.add(forwarded);
+          return CompletableFuture.completedFuture(new OwnerForwarding.Completed(new byte[] {9}));
+        });
+    MutationForwardRequest original = request();
+
+    MutationRelay.KnownResult result = assertInstanceOf(MutationRelay.KnownResult.class,
+        relay.forward(original, RequestScope.withoutDeadline()).join());
+
+    assertEquals("owner-b", sentRoutes.getFirst().ownerInstance());
+    assertEquals(2, sentRequests.getFirst().expectedOwnerEpoch());
+    assertEquals(original.invocationId(), sentRequests.getFirst().invocationId());
+    assertEquals(original.requestDigest(), sentRequests.getFirst().requestDigest());
+    assertEquals(original.operationBytes(), sentRequests.getFirst().operationBytes());
+    org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[] {9}, result.responseBytes());
+  }
+
+  @Test
+  void ownerChangeDuringRouteLookupDiscardsTheStaleRouteAndKeepsInvocation() throws Exception {
+    AtomicReference<CommitState> state = new AtomicReference<>(ownerAState());
+    var routeLookupStarted = new CompletableFuture<Void>();
+    var firstRoute = new CompletableFuture<OwnerForwarding.Route>();
+    var routeLookups = new AtomicInteger();
+    List<MutationForwardRequest> sentRequests = new CopyOnWriteArrayList<>();
+    List<OwnerForwarding.Route> sentRoutes = new CopyOnWriteArrayList<>();
+    MutationRelay relay = new MutationRelay(control(state), (group, owner, epoch) -> {
+      if (routeLookups.getAndIncrement() == 0) {
+        assertEquals("owner-a", owner);
+        assertEquals(1, epoch);
+        routeLookupStarted.complete(null);
+        return firstRoute;
+      }
+      assertEquals("owner-b", owner);
+      assertEquals(2, epoch);
+      return CompletableFuture.completedFuture(route(owner, epoch));
+    }, (selected, forwarded, scope) -> {
+      sentRoutes.add(selected);
+      sentRequests.add(forwarded);
+      return CompletableFuture.completedFuture(new OwnerForwarding.Completed(new byte[] {4}));
+    });
+    MutationForwardRequest original = request();
+    var result = relay.forward(original, RequestScope.withoutDeadline());
+
+    routeLookupStarted.get(5, TimeUnit.SECONDS);
+    assertTrue(sentRoutes.isEmpty(), "the relay must not send before the route is revalidated");
+    state.set(ownerBState());
+    firstRoute.complete(route("owner-a", 1));
+
+    assertInstanceOf(MutationRelay.KnownResult.class, result.join());
+    assertEquals(1, sentRoutes.size(), "only the current owner may receive the request");
+    assertEquals("owner-b", sentRoutes.getFirst().ownerInstance());
+    assertEquals(2, sentRequests.getFirst().expectedOwnerEpoch());
+    assertEquals(original.invocationId(), sentRequests.getFirst().invocationId());
+    assertEquals(original.requestDigest(), sentRequests.getFirst().requestDigest());
+    assertEquals(original.operationBytes(), sentRequests.getFirst().operationBytes());
+  }
+
+  @Test
+  void unknownReplyAfterSendIsNotRelocatedEvenWhenOwnerChanges() {
+    AtomicReference<CommitState> state = new AtomicReference<>(ownerAState());
+    var sends = new AtomicInteger();
+    MutationRelay relay = new MutationRelay(control(state),
+        (group, owner, epoch) -> CompletableFuture.completedFuture(route(owner, epoch)),
+        (selected, forwarded, scope) -> {
+          sends.incrementAndGet();
+          state.set(ownerBState());
+          return CompletableFuture.completedFuture(
+              new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
+        });
+
+    var result = assertInstanceOf(MutationRelay.ResultUnknown.class,
+        relay.forward(request(), RequestScope.withoutDeadline()).join());
+
+    assertEquals(BackendFailure.Category.UNAVAILABLE, result.category());
+    assertEquals(1, sends.get(), "an uncertain sent invocation must never be retried at a new owner");
+  }
+
   private static MutationRelay relay(
       java.util.function.Function<String, CompletableFuture<OwnerForwarding.Route>> routes,
       OwnerForwarding.AuthenticatedChannel channel) {
-    CommitState state = CommitState.initial(FINGERPRINT, 1).claimOwner("owner-a", 1, 10_000);
-    CommitControlStore control = new CommitControlStore() {
+    return new MutationRelay(control(new AtomicReference<>(ownerAState())),
+        (group, owner, epoch) -> routes.apply(owner), channel);
+  }
+
+  private static CommitControlStore control(AtomicReference<CommitState> state) {
+    return new CommitControlStore() {
       @Override
       public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
         return CompletableFuture.completedFuture(
-            Optional.of(new ControlSnapshot(state, new byte[] {1})));
+            Optional.of(new ControlSnapshot(state.get(), new byte[] {1})));
       }
 
       @Override
@@ -184,8 +277,18 @@ class MutationRelayTest {
         throw new UnsupportedOperationException();
       }
     };
-    return new MutationRelay(control,
-        (group, owner, epoch) -> routes.apply(owner), channel);
+  }
+
+  private static CommitState ownerAState() {
+    return CommitState.initial(FINGERPRINT, 1).claimOwner("owner-a", 1, 10_000);
+  }
+
+  private static CommitState ownerBState() {
+    return ownerAState().claimOwner("owner-b", 10_000, 20_000);
+  }
+
+  private static OwnerForwarding.Route route(String owner, long epoch) {
+    return new OwnerForwarding.Route(owner, epoch, "endpoint-" + owner, "peer-" + owner);
   }
 
   private static void assertUnknownCategory(

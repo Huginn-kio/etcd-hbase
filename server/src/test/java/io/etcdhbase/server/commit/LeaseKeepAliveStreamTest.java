@@ -88,22 +88,23 @@ class LeaseKeepAliveStreamTest {
   }
 
   @Test
-  void preservesGrantedKeepAliveTtlAfterOutboundBackpressureWhileLeaseRemainsActive() {
+  void preservesGrantedKeepAliveTtlWhenTheNextRenewalWindowStillFits() {
     var observer = new RecordingObserver();
     observer.ready = false;
     var releases = new AtomicInteger();
-    var remainingTtl = new AtomicLong(12);
+    var remainingTtl = new AtomicLong(8_000);
     try (var scope = RequestScope.withoutDeadline(); var timers = timers()) {
       var stream = new LeaseKeepAliveStream(observer, scope, Runnable::run, timers,
           request -> CompletableFuture.completedFuture(new LeaseKeepAliveStream.Delivery(
               Rpc.LeaseKeepAliveResponse.newBuilder().setID(request.getID()).setTTL(15).build(),
               releases::incrementAndGet, () -> {
-                if (remainingTtl.get() <= 0) throw new CompletionException(
+                if (!LeaseKeepAliveTiming.canSendPositiveResponse(15, remainingTtl.get())) {
+                  throw new CompletionException(
                     new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+                }
               })), new RequestMetrics());
       stream.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(25).build());
 
-      remainingTtl.set(4);
       observer.ready = true;
       observer.readyHandler.run();
 
@@ -111,6 +112,36 @@ class LeaseKeepAliveStreamTest {
       assertEquals(15, observer.responses.getFirst().getTTL(),
           "the KeepAlive response preserves the granted TTL while rechecking that the lease is active");
       assertEquals(1, releases.get());
+    }
+  }
+
+  @Test
+  void terminatesInsteadOfPromisingAFullTtlWhenTheClientCannotRenewBeforeExpiry() throws Exception {
+    var observer = new RecordingObserver();
+    observer.ready = false;
+    var releases = new AtomicInteger();
+    var remainingTtl = new AtomicLong(4_000);
+    try (var scope = RequestScope.withoutDeadline(); var timers = timers()) {
+      var stream = new LeaseKeepAliveStream(observer, scope, Runnable::run, timers,
+          request -> CompletableFuture.completedFuture(new LeaseKeepAliveStream.Delivery(
+              Rpc.LeaseKeepAliveResponse.newBuilder().setID(request.getID()).setTTL(15).build(),
+              releases::incrementAndGet, () -> {
+                if (!LeaseKeepAliveTiming.canSendPositiveResponse(15, remainingTtl.get())) {
+                  throw new CompletionException(
+                      new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+                }
+              })), new RequestMetrics());
+      stream.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(27).build());
+
+      observer.ready = true;
+      observer.readyHandler.run();
+
+      assertTrue(observer.failed.await(2, TimeUnit.SECONDS));
+      assertTrue(observer.responses.isEmpty());
+      assertEquals(io.grpc.Status.Code.UNAVAILABLE,
+          ((io.grpc.StatusRuntimeException) observer.failure).getStatus().getCode());
+      assertEquals(1, releases.get());
+      assertTrue(scope.isCancelled());
     }
   }
 
