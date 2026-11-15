@@ -38,12 +38,14 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Adapts the implemented Lease unary methods to one table group's bounded runtime. */
 public final class LeaseGateway {
@@ -351,25 +353,15 @@ public final class LeaseGateway {
     }
 
     if (response.getTTL() == 0) {
-      completeKeepAliveDelivery(response, () -> {}, account, result, finish);
+      completeKeepAliveDelivery(response, () -> CompletableFuture.completedFuture(null),
+          account, result, finish);
       return;
     }
     Rpc.LeaseKeepAliveResponse resolvedResponse = response;
-    readCurrentKeepAliveLease(request.getID(), scope, account).whenComplete((state, failure) -> {
-      if (failure != null) {
-        failKeepAliveProjection(failure, account, result, finish);
-        return;
-      }
-      try {
-        validateKeepAliveLease(state, resolvedResponse.getTTL());
-        completeKeepAliveDelivery(resolvedResponse,
-            () -> validateKeepAliveLease(state, resolvedResponse.getTTL()),
-            account, result, finish);
-      } catch (RuntimeException | Error projectionFailure) {
-        failKeepAliveProjection(projectionFailure, account, result, finish);
-        if (projectionFailure instanceof Error fatal) throw fatal;
-      }
-    });
+    completeKeepAliveDelivery(resolvedResponse,
+        () -> readCurrentKeepAliveLease(request.getID(), scope, account)
+            .thenAccept(state -> validateKeepAliveLease(state, resolvedResponse.getTTL())),
+        account, result, finish);
   }
 
   private CompletableFuture<LeaseState> readCurrentKeepAliveLease(long leaseId,
@@ -402,7 +394,7 @@ public final class LeaseGateway {
   }
 
   private void completeKeepAliveDelivery(Rpc.LeaseKeepAliveResponse response,
-      Runnable validateBeforeSend, BudgetManager.Account account,
+      Supplier<CompletionStage<Void>> validateBeforeSend, BudgetManager.Account account,
       CompletableFuture<LeaseKeepAliveStream.Delivery> result, Runnable finish) {
     try {
       int responseBytes = response.getSerializedSize();

@@ -16,6 +16,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
@@ -172,6 +173,111 @@ class LeaseKeepAliveStreamTest {
       assertEquals(io.grpc.Status.Code.UNAVAILABLE,
           ((io.grpc.StatusRuntimeException) observer.failure).getStatus().getCode());
       assertEquals(1, releases.get());
+      assertTrue(scope.isCancelled());
+    }
+  }
+
+  @Test
+  void rechecksAuthoritativeLeaseStateAfterBackpressureBeforeSendingPositiveResponse()
+      throws Exception {
+    var observer = new RecordingObserver();
+    observer.ready = false;
+    var leaseActive = new AtomicBoolean(true);
+    var validationCalls = new AtomicInteger();
+    var releases = new AtomicInteger();
+    try (var scope = RequestScope.withoutDeadline(); var timers = timers()) {
+      var stream = new LeaseKeepAliveStream(observer, scope, Runnable::run, timers,
+          request -> CompletableFuture.completedFuture(new LeaseKeepAliveStream.Delivery(
+              Rpc.LeaseKeepAliveResponse.newBuilder().setID(request.getID()).setTTL(15).build(),
+              releases::incrementAndGet, () -> {
+                validationCalls.incrementAndGet();
+                if (!leaseActive.get()) {
+                  return CompletableFuture.failedFuture(
+                      new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE)));
+                }
+                return CompletableFuture.completedFuture(null);
+              })), new RequestMetrics());
+      stream.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(28).build());
+
+      assertEquals(0, validationCalls.get(),
+          "the authoritative state check must wait until the response can be sent");
+      assertTrue(observer.responses.isEmpty());
+
+      leaseActive.set(false); // Revoke commits while the positive TTL response is backpressured.
+      observer.ready = true;
+      observer.readyHandler.run();
+
+      assertTrue(observer.failed.await(2, TimeUnit.SECONDS));
+      assertEquals(1, validationCalls.get());
+      assertTrue(observer.responses.isEmpty(), "a revoked lease must not receive a positive TTL");
+      assertEquals(io.grpc.Status.Code.UNAVAILABLE,
+          ((io.grpc.StatusRuntimeException) observer.failure).getStatus().getCode());
+      assertEquals(1, releases.get());
+      assertTrue(scope.isCancelled());
+    }
+  }
+
+  @Test
+  void discardsValidationThatSpansAnOutboundNotReadyTransition() throws Exception {
+    var observer = new RecordingObserver();
+    var firstValidation = new CompletableFuture<Void>();
+    var leaseActive = new AtomicBoolean(true);
+    var validationCalls = new AtomicInteger();
+    var releases = new AtomicInteger();
+    try (var scope = RequestScope.withoutDeadline(); var timers = timers()) {
+      var stream = new LeaseKeepAliveStream(observer, scope, Runnable::run, timers,
+          request -> CompletableFuture.completedFuture(new LeaseKeepAliveStream.Delivery(
+              Rpc.LeaseKeepAliveResponse.newBuilder().setID(request.getID()).setTTL(15).build(),
+              releases::incrementAndGet, () -> {
+                if (validationCalls.incrementAndGet() == 1) return firstValidation;
+                if (!leaseActive.get()) {
+                  return CompletableFuture.failedFuture(
+                      new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+                }
+                return CompletableFuture.completedFuture(null);
+              })), new RequestMetrics());
+      stream.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(30).build());
+
+      assertEquals(1, validationCalls.get());
+      observer.ready = false;
+      leaseActive.set(false);
+      observer.ready = true;
+      observer.readyHandler.run();
+      firstValidation.complete(null);
+
+      assertTrue(observer.failed.await(2, TimeUnit.SECONDS));
+      assertEquals(2, validationCalls.get(),
+          "a state read spanning an outbound readiness change must be discarded and retried");
+      assertTrue(observer.responses.isEmpty());
+      assertEquals(1, releases.get());
+    }
+  }
+
+  @Test
+  void releasesDeliveryOnceWhenCancellationWinsDuringAsynchronousValidation() {
+    var observer = new RecordingObserver();
+    var validation = new CompletableFuture<Void>();
+    var validationCalls = new AtomicInteger();
+    var releases = new AtomicInteger();
+    try (var scope = RequestScope.withoutDeadline(); var timers = timers()) {
+      var stream = new LeaseKeepAliveStream(observer, scope, Runnable::run, timers,
+          request -> CompletableFuture.completedFuture(new LeaseKeepAliveStream.Delivery(
+              Rpc.LeaseKeepAliveResponse.newBuilder().setID(request.getID()).setTTL(15).build(),
+              releases::incrementAndGet, () -> {
+                validationCalls.incrementAndGet();
+                return validation;
+              })), new RequestMetrics());
+      stream.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(29).build());
+
+      assertEquals(1, validationCalls.get());
+      assertTrue(observer.responses.isEmpty());
+      assertEquals(0, releases.get());
+
+      observer.cancel();
+      validation.complete(null);
+
+      assertTrue(observer.responses.isEmpty());
+      assertEquals(1, releases.get(), "cancellation and a late validation callback must release once");
       assertTrue(scope.isCancelled());
     }
   }

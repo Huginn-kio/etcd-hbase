@@ -8,6 +8,7 @@ import io.etcdhbase.grpc.protocol.ErrorProjection;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
@@ -16,25 +17,39 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** One-at-a-time, bounded KeepAlive duplex flow controller with a single response writer. */
 final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveRequest> {
   private static final long MAX_OUTBOUND_READY_WAIT_NANOS = TimeUnit.SECONDS.toNanos(5);
 
   record Delivery(Rpc.LeaseKeepAliveResponse response, Runnable release,
-      Runnable beforeSendCheck) {
+      Supplier<CompletionStage<Void>> beforeSendValidation) {
     Delivery {
       Objects.requireNonNull(response, "response");
       Objects.requireNonNull(release, "release");
-      Objects.requireNonNull(beforeSendCheck, "beforeSendCheck");
+      Objects.requireNonNull(beforeSendValidation, "beforeSendValidation");
     }
 
     Delivery(Rpc.LeaseKeepAliveResponse response, Runnable release) {
-      this(response, release, () -> {});
+      this(response, release, () -> CompletableFuture.completedFuture(null));
     }
 
-    void validateBeforeSend() {
-      if (response.getTTL() > 0) beforeSendCheck.run();
+    Delivery(Rpc.LeaseKeepAliveResponse response, Runnable release, Runnable beforeSendCheck) {
+      this(response, release, adapt(beforeSendCheck));
+    }
+
+    CompletionStage<Void> validateBeforeSend() {
+      if (response.getTTL() <= 0) return CompletableFuture.completedFuture(null);
+      return Objects.requireNonNull(beforeSendValidation.get(), "before-send validation");
+    }
+
+    private static Supplier<CompletionStage<Void>> adapt(Runnable beforeSendCheck) {
+      Objects.requireNonNull(beforeSendCheck, "beforeSendCheck");
+      return () -> {
+        beforeSendCheck.run();
+        return CompletableFuture.completedFuture(null);
+      };
     }
   }
 
@@ -54,6 +69,9 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
   private boolean cancelled;
   private Throwable failure;
   private Delivery pending;
+  private boolean pendingValidationStarted;
+  private boolean pendingValidated;
+  private long readinessGeneration;
   private ScheduledFuture<?> pendingReadyTimeout;
   private long pendingReadyWaitStartedNanos;
 
@@ -73,7 +91,7 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
           (ServerCallStreamObserver<Rpc.LeaseKeepAliveResponse>) serverCall;
       serverObserver = typed;
       serverObserver.disableAutoInboundFlowControl();
-      serverObserver.setOnReadyHandler(this::scheduleDrain);
+      serverObserver.setOnReadyHandler(this::onTransportReady);
       serverObserver.setOnCancelHandler(this::cancelFromPeer);
       requestNext();
     } else {
@@ -147,6 +165,8 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
         failure = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
       } else {
         pending = delivery;
+        pendingValidationStarted = false;
+        pendingValidated = false;
         pendingReadyWaitStartedNanos = System.nanoTime();
         readyWaitNanos = maximumOutboundReadyWaitNanos(delivery.response().getTTL());
         scheduleTimeout = true;
@@ -229,6 +249,8 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
       Throwable terminalFailure = null;
       boolean complete = false;
       boolean request = false;
+      Delivery validate = null;
+      long validateAtReadinessGeneration = -1;
       long outboundReadyWaitNanos = 0;
       ScheduledFuture<?> timeout = null;
       synchronized (lock) {
@@ -239,16 +261,28 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
           failure = null;
           delivery = pending;
           pending = null;
+          resetPendingValidation();
           timeout = pendingReadyTimeout;
           pendingReadyTimeout = null;
-        } else if (pending != null && isReady()) {
-          delivery = pending;
-          pending = null;
-          timeout = pendingReadyTimeout;
-          pendingReadyTimeout = null;
-          outboundReadyWaitNanos = Math.max(0,
-              System.nanoTime() - pendingReadyWaitStartedNanos);
-          pendingReadyWaitStartedNanos = 0;
+        } else if (pending != null && !isReady()) {
+          if (!pendingValidationStarted) pendingValidated = false;
+          return;
+        } else if (pending != null) {
+          if (pendingValidated) {
+            outboundReadyWaitNanos = Math.max(0,
+                System.nanoTime() - pendingReadyWaitStartedNanos);
+            delivery = pending;
+            pending = null;
+            resetPendingValidation();
+            timeout = pendingReadyTimeout;
+            pendingReadyTimeout = null;
+          } else if (!pendingValidationStarted) {
+            pendingValidationStarted = true;
+            validate = pending;
+            validateAtReadinessGeneration = readinessGeneration;
+          } else {
+            return;
+          }
         } else if (pending == null && !processing && inboundClosed) {
           terminal = true;
           complete = true;
@@ -283,12 +317,8 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
         }
         return;
       }
-      try {
-        delivery.validateBeforeSend();
-      } catch (RuntimeException | Error staleResponse) {
-        release(delivery);
-        fail(staleResponse);
-        if (staleResponse instanceof Error fatal) throw fatal;
+      if (validate != null) {
+        validateBeforeSend(validate, validateAtReadinessGeneration);
         return;
       }
       try {
@@ -306,10 +336,51 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
     }
   }
 
+  private void validateBeforeSend(Delivery expected, long startedAtReadinessGeneration) {
+    CompletionStage<Void> validation;
+    try {
+      validation = expected.validateBeforeSend();
+    } catch (RuntimeException | Error validationFailure) {
+      completePendingValidation(expected, startedAtReadinessGeneration, validationFailure);
+      if (validationFailure instanceof Error fatal) throw fatal;
+      return;
+    }
+    validation.whenComplete((ignored, validationFailure) ->
+        completePendingValidation(expected, startedAtReadinessGeneration, validationFailure));
+  }
+
+  private void completePendingValidation(Delivery expected, long startedAtReadinessGeneration,
+      Throwable validationFailure) {
+    synchronized (lock) {
+      if (pending != expected || terminal || cancelled) return;
+      if (validationFailure != null) {
+        if (failure == null) failure = validationFailure;
+      } else if (readinessGeneration == startedAtReadinessGeneration && isReady()) {
+        pendingValidationStarted = false;
+        pendingValidated = true;
+      } else {
+        pendingValidationStarted = false;
+        pendingValidated = false;
+      }
+    }
+    scheduleDrain();
+  }
+
+  private void onTransportReady() {
+    synchronized (lock) {
+      readinessGeneration++;
+      if (pending != null && pendingValidated) {
+        pendingValidationStarted = false;
+        pendingValidated = false;
+      }
+    }
+    scheduleDrain();
+  }
+
   private boolean hasRunnableWork() {
     synchronized (lock) {
       return !terminal && !cancelled && (failure != null
-          || pending != null && isReady()
+          || pending != null && isReady() && (!pendingValidationStarted || pendingValidated)
           || pending == null && !processing && inboundClosed
           || serverObserver != null && pending == null && !processing
               && !inboundClosed && !demandOutstanding);
@@ -336,6 +407,7 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
       terminal = true;
       release = pending;
       pending = null;
+      resetPendingValidation();
       timeout = pendingReadyTimeout;
       pendingReadyTimeout = null;
     }
@@ -358,6 +430,7 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
       demandOutstanding = false;
       release = pending;
       pending = null;
+      resetPendingValidation();
       timeout = pendingReadyTimeout;
       pendingReadyTimeout = null;
     }
@@ -385,5 +458,11 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
 
   private static void cancel(ScheduledFuture<?> timeout) {
     if (timeout != null) timeout.cancel(false);
+  }
+
+  private void resetPendingValidation() {
+    pendingValidationStarted = false;
+    pendingValidated = false;
+    pendingReadyWaitStartedNanos = 0;
   }
 }
