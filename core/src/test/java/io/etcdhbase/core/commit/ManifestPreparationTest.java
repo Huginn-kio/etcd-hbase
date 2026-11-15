@@ -667,6 +667,51 @@ class ManifestPreparationTest {
   }
 
   @Test
+  void partialAuxiliaryWriteFailureNeverSealsKvOrBindingChanges() {
+    MemoryRepository repository = new MemoryRepository();
+    repository.failAuxiliaryRecordWriteNumber = 2;
+    SingleResultRepository resultRepository = new SingleResultRepository();
+    ResultCatalog results = new ResultCatalog(resultRepository);
+    InvocationBinding invocation = InvocationBinding.begin(InvocationId.create(),
+        ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]), TransactionId.create(),
+        OWNER_EPOCH, BASE_SEQUENCE, BASE_REVISION);
+    ResultIdentity resultIdentity = ResultIdentity.from(invocation);
+    ResultPage resultPage = new ResultPage(resultIdentity, 0, new byte[] {1});
+    ResultDirectory resultDirectory = ResultDirectory.create(resultIdentity,
+        List.of(ResultPageReference.from(resultPage)));
+    resultRepository.page = resultPage;
+    resultRepository.directory = resultDirectory;
+    TransactionId transactionId = invocation.transactionId();
+    List<PreparedCandidate> candidates = List.of(
+        candidate(transactionId, new byte[] {'k'}, new byte[] {1}));
+    List<PreparedEvent> events = List.of(
+        event(transactionId, 0, new byte[] {'k'}, new byte[] {1}));
+    List<PreparedAuxiliaryRecord> bindings = List.of(
+        PreparedAuxiliaryRecord.create(transactionId, OWNER_EPOCH, BASE_SEQUENCE, 0,
+            SystemRecordType.LEASE_BINDING, ByteKey.copyOf(new byte[] {1}),
+            ByteKey.copyOf(new byte[] {1})),
+        PreparedAuxiliaryRecord.create(transactionId, OWNER_EPOCH, BASE_SEQUENCE, 1,
+            SystemRecordType.LEASE_BINDING, ByteKey.copyOf(new byte[] {2}),
+            ByteKey.copyOf(new byte[] {2})));
+
+    try (RequestScope scope = scope()) {
+      var preparation = new ManifestPreparation(repository,
+          new ManifestPreparation.Limits(1, 1, 1, 1024));
+      assertThrows(CompletionException.class, () -> preparation.prepareWithResultAndAuxiliary(
+          invocation, candidates.iterator(), events.iterator(), resultDirectory.reference(), results,
+          bindings.iterator(), () -> CompletableFuture.completedFuture(null), scope).join());
+
+      assertEquals(1, repository.candidates.size(), "the KV candidate is only private");
+      assertEquals(1, repository.events.size(), "the event is only private");
+      assertEquals(1, repository.auxiliaryRecords.size(), "one binding was prepared privately");
+      assertTrue(repository.roots.isEmpty(), "a partial binding set cannot have a visible root");
+      assertTrue(repository.auxiliaryPages.isEmpty(), "an incomplete page must not be published");
+      assertTrue(repository.auxiliaryDirectories.isEmpty());
+      assertEquals(0, repository.sealCalls, "partial auxiliary preparation must fail before seal");
+    }
+  }
+
+  @Test
   void businessRootRequiresDurableMatchingResultBeforeSealAndBeforePublication() {
     MemoryRepository repository = new MemoryRepository();
     SingleResultRepository resultRepository = new SingleResultRepository();
@@ -1089,6 +1134,8 @@ class ManifestPreparationTest {
     private int maximumLogicalKeyLength = Integer.MAX_VALUE;
     private int candidateWriteCount;
     private int failCandidateWriteNumber = -1;
+    private int auxiliaryRecordWriteCount;
+    private int failAuxiliaryRecordWriteNumber = -1;
     private int writeCount;
     private int sealCalls;
     private boolean deferCreateResults;
@@ -1155,6 +1202,11 @@ class ManifestPreparationTest {
     @Override
     public CompletableFuture<SystemRecordStore.CreateResult> createAuxiliaryRecord(
         PreparedAuxiliaryRecord record, RequestScope scope) {
+      auxiliaryRecordWriteCount++;
+      if (auxiliaryRecordWriteCount == failAuxiliaryRecordWriteNumber) {
+        return CompletableFuture.failedFuture(new IllegalStateException(
+            "injected auxiliary record write failure"));
+      }
       writeCount++;
       return create(auxiliaryRecords, record.systemIdentity(), record, PreparedAuxiliaryRecord::digest);
     }

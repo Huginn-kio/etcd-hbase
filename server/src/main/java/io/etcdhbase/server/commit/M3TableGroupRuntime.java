@@ -14,6 +14,7 @@ import io.etcdhbase.core.commit.LeaseBindingReader;
 import io.etcdhbase.core.commit.LeaseBindingReadView;
 import io.etcdhbase.core.commit.LeaseEnumerationReader;
 import io.etcdhbase.core.commit.LeaseReadView;
+import io.etcdhbase.core.commit.ManifestCatalog;
 import io.etcdhbase.core.commit.ManifestPreparation;
 import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
