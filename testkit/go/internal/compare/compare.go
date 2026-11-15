@@ -78,6 +78,24 @@ func CompareM4LeaseKeepAliveRecords(left, right []trace.Record) error {
 	return compare(left, right, m4KeepAlivePolicy)
 }
 
+// CompareM4LeaseRevokeTraces compares the J43 Revoke and expiry contract with native etcd.
+func CompareM4LeaseRevokeTraces(left, right io.Reader) error {
+	leftRecords, err := trace.ReadJSONL(left)
+	if err != nil {
+		return fmt.Errorf("read native M4 Revoke trace: %w", err)
+	}
+	rightRecords, err := trace.ReadJSONL(right)
+	if err != nil {
+		return fmt.Errorf("read target M4 Revoke trace: %w", err)
+	}
+	return CompareM4LeaseRevokeRecords(leftRecords, rightRecords)
+}
+
+// CompareM4LeaseRevokeRecords exposes the same strict J43 policy to native regressions.
+func CompareM4LeaseRevokeRecords(left, right []trace.Record) error {
+	return compare(left, right, m4LeaseRevokePolicy)
+}
+
 type tracePolicy int
 
 const (
@@ -88,6 +106,7 @@ const (
 	m3RangePolicy
 	m4LeasePolicy
 	m4KeepAlivePolicy
+	m4LeaseRevokePolicy
 )
 
 func compareTraces(left, right io.Reader, policy tracePolicy) error {
@@ -135,12 +154,13 @@ func compare(left, right []trace.Record, policy tracePolicy) error {
 	if err != nil {
 		return err
 	}
-	if policy != standardPolicy && policy != m4LeasePolicy && policy != m4KeepAlivePolicy && (leftScope == rightScope ||
+	if policy != standardPolicy && policy != m4LeasePolicy && policy != m4KeepAlivePolicy &&
+		policy != m4LeaseRevokePolicy && (leftScope == rightScope ||
 		(leftScope != "native-etcd" && rightScope != "native-etcd") ||
 		(leftScope != "target-hbase" && rightScope != "target-hbase")) {
 		return errors.New("M3 comparison requires native and target traces")
 	}
-	if policy == m4LeasePolicy || policy == m4KeepAlivePolicy {
+	if policy == m4LeasePolicy || policy == m4KeepAlivePolicy || policy == m4LeaseRevokePolicy {
 		if (leftScope != "native-etcd" && leftScope != "target-hbase") ||
 			(leftScope != rightScope && leftScope != "native-etcd" && rightScope != "native-etcd") ||
 			(leftScope != rightScope && leftScope != "target-hbase" && rightScope != "target-hbase") {
@@ -153,12 +173,19 @@ func compare(left, right []trace.Record, policy tracePolicy) error {
 			if err := validateM4LeaseTrace(right); err != nil {
 				return fmt.Errorf("validate right M4 trace: %w", err)
 			}
-		} else {
+		} else if policy == m4KeepAlivePolicy {
 			if err := validateM4LeaseKeepAliveTrace(left); err != nil {
 				return fmt.Errorf("validate left M4 KeepAlive trace: %w", err)
 			}
 			if err := validateM4LeaseKeepAliveTrace(right); err != nil {
 				return fmt.Errorf("validate right M4 KeepAlive trace: %w", err)
+			}
+		} else {
+			if err := validateM4LeaseRevokeTrace(left); err != nil {
+				return fmt.Errorf("validate left M4 Revoke trace: %w", err)
+			}
+			if err := validateM4LeaseRevokeTrace(right); err != nil {
+				return fmt.Errorf("validate right M4 Revoke trace: %w", err)
 			}
 		}
 	}
@@ -181,16 +208,18 @@ func compare(left, right []trace.Record, policy tracePolicy) error {
 			left[index].StreamTerminal.Kind == "eof" && right[index].StreamTerminal.Kind == "eof"
 		bothSucceeded := left[index].Error == nil && right[index].Error == nil &&
 			(left[index].StreamTerminal == nil && right[index].StreamTerminal == nil || cleanKeepAliveTerminal)
-		if (policy == m4LeasePolicy || policy == m4KeepAlivePolicy) && leftScope != rightScope && bothSucceeded {
+		if (policy == m4LeasePolicy || policy == m4KeepAlivePolicy || policy == m4LeaseRevokePolicy) &&
+			leftScope != rightScope && bothSucceeded {
 			if err := projectM4LeaseTerm(leftNormalized[index], rightNormalized[index], leftScope); err != nil {
 				return fmt.Errorf("trace record %d has invalid M4 response header: %w", index+1, err)
 			}
-		} else if policy != standardPolicy && policy != m4LeasePolicy && policy != m4KeepAlivePolicy {
+		} else if policy != standardPolicy && policy != m4LeasePolicy && policy != m4KeepAlivePolicy &&
+			policy != m4LeaseRevokePolicy {
 			if err := projectM3Term(leftNormalized[index], rightNormalized[index], leftScope, bothSucceeded, policy); err != nil {
 				return fmt.Errorf("trace record %d has invalid M3 header: %w", index+1, err)
 			}
 		}
-		if policy == m4LeasePolicy || policy == m4KeepAlivePolicy {
+		if policy == m4LeasePolicy || policy == m4KeepAlivePolicy || policy == m4LeaseRevokePolicy {
 			if err := projectM4LeaseResponseWindow(leftNormalized[index], rightNormalized[index], leftScope, rightScope); err != nil {
 				return fmt.Errorf("trace record %d violates the M4 Lease timing or ordering contract: %w", index+1, err)
 			}

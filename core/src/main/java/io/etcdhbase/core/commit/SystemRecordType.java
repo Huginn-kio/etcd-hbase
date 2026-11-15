@@ -20,7 +20,8 @@ public enum SystemRecordType {
   EXPIRY_CANDIDATE(16),
   AUXILIARY(17),
   LEASE_RESULT(18),
-  LEASE_BINDING(19);
+  LEASE_BINDING(19),
+  LEASE_EXPIRY_CHECKPOINT(20);
 
   private final int id;
 

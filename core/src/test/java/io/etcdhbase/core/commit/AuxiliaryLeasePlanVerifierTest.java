@@ -8,6 +8,7 @@ import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseBindingVersion;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
@@ -102,6 +103,19 @@ class AuxiliaryLeasePlanVerifierTest {
     assertDoesNotThrow(transaction::finish);
   }
 
+  @Test
+  void checkpointOnlyPublicationDoesNotRequireLeaseStateChanges() {
+    var transactionId = TransactionId.create();
+    var checkpoint = new LeaseExpiryCheckpoint(4, SELECTED_SEQUENCE, 4, BASE_SEQUENCE, 1_000,
+        new LeaseExpiryCheckpoint.Position(0, 1_000, 0, java.util.Optional.empty()));
+    var transaction = verifier(null, null).begin(BASE_SEQUENCE);
+    transaction.accept(PreparedAuxiliaryRecord.create(transactionId, 4, BASE_SEQUENCE, 0,
+        SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+        LeaseExpiryCheckpoint.versionIdentity(SELECTED_SEQUENCE), checkpoint.encode()));
+
+    assertDoesNotThrow(transaction::finish);
+  }
+
   private static LeaseState activeState() {
     return new LeaseState(LEASE_IDENTITY, 30, 20_000, 4,
         LeaseState.Status.ACTIVE, SELECTED_SEQUENCE, 0, 0, 0);
@@ -113,7 +127,8 @@ class AuxiliaryLeasePlanVerifierTest {
   }
 
   private static AuxiliaryLeasePlanVerifier verifier(LeaseState state, LeaseBindingVersion binding) {
-    Map<ByteKey, LeaseState> states = Map.of(STATE_PAYLOAD, state);
+    Map<ByteKey, LeaseState> states = state == null
+        ? Map.of() : Map.of(STATE_PAYLOAD, state);
     Map<ByteKey, LeaseBindingVersion> bindings = binding == null
         ? Map.of() : Map.of(BINDING_PAYLOAD, binding);
     return new AuxiliaryLeasePlanVerifier(
@@ -140,6 +155,13 @@ class AuxiliaryLeasePlanVerifierTest {
     if (binding != null) {
       records.add(record(transactionId, ordinal, SystemRecordType.LEASE_BINDING,
           binding.recordIdentity().encode(), BINDING_PAYLOAD));
+      ordinal++;
+    }
+    if (state != null) {
+      LeaseExpiryCheckpoint checkpoint = new LeaseExpiryCheckpoint(1, SELECTED_SEQUENCE, 4,
+          BASE_SEQUENCE, 20_000, LeaseExpiryCheckpoint.idleAt(0));
+      records.add(record(transactionId, ordinal, SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+          LeaseExpiryCheckpoint.versionIdentity(SELECTED_SEQUENCE), checkpoint.encode()));
     }
     return List.copyOf(records);
   }

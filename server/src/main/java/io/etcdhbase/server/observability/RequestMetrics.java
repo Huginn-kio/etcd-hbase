@@ -28,6 +28,7 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   private final Map<PutStage, StageCounter> putStages;
   private final Map<TxnStage, StageCounter> txnStages;
   private final Map<LeaseRenewalStage, StageCounter> leaseRenewalStages;
+  private final Map<LeaseRevocationStage, StageCounter> leaseRevocationStages;
   private final LongAdder putOutputBytes = new LongAdder();
   private final LongAdder txnOutputBytes = new LongAdder();
   private final LongAdder leaseRenewalRequests = new LongAdder();
@@ -40,6 +41,17 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   private final LongAdder leaseRenewalAuxiliaryPayloadBytes = new LongAdder();
   private final LongAdder leaseRenewalHBaseClientOperations = new LongAdder();
   private final LongAdder leaseRenewalLogicalHBaseRequestPayloadBytes = new LongAdder();
+  private final LongAdder leaseExpiryScanRows = new LongAdder();
+  private final LongAdder leaseExpiryScanBytes = new LongAdder();
+  private final LongAdder leaseExpiryCandidates = new LongAdder();
+  private final LongAdder leaseExpiryStaleCandidates = new LongAdder();
+  private final LongAdder leaseExpiryRevocations = new LongAdder();
+  private final LongAdder leaseExpiryDelayMillis = new LongAdder();
+  private final LongAdder leaseExpiryDelaySamplesMissing = new LongAdder();
+  private final LongAdder leaseExpiryRetries = new LongAdder();
+  private final AtomicLong leaseExpiryOwnerEpoch = new AtomicLong();
+  private final AtomicLong leaseExpiryCheckpointSequence = new AtomicLong();
+  private final AtomicLong leaseExpiryWindowStopExclusive = new AtomicLong();
   private final LongSupplier nanoTime;
   private final Consumer<FailureSummary> warnings;
   private final AtomicLong lastWarningNanos;
@@ -67,6 +79,11 @@ public final class RequestMetrics implements RequestCompletionRecorder {
     Map<LeaseRenewalStage, StageCounter> renewals = new EnumMap<>(LeaseRenewalStage.class);
     for (LeaseRenewalStage stage : LeaseRenewalStage.values()) renewals.put(stage, new StageCounter());
     leaseRenewalStages = Map.copyOf(renewals);
+    Map<LeaseRevocationStage, StageCounter> revocations = new EnumMap<>(LeaseRevocationStage.class);
+    for (LeaseRevocationStage stage : LeaseRevocationStage.values()) {
+      revocations.put(stage, new StageCounter());
+    }
+    leaseRevocationStages = Map.copyOf(revocations);
   }
 
   /** Bounded stages that J30 actually observes; publication includes M2 finalization. */
@@ -79,6 +96,9 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   public enum LeaseRenewalStage {
     QUEUE, PREPARE, PUBLISH_AND_FINALIZE, RESULT_RESOLUTION, DELIVERY_VALIDATION, OUTBOUND_READY_WAIT
   }
+
+  /** Bounded stages measured while preparing and publishing a Lease revocation. */
+  public enum LeaseRevocationStage { QUEUE, PREPARE, PUBLISH_AND_FINALIZE }
 
   public void recordTxnStage(TxnStage stage, long elapsedNanos) {
     Objects.requireNonNull(stage, "stage");
@@ -158,6 +178,67 @@ public final class RequestMetrics implements RequestCompletionRecorder {
         leaseRenewalAuxiliaryRecords.sum(), leaseRenewalAuxiliaryPayloadBytes.sum(),
         leaseRenewalHBaseClientOperations.sum(),
         leaseRenewalLogicalHBaseRequestPayloadBytes.sum(), stages);
+  }
+
+  public void recordLeaseRevocationStage(LeaseRevocationStage stage, long elapsedNanos) {
+    Objects.requireNonNull(stage, "stage");
+    if (elapsedNanos < 0) throw new IllegalArgumentException("elapsedNanos must not be negative");
+    StageCounter counter = leaseRevocationStages.get(stage);
+    counter.count.increment();
+    counter.totalNanos.add(elapsedNanos);
+  }
+
+  public Map<LeaseRevocationStage, StageSnapshot> leaseRevocationStages() {
+    Map<LeaseRevocationStage, StageSnapshot> snapshot = new EnumMap<>(LeaseRevocationStage.class);
+    leaseRevocationStages.forEach((stage, counter) -> snapshot.put(stage,
+        new StageSnapshot(counter.count.sum(), counter.totalNanos.sum())));
+    return Map.copyOf(snapshot);
+  }
+
+  /** One bounded expiry scan page; counts are logical scan rows/bytes, not HBase RPC wire bytes. */
+  public void recordLeaseExpiryScan(long physicalRows, long encodedBytes) {
+    if (physicalRows < 0 || encodedBytes < 0) {
+      throw new IllegalArgumentException("Lease expiry scan totals must not be negative");
+    }
+    leaseExpiryScanRows.add(physicalRows);
+    leaseExpiryScanBytes.add(encodedBytes);
+  }
+
+  public void recordLeaseExpiryCandidate() { leaseExpiryCandidates.increment(); }
+
+  public void recordLeaseExpiryStaleCandidate() { leaseExpiryStaleCandidates.increment(); }
+
+  /** Records delay from the trusted lower time bound to the revoked candidate deadline. */
+  public void recordLeaseExpiryRevocation(long delayMillis) {
+    if (delayMillis < 0) throw new IllegalArgumentException("Lease expiry delay must not be negative");
+    leaseExpiryRevocations.increment();
+    leaseExpiryDelayMillis.add(delayMillis);
+  }
+
+  /** Records a committed expiry whose post-finalization trusted-time sample was unavailable. */
+  public void recordLeaseExpiryRevocationWithoutDelaySample() {
+    leaseExpiryRevocations.increment();
+    leaseExpiryDelaySamplesMissing.increment();
+  }
+
+  public void recordLeaseExpiryRetry() { leaseExpiryRetries.increment(); }
+
+  /** Replaces only bounded watermarks; it never stores Lease IDs, keys, or credentials. */
+  public void recordLeaseExpiryCheckpoint(long ownerEpoch, long sequence, long windowStopExclusive) {
+    if (ownerEpoch < 0 || sequence < 0 || windowStopExclusive < 0) {
+      throw new IllegalArgumentException("Lease expiry watermarks must not be negative");
+    }
+    leaseExpiryOwnerEpoch.set(ownerEpoch);
+    leaseExpiryCheckpointSequence.set(sequence);
+    leaseExpiryWindowStopExclusive.set(windowStopExclusive);
+  }
+
+  public LeaseExpirySnapshot leaseExpiry() {
+    return new LeaseExpirySnapshot(leaseExpiryScanRows.sum(), leaseExpiryScanBytes.sum(),
+        leaseExpiryCandidates.sum(), leaseExpiryStaleCandidates.sum(), leaseExpiryRevocations.sum(),
+        leaseExpiryDelayMillis.sum(), leaseExpiryDelaySamplesMissing.sum(), leaseExpiryRetries.sum(),
+        leaseExpiryOwnerEpoch.get(), leaseExpiryCheckpointSequence.get(),
+        leaseExpiryWindowStopExclusive.get());
   }
 
   public void recordPutStage(PutStage stage, long elapsedNanos) {
@@ -268,6 +349,9 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   public record Snapshot(long completed, long totalElapsedNanos, long cleanupFailures) {}
 
   public record StageSnapshot(long count, long totalNanos) {}
+  public record LeaseExpirySnapshot(long scanRows, long scanBytes, long candidates,
+      long staleCandidates, long revocations, long totalDelayMillis, long missingDelaySamples, long retries,
+      long ownerEpoch, long checkpointSequence, long windowStopExclusive) {}
 
   public record LeaseRenewalSnapshot(long requests, long responses, long selected,
       long unknownOutcomes, long requestBytes, long responseBytes, long auxiliaryRecords,

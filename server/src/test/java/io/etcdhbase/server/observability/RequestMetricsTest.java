@@ -60,6 +60,33 @@ class RequestMetricsTest {
   }
 
   @Test
+  void recordsBoundedLeaseRevocationStages() {
+    var metrics = new RequestMetrics();
+    metrics.recordLeaseRevocationStage(RequestMetrics.LeaseRevocationStage.PREPARE, 13);
+    metrics.recordLeaseRevocationStage(
+        RequestMetrics.LeaseRevocationStage.PUBLISH_AND_FINALIZE, 29);
+
+    assertEquals(13, metrics.leaseRevocationStages()
+        .get(RequestMetrics.LeaseRevocationStage.PREPARE).totalNanos());
+    assertEquals(29, metrics.leaseRevocationStages()
+        .get(RequestMetrics.LeaseRevocationStage.PUBLISH_AND_FINALIZE).totalNanos());
+    assertThrows(IllegalArgumentException.class, () -> metrics.recordLeaseRevocationStage(
+        RequestMetrics.LeaseRevocationStage.PREPARE, -1));
+  }
+
+  @Test
+  void countsCommittedExpiryWithoutInventingAnUnavailableDelaySample() {
+    var metrics = new RequestMetrics();
+    metrics.recordLeaseExpiryRevocation(250);
+    metrics.recordLeaseExpiryRevocationWithoutDelaySample();
+
+    var snapshot = metrics.leaseExpiry();
+    assertEquals(2, snapshot.revocations());
+    assertEquals(250, snapshot.totalDelayMillis());
+    assertEquals(1, snapshot.missingDelaySamples());
+  }
+
+  @Test
   void countsOnlyBoundedMethodAndOutcomeDimensions() {
     RequestMetrics metrics = new RequestMetrics();
     RequestScope scope = RequestScope.withoutDeadline();

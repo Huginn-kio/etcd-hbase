@@ -70,6 +70,8 @@ class PutCommitPreparationTest {
   void cancellationKeepsPreparationMemoryUntilThePhysicalWriteStops() throws Exception {
     var repository = new DelayedResultRepository();
     var fixture = new Fixture(repository, 4L << 20);
+    var pageMemory = fixture.account.tryRetain(BudgetManager.Memory.PAGE, 512).orElseThrow();
+    PutCommitPreparation.retainUntilDrain(fixture.scope, pageMemory);
     var waiting = fixture.preparation.prepare(command(), binding(), Optional.empty(),
         fixture.scope, fixture.account, PutCommitPreparationTest::completedRead);
     assertEquals(1, repository.creates.get());
@@ -114,7 +116,7 @@ class PutCommitPreparationTest {
       var limits = new BudgetManager.Limits(2, 0, 2, 1, 1, 0, 16L << 20);
       budgets = new BudgetManager(limits, Map.of("group", limits), limits);
       account = budgets.admit("group", scope,
-          new BudgetManager.Reservation(0, 1, 1L << 20, 1, candidateCapacity));
+          new BudgetManager.Reservation(0, 512, 1L << 20, 1, candidateCapacity));
       preparation = new PutCommitPreparation(new ResultPreparation(results), new ResultCatalog(results),
           new ManifestPreparation(unused(ManifestRepository.class),
               new ManifestPreparation.Limits(1, 1024, 1, 2048)),

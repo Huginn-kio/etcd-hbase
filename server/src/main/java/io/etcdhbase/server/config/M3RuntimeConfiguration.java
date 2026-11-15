@@ -36,6 +36,7 @@ public record M3RuntimeConfiguration(
     boolean m4LeaseApiEnabled,
     long leaseMinTtlSeconds,
     long leaseClockUncertaintyMs,
+    int leaseClockMaxDriftPpm,
     int leaseMaximumBindings,
     long leaseMaximumKeyBytes,
     long leaseMaximumRevokeCostBytes,
@@ -85,12 +86,38 @@ public record M3RuntimeConfiguration(
     }
   }
 
+  /** Preserve callers using the full J41 activation shape before owner transport was added. */
+  public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
+      int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
+      int pinShards, int pinSlotsPerShard, int pinLeaseMs, boolean readCacheEnabled,
+      boolean m4LeaseApiEnabled, long leaseMinTtlSeconds, long leaseClockUncertaintyMs,
+      int leaseMaximumBindings, long leaseMaximumKeyBytes, long leaseMaximumRevokeCostBytes) {
+    this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
+        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
+        m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs, 0,
+        leaseMaximumBindings, leaseMaximumKeyBytes, leaseMaximumRevokeCostBytes, null, null);
+  }
+
+  /** Explicit clock-rate bound required for Lease activation. */
+  public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
+      int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
+      int pinShards, int pinSlotsPerShard, int pinLeaseMs, boolean readCacheEnabled,
+      boolean m4LeaseApiEnabled, long leaseMinTtlSeconds, long leaseClockUncertaintyMs,
+      int leaseClockMaxDriftPpm, int leaseMaximumBindings, long leaseMaximumKeyBytes,
+      long leaseMaximumRevokeCostBytes) {
+    this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
+        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
+        m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs, leaseClockMaxDriftPpm,
+        leaseMaximumBindings, leaseMaximumKeyBytes, leaseMaximumRevokeCostBytes, null, null);
+  }
+
   /** Existing callers retain the disabled-cache behavior. */
   public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
       int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
       int pinShards, int pinSlotsPerShard, int pinLeaseMs) {
     this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
         maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, false, false, 1, 1_000,
+        0,
         LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null);
@@ -102,7 +129,7 @@ public record M3RuntimeConfiguration(
       int pinShards, int pinSlotsPerShard, int pinLeaseMs, boolean readCacheEnabled) {
     this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
         maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
-        false, 1, 1_000, LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
+        false, 1, 1_000, 0, LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null);
   }
@@ -114,7 +141,7 @@ public record M3RuntimeConfiguration(
       boolean m4LeaseApiEnabled, long leaseMinTtlSeconds, long leaseClockUncertaintyMs) {
     this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
         maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
-        m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs,
+        m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs, 0,
         LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null);
@@ -139,7 +166,8 @@ public record M3RuntimeConfiguration(
         || maxEtcdRequestBytes < 1 || maxEtcdRequestBytes > MutationForwardRequest.MAX_OPERATION_BYTES
         || leaseMinTtlSeconds < 1 || leaseMinTtlSeconds > 9_000_000_000L
         || leaseClockUncertaintyMs < 0 || leaseClockUncertaintyMs > 60_000
-        || m4LeaseApiEnabled && leaseClockUncertaintyMs == 0) {
+        || leaseClockMaxDriftPpm < 0 || leaseClockMaxDriftPpm > 100_000
+        || m4LeaseApiEnabled && (leaseClockUncertaintyMs == 0 || leaseClockMaxDriftPpm == 0)) {
       throw new IllegalArgumentException("invalid M3 runtime limits");
     }
     long minimumLeaseMemory = M3MemoryReservations.minimumLeaseMemory(1, maxEtcdRequestBytes);

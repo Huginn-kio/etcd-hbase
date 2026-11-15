@@ -1,0 +1,48 @@
+schema_version: 1
+id: m4-lease-revoke-v1
+protocol: etcd-v3.5.23
+steps:
+  - case_id: L05
+    id: native-baseline
+  - case_id: L01
+    id: revoke-grant-bound
+  - case_id: P01
+    id: revoke-put-bound-key-a
+  - case_id: P01
+    id: revoke-put-bound-key-b
+  - case_id: R01
+    id: revoke-range-before-a
+  - case_id: R01
+    id: revoke-range-before-b
+  - case_id: L03
+    id: revoke-bound
+  - case_id: R01
+    id: revoke-range-after-a
+  - case_id: R01
+    id: revoke-range-after-b
+  - case_id: L04
+    id: revoke-ttl-after
+  - case_id: L03
+    id: revoke-missing
+  - case_id: L01
+    id: revoke-grant-empty
+  - case_id: L03
+    id: revoke-empty
+  - case_id: L04
+    id: revoke-empty-ttl
+  - case_id: L01
+    id: expiry-grant
+  - case_id: P01
+    id: expiry-put-bound-key-a
+  - case_id: P01
+    id: expiry-put-bound-key-b
+  - case_id: R01
+    id: expiry-range-before-a
+  - case_id: R01
+    id: expiry-range-before-b
+  - case_id: L04
+    id: expiry-ttl-after
+  - case_id: R01
+    id: expiry-range-after-a
+  - case_id: R01
+    id: expiry-range-after-b

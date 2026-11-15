@@ -10,6 +10,7 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.AuxiliaryFormatUpgrade;
 import io.etcdhbase.core.commit.AuxiliaryLeasePlanVerifier;
 import io.etcdhbase.core.commit.LeaseBindingFormatUpgrade;
+import io.etcdhbase.core.commit.LeaseExpiryFormatUpgrade;
 import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.LeaseBindingReader;
 import io.etcdhbase.core.commit.LeaseBindingReadView;
@@ -65,19 +66,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiFunction;
 import java.util.function.LongFunction;
 
 /** Owns the local KV runtime for one validated table group; the caller owns its HBase factory. */
 public final class M3TableGroupRuntime implements AutoCloseable {
   private static final BudgetManager.Reservation REQUEST_MEMORY =
       M3MemoryReservations.REQUEST;
+  // Lease requests retain proof-read headroom separately from ordinary KV requests.
   private static final BudgetManager.Reservation LEASE_REQUEST_MEMORY =
-      M3MemoryReservations.LEASE;
+      LeaseBudgetProfile.LEASE_REQUEST_MEMORY;
   private static final BudgetManager.Reservation RECOVERY_MEMORY =
       M3MemoryReservations.RECOVERY;
   private static final Executor CLEANUP = task -> Thread.ofVirtual().name("m3-runtime-cleanup").start(task);
-  private static final LongFunction<LeaseTimeSource> SYSTEM_LEASE_TIME_SOURCE =
-      uncertaintyMillis -> new BoundedSystemLeaseTimeSource(Clock.systemUTC(), uncertaintyMillis);
+  private static final BiFunction<Long, Integer, LeaseTimeSource> SYSTEM_LEASE_TIME_SOURCE =
+      (uncertaintyMillis, maximumDriftPpm) -> new BoundedSystemLeaseTimeSource(
+          Clock.systemUTC(), uncertaintyMillis, maximumDriftPpm);
 
   private final Pending resources;
   private final KvService kvService;
@@ -129,7 +133,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       LongFunction<LeaseTimeSource> leaseTimeSourceFactory, OwnerForwardingRuntime ownerForwarding,
       ScheduledExecutorService leaseTimers) throws Exception {
     return openInternal(plan, activation, limits, connections, identity, budgets, scans, startup,
-        Optional.empty(), leaseTimeSourceFactory, ownerForwarding, leaseTimers);
+        Optional.empty(), (uncertaintyMillis, ignoredDriftPpm) ->
+            leaseTimeSourceFactory.apply(uncertaintyMillis), ownerForwarding, leaseTimers);
   }
 
   /** Internal assembly path; public configuration still rejects cache activation. */
@@ -163,7 +168,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       M3RuntimeConfiguration activation, RuntimeConfiguration.ResourceBudgets limits,
       HBaseConnectionFactory connections, AuthorizedBackendIdentity identity, BudgetManager budgets,
       ScanScheduler scans, RequestScope startup, Optional<CacheLimits> cacheLimits,
-      LongFunction<LeaseTimeSource> leaseTimeSourceFactory, OwnerForwardingRuntime ownerForwarding,
+      BiFunction<Long, Integer, LeaseTimeSource> leaseTimeSourceFactory,
+      OwnerForwardingRuntime ownerForwarding,
       ScheduledExecutorService leaseTimers) throws Exception {
     Objects.requireNonNull(plan, "plan");
     Objects.requireNonNull(activation, "activation");
@@ -197,7 +203,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           stores.invocations(), stores.outcomes(), stores.finalizer());
       String instance = activation.ownerInstanceId() == null
           ? CommitOwnerService.newInstanceId() : OwnerIncarnation.newId(activation.ownerInstanceId());
-      Runnable ownerLost = activation.ownerForwarding() == null ? pending.queue::close : () -> {};
+      Runnable ownerLost = activation.ownerForwarding() == null ? pending::ownerLost : () -> {};
       var ownerFuture = activation.ownerForwarding() == null
           ? M3OwnerLease.acquire(recovery, owners, instance,
               Duration.ofMillis(activation.ownerLeaseMs()), Duration.ofMillis(activation.heartbeatMs()),
@@ -210,16 +216,17 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       if (activation.m4LeaseApiEnabled()) {
         if (owner.isOwner()) {
           ensureM4LeaseBindingFormat(plan, connections, identity, stores, owner, startup);
+          ensureM4LeaseExpiryFormat(plan, connections, identity, owner, startup);
           stores = await(TableGroupStores.openConfigured(connections, identity, plan,
               activation.pinConfiguration(), startup), startup);
-          verifyLeaseBindingFormat(stores, startup);
+          verifyLeaseExpiryFormat(stores, startup);
           invocations = new InvocationService(stores.invocations());
           owners = new CommitOwnerService(stores.control());
           recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
               stores.invocations(), stores.outcomes(), stores.finalizer());
           await(owner.refreshServices(owners, recovery, startup), startup);
         } else {
-          verifyLeaseBindingFormat(stores, startup);
+          verifyLeaseExpiryFormat(stores, startup);
         }
       }
       ByteKey authorization = authorizationDigest(identity);
@@ -232,10 +239,11 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       }
       ServiceComponents services = assembleService(plan, activation, identity, authorization, budgets,
           pending, stores, invocations, owner, business, ownerForwarding);
+      await(pending.initialReadiness(), startup);
       startup.closeAsync(CLEANUP);
       await(CompletableFuture.allOf(startup.cleanupCompletion().toCompletableFuture(),
           startup.physicalProducersCompletion().toCompletableFuture()), startup);
-      if (!runtimeReady(owner.isReady(), leaseTime)) {
+      if (!runtimeReady(owner.isReady(), leaseTime) || !pending.isReady()) {
         throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
       }
       return new M3TableGroupRuntime(pending, services.kvService(), services.leaseService(),
@@ -366,13 +374,76 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     }).exceptionallyCompose(failure -> CompletableFuture.failedFuture(HBaseFailures.classify(failure)));
   }
 
-  private static void verifyLeaseBindingFormat(TableGroupStores stores, RequestScope scope) throws Exception {
+  private static void ensureM4LeaseExpiryFormat(M3TableGroupPlan plan,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity,
+      M3OwnerLease ownerLease, RequestScope startup) throws Exception {
+    if (!ownerLease.isReady()) {
+      throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    }
+    await(ensureLeaseExpiryDescriptor(plan, connections, identity, startup), startup);
+    HBaseCommitControlStore expiryControl = await(
+        HBaseCommitControlStore.open(connections, identity, plan.system(), startup), startup);
+    if (!expiryControl.supportsAuxiliary() || !expiryControl.supportsLeaseBindings()
+        || !expiryControl.supportsLeaseExpiryCheckpoints()) {
+      throw new IllegalStateException("J43 expiry checkpoint descriptor capability is not available");
+    }
+    CommitOwnerService expiryOwners = new CommitOwnerService(expiryControl);
+    CommitState expiryState = await(expiryControl.read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    if (expiryState.formatVersion() == CommitState.LEASE_BINDING_FORMAT_VERSION) {
+      await(ownerLease.transitionFence(expiryOwners,
+          owner -> new LeaseExpiryFormatUpgrade(expiryControl)
+              .upgrade(owner, Clock.systemUTC().millis(), startup), startup), startup);
+    } else if (expiryState.supportsLeaseExpiryCheckpoints()) {
+      await(ownerLease.transitionFence(expiryOwners,
+          CompletableFuture::completedFuture, startup), startup);
+    } else {
+      throw new IllegalStateException("table-group control format cannot be activated for J43");
+    }
+
+    CommitState verified = await(expiryControl.read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    CommitOwnerService.OwnerToken owner = ownerLease.token();
+    if (!verified.supportsLeaseExpiryCheckpoints()
+        || verified.ownerInstance().filter(owner.instance()::equals).isEmpty()
+        || verified.ownerEpoch() != owner.epoch()
+        || verified.ownerLeaseExpired(Clock.systemUTC().millis()) || !ownerLease.isReady()) {
+      throw new IllegalStateException("J43 control format upgrade lost its owner fence");
+    }
+  }
+
+  private static CompletableFuture<Void> ensureLeaseExpiryDescriptor(M3TableGroupPlan plan,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity, RequestScope scope) {
+    var request = new HBaseRequestContext(scope);
+    return request.borrowConnection(connections, identity).thenCompose(connection -> {
+      var admin = connection.getAdmin();
+      return request.execute(() -> admin.getDescriptor(plan.system().table())).thenCompose(descriptor -> {
+        if (plan.system().supportsLeaseExpiryCheckpoints(descriptor)) {
+          return CompletableFuture.completedFuture(null);
+        }
+        var replacement = plan.system().withLeaseExpiryCheckpointCapability(descriptor);
+        return request.execute(() -> admin.modifyTable(replacement))
+            .thenCompose(ignored -> request.execute(() -> admin.getDescriptor(plan.system().table())))
+            .thenAccept(verified -> {
+              if (!plan.system().supportsLeaseExpiryCheckpoints(verified)) {
+                throw new IllegalStateException("J43 system-table capability was not persisted");
+              }
+            });
+      });
+    }).exceptionallyCompose(failure -> CompletableFuture.failedFuture(HBaseFailures.classify(failure)));
+  }
+
+  private static void verifyLeaseExpiryFormat(TableGroupStores stores, RequestScope scope) throws Exception {
     CommitState state = await(stores.control().read(scope), scope)
         .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized")).state();
-    if (!state.supportsLeaseBindings()
+    if (!state.supportsLeaseExpiryCheckpoints()
         || !stores.control().supportsAuxiliary() || !stores.control().supportsLeaseBindings()
-        || !stores.records().supportsAuxiliary() || !stores.records().supportsLeaseBindings()) {
-      throw new IllegalStateException("J41 Lease binding format is not fenced and available");
+        || !stores.control().supportsLeaseExpiryCheckpoints()
+        || !stores.records().supportsAuxiliary() || !stores.records().supportsLeaseBindings()
+        || !stores.records().supportsLeaseExpiryCheckpoints()) {
+      throw new IllegalStateException("J43 Lease expiry checkpoint format is not fenced and available");
     }
   }
 
@@ -380,7 +451,10 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       TxnReadExecutor txnReads, RequestMetrics metrics, Optional<LeaseComponents> lease) {}
 
   private record LeaseComponents(LeaseGrantOwnerProcessor grantProcessor,
-      LeaseRenewalOwnerProcessor renewalProcessor, LeaseEmptyExpiryOwnerProcessor expiryProcessor,
+      LeaseRenewalOwnerProcessor renewalProcessor,
+      LeaseRevocationOwnerProcessor revocationProcessor,
+      LeaseEmptyExpiryOwnerProcessor legacyEmptyExpiryProcessor,
+      LeaseExpiryStepOwnerProcessor expiryStepProcessor,
       LeaseReadView readView, LeaseEnumerationReader enumeration, LeaseBindingReader bindings,
       LeaseTimeSource time, LeaseBindingMutationPlanner bindingPlanner) {}
 
@@ -394,7 +468,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static BusinessComponents assembleBusiness(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
       HBaseConnectionFactory connections, BudgetManager budgets, ScanScheduler scans, Pending pending,
       TableGroupStores stores, InvocationService invocations, M3OwnerLease owner,
-      Optional<CacheLimits> cacheLimits, LongFunction<LeaseTimeSource> leaseTimeSourceFactory)
+      Optional<CacheLimits> cacheLimits,
+      BiFunction<Long, Integer, LeaseTimeSource> leaseTimeSourceFactory)
       throws BackendFailure {
     var preparation = new PutCommitPreparation(new ResultPreparation(stores.resultRepository()),
         stores.results(), new ManifestPreparation(stores.manifestRepository(),
@@ -406,7 +481,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         stores.invocations(), pending.handoff, stores.finalizer());
     var metrics = new RequestMetrics();
     Optional<LeaseComponents> lease = activation.m4LeaseApiEnabled()
-        ? Optional.of(assembleLease(plan, activation, budgets, stores, invocations, owner, publisher,
+        ? Optional.of(assembleLease(
+            plan, activation, budgets, connections, pending, stores, invocations, owner, publisher,
             metrics, leaseTimeSourceFactory))
         : Optional.empty();
     PutMutationExecutor executor = lease.isPresent()
@@ -442,9 +518,10 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   }
 
   private static LeaseComponents assembleLease(M3TableGroupPlan plan,
-      M3RuntimeConfiguration activation, BudgetManager budgets, TableGroupStores stores,
+      M3RuntimeConfiguration activation, BudgetManager budgets,
+      HBaseConnectionFactory connections, Pending pending, TableGroupStores stores,
       InvocationService invocations, M3OwnerLease owner, CommitPublisher publisher,
-      RequestMetrics metrics, LongFunction<LeaseTimeSource> leaseTimeSourceFactory) {
+      RequestMetrics metrics, BiFunction<Long, Integer, LeaseTimeSource> leaseTimeSourceFactory) {
     int maximumMutationRecords = LeaseBindingMutationPlanner.MAX_AUXILIARY_RECORDS_PER_MUTATION;
     var leaseReads = new LeaseReadView(stores.records(), stores.manifests(), LeaseStateMessages::decode,
         maximumMutationRecords, 64L << 20);
@@ -456,11 +533,15 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         LeaseGateway.bindingPageBytes(activation.maxEtcdRequestBytes()), 100_000, 64L << 20,
         100_000, activation.maxEtcdRequestBytes(), maximumMutationRecords, 64L << 20);
     LeaseTimeSource time = Objects.requireNonNull(
-        leaseTimeSourceFactory.apply(activation.leaseClockUncertaintyMs()), "Lease time source");
+        leaseTimeSourceFactory.apply(activation.leaseClockUncertaintyMs(),
+            activation.leaseClockMaxDriftPpm()), "Lease time source");
     var bindingReadView = new LeaseBindingReadView(stores.records(), stores.manifests(),
         LeaseBindingMessages::decode, maximumMutationRecords, 64L << 20);
+    var leaseCosts = new LeaseCostAdmission(activation.leaseCostLimits());
+    BudgetManager.Reservation revocationReservation =
+        LeaseBudgetProfile.ownerMutationReservation(activation.maxEtcdRequestBytes());
     var bindingPlanner = new LeaseBindingMutationPlanner(leaseReads, bindingReadView, time,
-        new LeaseCostAdmission(activation.leaseCostLimits()));
+        leaseCosts, plan.primary().codec().saltProfile().bucketCount());
     var allocator = new LeaseIdAllocator(
         () -> ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE), 16);
     var mutationPreparation = new LeaseAuxiliaryMutationPreparation(
@@ -471,23 +552,39 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     var executor = new LeaseGrantExecutor(plan.source().tableGroupId(),
         plan.system().profileFingerprint(), stores.control(), stores.views(), leaseReads, allocator,
         time, activation.leaseMinTtlSeconds(), LeaseTimeRules.MAX_TTL_SECONDS, Clock.systemUTC(),
-        preparation, publisher);
-    var expiryExecutor = new LeaseEmptyExpiryExecutor(plan.source().tableGroupId(),
-        plan.system().profileFingerprint(), stores.control(), stores.views(), leaseReads, time,
-        Clock.systemUTC(), mutationPreparation, publisher);
+        preparation, publisher, plan.primary().codec().saltProfile().bucketCount());
     var renewalPreparation = new LeaseRenewalPreparation(mutationPreparation);
+    var processor = new LeaseGrantOwnerProcessor(plan.source().tableGroupId(), owner::currentToken,
+        budgets, LEASE_REQUEST_MEMORY, executor, stores.outcomes(), invocations, Clock.systemUTC());
+    var revocationExecutor = new LeaseRevocationExecutor(plan.source().tableGroupId(),
+        plan.system().profileFingerprint(), stores.clusterId(), activation.memberIdBits(),
+        stores.control(), stores.views(), leaseReads, bindings, bindingPlanner, leaseCosts,
+        mutationPreparation, publisher, connections, plan.primary(), pending.worker,
+        Clock.systemUTC(), time, metrics);
     var renewalExecutor = new LeaseRenewalExecutor(plan.source().tableGroupId(),
         plan.system().profileFingerprint(), stores.clusterId(), activation.memberIdBits(),
         stores.control(), stores.views(), leaseReads, time, Clock.systemUTC(),
-        renewalPreparation, publisher, metrics);
-    var processor = new LeaseGrantOwnerProcessor(plan.source().tableGroupId(), owner::currentToken,
-        budgets, LEASE_REQUEST_MEMORY, executor, stores.outcomes(), invocations, Clock.systemUTC());
+        renewalPreparation, revocationExecutor, publisher, metrics,
+        plan.primary().codec().saltProfile().bucketCount());
     var renewalProcessor = new LeaseRenewalOwnerProcessor(plan.source().tableGroupId(), owner::currentToken,
-        budgets, LEASE_REQUEST_MEMORY, renewalExecutor, stores.outcomes(), invocations, Clock.systemUTC());
-    var expiryProcessor = new LeaseEmptyExpiryOwnerProcessor(plan.source().tableGroupId(),
-        owner::currentToken, budgets, LEASE_REQUEST_MEMORY, expiryExecutor, stores.outcomes(), invocations,
-        Clock.systemUTC());
-    return new LeaseComponents(processor, renewalProcessor, expiryProcessor, leaseReads, enumeration, bindings,
+        budgets, revocationReservation, renewalExecutor, stores.outcomes(), invocations, Clock.systemUTC());
+    var legacyEmptyExpiryExecutor = new LeaseEmptyExpiryExecutor(revocationExecutor, time);
+    var legacyEmptyExpiryProcessor = new LeaseEmptyExpiryOwnerProcessor(
+        plan.source().tableGroupId(), owner::currentToken, budgets, revocationReservation,
+        legacyEmptyExpiryExecutor, stores.outcomes(), invocations, Clock.systemUTC());
+    var revocationProcessor = new LeaseRevocationOwnerProcessor(plan.source().tableGroupId(),
+        owner::currentToken, budgets, revocationReservation, revocationExecutor, stores.outcomes(),
+        invocations, Clock.systemUTC());
+    var expiryStepExecutor = new LeaseExpiryStepExecutor(plan.source().tableGroupId(),
+        plan.system().profileFingerprint(), plan.system().saltProfile().bucketCount(),
+        stores.control(), stores.views(), leaseReads, stores.records(), time, Clock.systemUTC(),
+        mutationPreparation, publisher, revocationExecutor, connections, plan.primary(),
+        pending.worker, metrics);
+    var expiryStepProcessor = new LeaseExpiryStepOwnerProcessor(plan.source().tableGroupId(),
+        owner::currentToken, budgets, revocationReservation, expiryStepExecutor, stores.outcomes(),
+        invocations, Clock.systemUTC());
+    return new LeaseComponents(processor, renewalProcessor, revocationProcessor,
+        legacyEmptyExpiryProcessor, expiryStepProcessor, leaseReads, enumeration, bindings,
         time, bindingPlanner);
   }
 
@@ -540,11 +637,20 @@ public final class M3TableGroupRuntime implements AutoCloseable {
               : CompletableFuture.completedFuture(
                   new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
           case LEASE_EXPIRE_EMPTY -> business.lease().isPresent()
-              ? business.lease().orElseThrow().expiryProcessor().process(request, binding, principal, scope)
+              ? business.lease().orElseThrow().legacyEmptyExpiryProcessor()
+                  .process(request, binding, principal, scope)
               : CompletableFuture.completedFuture(
                   new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
           case LEASE_KEEP_ALIVE -> business.lease().isPresent()
               ? business.lease().orElseThrow().renewalProcessor().process(request, binding, principal, scope)
+              : CompletableFuture.completedFuture(
+                  new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
+          case LEASE_REVOKE -> business.lease().isPresent()
+              ? business.lease().orElseThrow().revocationProcessor().process(request, binding, principal, scope)
+              : CompletableFuture.completedFuture(
+                  new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
+          case LEASE_EXPIRY_STEP -> business.lease().isPresent()
+              ? business.lease().orElseThrow().expiryStepProcessor().process(request, binding, principal, scope)
               : CompletableFuture.completedFuture(
                   new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
         });
@@ -571,7 +677,14 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           lease.enumeration(), lease.bindings(), lease.time(), budgets, LEASE_REQUEST_MEMORY,
           pending.worker, pending.leaseTimers, business.metrics());
       leaseService = new LeaseService(leaseGateway.grantHandler(),
-          leaseGateway.timeToLiveHandler(), leaseGateway.leasesHandler(), leaseGateway.keepAliveHandler());
+          leaseGateway.timeToLiveHandler(), leaseGateway.leasesHandler(),
+          leaseGateway.keepAliveHandler(), leaseGateway.revokeHandler());
+      var expiryWorker = new LeaseExpiryWorker(plan.source().tableGroupId(), authorization,
+          plan.system().saltProfile().bucketCount(), 30_000,
+          stores.control(), stores.records(), owner, relay, identity, lease.time(), budgets,
+          LeaseBudgetProfile.EXPIRY_WORKER_MEMORY, pending.worker, pending.leaseTimers, Clock.systemUTC(),
+          business.metrics());
+      pending.startExpiryWorker(expiryWorker);
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
         txnGateway::range), leaseService);
@@ -704,6 +817,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     private RangeReadCache cache;
     private ScheduledExecutorService leaseTimers;
     private ScheduledThreadPoolExecutor ownedLeaseTimers;
+    private volatile LeaseExpiryWorker expiryWorker;
+    private volatile boolean leaseEnabled;
 
     private Pending(RequestScope startup, ScheduledExecutorService leaseTimers) {
       this.startup = startup;
@@ -725,6 +840,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
 
     private void initialize(M3TableGroupPlan plan, M3RuntimeConfiguration activation,
         RuntimeConfiguration.ResourceBudgets limits, BudgetManager budgets) throws BackendFailure {
+      leaseEnabled = activation.m4LeaseApiEnabled();
       if (activation.m4LeaseApiEnabled() && leaseTimers == null) {
         ownedLeaseTimers = new ScheduledThreadPoolExecutor(1,
             Thread.ofPlatform().daemon().name("m4-lease-ready-timeout-", 0).factory());
@@ -747,7 +863,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       }
       Duration deadline = Duration.ofMillis(Math.min(limits.requestDeadlineMs(), 300_000));
       long queueBytes = Math.addExact(8192L, Math.multiplyExact(8L, activation.maxEtcdRequestBytes()));
-      queue = new SerialMutationQueue(0, queueBytes, deadline);
+      queue = new SerialMutationQueue(0, queueBytes, 1,
+          LeaseBudgetProfile.RESERVED_OWNER_QUEUE_BYTES, deadline);
       handoff = new BoundedPublicationHandoff(1, 1, deadline);
       int queuedWorkers = (int) Math.min(1024L, Math.max(8L, (long) limits.maxConcurrentRequests() * 2));
       worker = new ThreadPoolExecutor(2, 2, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(queuedWorkers),
@@ -766,17 +883,51 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       if (!ownerStarted) ownerResolved.complete(null);
     }
 
+    private synchronized void startExpiryWorker(LeaseExpiryWorker worker) {
+      Objects.requireNonNull(worker, "worker");
+      if (closing.get() || expiryWorker != null) {
+        throw new IllegalStateException("Lease expiry worker cannot be installed now");
+      }
+      expiryWorker = worker;
+      worker.start();
+    }
+
+    private CompletableFuture<Void> initialReadiness() {
+      if (!leaseEnabled) return CompletableFuture.completedFuture(null);
+      LeaseExpiryWorker current = expiryWorker;
+      if (current == null) {
+        return CompletableFuture.failedFuture(
+            new IllegalStateException("Lease expiry worker was not installed"));
+      }
+      return current.initialReadiness();
+    }
+
+    private void ownerLost() {
+      LeaseExpiryWorker current = expiryWorker;
+      if (current != null) current.stop();
+      SerialMutationQueue currentQueue = queue;
+      if (currentQueue != null) currentQueue.close();
+    }
+
     private boolean isReady() {
       M3OwnerLease current = owner;
-      return !closing.get() && current != null && current.isReady();
+      if (closing.get() || current == null || !current.isReady()) return false;
+      LeaseExpiryWorker expiry = expiryWorker;
+      return !leaseEnabled || expiry != null && expiry.isReady();
     }
 
     private void close() {
       if (!closing.compareAndSet(false, true)) return;
       try {
-        if (queue != null) queue.close();
+        LeaseExpiryWorker expiry = expiryWorker;
+        if (expiry != null) expiry.stop();
       } catch (RuntimeException | Error failure) {
         shutdownFailure = failure;
+      }
+      try {
+        if (queue != null) queue.close();
+      } catch (RuntimeException | Error failure) {
+        shutdownFailure = merge(shutdownFailure, failure);
       }
       try {
         Thread.ofVirtual().name("m3-runtime-drain").start(this::drain);
@@ -789,6 +940,9 @@ public final class M3TableGroupRuntime implements AutoCloseable {
 
     private void drain() {
       Throwable failure = shutdownFailure;
+      try {
+        if (expiryWorker != null) expiryWorker.drained().join();
+      } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
       try {
         if (queue != null) queue.drained().join();
       } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }

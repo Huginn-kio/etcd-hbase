@@ -1,5 +1,6 @@
 package io.etcdhbase.server.commit;
 
+import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.LeaseBindingReader;
 import io.etcdhbase.core.commit.LeaseReadView;
@@ -13,12 +14,15 @@ import io.etcdhbase.core.kv.DeletePlanner;
 import io.etcdhbase.core.lease.LeaseBindingChange;
 import io.etcdhbase.core.lease.LeaseBindingVersion;
 import io.etcdhbase.core.lease.LeaseCostAdmission;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseState;
+import io.etcdhbase.core.lease.LeaseTimeObservation;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.DirectRecordReader;
+import io.etcdhbase.core.scan.PointResult;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -28,6 +32,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
 
 /** Builds one immutable KV and binding removal plan for a future Revoke or expiry selector. */
@@ -104,6 +109,29 @@ public final class LeaseRevocationPreparer {
       RequestScope scope, BudgetManager.Account account,
       ManifestCatalog.ProofReadBudget metadataBudget,
       Supplier<CompletableFuture<Void>> finishPinnedRead) {
+    return prepare(identity, invocation, requireExpired, pinned, currentRecords, scope, account,
+        metadataBudget, finishPinnedRead, null);
+  }
+
+  /** Uses a checkpoint-proven lower time bound for a background expiry selection. */
+  public CompletableFuture<Prepared> prepare(LeaseIdentity identity, InvocationBinding invocation,
+      boolean requireExpired, PinnedReadView pinned, RecordStore currentRecords,
+      RequestScope scope, BudgetManager.Account account,
+      ManifestCatalog.ProofReadBudget metadataBudget,
+      Supplier<CompletableFuture<Void>> finishPinnedRead,
+      LeaseTimeObservation expiryProof) {
+    return prepare(identity, invocation, requireExpired, pinned, currentRecords, scope, account,
+        metadataBudget, finishPinnedRead, expiryProof, Optional.empty());
+  }
+
+  /** Advances the durable expiry cursor in the same selection as this Lease revocation. */
+  public CompletableFuture<Prepared> prepare(LeaseIdentity identity, InvocationBinding invocation,
+      boolean requireExpired, PinnedReadView pinned, RecordStore currentRecords,
+      RequestScope scope, BudgetManager.Account account,
+      ManifestCatalog.ProofReadBudget metadataBudget,
+      Supplier<CompletableFuture<Void>> finishPinnedRead,
+      LeaseTimeObservation expiryProof,
+      Optional<LeaseExpiryCheckpoint.Position> nextExpiryPosition) {
     Objects.requireNonNull(identity, "identity");
     Objects.requireNonNull(invocation, "invocation");
     Objects.requireNonNull(pinned, "pinned");
@@ -112,6 +140,7 @@ public final class LeaseRevocationPreparer {
     Objects.requireNonNull(account, "account");
     Objects.requireNonNull(metadataBudget, "metadataBudget");
     Objects.requireNonNull(finishPinnedRead, "finishPinnedRead");
+    Objects.requireNonNull(nextExpiryPosition, "nextExpiryPosition");
     if (identity.leaseId() == 0 || invocation.state() != InvocationBinding.State.PREPARING
         || !pinned.belongsTo(scope) || !pinned.protectsAuxiliary() || !pinned.isOpen()
         || !account.belongsTo(scope) || !metadataBudget.belongsTo(scope)
@@ -122,26 +151,26 @@ public final class LeaseRevocationPreparer {
           "Lease revocation requires the invocation's unselected auxiliary-protected view"));
     }
 
-    CompletableFuture<Prepared> operation = leases.find(pinned, identity.leaseId(), scope, metadataBudget)
-        .thenCompose(found -> {
-          LeaseState state = found.orElseThrow(() -> new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
-          if (!state.identity().equals(identity) || state.status() != LeaseState.Status.ACTIVE) {
-            return CompletableFuture.failedFuture(new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
-          }
-          try {
-            costs.requireExistingStateFits(state);
-          } catch (BackendFailure invalidState) {
-            return CompletableFuture.failedFuture(invalidState);
-          }
-          return bindings.readBindings(pinned, state, scope, account, metadataBudget)
-              .thenCompose(effectiveBindings -> prepareRows(identity, state, invocation,
-                  requireExpired, pinned, currentRecords, scope, account,
-                  finishPinnedRead, effectiveBindings));
-        });
+    CompletableFuture<Prepared> operation =
+        leases.find(pinned, identity.leaseId(), scope, metadataBudget).thenCompose(found -> {
+      LeaseState state = found.orElseThrow(() -> new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
+      if (!state.identity().equals(identity) || state.status() != LeaseState.Status.ACTIVE) {
+        return CompletableFuture.failedFuture(new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
+      }
+      try {
+        costs.requireExistingStateFits(state);
+      } catch (BackendFailure invalidState) {
+        return CompletableFuture.failedFuture(invalidState);
+      }
+      return bindings.readBindings(pinned, state, scope, account, metadataBudget)
+          .thenCompose(effectiveBindings -> prepareRows(identity, state, invocation,
+              requireExpired, pinned, currentRecords, scope, account,
+              finishPinnedRead, expiryProof, nextExpiryPosition, effectiveBindings));
+    });
     return deliverPrepared(operation);
   }
 
-  /** Cancellation or a caller-supplied fallback cannot abandon the producer's retained memory. */
+  /** Closes a prepared plan if cancellation wins the race with owner delivery. */
   private static CompletableFuture<Prepared> deliverPrepared(CompletableFuture<Prepared> owner) {
     CompletableFuture<Prepared> response = new CompletableFuture<>();
     owner.whenComplete((prepared, failure) -> {
@@ -158,16 +187,35 @@ public final class LeaseRevocationPreparer {
       InvocationBinding invocation, boolean requireExpired, PinnedReadView pinned,
       RecordStore currentRecords, RequestScope scope, BudgetManager.Account account,
       Supplier<CompletableFuture<Void>> finishPinnedRead,
+      LeaseTimeObservation expiryProof,
+      Optional<LeaseExpiryCheckpoint.Position> nextExpiryPosition,
       List<LeaseBindingVersion> effectiveBindings) {
-    long reservedUnbindHistory;
+    long reservedUnbindHistory = 0;
     try {
-      reservedUnbindHistory = validateBindingHistory(identity, state, effectiveBindings);
+      if (effectiveBindings.size() != state.boundKeyCount()) {
+        throw new IllegalStateException("Lease bindings differ from authoritative count");
+      }
+      for (LeaseBindingVersion binding : effectiveBindings) {
+        if (!binding.bound() || !binding.identity().equals(identity)) {
+          throw new IllegalStateException("Lease binding differs from the expected incarnation");
+        }
+        reservedUnbindHistory = Math.addExact(reservedUnbindHistory,
+            costs.bindingHistoryRecordBytes(binding.key()));
+      }
     } catch (RuntimeException invalidBinding) {
       return CompletableFuture.failedFuture(invalidBinding);
     }
+
+    long retainedBytes;
+    try {
+      retainedBytes = Math.addExact(state.revokeCostBytes(), reservedUnbindHistory);
+    } catch (ArithmeticException overflow) {
+      return CompletableFuture.failedFuture(resourceLimit());
+    }
     BudgetManager.Lease retainedMemory;
     try {
-      retainedMemory = retainPlanMemory(state, reservedUnbindHistory, account);
+      retainedMemory = account.tryRetain(BudgetManager.Memory.CANDIDATE, retainedBytes)
+          .orElseThrow(LeaseRevocationPreparer::resourceLimit);
     } catch (BackendFailure | RuntimeException unavailable) {
       return CompletableFuture.failedFuture(unavailable);
     }
@@ -180,53 +228,19 @@ public final class LeaseRevocationPreparer {
       retainedMemory.close();
       return CompletableFuture.failedFuture(invalidReader);
     }
-    CompletableFuture<PreparedAuxiliaryPlan> operation =
-        readBindingRows(identity, invocation, reader, effectiveBindings, plan)
-            .thenCompose(ignored -> prepareAuxiliary(identity, state, invocation, requireExpired,
-                pinned, scope, account, finishPinnedRead, plan));
-    return operation.thenApply(auxiliary -> new Prepared(identity, plan.candidates, plan.events,
-        plan.changes, auxiliary.auxiliaryRecords(), retainedMemory))
-        .whenComplete((prepared, failure) -> {
-          if (failure != null) retainedMemory.close();
-        });
-  }
-
-  private long validateBindingHistory(LeaseIdentity identity, LeaseState state,
-      List<LeaseBindingVersion> effectiveBindings) {
-    long reservedUnbindHistory = 0;
-    if (effectiveBindings.size() != state.boundKeyCount()) {
-      throw new IllegalStateException("Lease bindings differ from authoritative count");
-    }
-    for (LeaseBindingVersion binding : effectiveBindings) {
-      if (!binding.bound() || !binding.identity().equals(identity)) {
-        throw new IllegalStateException("Lease binding differs from the expected incarnation");
-      }
-      reservedUnbindHistory = Math.addExact(reservedUnbindHistory,
-          costs.bindingHistoryRecordBytes(binding.key()));
-    }
-    return reservedUnbindHistory;
-  }
-
-  private BudgetManager.Lease retainPlanMemory(LeaseState state, long reservedUnbindHistory,
-      BudgetManager.Account account) throws BackendFailure {
-    long retainedBytes;
-    try {
-      retainedBytes = Math.addExact(state.revokeCostBytes(), reservedUnbindHistory);
-    } catch (ArithmeticException overflow) {
-      throw resourceLimit();
-    }
-    return account.tryRetain(BudgetManager.Memory.CANDIDATE, retainedBytes)
-        .orElseThrow(LeaseRevocationPreparer::resourceLimit);
-  }
-
-  private CompletableFuture<Void> readBindingRows(LeaseIdentity identity, InvocationBinding invocation,
-      DirectRecordReader reader, List<LeaseBindingVersion> effectiveBindings, PlanBuilder plan) {
     CompletableFuture<Void> bindingReads = CompletableFuture.completedFuture(null);
     for (LeaseBindingVersion binding : effectiveBindings) {
       bindingReads = bindingReads.thenCompose(ignored -> readBinding(binding, identity, invocation,
           reader, plan));
     }
-    return bindingReads;
+    CompletableFuture<PreparedAuxiliaryPlan> operation = bindingReads.thenCompose(ignored ->
+        prepareAuxiliary(identity, state, invocation, requireExpired, pinned, scope, account,
+            finishPinnedRead, expiryProof, nextExpiryPosition, plan));
+    return operation.thenApply(auxiliary -> new Prepared(identity, plan.candidates, plan.events,
+        plan.changes, auxiliary.auxiliaryRecords(), retainedMemory))
+        .whenComplete((prepared, failure) -> {
+          if (failure != null) retainedMemory.close();
+        });
   }
 
   private CompletableFuture<Void> readBinding(LeaseBindingVersion binding, LeaseIdentity identity,
@@ -260,7 +274,9 @@ public final class LeaseRevocationPreparer {
   private CompletableFuture<PreparedAuxiliaryPlan> prepareAuxiliary(LeaseIdentity identity,
       LeaseState state, InvocationBinding invocation, boolean requireExpired, PinnedReadView pinned,
       RequestScope scope, BudgetManager.Account account,
-      Supplier<CompletableFuture<Void>> finishPinnedRead, PlanBuilder plan) {
+      Supplier<CompletableFuture<Void>> finishPinnedRead,
+      LeaseTimeObservation expiryProof,
+      Optional<LeaseExpiryCheckpoint.Position> nextExpiryPosition, PlanBuilder plan) {
     if (plan.revokeCostBytes != state.revokeCostBytes()) {
       return CompletableFuture.failedFuture(
           new IllegalStateException("Lease revoke costs differ from authoritative accounting"));
@@ -271,7 +287,11 @@ public final class LeaseRevocationPreparer {
     } catch (RuntimeException invalidView) {
       return CompletableFuture.failedFuture(invalidView);
     }
-    return mutationView.prepareRevocation(invocation, identity, plan.changes, requireExpired)
+    CompletableFuture<List<PreparedAuxiliaryRecord>> revocation = requireExpired && expiryProof != null
+        ? mutationView.prepareRevocation(invocation, identity, plan.changes, expiryProof)
+        : mutationView.prepareRevocation(invocation, identity, plan.changes, requireExpired);
+    return revocation.thenApply(auxiliary -> withExpiryPosition(auxiliary,
+            nextExpiryPosition, invocation))
         .thenCompose(auxiliary -> {
           if (!pinned.isOpen() || scope.isClosed() || scope.isDeadlineExceeded()) {
             return CompletableFuture.failedFuture(inactive(scope));
@@ -282,14 +302,36 @@ public final class LeaseRevocationPreparer {
           } catch (RuntimeException | Error failure) {
             return CompletableFuture.failedFuture(failure);
           }
-          return finish.thenCompose(ignored -> {
-            // A successful pin completion may arrive after cancellation or the request deadline.
-            if (scope.isClosed() || scope.isDeadlineExceeded()) {
-              return CompletableFuture.failedFuture(inactive(scope));
-            }
-            return CompletableFuture.completedFuture(new PreparedAuxiliaryPlan(auxiliary));
-          });
+          return finish.thenApply(ignored -> new PreparedAuxiliaryPlan(auxiliary));
         });
+  }
+
+  private static List<PreparedAuxiliaryRecord> withExpiryPosition(
+      List<PreparedAuxiliaryRecord> records,
+      Optional<LeaseExpiryCheckpoint.Position> nextPosition,
+      InvocationBinding invocation) {
+    if (nextPosition.isEmpty()) return records;
+    List<PreparedAuxiliaryRecord> replacement = new ArrayList<>(records.size());
+    boolean found = false;
+    for (PreparedAuxiliaryRecord record : records) {
+      if (record.targetType() != io.etcdhbase.core.commit.SystemRecordType.LEASE_EXPIRY_CHECKPOINT) {
+        replacement.add(record);
+        continue;
+      }
+      if (found) throw new IllegalStateException("Lease revocation contains multiple expiry checkpoints");
+      LeaseExpiryCheckpoint checkpoint = LeaseExpiryCheckpoint.decode(record.payload());
+      LeaseExpiryCheckpoint.requireScanProgress(checkpoint.position(), nextPosition.orElseThrow(),
+          checkpoint.trustedTimeLowerEpochMillis(), checkpoint.bucketCount());
+      LeaseExpiryCheckpoint advanced = new LeaseExpiryCheckpoint(checkpoint.ownerEpoch(),
+          checkpoint.sequence(), checkpoint.bucketCount(), checkpoint.protectedSequence(),
+          checkpoint.trustedTimeLowerEpochMillis(), nextPosition.orElseThrow());
+      replacement.add(PreparedAuxiliaryRecord.create(invocation.transactionId(),
+          invocation.preparedOwnerEpoch(), invocation.baseSequence(), record.ordinal(),
+          record.targetType(), record.targetIdentity(), advanced.encode()));
+      found = true;
+    }
+    if (!found) throw new IllegalStateException("Lease revocation omitted its expiry checkpoint");
+    return List.copyOf(replacement);
   }
 
   private record PreparedAuxiliaryPlan(List<PreparedAuxiliaryRecord> auxiliaryRecords) {

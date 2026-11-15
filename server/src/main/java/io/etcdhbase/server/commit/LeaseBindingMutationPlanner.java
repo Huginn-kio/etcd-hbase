@@ -13,10 +13,12 @@ import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseBindingChange;
 import io.etcdhbase.core.lease.LeaseBindingStatePlanner;
+import io.etcdhbase.core.lease.LeaseBindingIdentity;
 import io.etcdhbase.core.lease.LeaseBindingVersion;
 import io.etcdhbase.core.lease.LeaseCostAdmission;
 import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
@@ -46,7 +48,7 @@ public final class LeaseBindingMutationPlanner {
   public static final int MAX_BINDING_CHANGES_PER_MUTATION = LeaseCostAdmission.MAXIMUM_SUPPORTED_BINDINGS;
   public static final int MAX_LEASES_PER_MUTATION = 128;
   public static final int MAX_AUXILIARY_RECORDS_PER_MUTATION =
-      2 * MAX_BINDING_CHANGES_PER_MUTATION + 3 * MAX_LEASES_PER_MUTATION;
+      2 * MAX_BINDING_CHANGES_PER_MUTATION + 3 * MAX_LEASES_PER_MUTATION + 1;
   private static final int MAX_METADATA_READS = 8_192;
   private static final long MAX_METADATA_BYTES = 64L << 20;
 
@@ -55,14 +57,24 @@ public final class LeaseBindingMutationPlanner {
   private final LeaseTimeSource time;
   private final LeaseCostAdmission costs;
   private final LeaseBindingStatePlanner statePlanner;
+  private final int expiryBucketCount;
 
   public LeaseBindingMutationPlanner(LeaseReadView leases, LeaseBindingReadView bindings,
       LeaseTimeSource time, LeaseCostAdmission costs) {
+    this(leases, bindings, time, costs, 1);
+  }
+
+  public LeaseBindingMutationPlanner(LeaseReadView leases, LeaseBindingReadView bindings,
+      LeaseTimeSource time, LeaseCostAdmission costs, int expiryBucketCount) {
     this.leases = Objects.requireNonNull(leases, "leases");
     this.bindings = Objects.requireNonNull(bindings, "bindings");
     this.time = Objects.requireNonNull(time, "time");
     this.costs = Objects.requireNonNull(costs, "costs");
     this.statePlanner = new LeaseBindingStatePlanner(costs);
+    if (expiryBucketCount < 1 || expiryBucketCount > 65_536) {
+      throw new IllegalArgumentException("invalid Lease expiry bucket count");
+    }
+    this.expiryBucketCount = expiryBucketCount;
   }
 
   public MutationView open(PinnedReadView pinned, RequestScope scope, BudgetManager.Account account) {
@@ -77,6 +89,7 @@ public final class LeaseBindingMutationPlanner {
     private final ManifestCatalog.ProofReadBudget metadataBudget;
     private final ConcurrentHashMap<Long, CompletableFuture<Optional<LeaseState>>> states =
         new ConcurrentHashMap<>();
+    private CompletableFuture<Optional<LeaseExpiryCheckpoint>> expiryCheckpoint;
 
     private MutationView(PinnedReadView pinned, RequestScope scope, BudgetManager.Account account) {
       this.pinned = Objects.requireNonNull(pinned, "pinned");
@@ -101,7 +114,7 @@ public final class LeaseBindingMutationPlanner {
     /** Builds immutable state and binding versions for all net KV transitions in one invocation. */
     public CompletableFuture<List<PreparedAuxiliaryRecord>> prepare(
         InvocationBinding invocation, List<LeaseBindingChange> changes) {
-      return prepareInternal(invocation, changes, Map.of(), false);
+      return prepareInternal(invocation, changes, Map.of(), false, null);
     }
 
     /**
@@ -112,16 +125,31 @@ public final class LeaseBindingMutationPlanner {
         InvocationBinding invocation, LeaseIdentity identity,
         List<LeaseBindingChange> changes, boolean requireExpired) {
       Objects.requireNonNull(identity, "identity");
-      return prepareInternal(invocation, changes, Map.of(identity.leaseId(), identity), requireExpired);
+      return prepareInternal(invocation, changes, Map.of(identity.leaseId(), identity), requireExpired, null);
+    }
+
+    /** Uses a checkpoint-proven monotonic lower clock bound for owner expiry work. */
+    public CompletableFuture<List<PreparedAuxiliaryRecord>> prepareRevocation(
+        InvocationBinding invocation, LeaseIdentity identity,
+        List<LeaseBindingChange> changes, LeaseTimeObservation expiryProof) {
+      Objects.requireNonNull(identity, "identity");
+      Objects.requireNonNull(expiryProof, "expiryProof");
+      return prepareInternal(invocation, changes, Map.of(identity.leaseId(), identity), true, expiryProof);
     }
 
     private CompletableFuture<List<PreparedAuxiliaryRecord>> prepareInternal(
         InvocationBinding invocation, List<LeaseBindingChange> changes,
-        Map<Long, LeaseIdentity> revokingLeases, boolean requireExpired) {
+        Map<Long, LeaseIdentity> revokingLeases, boolean requireExpired,
+        LeaseTimeObservation expiryProof) {
       Objects.requireNonNull(invocation, "invocation");
       Objects.requireNonNull(changes, "changes");
       Objects.requireNonNull(revokingLeases, "revokingLeases");
-      if (!isUsableFor(invocation)) {
+      if (invocation.state() != InvocationBinding.State.PREPARING
+          || invocation.baseSequence() == Long.MAX_VALUE
+          || !pinned.belongsTo(scope) || !pinned.isOpen() || scope.isClosed() || scope.isDeadlineExceeded()
+          || pinned.view().barrierSequence() != invocation.baseSequence()
+          || pinned.view().targetRevision() != invocation.baseRevision()
+          || pinned.view().selectedDecision().isPresent()) {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       }
       if (changes.isEmpty() && revokingLeases.isEmpty()) {
@@ -139,35 +167,6 @@ public final class LeaseBindingMutationPlanner {
 
       List<LeaseBindingChange> ordered = changes.stream()
           .sorted(Comparator.comparing(LeaseBindingChange::key)).toList();
-      LeaseIds ids;
-      try {
-        ids = collectLeaseIds(ordered, revokingLeases);
-      } catch (BackendFailure | IllegalArgumentException invalidRequest) {
-        return CompletableFuture.failedFuture(invalidRequest);
-      }
-      return resolveStates(ids, revokingLeases.keySet()).thenCompose(resolved -> {
-        LeaseTimeObservation observation = time.observe();
-        try {
-          validateLeaseStates(ids.attaching(), resolved, revokingLeases, requireExpired, observation);
-        } catch (BackendFailure | RuntimeException invalidState) {
-          return CompletableFuture.failedFuture(invalidState);
-        }
-        return validatePreviousBindings(ordered, resolved).thenApply(validated ->
-            createRecords(invocation, ordered, resolved, revokingLeases.keySet()));
-      });
-    }
-
-    private boolean isUsableFor(InvocationBinding invocation) {
-      return invocation.state() == InvocationBinding.State.PREPARING
-          && invocation.baseSequence() != Long.MAX_VALUE
-          && pinned.belongsTo(scope) && pinned.isOpen() && !scope.isClosed() && !scope.isDeadlineExceeded()
-          && pinned.view().barrierSequence() == invocation.baseSequence()
-          && pinned.view().targetRevision() == invocation.baseRevision()
-          && pinned.view().selectedDecision().isEmpty();
-    }
-
-    private LeaseIds collectLeaseIds(List<LeaseBindingChange> ordered,
-        Map<Long, LeaseIdentity> revokingLeases) throws BackendFailure {
       TreeSet<Long> leaseIds = new TreeSet<>();
       TreeSet<Long> attachingLeaseIds = new TreeSet<>();
       for (LeaseBindingChange change : ordered) {
@@ -180,55 +179,67 @@ public final class LeaseBindingMutationPlanner {
       for (Map.Entry<Long, LeaseIdentity> revocation : revokingLeases.entrySet()) {
         if (revocation.getKey() == 0 || revocation.getValue().leaseId() != revocation.getKey()
             || attachingLeaseIds.contains(revocation.getKey())) {
-          throw new IllegalArgumentException("invalid or simultaneously attached Lease revocation");
+          return CompletableFuture.failedFuture(
+              new IllegalArgumentException("invalid or simultaneously attached Lease revocation"));
         }
         leaseIds.add(revocation.getKey());
       }
       if (leaseIds.size() > MAX_LEASES_PER_MUTATION) {
-        throw resourceLimit();
+        return CompletableFuture.failedFuture(resourceLimit());
       }
 
-      return new LeaseIds(leaseIds, attachingLeaseIds);
-    }
-
-    private CompletableFuture<Map<Long, LeaseState>> resolveStates(
-        LeaseIds ids, Set<Long> revokingLeaseIds) {
       Map<Long, LeaseState> resolved = new HashMap<>();
       CompletableFuture<Void> loading = CompletableFuture.completedFuture(null);
-      for (long leaseId : ids.all()) {
+      for (long leaseId : leaseIds) {
         loading = loading.thenCompose(ignored -> load(leaseId).thenAccept(found -> {
-          resolved.put(leaseId, found.orElseThrow(() -> ids.attaching().contains(leaseId)
-              || revokingLeaseIds.contains(leaseId)
+          resolved.put(leaseId, found.orElseThrow(() -> attachingLeaseIds.contains(leaseId)
+              || revokingLeases.containsKey(leaseId)
                   ? new LeaseFailure(LeaseFailure.Reason.NOT_FOUND)
                   : new IllegalStateException("live KV record refers to an unknown Lease")));
         }));
       }
-      return loading.thenApply(ignored -> resolved);
+      return loading.thenCompose(ignored -> {
+        return currentExpiryCheckpoint().thenCompose(previousCheckpoint -> {
+        LeaseTimeObservation observation = expiryProof != null ? expiryProof
+            : !attachingLeaseIds.isEmpty() || requireExpired ? time.observe() : null;
+        try {
+          if (observation != null && previousCheckpoint.isPresent()
+              && observation.nowLowerEpochMillis()
+                  < previousCheckpoint.orElseThrow().trustedTimeLowerEpochMillis()) {
+            throw new LeaseFailure(LeaseFailure.Reason.CLOCK_UNHEALTHY);
+          }
+          for (long leaseId : attachingLeaseIds) {
+            requireAttachable(Objects.requireNonNull(resolved.get(leaseId)),
+                Objects.requireNonNull(observation, "trusted time for Lease attachment"));
+          }
+          for (Map.Entry<Long, LeaseIdentity> revocation : revokingLeases.entrySet()) {
+            LeaseState state = Objects.requireNonNull(resolved.get(revocation.getKey()));
+            if (!state.identity().equals(revocation.getValue())
+                || state.status() != LeaseState.Status.ACTIVE) {
+              throw new LeaseFailure(LeaseFailure.Reason.NOT_FOUND);
+            }
+            if (requireExpired && !observation.healthy()) {
+              throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+            }
+            if (requireExpired && !LeaseTimeRules.isExpired(state, observation)) {
+              throw new LeaseFailure(LeaseFailure.Reason.NOT_FOUND);
+            }
+          }
+        } catch (BackendFailure | RuntimeException invalidState) {
+          return CompletableFuture.failedFuture(invalidState);
+        }
+        return validatePreviousBindings(ordered, resolved).thenApply(validated ->
+            createRecords(invocation, ordered, resolved, revokingLeases.keySet(),
+                previousCheckpoint, Optional.ofNullable(observation)));
+        });
+      });
     }
 
-    private void validateLeaseStates(Set<Long> attachingLeaseIds, Map<Long, LeaseState> resolved,
-        Map<Long, LeaseIdentity> revokingLeases, boolean requireExpired,
-        LeaseTimeObservation observation) throws BackendFailure {
-      for (long leaseId : attachingLeaseIds) {
-        requireAttachable(Objects.requireNonNull(resolved.get(leaseId)), observation);
+    private synchronized CompletableFuture<Optional<LeaseExpiryCheckpoint>> currentExpiryCheckpoint() {
+      if (expiryCheckpoint == null) {
+        expiryCheckpoint = leases.expiryCheckpoint(pinned, scope, metadataBudget);
       }
-      for (Map.Entry<Long, LeaseIdentity> revocation : revokingLeases.entrySet()) {
-        LeaseState state = Objects.requireNonNull(resolved.get(revocation.getKey()));
-        requireRevocable(state, revocation.getValue(), requireExpired, observation);
-      }
-    }
-
-    private void requireRevocable(LeaseState state, LeaseIdentity identity, boolean requireExpired,
-        LeaseTimeObservation observation) throws BackendFailure {
-      if (!state.identity().equals(identity) || state.status() != LeaseState.Status.ACTIVE) {
-        throw new LeaseFailure(LeaseFailure.Reason.NOT_FOUND);
-      }
-      if (requireExpired && !observation.healthy()) {
-        throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
-      }
-      if (requireExpired && !LeaseTimeRules.isExpired(state, observation)) {
-        throw new LeaseFailure(LeaseFailure.Reason.NOT_FOUND);
-      }
+      return expiryCheckpoint.copy();
     }
 
     private CompletableFuture<Optional<LeaseState>> load(long leaseId) {
@@ -266,7 +277,9 @@ public final class LeaseBindingMutationPlanner {
     }
 
     private List<PreparedAuxiliaryRecord> createRecords(InvocationBinding invocation,
-        List<LeaseBindingChange> changes, Map<Long, LeaseState> resolved, Set<Long> revokingLeaseIds) {
+        List<LeaseBindingChange> changes, Map<Long, LeaseState> resolved, Set<Long> revokingLeaseIds,
+        Optional<LeaseExpiryCheckpoint> previousCheckpoint,
+        Optional<LeaseTimeObservation> observation) {
       long sequence = Math.addExact(invocation.baseSequence(), 1);
       Map<Long, LeaseState> updatedStates;
       try {
@@ -274,14 +287,16 @@ public final class LeaseBindingMutationPlanner {
       } catch (BackendFailure failure) {
         throw new CompletionException(failure);
       }
-      return encodeRecords(invocation, sequence, changes, updatedStates);
+      return encodeRecords(invocation, sequence, changes, updatedStates, previousCheckpoint, observation);
     }
 
     private List<PreparedAuxiliaryRecord> encodeRecords(InvocationBinding invocation, long sequence,
-        List<LeaseBindingChange> changes, Map<Long, LeaseState> updatedStates) {
+        List<LeaseBindingChange> changes, Map<Long, LeaseState> updatedStates,
+        Optional<LeaseExpiryCheckpoint> previousCheckpoint,
+        Optional<LeaseTimeObservation> observation) {
       var records = new ArrayList<PreparedAuxiliaryRecord>(
           Math.addExact(Math.multiplyExact(updatedStates.size(), 3),
-              changes.stream().mapToInt(LeaseBindingChange::newBindingVersionCount).sum()));
+              changes.stream().mapToInt(LeaseBindingChange::newBindingVersionCount).sum() + 1));
       long ordinal = 0;
       for (LeaseState state : updatedStates.values()) {
         ordinal = appendLeaseStateRecords(records, invocation, state, ordinal);
@@ -290,29 +305,14 @@ public final class LeaseBindingMutationPlanner {
       for (LeaseBindingChange change : changes) {
         ordinal = appendBindingRecords(records, invocation, sequence, updatedStates, change, ordinal);
       }
+      if (!updatedStates.isEmpty()) {
+        LeaseExpiryCheckpoint checkpoint = LeaseExpiryCheckpoint.afterMutation(
+            invocation.preparedOwnerEpoch(), sequence, expiryBucketCount,
+            invocation.baseSequence(), previousCheckpoint, observation);
+        ordinal = add(records, invocation, ordinal, SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+            LeaseExpiryCheckpoint.versionIdentity(sequence), checkpoint.encode());
+      }
       return List.copyOf(records);
-    }
-
-    private long appendBindingRecords(List<PreparedAuxiliaryRecord> records,
-        InvocationBinding invocation, long sequence, Map<Long, LeaseState> updatedStates,
-        LeaseBindingChange change, long ordinal) {
-      LeaseState previous = change.previousLeaseId() == 0 ? null
-          : Objects.requireNonNull(updatedStates.get(change.previousLeaseId()), "previous Lease update missing");
-      LeaseState current = change.currentLeaseId() == 0 ? null
-          : Objects.requireNonNull(updatedStates.get(change.currentLeaseId()), "current Lease update missing");
-      if (change.previousLeaseId() != 0 && change.previousLeaseId() != change.currentLeaseId()) {
-        var unbound = new LeaseBindingVersion(previous.identity(), change.key(), false, sequence,
-            change.currentCreateRevision(), change.currentModRevision());
-        ordinal = add(records, invocation, ordinal, SystemRecordType.LEASE_BINDING,
-            unbound.recordIdentity().encode(), LeaseBindingMessages.encode(unbound));
-      }
-      if (current != null && change.changesBindingIdentity()) {
-        var bound = new LeaseBindingVersion(current.identity(), change.key(), true, sequence,
-            change.currentCreateRevision(), change.currentModRevision());
-        ordinal = add(records, invocation, ordinal, SystemRecordType.LEASE_BINDING,
-            bound.recordIdentity().encode(), LeaseBindingMessages.encode(bound));
-      }
-      return ordinal;
     }
 
     static long appendLeaseStateRecords(List<PreparedAuxiliaryRecord> records,
@@ -358,7 +358,12 @@ public final class LeaseBindingMutationPlanner {
     }
   }
 
-  private record LeaseIds(Set<Long> all, Set<Long> attaching) {}
+  private static final class Delta {
+    private long bindingCount;
+    private long keyBytes;
+    private long revokeCostBytes;
+    private long bindingHistoryBytes;
+  }
 
   private static BackendFailure resourceLimit() {
     return new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);

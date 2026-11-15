@@ -16,6 +16,7 @@ import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.lease.LeaseFailure;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.lease.LeaseTimeRules;
 import io.etcdhbase.core.lease.LeaseTimeSource;
@@ -36,6 +37,21 @@ public final class LeaseRenewalExecutor {
   private static final int MAX_EXAMINED_LEASES = 1_024;
   private static final long MAX_METADATA_BYTES = 64L << 20;
 
+  private sealed interface RenewalAttempt permits PreparedAttempt, RevokedAttempt {}
+
+  private record PreparedAttempt(LeaseRenewalPreparation.Prepared prepared)
+      implements RenewalAttempt {
+    private PreparedAttempt {
+      Objects.requireNonNull(prepared, "prepared");
+    }
+  }
+
+  private record RevokedAttempt(InvocationId invocationId) implements RenewalAttempt {
+    private RevokedAttempt {
+      Objects.requireNonNull(invocationId, "invocationId");
+    }
+  }
+
   private final String tableGroup;
   private final ByteKey profileFingerprint;
   private final long clusterId;
@@ -44,23 +60,30 @@ public final class LeaseRenewalExecutor {
   private final ReadViewService views;
   private final LeaseReadView leases;
   private final LeaseTimeSource time;
+  private final int expiryBucketCount;
   private final Clock ownerClock;
   private final LeaseRenewalPreparation preparation;
+  private final LeaseRevocationExecutor revocations;
   private final CommitPublisher publisher;
   private final RequestMetrics metrics;
 
   public LeaseRenewalExecutor(String tableGroup, ByteKey profileFingerprint,
       long clusterId, long memberId, CommitControlStore control, ReadViewService views,
       LeaseReadView leases, LeaseTimeSource time, Clock ownerClock,
-      LeaseRenewalPreparation preparation, CommitPublisher publisher, RequestMetrics metrics) {
+      LeaseRenewalPreparation preparation, LeaseRevocationExecutor revocations,
+      CommitPublisher publisher, RequestMetrics metrics,
+      int expiryBucketCount) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
     this.profileFingerprint = Objects.requireNonNull(profileFingerprint, "profileFingerprint");
     this.control = Objects.requireNonNull(control, "control");
     this.views = Objects.requireNonNull(views, "views");
     this.leases = Objects.requireNonNull(leases, "leases");
     this.time = Objects.requireNonNull(time, "time");
+    if (expiryBucketCount < 1) throw new IllegalArgumentException("expiry bucket count must be positive");
+    this.expiryBucketCount = expiryBucketCount;
     this.ownerClock = Objects.requireNonNull(ownerClock, "ownerClock");
     this.preparation = Objects.requireNonNull(preparation, "preparation");
+    this.revocations = Objects.requireNonNull(revocations, "revocations");
     this.publisher = Objects.requireNonNull(publisher, "publisher");
     this.metrics = Objects.requireNonNull(metrics, "metrics");
     if (tableGroup.isBlank() || profileFingerprint.length() != 32
@@ -103,12 +126,18 @@ public final class LeaseRenewalExecutor {
           .thenCompose(ignored -> {
             long started = System.nanoTime();
             return views.openAuxiliary(binding.authorizationScopeDigest(), scope)
-                .thenCompose(pinned -> prepare(leaseId, binding, pinned, scope, account))
-                .whenComplete((sealed, failure) -> metrics.recordLeaseRenewalStage(
+                .thenCompose(pinned -> prepare(leaseId, binding, owner, identity,
+                    pinned, scope, account))
+                .whenComplete((attempt, failure) -> metrics.recordLeaseRenewalStage(
                     RequestMetrics.LeaseRenewalStage.PREPARE,
                     Math.max(0, System.nanoTime() - started)));
           })
-          .thenCompose(prepared -> {
+          .thenCompose(attempt -> {
+            if (attempt instanceof RevokedAttempt revoked) {
+              return CompletableFuture.completedFuture(revoked.invocationId());
+            }
+            LeaseRenewalPreparation.Prepared prepared =
+                ((PreparedAttempt) attempt).prepared();
             if (prepared instanceof LeaseRenewalPreparation.NoChanges noChanges) {
               return CompletableFuture.completedFuture(noChanges.invocation().invocationId());
             }
@@ -150,9 +179,10 @@ public final class LeaseRenewalExecutor {
     return operation.copy();
   }
 
-  private CompletableFuture<LeaseRenewalPreparation.Prepared> prepare(long leaseId,
-      InvocationBinding binding, PinnedReadView pinned, RequestScope scope,
-      BudgetManager.Account account) {
+  private CompletableFuture<RenewalAttempt> prepare(long leaseId,
+      InvocationBinding binding, CommitOwnerService.OwnerToken owner,
+      AuthorizedBackendIdentity identity, PinnedReadView pinned,
+      RequestScope scope, BudgetManager.Account account) {
     if (pinned.view().barrierSequence() != binding.baseSequence()
         || pinned.view().targetRevision() != binding.baseRevision()
         || pinned.view().selectedDecision().isPresent()
@@ -161,9 +191,11 @@ public final class LeaseRenewalExecutor {
     }
     var readBudget = new ManifestCatalog.ProofReadBudget(
         scope, account, MAX_EXAMINED_LEASES, MAX_METADATA_BYTES);
-    return leases.find(pinned, leaseId, scope, readBudget).thenCompose(found -> {
+    return leases.expiryCheckpoint(pinned, scope, readBudget).thenCompose(checkpoint ->
+        leases.find(pinned, leaseId, scope, readBudget).<RenewalAttempt>thenCompose(found -> {
       var observed = time.observe();
       LeaseState renewed = null;
+      LeaseExpiryCheckpoint nextCheckpoint = null;
       long ttl = 0;
       if (found.isPresent()) {
         LeaseState current = found.orElseThrow();
@@ -172,15 +204,21 @@ public final class LeaseRenewalExecutor {
               new BackendFailure(BackendFailure.Category.UNKNOWN));
         }
         if (current.status() == LeaseState.Status.ACTIVE) {
+          if (checkpoint.isPresent() && observed.nowLowerEpochMillis()
+              < checkpoint.orElseThrow().trustedTimeLowerEpochMillis()) {
+            return CompletableFuture.failedFuture(new LeaseFailure(LeaseFailure.Reason.CLOCK_UNHEALTHY));
+          }
           if (LeaseTimeRules.isExpired(current, observed)) {
-            // J43 will select the durable revoke. Until that decision is available, do not
-            // return a TTL=0 success while the authoritative state still says ACTIVE.
-            return CompletableFuture.failedFuture(
-                new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
+            return revocations.executeExpiredKeepAlive(leaseId, current, binding,
+                owner, identity, pinned, observed, scope, account)
+                .thenApply(RevokedAttempt::new);
           }
           long nextSequence = Math.addExact(binding.baseSequence(), 1);
           long deadline = LeaseTimeRules.deadlineEpochMillis(observed, current.grantedTtlSeconds());
           renewed = current.renew(deadline, nextSequence);
+          nextCheckpoint = LeaseExpiryCheckpoint.afterLeaseMutation(
+              binding.preparedOwnerEpoch(), nextSequence, expiryBucketCount,
+              binding.baseSequence(), checkpoint, observed);
           ttl = renewed.grantedTtlSeconds();
         }
       }
@@ -189,9 +227,9 @@ public final class LeaseRenewalExecutor {
           .setID(leaseId)
           .setTTL(ttl)
           .build();
-      return preparation.prepare(binding, response, renewed, scope, account,
-          () -> leases.finish(pinned, scope));
-    }).exceptionallyCompose(failure -> CompletableFuture.failedFuture(
+      return preparation.prepare(binding, response, renewed, nextCheckpoint, scope, account,
+          () -> leases.finish(pinned, scope)).thenApply(PreparedAttempt::new);
+    })).exceptionallyCompose(failure -> CompletableFuture.failedFuture(
         CompletionFailures.unwrapCompletion(failure)));
   }
 

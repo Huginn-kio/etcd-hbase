@@ -23,6 +23,7 @@
     "m4_lease_api_enabled": {"type": "boolean"},
     "lease_min_ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 9000000000},
     "lease_clock_uncertainty_ms": {"type": "integer", "minimum": 1, "maximum": 60000},
+    "lease_clock_max_drift_ppm": {"type": "integer", "minimum": 1, "maximum": 100000},
     "lease_maximum_bindings": {"type": "integer", "minimum": 1, "maximum": 1024},
     "lease_maximum_key_bytes": {"type": "integer", "minimum": 1, "maximum": 4194304},
     "lease_maximum_revoke_cost_bytes": {"type": "integer", "minimum": 1, "maximum": 33554432}
@@ -35,7 +36,8 @@
       },
       "then": {
         "required": [
-          "lease_min_ttl_seconds", "lease_clock_uncertainty_ms", "lease_maximum_bindings",
+          "lease_min_ttl_seconds", "lease_clock_uncertainty_ms", "lease_clock_max_drift_ppm",
+          "lease_maximum_bindings",
           "lease_maximum_key_bytes", "lease_maximum_revoke_cost_bytes"
         ]
       }

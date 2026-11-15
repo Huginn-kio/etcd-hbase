@@ -8,6 +8,7 @@ import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
 import io.etcdhbase.core.lease.LeaseBindingIdentity;
 import io.etcdhbase.core.lease.LeaseBindingVersion;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.request.RequestScope;
@@ -47,12 +48,15 @@ public final class SystemRecordAuxiliaryMaterializationStore
     } catch (RuntimeException failure) {
       return CompletableFuture.failedFuture(failure);
     }
-    return records.read(record.targetType(), record.targetIdentity(), scope).thenAccept(existing -> {
+    return records.read(record.targetType(), record.targetIdentity(), scope).thenCompose(existing -> {
       if (record.targetType() == SystemRecordType.LEASE_ENUMERATION) {
         validatePointerBeforeSelection(record, existing);
+      } else if (record.targetType() == SystemRecordType.LEASE_EXPIRY_CHECKPOINT) {
+        return validateCheckpointBeforeSelection(record, existing, scope);
       } else if (existing.isPresent() && !existing.orElseThrow().equals(record.payload())) {
         throw conflict("immutable auxiliary target already has different bytes");
       }
+      return CompletableFuture.completedFuture(null);
     });
   }
 
@@ -205,8 +209,48 @@ public final class SystemRecordAuxiliaryMaterializationStore
           throw new IllegalArgumentException("Lease binding payload differs from its identity");
         }
       }
+      case LEASE_EXPIRY_CHECKPOINT -> {
+        LeaseExpiryCheckpoint checkpoint = LeaseExpiryCheckpoint.decode(record.payload());
+        if (!record.targetIdentity().equals(LeaseExpiryCheckpoint.versionIdentity(targetSequence))) {
+          throw new IllegalArgumentException("Lease expiry checkpoint target identity is invalid");
+        }
+        if (checkpoint.ownerEpoch() != record.ownerEpoch() || checkpoint.sequence() != targetSequence
+            || checkpoint.protectedSequence() != record.baseSequence()) {
+          throw new IllegalArgumentException("Lease expiry checkpoint differs from its selection");
+        }
+      }
       default -> throw new IllegalArgumentException("unsupported auxiliary target type");
     }
+  }
+
+  private CompletableFuture<Void> validateCheckpointBeforeSelection(PreparedAuxiliaryRecord record,
+      Optional<ByteKey> existing, RequestScope scope) {
+    LeaseExpiryCheckpoint replacement = LeaseExpiryCheckpoint.decode(record.payload());
+    if (!record.targetIdentity().equals(LeaseExpiryCheckpoint.versionIdentity(replacement.sequence()))
+        || replacement.sequence() != targetSequence(record)
+        || replacement.protectedSequence() != record.baseSequence()) {
+      return CompletableFuture.failedFuture(
+          conflict("Lease expiry checkpoint target identity differs from its selected sequence"));
+    }
+    if (existing.isPresent() && !existing.orElseThrow().equals(record.payload())) {
+      return CompletableFuture.failedFuture(
+          conflict("same-sequence Lease expiry checkpoints differ"));
+    }
+    return records.latestAtOrBefore(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+        LeaseExpiryCheckpoint.routePrefix(), record.baseSequence(), scope).thenAccept(previous -> {
+      if (previous.isEmpty()) {
+        if (replacement.position().windowStartInclusive() != 0) {
+          throw conflict("initial Lease expiry checkpoint must start at the first deadline boundary");
+        }
+        return;
+      }
+      LeaseExpiryCheckpoint current = LeaseExpiryCheckpoint.decode(previous.orElseThrow().value());
+      try {
+        LeaseExpiryCheckpoint.requireForwardProgress(current, replacement);
+      } catch (IllegalArgumentException stale) {
+        throw conflict("Lease expiry checkpoint does not advance protected durable progress");
+      }
+    });
   }
 
   private static long targetSequence(PreparedAuxiliaryRecord record) {

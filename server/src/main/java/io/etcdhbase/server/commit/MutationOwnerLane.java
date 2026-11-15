@@ -67,16 +67,23 @@ public final class MutationOwnerLane {
     long entered = nanoTime.getAsLong();
     long bytes = ENVELOPE_ALLOWANCE + 8L * request.operationBytes().length()
         + 2L * request.authorizationContextReference().length() + 2L * tableGroup.length();
+    boolean reserved = operationKind == MutationOperationEnvelope.Kind.LEASE_REVOKE
+        || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRY_STEP
+        || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRE_EMPTY;
     try {
-      return queue.submit(bytes, scope, serviceScope -> {
+      java.util.function.Function<RequestScope, CompletableFuture<OwnerForwarding.Reply>> work = serviceScope -> {
         long elapsed = nanoTime.getAsLong() - entered;
         if (operationKind == MutationOperationEnvelope.Kind.PUT) {
           metrics.recordPutStage(RequestMetrics.PutStage.QUEUE, Math.max(0, elapsed));
         } else if (operationKind == MutationOperationEnvelope.Kind.LEASE_KEEP_ALIVE) {
           metrics.recordLeaseRenewalStage(
               RequestMetrics.LeaseRenewalStage.QUEUE, Math.max(0, elapsed));
-        } else if (operationKind != MutationOperationEnvelope.Kind.LEASE_GRANT
-            && operationKind != MutationOperationEnvelope.Kind.LEASE_EXPIRE_EMPTY) {
+        } else if (operationKind == MutationOperationEnvelope.Kind.LEASE_REVOKE
+            || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRY_STEP
+            || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRE_EMPTY) {
+          metrics.recordLeaseRevocationStage(
+              RequestMetrics.LeaseRevocationStage.QUEUE, Math.max(0, elapsed));
+        } else if (operationKind != MutationOperationEnvelope.Kind.LEASE_GRANT) {
           metrics.recordTxnStage(RequestMetrics.TxnStage.QUEUE, Math.max(0, elapsed));
         }
         long remaining = elapsed < 0 || elapsed >= request.remainingTimeoutNanos()
@@ -90,7 +97,19 @@ public final class MutationOwnerLane {
             request.hopCount(), request.operationBytes());
         return receiver.receive(peerIdentity, delivered, serviceScope)
             .thenApply(reply -> validateReceipt(request, reply));
-      }).handle((reply, failure) -> failure == null ? reply : new OwnerForwarding.Unknown(category(failure)));
+      };
+      CompletableFuture<OwnerForwarding.Reply> submitted = reserved
+          ? queue.submitReserved(bytes, scope, work)
+          : queue.submit(bytes, scope, work);
+      return submitted.handle((reply, failure) -> {
+        if (failure == null) return reply;
+        if (Boolean.getBoolean("etcdhbase.m4.debug.failures")) {
+          Throwable cause = CompletionFailures.unwrapCompletion(failure);
+          System.err.println("[M4 diagnostic] Mutation owner lane failure: " + cause.getClass().getName());
+          cause.printStackTrace(System.err);
+        }
+        return new OwnerForwarding.Unknown(category(failure));
+      });
     } catch (RuntimeException failure) {
       return CompletableFuture.completedFuture(new OwnerForwarding.Unknown(category(failure)));
     }

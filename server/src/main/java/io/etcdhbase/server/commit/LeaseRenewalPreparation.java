@@ -9,6 +9,7 @@ import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseRenewalVersion;
 import io.etcdhbase.core.lease.LeaseState;
@@ -64,7 +65,8 @@ public final class LeaseRenewalPreparation {
 
   /** The caller owns the mutation lane, fixed view, and all service-scope cleanup. */
   public CompletableFuture<Prepared> prepare(InvocationBinding invocation,
-      Rpc.LeaseKeepAliveResponse response, LeaseState renewedState, RequestScope scope,
+      Rpc.LeaseKeepAliveResponse response, LeaseState renewedState,
+      LeaseExpiryCheckpoint checkpoint, RequestScope scope,
       BudgetManager.Account account, Supplier<CompletableFuture<Void>> finishPinnedRead) {
     Objects.requireNonNull(invocation, "invocation");
     Objects.requireNonNull(response, "response");
@@ -90,7 +92,8 @@ public final class LeaseRenewalPreparation {
       return auxiliaryMutations.completeWithoutChanges(invocation, responsePayload,
           finishPinnedRead, scope, account).thenApply(NoChanges::new);
     }
-    RenewalRecords records = renewalRecords(invocation, response, renewedState);
+    Objects.requireNonNull(checkpoint, "checkpoint");
+    RenewalRecords records = renewalRecords(invocation, response, renewedState, checkpoint);
     return auxiliaryMutations.prepare(invocation, responsePayload,
         records.records().iterator(), finishPinnedRead, scope, account)
         .thenApply(sealed -> new Sealed(sealed.invocation(), sealed.manifest(),
@@ -98,15 +101,18 @@ public final class LeaseRenewalPreparation {
   }
 
   private static RenewalRecords renewalRecords(InvocationBinding invocation,
-      Rpc.LeaseKeepAliveResponse response, LeaseState state) {
+      Rpc.LeaseKeepAliveResponse response, LeaseState state, LeaseExpiryCheckpoint checkpoint) {
     long leaseId = state.identity().leaseId();
     long sequence = state.sequence();
     if (state.status() != LeaseState.Status.ACTIVE || state.renewalGeneration() <= 0
         || sequence != invocation.baseSequence() + 1 || response.getID() != leaseId
-        || response.getTTL() != state.grantedTtlSeconds()) {
+        || response.getTTL() != state.grantedTtlSeconds()
+        || checkpoint.ownerEpoch() != invocation.preparedOwnerEpoch()
+        || checkpoint.sequence() != sequence
+        || checkpoint.protectedSequence() != invocation.baseSequence()) {
       throw new IllegalArgumentException("renewed Lease state differs from its KeepAlive response");
     }
-    var records = new ArrayList<PreparedAuxiliaryRecord>(3);
+    var records = new ArrayList<PreparedAuxiliaryRecord>(4);
     records.add(PreparedAuxiliaryRecord.create(invocation.transactionId(),
         invocation.preparedOwnerEpoch(), invocation.baseSequence(), 0,
         SystemRecordType.LEASE_STATE, LeaseRecordIdentity.stateVersion(leaseId, sequence),
@@ -121,6 +127,10 @@ public final class LeaseRenewalPreparation {
         invocation.preparedOwnerEpoch(), invocation.baseSequence(), 2,
         SystemRecordType.EXPIRY_CANDIDATE, expiry.encode(),
         new ExpiryCandidateRecord(sequence).encode()));
+    records.add(PreparedAuxiliaryRecord.create(invocation.transactionId(),
+        invocation.preparedOwnerEpoch(), invocation.baseSequence(), 3,
+        SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+        LeaseExpiryCheckpoint.versionIdentity(sequence), checkpoint.encode()));
     long payloadBytes = records.stream()
         .mapToLong(record -> record.payload().length()).reduce(0, Math::addExact);
     return new RenewalRecords(records, payloadBytes);

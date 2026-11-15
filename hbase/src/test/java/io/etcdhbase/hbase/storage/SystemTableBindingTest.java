@@ -49,8 +49,13 @@ class SystemTableBindingTest {
     var withLeaseBindings = BINDING.withLeaseBindingCapability(withAuxiliary);
     assertTrue(BINDING.supportsAuxiliary(withLeaseBindings));
     assertTrue(BINDING.supportsLeaseBindings(withLeaseBindings));
+    assertFalse(BINDING.supportsLeaseExpiryCheckpoints(withLeaseBindings));
+    var withExpiry = BINDING.withLeaseExpiryCheckpointCapability(withLeaseBindings);
+    assertTrue(BINDING.supportsAuxiliary(withExpiry));
+    assertTrue(BINDING.supportsLeaseBindings(withExpiry));
+    assertTrue(BINDING.supportsLeaseExpiryCheckpoints(withExpiry));
     var unknownAuxiliary = TableDescriptorBuilder.newBuilder(withResult)
-        .setValue("etcdhbase.m4.auxiliary-format", "3").build();
+        .setValue("etcdhbase.m4.auxiliary-format", "4").build();
     assertFalse(BINDING.supportsAuxiliary(unknownAuxiliary));
     assertThrows(IllegalStateException.class,
         () -> BINDING.withAuxiliaryCapability(unknownAuxiliary));

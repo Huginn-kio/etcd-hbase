@@ -33,6 +33,12 @@ public final class M3RuntimeConfigurationLoader {
         }
         object.put("lease_clock_uncertainty_ms", 1_000);
       }
+      if (!object.has("lease_clock_max_drift_ppm")) {
+        if (m4LeaseApiEnabled) {
+          throw new IllegalArgumentException("M4 Lease activation requires lease_clock_max_drift_ppm");
+        }
+        object.put("lease_clock_max_drift_ppm", 0);
+      }
       if (!object.has("lease_maximum_bindings")) {
         if (m4LeaseApiEnabled) {
           throw new IllegalArgumentException("M4 Lease activation requires lease_maximum_bindings");

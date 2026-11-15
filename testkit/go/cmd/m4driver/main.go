@@ -48,10 +48,12 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 		return compareLeaseBindingTraces(arguments[1:], stdout, stderr)
 	case "compare-keepalive":
 		return compareLeaseKeepAliveTraces(arguments[1:], stdout, stderr)
+	case "compare-revoke":
+		return compareLeaseRevokeTraces(arguments[1:], stdout, stderr)
 	case "keepalive-once":
 		return runLeaseKeepAliveOnce(ctx, arguments[1:], stdout, stderr)
 	default:
-		return errors.New("M4 driver command must be run, compare, compare-bindings, compare-keepalive, or keepalive-once")
+		return errors.New("M4 driver command must be run, compare, compare-bindings, compare-keepalive, compare-revoke, or keepalive-once")
 	}
 }
 
@@ -124,6 +126,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 		suite, suiteDigest, err = scenario.LoadM4LeaseKeepAliveSuite(options.scenario)
 	}
 	if err != nil {
+		suite, suiteDigest, err = scenario.LoadM4LeaseRevokeSuite(options.scenario)
+	}
+	if err != nil {
 		return err
 	}
 	build, err := scenario.BuildMetadata(suite)
@@ -148,6 +153,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 		if suite.ID == "m4-lease-keepalive-v1" {
 			return scenario.RunM4NativeLeaseKeepAlive(ctx, options.nativeData, options.prefix, evidence.trace)
 		}
+		if suite.ID == "m4-lease-revoke-v1" {
+			return scenario.RunM4NativeLeaseRevoke(ctx, options.nativeData, options.prefix, evidence.trace)
+		}
 		return scenario.RunM4NativeLease(ctx, options.nativeData, options.prefix, evidence.trace)
 	}
 	connection, err := client.New(client.Options{Endpoint: options.endpoint, Timeout: options.timeout})
@@ -160,6 +168,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 	}
 	if suite.ID == "m4-lease-keepalive-v1" {
 		return scenario.RunM4LeaseKeepAlive(ctx, connection, options.scope, options.prefix, evidence.trace)
+	}
+	if suite.ID == "m4-lease-revoke-v1" {
+		return scenario.RunM4LeaseRevoke(ctx, connection, options.scope, options.prefix, evidence.trace)
 	}
 	return scenario.RunM4Lease(ctx, connection, options.scope, options.prefix, evidence.trace)
 }
@@ -367,5 +378,34 @@ func compareLeaseKeepAliveTraces(arguments []string, stdout, stderr io.Writer) e
 		return err
 	}
 	_, err = fmt.Fprintln(stdout, "M4 KeepAlive traces match the registered native comparison policy")
+	return err
+}
+
+func compareLeaseRevokeTraces(arguments []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("m4driver compare-revoke", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var left, right string
+	flags.StringVar(&left, "left", "", "native Revoke trace JSONL")
+	flags.StringVar(&right, "right", "", "target Revoke trace JSONL")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || left == "" || right == "" || left == right {
+		return errors.New("M4 Revoke compare requires distinct native and target trace files")
+	}
+	leftFile, err := os.Open(left)
+	if err != nil {
+		return errors.New("native M4 Revoke trace cannot be opened")
+	}
+	defer leftFile.Close()
+	rightFile, err := os.Open(right)
+	if err != nil {
+		return errors.New("target M4 Revoke trace cannot be opened")
+	}
+	defer rightFile.Close()
+	if err := compare.CompareM4LeaseRevokeTraces(leftFile, rightFile); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, "M4 Revoke traces match the registered native comparison policy")
 	return err
 }

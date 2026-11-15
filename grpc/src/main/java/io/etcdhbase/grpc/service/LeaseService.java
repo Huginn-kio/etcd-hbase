@@ -10,6 +10,7 @@ import java.util.function.Function;
 /** Lease RPC surface whose unary handlers are installed by a capable table-group runtime. */
 public final class LeaseService extends LeaseGrpc.LeaseImplBase {
   private final BiConsumer<Rpc.LeaseGrantRequest, StreamObserver<Rpc.LeaseGrantResponse>> grant;
+  private final BiConsumer<Rpc.LeaseRevokeRequest, StreamObserver<Rpc.LeaseRevokeResponse>> revoke;
   private final BiConsumer<Rpc.LeaseTimeToLiveRequest, StreamObserver<Rpc.LeaseTimeToLiveResponse>> ttl;
   private final BiConsumer<Rpc.LeaseLeasesRequest, StreamObserver<Rpc.LeaseLeasesResponse>> list;
   private final Function<StreamObserver<Rpc.LeaseKeepAliveResponse>,
@@ -18,6 +19,7 @@ public final class LeaseService extends LeaseGrpc.LeaseImplBase {
   /** Protocol-only mode retains explicit UNIMPLEMENTED responses. */
   public LeaseService() {
     grant = null;
+    revoke = null;
     ttl = null;
     list = null;
     keepAlive = null;
@@ -27,7 +29,7 @@ public final class LeaseService extends LeaseGrpc.LeaseImplBase {
       BiConsumer<Rpc.LeaseGrantRequest, StreamObserver<Rpc.LeaseGrantResponse>> grant,
       BiConsumer<Rpc.LeaseTimeToLiveRequest, StreamObserver<Rpc.LeaseTimeToLiveResponse>> ttl,
       BiConsumer<Rpc.LeaseLeasesRequest, StreamObserver<Rpc.LeaseLeasesResponse>> list) {
-    this(grant, ttl, list, null);
+    this(grant, ttl, list, null, null);
   }
 
   public LeaseService(
@@ -36,7 +38,18 @@ public final class LeaseService extends LeaseGrpc.LeaseImplBase {
       BiConsumer<Rpc.LeaseLeasesRequest, StreamObserver<Rpc.LeaseLeasesResponse>> list,
       Function<StreamObserver<Rpc.LeaseKeepAliveResponse>,
           StreamObserver<Rpc.LeaseKeepAliveRequest>> keepAlive) {
+    this(grant, ttl, list, keepAlive, null);
+  }
+
+  public LeaseService(
+      BiConsumer<Rpc.LeaseGrantRequest, StreamObserver<Rpc.LeaseGrantResponse>> grant,
+      BiConsumer<Rpc.LeaseTimeToLiveRequest, StreamObserver<Rpc.LeaseTimeToLiveResponse>> ttl,
+      BiConsumer<Rpc.LeaseLeasesRequest, StreamObserver<Rpc.LeaseLeasesResponse>> list,
+      Function<StreamObserver<Rpc.LeaseKeepAliveResponse>,
+          StreamObserver<Rpc.LeaseKeepAliveRequest>> keepAlive,
+      BiConsumer<Rpc.LeaseRevokeRequest, StreamObserver<Rpc.LeaseRevokeResponse>> revoke) {
     this.grant = Objects.requireNonNull(grant, "grant");
+    this.revoke = revoke;
     this.ttl = Objects.requireNonNull(ttl, "ttl");
     this.list = Objects.requireNonNull(list, "list");
     this.keepAlive = keepAlive;
@@ -52,7 +65,8 @@ public final class LeaseService extends LeaseGrpc.LeaseImplBase {
   @Override
   public void leaseRevoke(
       Rpc.LeaseRevokeRequest request, StreamObserver<Rpc.LeaseRevokeResponse> responseObserver) {
-    UnimplementedStreams.failUnary(responseObserver, "Lease.LeaseRevoke");
+    if (revoke == null) UnimplementedStreams.failUnary(responseObserver, "Lease.LeaseRevoke");
+    else revoke.accept(request, responseObserver);
   }
 
   @Override

@@ -183,6 +183,65 @@ func TestRunNativeLeaseKeepAliveWritesFreshTraceAndVerifiableMetadata(t *testing
 	}
 }
 
+func TestRunNativeLeaseRevokeWritesFreshTraceAndVerifiableMetadata(t *testing.T) {
+	root := repositoryRoot(t)
+	artifact := t.TempDir()
+	tracePath := filepath.Join(artifact, "native-revoke.jsonl")
+	metadataPath := filepath.Join(artifact, "native-revoke.json")
+	scenarioPath := filepath.Join(root, "testkit/scenarios/m4-lease-revoke.yaml")
+	suite, suiteDigest, err := scenario.LoadM4LeaseRevokeSuite(scenarioPath)
+	if err != nil {
+		t.Fatalf("load registered M4 Revoke scenario: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	args := []string{"run", "--scenario", scenarioPath,
+		"--native-data-dir", filepath.Join(artifact, "native-revoke-data"),
+		"--scope", "native-etcd", "--prefix", "etcd-hbase-m4-test/driver/revoke/",
+		"--trace", tracePath, "--metadata", metadataPath}
+	if err := run(ctx, args, io.Discard, io.Discard); err != nil {
+		t.Fatalf("run native M4 Revoke scenario: %v", err)
+	}
+	traceBytes, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := trace.ReadJSONL(bytes.NewReader(traceBytes))
+	if err != nil || len(records) != len(suite.Steps) {
+		t.Fatalf("native M4 Revoke trace has %d records, want %d, err=%v",
+			len(records), len(suite.Steps), err)
+	}
+	for index, step := range suite.Steps {
+		if records[index].CaseID != step.ID || records[index].EvidenceScope != "native-etcd" {
+			t.Fatalf("native M4 Revoke record %d does not match its registered step: %#v",
+				index+1, records[index])
+		}
+	}
+	var metadata runMetadata
+	encoded, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(traceBytes)
+	if metadata.Schema != "etcd-hbase-m4-run/v1" || metadata.Status != "passed" ||
+		metadata.EvidenceScope != "native-etcd" || !metadata.EmbeddedNative || metadata.Layout != "" ||
+		metadata.SuiteSHA256 != suiteDigest || metadata.TraceSHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("M4 native Revoke metadata does not describe the trace: %#v", metadata)
+	}
+
+	copyPath := filepath.Join(artifact, "native-revoke-copy.jsonl")
+	if err := os.WriteFile(copyPath, traceBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := compareLeaseRevokeTraces(
+		[]string{"--left", tracePath, "--right", copyPath}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("compare equivalent native M4 Revoke traces: %v", err)
+	}
+}
+
 func TestParseRunOptionsRejectsMissingLayoutAndUnscopedPrefix(t *testing.T) {
 	base := []string{"--scenario", "suite.yaml", "--scope", "target-hbase",
 		"--prefix", "etcd-hbase-m4-test/run/", "--endpoint", "127.0.0.1:2379",
@@ -276,6 +335,32 @@ func TestCompareKeepAliveRejectsCorruptOrMismatchedTrace(t *testing.T) {
 	if err := compareLeaseKeepAliveTraces(
 		[]string{"--left", left, "--right", right}, io.Discard, io.Discard); err == nil {
 		t.Fatal("corrupt M4 KeepAlive traces were accepted")
+	}
+}
+
+func TestCompareRevokeRejectsCorruptOrEmptyTrace(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		left, right []byte
+	}{
+		{name: "corrupt", left: []byte("{}\n")},
+		{name: "empty"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			left := filepath.Join(directory, "left.jsonl")
+			right := filepath.Join(directory, "right.jsonl")
+			if err := os.WriteFile(left, test.left, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(right, test.right, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := compareLeaseRevokeTraces(
+				[]string{"--left", left, "--right", right}, io.Discard, io.Discard); err == nil {
+				t.Fatal("incomplete M4 Revoke traces were accepted")
+			}
+		})
 	}
 }
 

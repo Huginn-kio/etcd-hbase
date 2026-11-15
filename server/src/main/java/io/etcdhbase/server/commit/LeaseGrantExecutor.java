@@ -16,7 +16,9 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.lease.LeaseGrantPlanner;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseIdAllocator;
+import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.lease.LeaseTimeSource;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
@@ -40,6 +42,7 @@ public final class LeaseGrantExecutor {
   private final LeaseTimeSource time;
   private final long minimumTtlSeconds;
   private final long maximumTtlSeconds;
+  private final int expiryBucketCount;
   private final Clock ownerClock;
   private final LeaseGrantPreparation preparation;
   private final CommitPublisher publisher;
@@ -48,7 +51,7 @@ public final class LeaseGrantExecutor {
       CommitControlStore control, ReadViewService views, LeaseReadView leases,
       LeaseIdAllocator allocator, LeaseTimeSource time, long minimumTtlSeconds,
       long maximumTtlSeconds, Clock ownerClock, LeaseGrantPreparation preparation,
-      CommitPublisher publisher) {
+      CommitPublisher publisher, int expiryBucketCount) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
     this.profileFingerprint = Objects.requireNonNull(profileFingerprint, "profileFingerprint");
     this.control = Objects.requireNonNull(control, "control");
@@ -65,6 +68,8 @@ public final class LeaseGrantExecutor {
     }
     this.minimumTtlSeconds = minimumTtlSeconds;
     this.maximumTtlSeconds = maximumTtlSeconds;
+    if (expiryBucketCount < 1) throw new IllegalArgumentException("expiry bucket count must be positive");
+    this.expiryBucketCount = expiryBucketCount;
   }
 
   /** Caller owns the serial lane and resolves previously sealed or selected invocations. */
@@ -120,18 +125,28 @@ public final class LeaseGrantExecutor {
       return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
     var metadataBudget = new ManifestCatalog.ProofReadBudget(scope, account, 1024, 64L << 30);
-    return allocator.select(requestedId, id -> leases.find(pinned, id, scope, metadataBudget))
-        .thenApply(selection -> LeaseGrantPlanner.grant(selection.id(), ttl, selection.previous(),
-            Math.addExact(binding.baseSequence(), 1), time.observe(),
-            minimumTtlSeconds, maximumTtlSeconds))
+    return leases.expiryCheckpoint(pinned, scope, metadataBudget).thenCompose(checkpoint ->
+        allocator.select(requestedId, id -> leases.find(pinned, id, scope, metadataBudget))
+        .thenApply(selection -> {
+          var observation = time.observe();
+          LeaseState state = LeaseGrantPlanner.grant(selection.id(), ttl, selection.previous(),
+              Math.addExact(binding.baseSequence(), 1), observation,
+              minimumTtlSeconds, maximumTtlSeconds);
+          LeaseExpiryCheckpoint nextCheckpoint = LeaseExpiryCheckpoint.afterLeaseMutation(
+              binding.preparedOwnerEpoch(), state.sequence(), expiryBucketCount,
+              binding.baseSequence(), checkpoint, observation);
+          return new PreparedGrant(state, nextCheckpoint);
+        }))
         .exceptionallyCompose(failure -> {
           Throwable cause = CompletionFailures.unwrapCompletion(failure);
           return CompletableFuture.failedFuture(cause instanceof LeaseFailure semantic
               ? new RejectedBeforePreparation(semantic) : cause);
         })
-        .thenCompose(state -> preparation.prepare(binding, state, scope, account,
+        .thenCompose(prepared -> preparation.prepare(binding, prepared.state(), prepared.checkpoint(), scope, account,
             () -> leases.finish(pinned, scope)));
   }
+
+  private record PreparedGrant(LeaseState state, LeaseExpiryCheckpoint checkpoint) {}
 
   /** Marks a domain rejection proven to have occurred before any private Grant preparation. */
   static final class RejectedBeforePreparation extends RuntimeException {

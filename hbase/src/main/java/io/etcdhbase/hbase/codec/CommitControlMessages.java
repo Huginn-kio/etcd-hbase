@@ -46,6 +46,7 @@ public final class CommitControlMessages {
           || message.getFormatVersion() != CommitState.FORMAT_VERSION
               && message.getFormatVersion() != CommitState.AUXILIARY_FORMAT_VERSION
               && message.getFormatVersion() != CommitState.LEASE_BINDING_FORMAT_VERSION
+              && message.getFormatVersion() != CommitState.LEASE_EXPIRY_FORMAT_VERSION
           || !message.hasProfileFingerprint() || !message.hasOwnerEpoch()
           || !message.hasOwnerLeaseDeadlineEpochMillis() || !message.hasStateVersion()
           || !message.hasPublishedSequence() || !message.hasPublishedRevision()

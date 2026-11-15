@@ -107,6 +107,10 @@ public final class LeaseGrantOwnerProcessor implements MutationForwardReceiver.M
           ? receipt(request) : new OwnerForwarding.Unknown(BackendFailure.Category.UNKNOWN));
     }
     Throwable cause = CompletionFailures.unwrapCompletion(failure);
+    if (Boolean.getBoolean("etcdhbase.m4.debug.failures")) {
+      System.err.println("[M4 diagnostic] Lease Grant owner failure: " + cause.getClass().getName());
+      cause.printStackTrace(System.err);
+    }
     if (cause instanceof LeaseGrantExecutor.RejectedBeforePreparation semantic) {
       return persistSemanticRejection(binding, semantic.reason(), scope);
     }

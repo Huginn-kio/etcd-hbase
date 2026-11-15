@@ -11,15 +11,18 @@ import org.junit.jupiter.api.Test;
 
 class LeaseServiceTest {
   @Test
-  void routesOnlyInstalledUnaryOperationsAndLeavesRevokeUnimplemented() {
+  void routesInstalledUnaryOperations() {
     var grantRequest = Rpc.LeaseGrantRequest.newBuilder().setID(-7).setTTL(10).build();
     var ttlRequest = Rpc.LeaseTimeToLiveRequest.newBuilder().setID(-7).setKeys(true).build();
     var listRequest = Rpc.LeaseLeasesRequest.getDefaultInstance();
     var grantSeen = new AtomicReference<Rpc.LeaseGrantRequest>();
     var ttlSeen = new AtomicReference<Rpc.LeaseTimeToLiveRequest>();
     var listSeen = new AtomicReference<Rpc.LeaseLeasesRequest>();
+    var revokeRequest = Rpc.LeaseRevokeRequest.newBuilder().setID(-9).build();
+    var revokeSeen = new AtomicReference<Rpc.LeaseRevokeRequest>();
     var service = new LeaseService((request, observer) -> grantSeen.set(request),
-        (request, observer) -> ttlSeen.set(request), (request, observer) -> listSeen.set(request));
+        (request, observer) -> ttlSeen.set(request), (request, observer) -> listSeen.set(request),
+        null, (request, observer) -> revokeSeen.set(request));
     service.leaseGrant(grantRequest, new Observer<>());
     service.leaseTimeToLive(ttlRequest, new Observer<>());
     service.leaseLeases(listRequest, new Observer<>());
@@ -27,9 +30,8 @@ class LeaseServiceTest {
     assertSame(ttlRequest, ttlSeen.get());
     assertSame(listRequest, listSeen.get());
 
-    var revoke = new Observer<Rpc.LeaseRevokeResponse>();
-    service.leaseRevoke(Rpc.LeaseRevokeRequest.getDefaultInstance(), revoke);
-    assertEquals(Status.Code.UNIMPLEMENTED, Status.fromThrowable(revoke.failure.get()).getCode());
+    service.leaseRevoke(revokeRequest, new Observer<>());
+    assertSame(revokeRequest, revokeSeen.get());
   }
 
   @Test
@@ -38,12 +40,15 @@ class LeaseServiceTest {
     var grant = new Observer<Rpc.LeaseGrantResponse>();
     var ttl = new Observer<Rpc.LeaseTimeToLiveResponse>();
     var list = new Observer<Rpc.LeaseLeasesResponse>();
+    var revoke = new Observer<Rpc.LeaseRevokeResponse>();
     service.leaseGrant(Rpc.LeaseGrantRequest.getDefaultInstance(), grant);
     service.leaseTimeToLive(Rpc.LeaseTimeToLiveRequest.getDefaultInstance(), ttl);
     service.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance(), list);
+    service.leaseRevoke(Rpc.LeaseRevokeRequest.getDefaultInstance(), revoke);
     assertEquals(Status.Code.UNIMPLEMENTED, Status.fromThrowable(grant.failure.get()).getCode());
     assertEquals(Status.Code.UNIMPLEMENTED, Status.fromThrowable(ttl.failure.get()).getCode());
     assertEquals(Status.Code.UNIMPLEMENTED, Status.fromThrowable(list.failure.get()).getCode());
+    assertEquals(Status.Code.UNIMPLEMENTED, Status.fromThrowable(revoke.failure.get()).getCode());
   }
 
   private static final class Observer<T> implements StreamObserver<T> {

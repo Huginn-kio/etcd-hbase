@@ -11,6 +11,7 @@ import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.PreparedAuxiliaryRecord;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.commit.TransactionId;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.hbase.codec.LeaseBindingMessages;
@@ -36,6 +37,7 @@ class LeaseBindingMutationPlannerTest {
     assertEquals(List.of(SystemRecordType.LEASE_STATE, SystemRecordType.LEASE_ENUMERATION),
         records.stream().map(PreparedAuxiliaryRecord::targetType).toList());
     assertFalse(records.stream().anyMatch(record -> record.targetType() == SystemRecordType.EXPIRY_CANDIDATE));
+    appendCheckpoint(records, invocation);
     AuxiliaryLeasePlanVerifier.Transaction plan = verifier().begin(BASE_SEQUENCE);
     records.forEach(plan::accept);
     assertDoesNotThrow(plan::finish);
@@ -53,6 +55,7 @@ class LeaseBindingMutationPlannerTest {
     assertEquals(List.of(SystemRecordType.LEASE_STATE, SystemRecordType.LEASE_ENUMERATION,
         SystemRecordType.EXPIRY_CANDIDATE),
         records.stream().map(PreparedAuxiliaryRecord::targetType).toList());
+    appendCheckpoint(records, invocation);
     AuxiliaryLeasePlanVerifier.Transaction plan = verifier().begin(BASE_SEQUENCE);
     records.forEach(plan::accept);
     assertDoesNotThrow(plan::finish);
@@ -66,5 +69,15 @@ class LeaseBindingMutationPlannerTest {
 
   private static AuxiliaryLeasePlanVerifier verifier() {
     return new AuxiliaryLeasePlanVerifier(LeaseStateMessages::decode, LeaseBindingMessages::decode);
+  }
+
+  private static void appendCheckpoint(List<PreparedAuxiliaryRecord> records,
+      InvocationBinding invocation) {
+    LeaseExpiryCheckpoint checkpoint = new LeaseExpiryCheckpoint(1, SELECTED_SEQUENCE, 4,
+        BASE_SEQUENCE, 0, LeaseExpiryCheckpoint.idleAt(0));
+    records.add(PreparedAuxiliaryRecord.create(invocation.transactionId(),
+        invocation.preparedOwnerEpoch(), invocation.baseSequence(), records.size(),
+        SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+        LeaseExpiryCheckpoint.versionIdentity(SELECTED_SEQUENCE), checkpoint.encode()));
   }
 }

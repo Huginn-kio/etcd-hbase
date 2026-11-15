@@ -168,6 +168,31 @@ class M4ReportTest(unittest.TestCase):
         with self.assertRaisesRegex(m4_report.ReportError, "stream terminal coverage"):
             m4_report.validate_registry_document(missing_terminal)
 
+    def test_j43_registry_requires_expiry_scan_drain_and_owner_fence_tests(self) -> None:
+        for class_name, method_name in (
+            ("io.etcdhbase.server.commit.LeaseExpiryStepExecutorTest",
+             "expiryPageBudgetRemainsReservedUntilThePhysicalScanDrains"),
+            ("io.etcdhbase.server.commit.LeaseExpiryWorkerTest",
+             "successfulCloseWaitsForBothCleanupAndPhysicalProducerCompletion"),
+            ("io.etcdhbase.server.commit.LeaseExpiryWorkerTest",
+             "staleExpiryWorkerDoesNotForwardAfterOwnerChangesDuringCheckpointRead"),
+        ):
+            with self.subTest(class_name=class_name, method_name=method_name):
+                changed = copy.deepcopy(self.registry)
+                task = next(item for item in changed["tasks"] if item["id"] == "J43")
+                suite = next(item for item in task["maven_tests"] if item["class"] == class_name)
+                suite["tests"].remove(method_name)
+                with self.assertRaisesRegex(m4_report.ReportError,
+                                            "checkpoint, clock, race, or mixed-load"):
+                    m4_report.validate_registry_document(changed)
+
+        without_step_executor = copy.deepcopy(self.registry)
+        task = next(item for item in without_step_executor["tasks"] if item["id"] == "J43")
+        task["maven_tests"] = [suite for suite in task["maven_tests"]
+                               if suite["class"] != "io.etcdhbase.server.commit.LeaseExpiryStepExecutorTest"]
+        with self.assertRaisesRegex(m4_report.ReportError, "expiry, Revoke, race"):
+            m4_report.validate_registry_document(without_step_executor)
+
     def test_complete_j42_artifact_is_read_from_its_registered_subdirectory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)
@@ -186,6 +211,43 @@ class M4ReportTest(unittest.TestCase):
             evidence = artifact / "j42"
             (evidence / "keepalive-history.log").unlink()
             with self.assertRaisesRegex(m4_report.ReportError, "comparison"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+    def test_complete_j43_artifact_requires_source_bound_mixed_load_and_takeover_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J43")
+            summary = m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+            self.assertEqual(["HISTORY", "NATIVE"], summary["j29_4_layouts"])
+            self.assertEqual([1, 2, 4], summary["j29_4_concurrency"])
+            self.assertEqual(6001, summary["owner_takeover_millis"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J43")
+            report_path = artifact / "j43/mixed-lease-load.json"
+            report_path.unlink()
+            with self.assertRaisesRegex(m4_report.ReportError, "mixed-lease-load.json"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J43")
+            report_path = artifact / "j43/mixed-lease-load.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["layouts"][0]["concurrency"][2]["expiry"]["stale_candidates"] = 0
+            report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(m4_report.ReportError, "expiry metric stale_candidates"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J43")
+            report_path = artifact / "j43/mixed-lease-load.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["owner_takeover"]["new_owner_epoch"] = report["owner_takeover"]["old_owner_epoch"]
+            report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(m4_report.ReportError, "owner takeover epoch"):
                 m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
 
     def test_j42_trace_terminals_match_registered_stream_contract(self) -> None:
@@ -442,6 +504,8 @@ class M4ReportTest(unittest.TestCase):
             evidence_root, task, run_id, source_commit, suite_hash, prefix_hash
         )
         self._write_comparison_logs(evidence_root, task)
+        if task_id == "J43":
+            self._write_valid_j29_4_evidence(evidence_root, run_id, source_commit)
 
     @staticmethod
     def _refresh_trace_digest(artifact: Path, trace_path: Path, metadata_name: str) -> None:
@@ -611,6 +675,8 @@ class M4ReportTest(unittest.TestCase):
             return M4ReportTest._valid_binding_trace_records(task, descriptor)
         if task["id"] == "J42":
             return M4ReportTest._valid_keepalive_trace_records(task, descriptor)
+        if task["id"] == "J43":
+            return M4ReportTest._valid_revoke_trace_records(task, descriptor)
         records: list[dict[str, object]] = []
         case_ordinals: dict[str, int] = {}
         for expected in task["trace_cases"]:
@@ -682,6 +748,38 @@ class M4ReportTest(unittest.TestCase):
                 "request": M4ReportTest._snapshot({}),
                 "response": M4ReportTest._snapshot({}),
                 "error": None,
+                "stream_terminal": expected.get("stream_terminal"),
+                "evidence_scope": descriptor["scope"],
+                "elapsed_ns": "1",
+            })
+        return records
+
+    @staticmethod
+    def _valid_revoke_trace_records(
+        task: dict[str, object], descriptor: dict[str, object],
+    ) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        case_ordinals: dict[str, int] = {}
+        for expected in task["trace_cases"]:
+            case_id = expected["id"]
+            case_ordinals[case_id] = case_ordinals.get(case_id, 0) + 1
+            error = None
+            response = M4ReportTest._snapshot({})
+            if case_id == "revoke-missing":
+                error = {
+                    "grpc_code": "NotFound",
+                    "consumer_kind": "grpc-status",
+                    "semantic_kind": "LEASE_NOT_FOUND",
+                }
+                response = None
+            records.append({
+                "schema": "etcd-hbase-trace/v1",
+                "case_id": case_id,
+                "ordinal": case_ordinals[case_id],
+                "method": expected["method"],
+                "request": M4ReportTest._snapshot({}),
+                "response": response,
+                "error": error,
                 "stream_terminal": expected.get("stream_terminal"),
                 "evidence_scope": descriptor["scope"],
                 "elapsed_ns": "1",
@@ -787,9 +885,127 @@ class M4ReportTest(unittest.TestCase):
         success = {
             "J41": m4_report.J41_COMPARE_SUCCESS,
             "J42": m4_report.J42_COMPARE_SUCCESS,
+            "J43": m4_report.J43_COMPARE_SUCCESS,
         }.get(task["id"], m4_report.COMPARE_SUCCESS)
         for name in task["evidence"]["compare_logs"]:
             (evidence_root / name).write_text(success + "\n", encoding="utf-8")
+
+
+    def _write_valid_j29_4_evidence(self, evidence_root: Path, run_id: str,
+                                    source_commit: str) -> None:
+        source_files = {
+            relative: hashlib.sha256((m4_report.REPO / relative).read_bytes()).hexdigest()
+            for relative in m4_report.J29_4_SOURCE_FILES
+        }
+        source_digest = hashlib.sha256()
+        for relative in m4_report.J29_4_SOURCE_FILES:
+            source_digest.update(relative.encode("utf-8"))
+            source_digest.update(b"\0")
+            source_digest.update(source_files[relative].encode("ascii"))
+            source_digest.update(b"\0")
+
+        layouts = []
+        for layout in ("HISTORY", "NATIVE"):
+            concurrency = []
+            for count in (1, 2, 4):
+                requests = count * 24 if count != 4 else 48
+                expiry = None
+                run_mode = "fixed-iterations"
+                iterations = 24
+                if count == 4:
+                    run_mode = "until-expiry-revocation"
+                    iterations = 0
+                    expiry = {
+                        "expired_during_mixed_load": True,
+                        "active_workers_at_revoke": 4,
+                        "revocations": 1,
+                        "stale_candidates": 1,
+                        "candidates": 2,
+                        "scan_rows": 2,
+                        "scan_bytes": 512,
+                        "retries": 0,
+                        "trusted_delay_samples": 1,
+                        "missing_trusted_delay_samples": 0,
+                        "trusted_delay_total_millis": 12,
+                        "observed_deadline_to_revoke_millis": 37,
+                        "owner_epoch": 1,
+                        "checkpoint_sequence": 24,
+                        "window_stop_exclusive": 1_000,
+                    }
+                row = {
+                    "layout": layout,
+                    "concurrency": count,
+                    "run_mode": run_mode,
+                    "iterations_per_worker": iterations,
+                    "elapsed_nanos": 1_000_000,
+                    "keepalive_requests": requests,
+                    "keepalive_responses": requests,
+                    "selected_renewals": requests,
+                    "business_puts": requests,
+                    "combined_operations": requests * 2,
+                    "keepalive_client_rpc_p99_samples": requests,
+                    "keepalive_client_rpc_latency_nanos": {
+                        "samples": requests, "p50_nanos": 1_000, "p95_nanos": 2_000,
+                        "p99_nanos": 3_000,
+                    },
+                    "business_put_client_rpc_latency_nanos": {
+                        "samples": requests, "p50_nanos": 2_000, "p95_nanos": 3_000,
+                        "p99_nanos": 4_000,
+                    },
+                    "owner_queue_wait_samples": requests,
+                    "owner_queue_wait_total_nanos": requests * 100,
+                    "owner_queue_wait_mean_nanos": 100,
+                    "renewal_logical_hbase_client_operations": requests * 4,
+                    "renewal_logical_hbase_request_payload_bytes": requests * 128,
+                    "logical_hbase_operations_per_renewal": 4.0,
+                    "logical_hbase_request_payload_bytes_per_renewal": 128.0,
+                    "unknown_outcomes": 0,
+                    "request_proto_bytes": requests * 16,
+                    "response_proto_bytes": requests * 24,
+                }
+                if expiry is not None:
+                    row["expiry"] = expiry
+                concurrency.append(row)
+            layouts.append({"layout": layout, "concurrency": concurrency})
+
+        report = {
+            "schema": "etcd-hbase-m4-j29.4/v1",
+            "status": "passed",
+            "run_id": run_id,
+            "source_commit": source_commit,
+            "source_files": source_files,
+            "source_sha256": source_digest.hexdigest(),
+            "scope": "public-local-minicluster",
+            "protocol": "etcd-v3.5.23",
+            "target_capacity_accepted": False,
+            "physical_hbase_rpc_bytes_collected": False,
+            "recovery_reserve_usage_measured": False,
+            "recovery_reserve": {
+                "scope": "configured-per-table-group",
+                "requests": 2,
+                "queued": 0,
+                "operations": 2,
+                "scanners": 1,
+                "cleanup": 2,
+                "queued_bytes": 0,
+                "memory_bytes": 87162880,
+                "expiry_worker_memory_bytes": 1118208,
+                "expiry_worker_read_physical_rows": 16,
+                "expiry_worker_read_cell_bytes": 1048576,
+                "runtime_usage_peak_measured": False,
+            },
+            "layouts": layouts,
+            "owner_takeover": {
+                "scenario": "two-runtime-mtls-owner-takeover",
+                "old_owner_epoch": 1,
+                "new_owner_epoch": 2,
+                "new_owner": "owner-b",
+                "elapsed_millis": 6001,
+            },
+        }
+        (evidence_root / "mixed-lease-load.json").write_text(
+            json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
 
 if __name__ == "__main__":

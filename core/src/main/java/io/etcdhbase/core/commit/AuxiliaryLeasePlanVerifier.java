@@ -6,6 +6,7 @@ import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseBindingIdentity;
 import io.etcdhbase.core.lease.LeaseBindingVersion;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
 import java.util.HashMap;
@@ -41,6 +42,7 @@ public final class AuxiliaryLeasePlanVerifier {
     private final Map<Long, ExpiryCandidateIdentity> expiryByLease = new HashMap<>();
     private final Map<Long, ExpiryCandidateRecord> expiryRecords = new HashMap<>();
     private final Map<BindingKey, LeaseBindingVersion> bindings = new HashMap<>();
+    private boolean expiryCheckpointUpdated;
     private boolean finished;
 
     private Transaction(long selectedSequence) {
@@ -55,6 +57,7 @@ public final class AuxiliaryLeasePlanVerifier {
         case LEASE_ENUMERATION -> acceptEnumeration(record);
         case EXPIRY_CANDIDATE -> acceptExpiry(record);
         case LEASE_BINDING -> acceptBinding(record);
+        case LEASE_EXPIRY_CHECKPOINT -> acceptExpiryCheckpoint(record);
         default -> {
           // Other auxiliary domains are validated by their own materialization codecs.
         }
@@ -66,6 +69,9 @@ public final class AuxiliaryLeasePlanVerifier {
       finished = true;
       if (!states.keySet().equals(enumerationIds)) {
         throw invalid("Lease state and enumeration pointer must be updated together");
+      }
+      if (!states.isEmpty() && !expiryCheckpointUpdated) {
+        throw invalid("Lease state changes must advance the expiry checkpoint in the same selection");
       }
       Set<Long> activeLeases = new HashSet<>();
       for (Map.Entry<Long, LeaseState> entry : states.entrySet()) {
@@ -143,6 +149,18 @@ public final class AuxiliaryLeasePlanVerifier {
               binding) != null) {
         throw invalid("Lease binding identity differs from its selected transaction");
       }
+    }
+
+    private void acceptExpiryCheckpoint(PreparedAuxiliaryRecord record) {
+      LeaseExpiryCheckpoint checkpoint = LeaseExpiryCheckpoint.decode(record.payload());
+      if (!record.targetIdentity().equals(LeaseExpiryCheckpoint.versionIdentity(selectedSequence))
+          || checkpoint.sequence() != selectedSequence
+          || checkpoint.ownerEpoch() != record.ownerEpoch()
+          || checkpoint.protectedSequence() != record.baseSequence()
+          || expiryCheckpointUpdated) {
+        throw invalid("Lease expiry checkpoint differs from its selected transaction");
+      }
+      expiryCheckpointUpdated = true;
     }
   }
 

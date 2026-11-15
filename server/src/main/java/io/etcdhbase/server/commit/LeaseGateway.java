@@ -16,7 +16,6 @@ import io.etcdhbase.core.commit.PinnedReadView;
 import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
-import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.lease.LeaseRenewalVersion;
 import io.etcdhbase.core.lease.LeaseState;
@@ -124,13 +123,17 @@ public final class LeaseGateway {
     return M3MemoryReservations.leaseBindingPageBytes(maximumEtcdRequestBytes);
   }
 
-  private static BudgetManager.Reservation bindingReadReservation(
+  static BudgetManager.Reservation bindingReadReservation(
       BudgetManager.Reservation base, int maximumEtcdRequestBytes) {
     return M3MemoryReservations.leaseBindingRead(base, maximumEtcdRequestBytes);
   }
 
   public BiConsumer<Rpc.LeaseGrantRequest, StreamObserver<Rpc.LeaseGrantResponse>> grantHandler() {
     return this::grant;
+  }
+
+  public BiConsumer<Rpc.LeaseRevokeRequest, StreamObserver<Rpc.LeaseRevokeResponse>> revokeHandler() {
+    return this::revoke;
   }
 
   public BiConsumer<Rpc.LeaseTimeToLiveRequest, StreamObserver<Rpc.LeaseTimeToLiveResponse>>
@@ -166,6 +169,31 @@ public final class LeaseGateway {
         throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
       }
       worker.execute(() -> beginGrant(request, observer, scope, account, terminal, drained));
+    } catch (BackendFailure | RuntimeException failure) {
+      drained.complete(null);
+      signalError(scope, observer, terminal, failure);
+    } catch (Error fatal) {
+      drained.complete(null);
+      signalError(scope, observer, terminal, fatal);
+      throw fatal;
+    }
+  }
+
+  private void revoke(Rpc.LeaseRevokeRequest request, StreamObserver<Rpc.LeaseRevokeResponse> observer) {
+    Objects.requireNonNull(request, "request");
+    Objects.requireNonNull(observer, "observer");
+    RequestScope scope = RequestScopeInterceptor.currentScope();
+    var terminal = new AtomicBoolean();
+    var drained = new CompletableFuture<Void>();
+    if (!scope.startIfOpen(() -> scope.trackPhysicalProducer(drained))) return;
+    BudgetManager.Account account;
+    try {
+      account = budgets.admit(tableGroup, scope, reservation);
+      retainInput(scope, account, request.getSerializedSize());
+      if (request.getSerializedSize() > maximumEtcdRequestBytes) {
+        throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+      }
+      worker.execute(() -> beginRevoke(request, observer, scope, account, terminal, drained));
     } catch (BackendFailure | RuntimeException failure) {
       drained.complete(null);
       signalError(scope, observer, terminal, failure);
@@ -472,6 +500,104 @@ public final class LeaseGateway {
     }
   }
 
+  private void beginRevoke(Rpc.LeaseRevokeRequest request,
+      StreamObserver<Rpc.LeaseRevokeResponse> observer, RequestScope scope,
+      BudgetManager.Account account, AtomicBoolean terminal,
+      CompletableFuture<Void> gatewayDrained) {
+    InvocationId invocation = InvocationId.create();
+    ByteKey operation = MutationOperationEnvelope.leaseRevoke(request.toByteArray());
+    ByteKey digest = MutationForwardRequest.digest(tableGroup, operation);
+    try {
+      control.read(scope).thenCompose(snapshot -> {
+        var state = snapshot.orElseThrow(() ->
+            new IllegalStateException("authoritative commit control state is missing")).state();
+        long remaining = Math.min(scope.remainingDeadlineNanos(), MutationForwardRequest.MAX_TIMEOUT_NANOS);
+        if (state.ownerInstance().isEmpty() || remaining <= 0) {
+          return CompletableFuture.failedFuture(new BackendFailure(remaining <= 0
+              ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.UNAVAILABLE));
+        }
+        var forwarded = new MutationForwardRequest(tableGroup, invocation, digest, authorizationDigest,
+            ServiceAuthorizationContextReference.create(identity, authorizationDigest), state.ownerEpoch(),
+            remaining, 0, operation);
+        return relay.forward(forwarded, scope);
+      }).thenCompose(reply -> resolveRevokeReply(reply, invocation, digest, scope, account))
+          .whenComplete((resolved, failure) -> {
+            if (!scope.startIfOpen(() -> {})) {
+              if (resolved != null) resolved.close();
+              gatewayDrained.complete(null);
+              return;
+            }
+            dispatchRevokeResponse(observer, scope, account, terminal, gatewayDrained,
+                resolved, failure);
+          });
+    } catch (RuntimeException | Error failure) {
+      gatewayDrained.complete(null);
+      signalError(scope, observer, terminal, failure);
+      if (failure instanceof Error fatal) throw fatal;
+    }
+  }
+
+  private CompletableFuture<InvocationResultResolver.ResolvedResult> resolveRevokeReply(
+      MutationRelay.Result reply, InvocationId invocation, ByteKey digest,
+      RequestScope scope, BudgetManager.Account account) {
+    if (reply instanceof MutationRelay.KnownResult known) {
+      if (!java.util.Arrays.equals(known.responseBytes(), invocation.bytes())) {
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+      }
+      return resolveOriginal(invocation, digest, scope, account);
+    }
+    if (reply instanceof MutationRelay.LeaseRejection rejection) {
+      return CompletableFuture.failedFuture(new LeaseFailure(rejection.reason()));
+    }
+    if (reply instanceof MutationRelay.KnownRejection rejection) {
+      return CompletableFuture.failedFuture(new BackendFailure(rejection.category()));
+    }
+    if (reply instanceof MutationRelay.SemanticRejection) {
+      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+    }
+    MutationRelay.ResultUnknown unknown = reply instanceof MutationRelay.ResultUnknown value
+        ? value : new MutationRelay.ResultUnknown(BackendFailure.Category.UNKNOWN);
+    return resolveOriginal(invocation, digest, scope, account).exceptionallyCompose(failure ->
+        CompletableFuture.failedFuture(new BackendFailure(unknown.category(),
+            CompletionFailures.unwrapCompletion(failure))));
+  }
+
+  private void dispatchRevokeResponse(StreamObserver<Rpc.LeaseRevokeResponse> observer,
+      RequestScope scope, BudgetManager.Account account, AtomicBoolean terminal,
+      CompletableFuture<Void> gatewayDrained,
+      InvocationResultResolver.ResolvedResult resolved, Throwable failure) {
+    try {
+      worker.execute(() -> {
+        try {
+          if (failure != null) {
+            signalError(scope, observer, terminal, CompletionFailures.unwrapCompletion(failure));
+            return;
+          }
+          if (resolved == null || scope.isClosed() || scope.isDeadlineExceeded()) {
+            if (resolved != null) resolved.close();
+            return;
+          }
+          var buffer = resolved.payload().buffer();
+          var bytes = new byte[buffer.remaining()];
+          buffer.get(bytes);
+          Rpc.LeaseRevokeResponse response = Rpc.LeaseRevokeResponse.parseFrom(bytes);
+          send(response, response.getSerializedSize(), scope, account, observer, terminal);
+        } catch (InvalidProtocolBufferException | RuntimeException | Error projectionFailure) {
+          signalError(scope, observer, terminal, projectionFailure);
+          if (projectionFailure instanceof Error fatal) throw fatal;
+        } finally {
+          if (resolved != null) resolved.close();
+          gatewayDrained.complete(null);
+        }
+      });
+    } catch (RuntimeException rejected) {
+      if (resolved != null) resolved.close();
+      gatewayDrained.complete(null);
+      signalError(scope, observer, terminal,
+          new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT, rejected));
+    }
+  }
+
   private CompletableFuture<InvocationResultResolver.ResolvedResult> resolveGrantReply(
       MutationRelay.Result reply, Rpc.LeaseGrantRequest request, InvocationId invocation,
       ByteKey digest, RequestScope scope, BudgetManager.Account account) {
@@ -637,122 +763,33 @@ public final class LeaseGateway {
   private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readTimeToLive(
       Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account) {
     if (request.getID() == 0) {
-      return readMissingLeaseTimeToLive(request, scope);
+      return views.openAuxiliary(authorizationDigest, scope).thenCompose(pin ->
+          leaseReads.finish(pin, scope).thenApply(ignored ->
+              projectTimeToLive(request, Optional.empty(), pin, time.observe(), List.of())));
     }
-    return readLeaseTimeToLive(request, scope, account, true);
-  }
-
-  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readMissingLeaseTimeToLive(
-      Rpc.LeaseTimeToLiveRequest request, RequestScope scope) {
-    return views.openAuxiliary(authorizationDigest, scope).thenCompose(pin ->
-        leaseReads.finish(pin, scope).thenApply(ignored ->
-            projectTimeToLive(request, Optional.empty(), pin, time.observe(), List.of())));
-  }
-
-  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readLeaseTimeToLive(
-      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
-      boolean resolveExpiredEmpty) {
     var proof = new ManifestCatalog.ProofReadBudget(scope, account, 64, MAX_METADATA_BYTES);
     return views.openAuxiliary(authorizationDigest, scope).thenCompose(pin ->
         leaseReads.find(pin, request.getID(), scope, proof)
-            .thenCompose(found -> resolveExpiryBeforeTimeToLive(request, scope, account, pin,
-                proof, found, resolveExpiredEmpty))
+            .thenCompose(found -> {
+              var clock = time.observe();
+              if (found.isPresent() && found.orElseThrow().status() == LeaseState.Status.ACTIVE
+                  && LeaseTimeRules.isExpired(found.orElseThrow(), clock)) {
+                LeaseState expired = found.orElseThrow();
+                if (expired.boundKeyCount() != 0 || expired.boundKeyBytes() != 0
+                    || expired.revokeCostBytes() != 0) {
+                  return CompletableFuture.failedFuture(
+                      new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+                }
+              }
+              if (!request.getKeys() || found.isEmpty()
+                  || found.orElseThrow().status() != LeaseState.Status.ACTIVE) {
+                return CompletableFuture.completedFuture(
+                    projectTimeToLive(request, found, pin, clock, List.of()));
+              }
+              return leaseBindings.read(pin, found.orElseThrow(), scope, account, proof)
+                  .thenApply(keys -> projectTimeToLive(request, found, pin, clock, keys));
+            })
             .thenCompose(response -> leaseReads.finish(pin, scope).thenApply(ignored -> response)));
-  }
-
-  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> resolveExpiryBeforeTimeToLive(
-      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
-      PinnedReadView pin, ManifestCatalog.ProofReadBudget proof, Optional<LeaseState> found,
-      boolean resolveExpiredEmpty) {
-    var clock = time.observe();
-    return resolveExpiredLease(found, clock, resolveExpiredEmpty, scope, account).thenCompose(resolved -> {
-      if (resolved) return readLeaseTimeToLive(request, scope, account, false);
-      return projectLeaseTimeToLive(request, scope, account, pin, proof, found, clock);
-    });
-  }
-
-  private CompletableFuture<Boolean> resolveExpiredLease(Optional<LeaseState> found,
-      io.etcdhbase.core.lease.LeaseTimeObservation clock, boolean resolveExpiredEmpty,
-      RequestScope scope, BudgetManager.Account account) {
-    if (found.isEmpty()) return CompletableFuture.completedFuture(false);
-    LeaseState state = found.orElseThrow();
-    if (state.status() != LeaseState.Status.ACTIVE || !LeaseTimeRules.isExpired(state, clock)) {
-      return CompletableFuture.completedFuture(false);
-    }
-    if (state.boundKeyCount() != 0 || state.boundKeyBytes() != 0 || state.revokeCostBytes() != 0) {
-      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-    }
-    if (!resolveExpiredEmpty) {
-      return CompletableFuture.completedFuture(false);
-    }
-    return expireEmptyLease(state, scope, account)
-        .thenApply(ignored -> true);
-  }
-
-  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> projectLeaseTimeToLive(
-      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
-      PinnedReadView pin, ManifestCatalog.ProofReadBudget proof, Optional<LeaseState> found,
-      io.etcdhbase.core.lease.LeaseTimeObservation clock) {
-    return projectLeaseKeys(request, scope, account, pin, proof, found, clock);
-  }
-
-  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> projectLeaseKeys(
-      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
-      PinnedReadView pin, ManifestCatalog.ProofReadBudget proof, Optional<LeaseState> found,
-      io.etcdhbase.core.lease.LeaseTimeObservation clock) {
-    if (!request.getKeys() || found.isEmpty()
-        || found.orElseThrow().status() != LeaseState.Status.ACTIVE) {
-      return CompletableFuture.completedFuture(projectTimeToLive(request, found, pin, clock, List.of()));
-    }
-    return leaseBindings.read(pin, found.orElseThrow(), scope, account, proof)
-        .thenApply(keys -> projectTimeToLive(request, found, pin, clock, keys));
-  }
-
-  private CompletableFuture<Void> expireEmptyLease(LeaseState state, RequestScope scope,
-      BudgetManager.Account account) {
-    var candidate = new ExpiryCandidateIdentity(state.deadlineEpochMillis(),
-        state.identity().leaseId(), state.identity().incarnation(), state.renewalGeneration());
-    ByteKey operation = MutationOperationEnvelope.leaseExpireEmpty(candidate.encode().bytes());
-    InvocationId invocation = InvocationId.create();
-    ByteKey digest = MutationForwardRequest.digest(tableGroup, operation);
-    return control.read(scope).thenCompose(snapshot -> {
-      var controlState = snapshot.orElseThrow(() ->
-          new IllegalStateException("authoritative commit control state is missing")).state();
-      long remaining = Math.min(scope.remainingDeadlineNanos(), MutationForwardRequest.MAX_TIMEOUT_NANOS);
-      if (controlState.ownerInstance().isEmpty() || remaining <= 0) {
-        return CompletableFuture.failedFuture(new BackendFailure(remaining <= 0
-            ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.UNAVAILABLE));
-      }
-      var forwarded = new MutationForwardRequest(tableGroup, invocation, digest, authorizationDigest,
-          ServiceAuthorizationContextReference.create(identity, authorizationDigest),
-          controlState.ownerEpoch(), remaining, 0, operation);
-      return relay.forward(forwarded, scope).thenCompose(reply ->
-          resolveExpiryReply(reply, invocation, digest, scope, account));
-    });
-  }
-
-  private CompletableFuture<Void> resolveExpiryReply(MutationRelay.Result reply,
-      InvocationId invocation, ByteKey digest, RequestScope scope, BudgetManager.Account account) {
-    if (reply instanceof MutationRelay.KnownResult known) {
-      if (!java.util.Arrays.equals(known.responseBytes(), invocation.bytes())) {
-        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
-      }
-      return closeResolved(results.resolve(invocation, digest, authorizationDigest, scope, account));
-    }
-    if (reply instanceof MutationRelay.LeaseRejection) {
-      return CompletableFuture.completedFuture(null);
-    }
-    if (reply instanceof MutationRelay.KnownRejection rejected) {
-      return CompletableFuture.failedFuture(new BackendFailure(rejected.category()));
-    }
-    if (reply instanceof MutationRelay.SemanticRejection) {
-      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
-    }
-    MutationRelay.ResultUnknown unknown = reply instanceof MutationRelay.ResultUnknown value
-        ? value : new MutationRelay.ResultUnknown(BackendFailure.Category.UNKNOWN);
-    return closeResolved(results.resolve(invocation, digest, authorizationDigest, scope, account))
-        .exceptionallyCompose(failure -> CompletableFuture.failedFuture(new BackendFailure(
-            unknown.category(), CompletionFailures.unwrapCompletion(failure))));
   }
 
   private static CompletableFuture<Void> closeResolved(

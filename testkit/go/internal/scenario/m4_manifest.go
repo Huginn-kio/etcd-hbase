@@ -86,6 +86,31 @@ var expectedM4LeaseKeepAliveSteps = []Step{
 	{CaseID: "R01", ID: "keepalive-range-after"},
 }
 
+var expectedM4LeaseRevokeSteps = []Step{
+	{CaseID: "L05", ID: "native-baseline"},
+	{CaseID: "L01", ID: "revoke-grant-bound"},
+	{CaseID: "P01", ID: "revoke-put-bound-key-a"},
+	{CaseID: "P01", ID: "revoke-put-bound-key-b"},
+	{CaseID: "R01", ID: "revoke-range-before-a"},
+	{CaseID: "R01", ID: "revoke-range-before-b"},
+	{CaseID: "L03", ID: "revoke-bound"},
+	{CaseID: "R01", ID: "revoke-range-after-a"},
+	{CaseID: "R01", ID: "revoke-range-after-b"},
+	{CaseID: "L04", ID: "revoke-ttl-after"},
+	{CaseID: "L03", ID: "revoke-missing"},
+	{CaseID: "L01", ID: "revoke-grant-empty"},
+	{CaseID: "L03", ID: "revoke-empty"},
+	{CaseID: "L04", ID: "revoke-empty-ttl"},
+	{CaseID: "L01", ID: "expiry-grant"},
+	{CaseID: "P01", ID: "expiry-put-bound-key-a"},
+	{CaseID: "P01", ID: "expiry-put-bound-key-b"},
+	{CaseID: "R01", ID: "expiry-range-before-a"},
+	{CaseID: "R01", ID: "expiry-range-before-b"},
+	{CaseID: "L04", ID: "expiry-ttl-after"},
+	{CaseID: "R01", ID: "expiry-range-after-a"},
+	{CaseID: "R01", ID: "expiry-range-after-b"},
+}
+
 // LoadM4LeaseSuite accepts only the pinned J40 public lease-query scenario.
 func LoadM4LeaseSuite(path string) (Suite, string, error) {
 	return loadM4Suite(path, "m4-lease-v1", expectedM4LeaseSteps)
@@ -99,6 +124,11 @@ func LoadM4LeaseBindingSuite(path string) (Suite, string, error) {
 // LoadM4LeaseKeepAliveSuite accepts only the pinned J42 bidi-stream scenario.
 func LoadM4LeaseKeepAliveSuite(path string) (Suite, string, error) {
 	return loadM4Suite(path, "m4-lease-keepalive-v1", expectedM4LeaseKeepAliveSteps)
+}
+
+// LoadM4LeaseRevokeSuite accepts only the pinned J43 revoke and automatic-expiry scenario.
+func LoadM4LeaseRevokeSuite(path string) (Suite, string, error) {
+	return loadM4Suite(path, "m4-lease-revoke-v1", expectedM4LeaseRevokeSteps)
 }
 
 func loadM4Suite(path, expectedID string, expectedSteps []Step) (Suite, string, error) {

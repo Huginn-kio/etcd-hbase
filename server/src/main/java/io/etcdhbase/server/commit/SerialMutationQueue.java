@@ -21,24 +21,42 @@ public final class SerialMutationQueue implements AutoCloseable {
 
   private final Object lock = new Object();
   private final ArrayDeque<Task<?>> waiting = new ArrayDeque<>();
+  private final ArrayDeque<Task<?>> reservedWaiting = new ArrayDeque<>();
   private final int maxQueued;
   private final long maxBytes;
+  private final int maxReservedQueued;
+  private final long maxReservedBytes;
   private final Duration serviceDeadline;
   private final ThreadPoolExecutor worker;
   private final ScheduledThreadPoolExecutor deadlines;
   private final CompletableFuture<Void> drained = new CompletableFuture<>();
   private Task<?> active;
   private long retainedBytes;
+  private long reservedRetainedBytes;
+  private boolean preferReserved = true;
   private boolean closing;
 
   public SerialMutationQueue(int maxQueued, long maxBytes, Duration serviceDeadline) {
+    this(maxQueued, maxBytes, 0, 0, serviceDeadline);
+  }
+
+  /**
+   * Creates a shared serial lane with an independent bounded control queue. Both queues still
+   * execute on the same owner lane; control work is selected fairly when both are waiting.
+   */
+  public SerialMutationQueue(int maxQueued, long maxBytes, int maxReservedQueued,
+      long maxReservedBytes, Duration serviceDeadline) {
     this.serviceDeadline = Objects.requireNonNull(serviceDeadline, "serviceDeadline");
-    if (maxQueued < 0 || maxQueued > 65_536 || maxBytes < 1 || serviceDeadline.isZero()
+    if (maxQueued < 0 || maxQueued > 65_536 || maxBytes < 1 || maxReservedQueued < 0
+        || maxReservedQueued > 65_536 || maxReservedBytes < 0
+        || (maxReservedQueued == 0) != (maxReservedBytes == 0) || serviceDeadline.isZero()
         || serviceDeadline.isNegative() || serviceDeadline.compareTo(Duration.ofMinutes(10)) > 0) {
       throw new IllegalArgumentException("invalid mutation queue limits");
     }
     this.maxQueued = maxQueued;
     this.maxBytes = maxBytes;
+    this.maxReservedQueued = maxReservedQueued;
+    this.maxReservedBytes = maxReservedBytes;
     this.worker = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
         new java.util.concurrent.ArrayBlockingQueue<>(1),
         Thread.ofPlatform().daemon().name("mutation-owner-", 0).factory());
@@ -56,12 +74,24 @@ public final class SerialMutationQueue implements AutoCloseable {
    */
   public <T> CompletableFuture<T> submit(long requestBytes, RequestScope requestScope,
       Function<RequestScope, CompletableFuture<T>> work) {
+    return submit(requestBytes, requestScope, work, false);
+  }
+
+  /** Submits internally classified revoke/expiry work to its independently bounded lane. */
+  public <T> CompletableFuture<T> submitReserved(long requestBytes, RequestScope requestScope,
+      Function<RequestScope, CompletableFuture<T>> work) {
+    return submit(requestBytes, requestScope, work, true);
+  }
+
+  private <T> CompletableFuture<T> submit(long requestBytes, RequestScope requestScope,
+      Function<RequestScope, CompletableFuture<T>> work, boolean reserved) {
     Objects.requireNonNull(requestScope, "requestScope");
     Objects.requireNonNull(work, "work");
-    if (requestBytes <= 0 || requestBytes > maxBytes) {
+    long maximumBytes = reserved ? maxReservedBytes : maxBytes;
+    if (requestBytes <= 0 || requestBytes > maximumBytes) {
       return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
     }
-    Task<T> task = new Task<>(requestBytes, requestScope, work);
+    Task<T> task = new Task<>(requestBytes, requestScope, work, reserved);
     task.registration = requestScope.registerScopedCleanup(task);
     boolean open = requestScope.startIfOpen(() -> {
       synchronized (lock) {
@@ -69,14 +99,18 @@ public final class SerialMutationQueue implements AutoCloseable {
         if (closing) {
           task.state = State.REJECTED;
           task.rejection = BackendFailure.Category.UNAVAILABLE;
-        } else if ((active == null ? 0 : 1) + waiting.size() >= (long) maxQueued + 1
-            || requestBytes > maxBytes - retainedBytes) {
+        } else if (reserved
+            ? reservedWaiting.size() >= maxReservedQueued
+                || requestBytes > maxReservedBytes - reservedRetainedBytes
+            : (active != null && !active.reserved ? 1 : 0) + waiting.size() >= (long) maxQueued + 1
+                || requestBytes > maxBytes - (retainedBytes - reservedRetainedBytes)) {
           task.state = State.REJECTED;
           task.rejection = BackendFailure.Category.RESOURCE_LIMIT;
         } else {
           task.state = State.WAITING;
-          waiting.addLast(task);
+          (reserved ? reservedWaiting : waiting).addLast(task);
           retainedBytes += requestBytes;
+          if (reserved) reservedRetainedBytes += requestBytes;
         }
       }
     });
@@ -94,7 +128,9 @@ public final class SerialMutationQueue implements AutoCloseable {
   }
 
   public Snapshot snapshot() {
-    synchronized (lock) { return new Snapshot(waiting.size(), active != null, retainedBytes, closing); }
+    synchronized (lock) {
+      return new Snapshot(waiting.size() + reservedWaiting.size(), active != null, retainedBytes, closing);
+    }
   }
 
   /** Completes after accepted work and its physical producers drain, once closing begins. */
@@ -119,10 +155,13 @@ public final class SerialMutationQueue implements AutoCloseable {
       if (closing) return;
       closing = true;
       rejected = new ArrayList<>(waiting);
+      rejected.addAll(reservedWaiting);
       waiting.clear();
+      reservedWaiting.clear();
       for (Task<?> task : rejected) {
         task.state = State.REJECTED;
         retainedBytes -= task.bytes;
+        if (task.reserved) reservedRetainedBytes -= task.bytes;
       }
     }
     for (Task<?> task : rejected) {
@@ -136,19 +175,23 @@ public final class SerialMutationQueue implements AutoCloseable {
     while (true) {
       Task<?> next;
       synchronized (lock) {
-        if (active != null || waiting.isEmpty() || closing) return;
-        next = waiting.peekFirst();
+        if (active != null || (waiting.isEmpty() && reservedWaiting.isEmpty()) || closing) return;
+        boolean chooseReserved = !reservedWaiting.isEmpty()
+            && (waiting.isEmpty() || preferReserved);
+        next = chooseReserved ? reservedWaiting.peekFirst() : waiting.peekFirst();
       }
       boolean[] dispatched = {false};
       // Keep the same scope-then-queue lock order as admission. Deadline and cancellation must
       // be checked at the ownership handoff, not only when the request first entered the queue.
       boolean open = next.requestScope.startIfOpen(() -> {
         synchronized (lock) {
-          if (active == null && !closing && waiting.peekFirst() == next
+          ArrayDeque<Task<?>> source = next.reserved ? reservedWaiting : waiting;
+          if (active == null && !closing && source.peekFirst() == next
               && next.state == State.WAITING) {
-            waiting.removeFirst();
+            source.removeFirst();
             active = next;
             next.state = State.ACTIVE;
+            preferReserved = !next.reserved;
             dispatched[0] = true;
           }
         }
@@ -175,6 +218,7 @@ public final class SerialMutationQueue implements AutoCloseable {
       task.state = State.FINISHED;
       active = null;
       retainedBytes -= task.bytes;
+      if (task.reserved) reservedRetainedBytes -= task.bytes;
     }
     task.detach();
     scheduleNext();
@@ -183,7 +227,9 @@ public final class SerialMutationQueue implements AutoCloseable {
 
   private void completeIfDrained() {
     boolean complete;
-    synchronized (lock) { complete = closing && active == null && waiting.isEmpty(); }
+    synchronized (lock) {
+      complete = closing && active == null && waiting.isEmpty() && reservedWaiting.isEmpty();
+    }
     if (complete) {
       worker.shutdown();
       deadlines.shutdown();
@@ -197,6 +243,7 @@ public final class SerialMutationQueue implements AutoCloseable {
     private final long bytes;
     private final RequestScope requestScope;
     private final Function<RequestScope, CompletableFuture<T>> work;
+    private final boolean reserved;
     private final CompletableFuture<T> response = new CompletableFuture<>();
     private RequestScope.ScopedCleanup registration;
     private State state = State.NEW;
@@ -204,10 +251,12 @@ public final class SerialMutationQueue implements AutoCloseable {
     private boolean started;
     private final AtomicBoolean settled = new AtomicBoolean();
 
-    private Task(long bytes, RequestScope requestScope, Function<RequestScope, CompletableFuture<T>> work) {
+    private Task(long bytes, RequestScope requestScope, Function<RequestScope, CompletableFuture<T>> work,
+        boolean reserved) {
       this.bytes = bytes;
       this.requestScope = requestScope;
       this.work = work;
+      this.reserved = reserved;
     }
 
     private void start() {
@@ -293,6 +342,7 @@ public final class SerialMutationQueue implements AutoCloseable {
         state = State.FINISHED;
         active = null;
         retainedBytes -= bytes;
+        if (reserved) reservedRetainedBytes -= bytes;
       }
       detach();
       scheduleNext();
@@ -314,9 +364,11 @@ public final class SerialMutationQueue implements AutoCloseable {
         if (state == State.NEW) {
           state = State.CANCELLED;
           cancel = true;
-        } else if (state == State.WAITING && waiting.remove(this)) {
+        } else if (state == State.WAITING
+            && (reserved ? reservedWaiting : waiting).remove(this)) {
           state = State.CANCELLED;
           retainedBytes -= bytes;
+          if (reserved) reservedRetainedBytes -= bytes;
           cancel = true;
         } else if (state == State.ACTIVE) {
           cancel = true;

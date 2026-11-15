@@ -25,11 +25,14 @@ import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 public final class SystemTableBinding {
   private static final String AUXILIARY_FORMAT_VALUE = "1";
   private static final String LEASE_BINDING_FORMAT_VALUE = "2";
+  private static final String LEASE_EXPIRY_FORMAT_VALUE = "3";
   private static final Set<String> REQUIRED_RECORD_CATEGORIES =
       Set.of("CONTROL", "INVOCATION", "CANDIDATE", "MANIFEST", "DECISION", "SNAPSHOT_PIN");
   private static final Set<String> AUXILIARY_RECORD_CATEGORIES = Set.of(
       "AUXILIARY", "LEASE_STATE", "LEASE_ENUMERATION", "EXPIRY_CANDIDATE",
       "LEASE_RESULT", "LEASE_BINDING");
+  private static final Set<String> LEASE_EXPIRY_RECORD_CATEGORIES =
+      Set.of("LEASE_EXPIRY_CHECKPOINT");
   private final TableName table;
   private final byte[] family;
   private final String tableGroupId;
@@ -109,15 +112,25 @@ public final class SystemTableBinding {
   public boolean supportsAuxiliary(TableDescriptor descriptor) {
     String format = descriptor.getValue("etcdhbase.m4.auxiliary-format");
     return supportsResults(descriptor)
-        && (AUXILIARY_FORMAT_VALUE.equals(format) || LEASE_BINDING_FORMAT_VALUE.equals(format))
+        && (AUXILIARY_FORMAT_VALUE.equals(format) || LEASE_BINDING_FORMAT_VALUE.equals(format)
+            || LEASE_EXPIRY_FORMAT_VALUE.equals(format))
         && containsAllCategories(descriptor.getValue("etcdhbase.m0.record-categories"),
             AUXILIARY_RECORD_CATEGORIES);
   }
 
   /** J41 writers require this descriptor marker in addition to the control-row epoch fence. */
   public boolean supportsLeaseBindings(TableDescriptor descriptor) {
+    String format = descriptor.getValue("etcdhbase.m4.auxiliary-format");
     return supportsAuxiliary(descriptor)
-        && LEASE_BINDING_FORMAT_VALUE.equals(descriptor.getValue("etcdhbase.m4.auxiliary-format"));
+        && (LEASE_BINDING_FORMAT_VALUE.equals(format) || LEASE_EXPIRY_FORMAT_VALUE.equals(format));
+  }
+
+  /** J43 checkpoint records require their descriptor declaration and the control-row epoch fence. */
+  public boolean supportsLeaseExpiryCheckpoints(TableDescriptor descriptor) {
+    return supportsLeaseBindings(descriptor)
+        && LEASE_EXPIRY_FORMAT_VALUE.equals(descriptor.getValue("etcdhbase.m4.auxiliary-format"))
+        && containsAllCategories(descriptor.getValue("etcdhbase.m0.record-categories"),
+            LEASE_EXPIRY_RECORD_CATEGORIES);
   }
 
   /** Returns an additive record-category declaration for the fenced M4 capability upgrade. */
@@ -164,10 +177,32 @@ public final class SystemTableBinding {
     return upgraded;
   }
 
+  /** Adds the J43 checkpoint record category and format without changing table rows or family policy. */
+  public TableDescriptor withLeaseExpiryCheckpointCapability(TableDescriptor descriptor) {
+    validate(descriptor);
+    if (supportsLeaseExpiryCheckpoints(descriptor)) return descriptor;
+    requireKnownAuxiliaryFormat(descriptor);
+    if (!supportsLeaseBindings(descriptor)) {
+      throw new IllegalStateException("J43 expiry checkpoints require J41 Lease binding capability");
+    }
+    var categories = new LinkedHashSet<>(Arrays.asList(
+        descriptor.getValue("etcdhbase.m0.record-categories").split(",", -1)));
+    categories.addAll(LEASE_EXPIRY_RECORD_CATEGORIES);
+    TableDescriptor upgraded = TableDescriptorBuilder.newBuilder(descriptor)
+        .setValue("etcdhbase.m0.record-categories", String.join(",", categories))
+        .setValue("etcdhbase.m4.auxiliary-format", LEASE_EXPIRY_FORMAT_VALUE)
+        .build();
+    if (!supportsLeaseExpiryCheckpoints(upgraded)) {
+      throw new IllegalStateException("J43 expiry descriptor capability could not be constructed");
+    }
+    return upgraded;
+  }
+
   private static void requireKnownAuxiliaryFormat(TableDescriptor descriptor) {
     String format = descriptor.getValue("etcdhbase.m4.auxiliary-format");
     if (format != null && !AUXILIARY_FORMAT_VALUE.equals(format)
-        && !LEASE_BINDING_FORMAT_VALUE.equals(format)) {
+        && !LEASE_BINDING_FORMAT_VALUE.equals(format)
+        && !LEASE_EXPIRY_FORMAT_VALUE.equals(format)) {
       throw new IllegalStateException("system table declares an unsupported M4 format");
     }
   }

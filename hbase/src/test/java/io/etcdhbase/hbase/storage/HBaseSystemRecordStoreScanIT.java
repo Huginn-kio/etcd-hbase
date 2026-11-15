@@ -12,6 +12,7 @@ import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.LeaseBindingIdentity;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
@@ -34,7 +35,8 @@ class HBaseSystemRecordStoreScanIT {
   private static final String RECORD_CATEGORIES = String.join(",",
       "CONTROL", "INVOCATION", "CANDIDATE", "MANIFEST", "DECISION", "SNAPSHOT_PIN",
       "RESULT", "TABLE_GROUP_IDENTITY", "WORKSET", "LEASE_STATE", "LEASE_ENUMERATION",
-      "EXPIRY_CANDIDATE", "AUXILIARY", "LEASE_RESULT", "LEASE_BINDING");
+      "EXPIRY_CANDIDATE", "AUXILIARY", "LEASE_RESULT", "LEASE_BINDING",
+      "LEASE_EXPIRY_CHECKPOINT");
 
   @Test
   void scansOneBucketInBoundedExclusiveResumePages() throws Exception {
@@ -182,6 +184,32 @@ class HBaseSystemRecordStoreScanIT {
   }
 
   @Test
+  void seeksLatestExpiryCheckpointAtTheReadBarrier() throws Exception {
+    try (M1TestEnvironment environment = M1TestEnvironment.start(1);
+        RequestScope scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
+      SystemTableBinding binding = createLeaseCapableSystemTable(environment, true, true);
+      SystemRecordStore records = HBaseSystemRecordStore.open(
+          environment.factory(), environment.identity(), binding, scope).join();
+      var earlier = checkpoint(11, 10_000);
+      var later = checkpoint(29, 20_000);
+      records.createIfAbsent(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+          LeaseExpiryCheckpoint.versionIdentity(11), earlier.encode(), scope).join();
+      records.createIfAbsent(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+          LeaseExpiryCheckpoint.versionIdentity(29), later.encode(), scope).join();
+
+      SystemRecordEntry atBarrier = records.latestAtOrBefore(
+          SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+          LeaseExpiryCheckpoint.routePrefix(), 17, scope).join().orElseThrow();
+      assertEquals(LeaseExpiryCheckpoint.versionIdentity(11), atBarrier.identity());
+      assertEquals(earlier.encode(), atBarrier.value());
+      assertTrue(records.latestAtOrBefore(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+          LeaseExpiryCheckpoint.routePrefix(), 5, scope).join().isEmpty());
+      assertTrue(records.latestAtOrBefore(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+          LeaseExpiryCheckpoint.routePrefix(), 0, scope).join().isEmpty());
+    }
+  }
+
+  @Test
   void rejectsBindingWritesUntilTheCapabilityIsPersistedAndTheStoreIsReopened() throws Exception {
     try (M1TestEnvironment environment = M1TestEnvironment.start(1);
         RequestScope scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
@@ -212,11 +240,16 @@ class HBaseSystemRecordStoreScanIT {
 
   private static SystemTableBinding createLeaseCapableSystemTable(
       M1TestEnvironment environment) throws Exception {
-    return createLeaseCapableSystemTable(environment, false);
+    return createLeaseCapableSystemTable(environment, false, false);
   }
 
   private static SystemTableBinding createLeaseCapableSystemTable(
       M1TestEnvironment environment, boolean leaseBindings) throws Exception {
+    return createLeaseCapableSystemTable(environment, leaseBindings, false);
+  }
+
+  private static SystemTableBinding createLeaseCapableSystemTable(
+      M1TestEnvironment environment, boolean leaseBindings, boolean expiryCheckpoints) throws Exception {
     String suffix = UUID.randomUUID().toString().replace("-", "");
     String group = "j40-scan-" + suffix;
     String saltProfileId = "j40-salt-" + suffix;
@@ -235,10 +268,15 @@ class HBaseSystemRecordStoreScanIT {
         .setValue("etcdhbase.m0.salt-bucket-count", Integer.toString(salt.profile().bucketCount()))
         .setValue("etcdhbase.m0.salt-width-bytes", Integer.toString(salt.profile().saltWidthBytes()))
         .setValue("etcdhbase.m0.record-categories", RECORD_CATEGORIES)
-        .setValue("etcdhbase.m4.auxiliary-format", leaseBindings ? "2" : "1")
+        .setValue("etcdhbase.m4.auxiliary-format", expiryCheckpoints ? "3" : leaseBindings ? "2" : "1")
         .build();
     environment.create(table, descriptor, salt.splitKeys().toArray(byte[][]::new));
     return binding;
+  }
+
+  private static LeaseExpiryCheckpoint checkpoint(long sequence, long nowLower) {
+    return new LeaseExpiryCheckpoint(1, sequence, 4, sequence - 1, nowLower,
+        LeaseExpiryCheckpoint.idleAt(nowLower));
   }
 
   private static List<ByteKey> identitiesInOneBucket(SystemRecordStore records, int count) {

@@ -1,6 +1,7 @@
 package io.etcdhbase.server;
 
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.server.commit.LeaseBudgetProfile;
 import io.etcdhbase.server.commit.OwnerForwardingRuntime;
 import io.etcdhbase.server.config.M3MemoryReservations;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
@@ -37,26 +38,47 @@ final class M3RuntimeBudgets {
         || resources.maxScannersPerTable() > 1024 || resources.maxQueuedRequests() != 0) {
       throw new IllegalArgumentException("invalid M3 group or admission limits");
     }
-    long minimumLeaseMemory = M3MemoryReservations.minimumLeaseMemory(groups.size(), activation.maxEtcdRequestBytes());
-    if (activation.m4LeaseApiEnabled() && activation.memoryBytes() < minimumLeaseMemory) {
-      throw new IllegalArgumentException("M4 memory_bytes must be at least " + minimumLeaseMemory
-          + " for all group recovery accounts and one Lease request/owner pair");
-    }
-    int requests = Math.addExact(Math.multiplyExact(resources.maxConcurrentRequests(), 2), groups.size());
-    int operations = Math.addExact(Math.multiplyExact(resources.maxConcurrentRequests(), 4),
-        Math.multiplyExact(groups.size(), 2));
-    int scanners = Math.multiplyExact(resources.maxScannersPerTable(), groups.size());
-    int cleanup = Math.addExact(operations, scanners);
+    BudgetManager.ReservedCapacity perGroupReserve = activation.m4LeaseApiEnabled()
+        ? LeaseBudgetProfile.perGroupCapacity(activation.maxEtcdRequestBytes())
+        : BudgetManager.ReservedCapacity.none();
+    BudgetManager.ReservedCapacity globalReserve = activation.m4LeaseApiEnabled()
+        ? LeaseBudgetProfile.capacityForGroups(groups.size(), activation.maxEtcdRequestBytes())
+        : BudgetManager.ReservedCapacity.none();
+    Map<String, BudgetManager.ReservedCapacity> groupReserve = activation.m4LeaseApiEnabled()
+        ? LeaseBudgetProfile.capacitiesFor(groups, activation.maxEtcdRequestBytes()) : Map.of();
+    int requests = Math.addExact(
+        Math.addExact(Math.multiplyExact(resources.maxConcurrentRequests(), 2), groups.size()),
+        globalReserve.requests());
+    int operations = Math.addExact(
+        Math.addExact(Math.multiplyExact(resources.maxConcurrentRequests(), 4),
+            Math.multiplyExact(groups.size(), 2)),
+        globalReserve.operations());
+    int scanners = Math.multiplyExact(
+        Math.addExact(resources.maxScannersPerTable(), perGroupReserve.scanners()), groups.size());
     long memory = activation.memoryBytes() - ownerTransportMemoryBytes;
+    if (activation.m4LeaseApiEnabled()) {
+      long minimumLeaseMemory = M3MemoryReservations.minimumLeaseMemory(
+          groups.size(), activation.maxEtcdRequestBytes());
+      if (memory < minimumLeaseMemory) {
+        throw new IllegalArgumentException("M4 memory_bytes must leave at least " + minimumLeaseMemory
+            + " after owner transport reservation for recovery accounts and a Lease request/owner pair");
+      }
+    }
+    int cleanup = Math.addExact(operations, scanners);
+    if (globalReserve.memoryBytes() > memory) {
+      throw new IllegalArgumentException(
+          "M4 Lease and expiry reserved capacity exceeds the runtime memory budget");
+    }
     // This queue belongs to finite-page scans within already admitted requests. It does not
     // enable an external mutation request queue (which remains disabled for this runtime).
     long scanQueueBytes = Math.min(memory, Math.multiplyExact((long) requests,
         Math.addExact(256L, Math.multiplyExact(3L, resources.maxRequestBytes()))));
     var global = new BudgetManager.Limits(requests, requests, operations, scanners, cleanup, scanQueueBytes, memory);
     var perGroup = new BudgetManager.Limits(requests, requests, operations,
-        resources.maxScannersPerTable(), cleanup, scanQueueBytes, memory);
+        Math.addExact(resources.maxScannersPerTable(), perGroupReserve.scanners()),
+        cleanup, scanQueueBytes, memory);
     Map<String, BudgetManager.Limits> groupLimits = new LinkedHashMap<>();
     for (String group : groups) groupLimits.put(group, perGroup);
-    return new BudgetManager(global, groupLimits, perGroup);
+    return new BudgetManager(global, groupLimits, perGroup, globalReserve, groupReserve);
   }
 }

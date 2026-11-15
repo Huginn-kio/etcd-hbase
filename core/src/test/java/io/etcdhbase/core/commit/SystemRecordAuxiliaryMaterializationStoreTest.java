@@ -9,6 +9,7 @@ import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
 import io.etcdhbase.core.lease.LeaseBindingVersion;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
@@ -17,6 +18,7 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import org.junit.jupiter.api.Test;
@@ -87,6 +89,38 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
 
     try (RequestScope scope = scope()) {
       assertThrows(CompletionException.class, () -> materialization.preflight(candidate, scope).join());
+    }
+  }
+
+  @Test
+  void expiryCheckpointVersionsAreSelectedAndMaterializedIdempotently() {
+    var records = new MemorySystemRecordStore();
+    var materialization = materialization(records);
+    TransactionId firstTransaction = TransactionId.create();
+    PreparedAuxiliaryRecord first = checkpointRecord(firstTransaction, 0, 1,
+        new LeaseExpiryCheckpoint.Position(0, 1_000, 0, Optional.empty()));
+    CommitDecision firstDecision = decision(firstTransaction, 1);
+
+    try (RequestScope scope = scope()) {
+      materialization.preflight(first, scope).join();
+      assertEquals(AuxiliaryMaterializationStore.ApplyResult.APPLIED,
+          materialization.applySelected(firstDecision, first, scope).join());
+
+      TransactionId secondTransaction = TransactionId.create();
+      PreparedAuxiliaryRecord second = checkpointRecord(secondTransaction, 1, 2,
+          new LeaseExpiryCheckpoint.Position(0, 1_000, 0,
+              Optional.of(new ExpiryCandidateIdentity(500, 17, 1, 0).encode())));
+      CommitDecision secondDecision = decision(secondTransaction, 2);
+      materialization.preflight(second, scope).join();
+      records.failNextCreateAfterApply = true;
+      assertThrows(CompletionException.class,
+          () -> materialization.applySelected(secondDecision, second, scope).join());
+      assertEquals(AuxiliaryMaterializationStore.ApplyResult.ALREADY_APPLIED,
+          materialization.applySelected(secondDecision, second, scope).join());
+      assertEquals(second.payload(), records.value(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+          LeaseExpiryCheckpoint.versionIdentity(2)));
+      assertEquals(AuxiliaryMaterializationStore.ApplyResult.ALREADY_APPLIED,
+          materialization.applySelected(firstDecision, first, scope).join());
     }
   }
 
@@ -163,6 +197,15 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
         new LeaseEnumerationPointer(sequence).encode());
   }
 
+  private static PreparedAuxiliaryRecord checkpointRecord(TransactionId transactionId,
+      long baseSequence, long sequence, LeaseExpiryCheckpoint.Position position) {
+    LeaseExpiryCheckpoint checkpoint = new LeaseExpiryCheckpoint(1, sequence, 4,
+        baseSequence, Math.max(1_000, position.windowStopExclusive()), position);
+    return PreparedAuxiliaryRecord.create(transactionId, 1, baseSequence, 0,
+        SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+        LeaseExpiryCheckpoint.versionIdentity(sequence), checkpoint.encode());
+  }
+
   private static CommitDecision decision(TransactionId transactionId, long sequence) {
     return new CommitDecision(transactionId, InvocationId.create(), sequence, 1, 1,
         ByteKey.copyOf(new byte[] {1}), ByteKey.copyOf(new byte[32]), false);
@@ -175,6 +218,7 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
   private static final class MemorySystemRecordStore implements SystemRecordStore {
     private final Map<Key, ByteKey> rows = new HashMap<>();
     private boolean failNextCasAfterApply;
+    private boolean failNextCreateAfterApply;
 
     @Override
     public CompletableFuture<Optional<ByteKey>> read(SystemRecordType type, ByteKey identity,
@@ -192,6 +236,10 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
         ByteKey value, RequestScope scope) {
       Key key = new Key(type, identity);
       ByteKey old = rows.putIfAbsent(key, value);
+      if (old == null && failNextCreateAfterApply) {
+        failNextCreateAfterApply = false;
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+      }
       return CompletableFuture.completedFuture(old == null ? CreateResult.CREATED
           : old.equals(value) ? CreateResult.ALREADY_PRESENT : CreateResult.CONFLICT);
     }
@@ -210,6 +258,23 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
       }
       return CompletableFuture.completedFuture(true);
+    }
+
+    @Override
+    public CompletableFuture<Optional<SystemRecordEntry>> latestAtOrBefore(SystemRecordType type,
+        ByteKey routePrefix, long sequence, RequestScope scope) {
+      if (type != SystemRecordType.LEASE_EXPIRY_CHECKPOINT) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(type.name()));
+      }
+      return CompletableFuture.completedFuture(rows.entrySet().stream()
+          .filter(entry -> entry.getKey().type() == type
+              && entry.getKey().identity().length() >= routePrefix.length()
+              && Arrays.equals(entry.getKey().identity().bytes(), 0, routePrefix.length(),
+                  routePrefix.bytes(), 0, routePrefix.length()))
+          .filter(entry -> LeaseExpiryCheckpoint.sequence(entry.getKey().identity()) <= sequence)
+          .max(java.util.Comparator.comparingLong(entry ->
+              LeaseExpiryCheckpoint.sequence(entry.getKey().identity())))
+          .map(entry -> new SystemRecordEntry(entry.getKey().identity(), entry.getValue())));
     }
 
     private ByteKey value(SystemRecordType type, ByteKey identity) {

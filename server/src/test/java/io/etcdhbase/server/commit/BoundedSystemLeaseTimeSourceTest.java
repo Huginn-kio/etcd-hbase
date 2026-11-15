@@ -19,12 +19,12 @@ import org.junit.jupiter.api.Test;
 
 class BoundedSystemLeaseTimeSourceTest {
   private static final long UNCERTAINTY_MILLIS = 1_000;
+  private static final int MAXIMUM_DRIFT_PPM = 100_000;
 
   @Test
   void returnsConservativeBoundsWhileWallAndMonotonicClocksAdvanceTogether() {
     var clocks = new MutableClocks(10_000);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
-        clocks.monotonicNanos()::get);
+    var source = source(clocks);
 
     LeaseTimeObservation initial = source.observe();
     assertTrue(initial.healthy());
@@ -40,36 +40,57 @@ class BoundedSystemLeaseTimeSourceTest {
   }
 
   @Test
-  void failsClosedAndStaysUnhealthyAfterForwardWallClockJump() {
+  void wallClockStepPausesTrustedTimeAndReportsOnceUntilTheClockReturns() {
     var clocks = new MutableClocks(10_000);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
-        clocks.monotonicNanos()::get);
-    assertTrue(source.observe().healthy());
+    var reasons = new ArrayList<BoundedSystemLeaseTimeSource.UnhealthyReason>();
+    var source = source(clocks, reasons::add);
+    LeaseTimeObservation initial = source.observe();
+    assertTrue(initial.healthy());
 
     clocks.jumpWallClock(60_000);
 
     assertFalse(source.observe().healthy());
     clocks.advance(5_000);
     assertFalse(source.observe().healthy());
+    assertEquals(List.of(
+        BoundedSystemLeaseTimeSource.UnhealthyReason.WALL_MONOTONIC_DISCONTINUITY), reasons);
+
+    clocks.jumpWallClock(-60_000);
+    LeaseTimeObservation recovered = source.observe();
+    assertTrue(recovered.healthy(), recovered.toString());
+    assertEquals(initial.nowLowerEpochMillis() + 5_000, recovered.nowLowerEpochMillis());
+    assertEquals(initial.nowUpperEpochMillis() + 5_000, recovered.nowUpperEpochMillis());
+
+    clocks.jumpWallClock(60_000);
+    assertFalse(source.observe().healthy());
+    assertEquals(2, reasons.size());
+    assertEquals(BoundedSystemLeaseTimeSource.UnhealthyReason.WALL_MONOTONIC_DISCONTINUITY,
+        reasons.get(1));
   }
 
   @Test
-  void failsClosedAfterBackwardWallClockJump() {
+  void backwardWallClockStepAlsoPausesUntilTheClockCatchesUp() {
     var clocks = new MutableClocks(60_000);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
-        clocks.monotonicNanos()::get);
+    var source = source(clocks);
     assertTrue(source.observe().healthy());
 
     clocks.jumpWallClock(-10_000);
 
     assertFalse(source.observe().healthy());
+
+    clocks.advanceMonotonic(10_000);
+    clocks.advanceWall(20_000);
+    LeaseTimeObservation recovered = source.observe();
+    assertTrue(recovered.healthy(), recovered.toString());
+    assertEquals(69_000, recovered.nowLowerEpochMillis());
+    assertEquals(71_000, recovered.nowUpperEpochMillis());
   }
 
   @Test
   void detectsCumulativeDriftAcrossManySmallWallClockChanges() {
     var clocks = new MutableClocks(10_000);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
-        clocks.monotonicNanos()::get);
+    var source = source(clocks);
+    assertTrue(source.observe().healthy());
 
     for (int i = 0; i < 10; i++) {
       clocks.advanceMonotonic(100);
@@ -78,19 +99,19 @@ class BoundedSystemLeaseTimeSourceTest {
     }
     assertTrue(source.observe().healthy());
 
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < 41; i++) {
       clocks.advanceMonotonic(100);
       clocks.advanceWall(150);
     }
 
-    assertFalse(source.observe().healthy());
+    LeaseTimeObservation finalObservation = source.observe();
+    assertFalse(finalObservation.healthy(), finalObservation.toString());
   }
 
   @Test
-  void failsClosedWhenClockReadThrowsAndDoesNotRecoverWithoutRevalidation() {
+  void clockReadFailureRecoversOnlyAfterASuccessfulTimeObservation() {
     var clocks = new MutableClocks(10_000);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
-        clocks.monotonicNanos()::get);
+    var source = source(clocks);
     assertTrue(source.observe().healthy());
 
     clocks.wall().setFailing(true);
@@ -98,47 +119,82 @@ class BoundedSystemLeaseTimeSourceTest {
 
     clocks.wall().setFailing(false);
     clocks.advance(5_000);
-    assertFalse(source.observe().healthy());
+    LeaseTimeObservation recovered = source.observe();
+    assertTrue(recovered.healthy(), recovered.toString());
   }
 
   @Test
-  void reportsInitializationClockFailureOnceWithAStableReason() {
+  void reportsInitializationClockFailureOnceAndRecoversFromAValidObservation() {
     var clocks = new MutableClocks(10_000);
     clocks.wall().setFailing(true);
-    var reportedReasons = new ArrayList<BoundedSystemLeaseTimeSource.UnhealthyReason>();
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
-        clocks.monotonicNanos()::get, reportedReasons::add);
+    var reasons = new ArrayList<BoundedSystemLeaseTimeSource.UnhealthyReason>();
+    var source = source(clocks, reasons::add);
 
     assertFalse(source.observe().healthy());
-    clocks.wall().setFailing(false);
-    clocks.advance(5_000);
     assertFalse(source.observe().healthy());
     assertEquals(List.of(BoundedSystemLeaseTimeSource.UnhealthyReason.WALL_CLOCK_READ_FAILED),
-        reportedReasons);
-  }
+        reasons);
 
-  @Test
-  void reportsObservedClockDiscontinuityOnlyOnTheFirstUnhealthyTransition() {
-    var clocks = new MutableClocks(10_000);
-    var reportedReasons = new ArrayList<BoundedSystemLeaseTimeSource.UnhealthyReason>();
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
-        clocks.monotonicNanos()::get, reportedReasons::add);
-
+    clocks.wall().setFailing(false);
+    clocks.advance(5_000);
     assertTrue(source.observe().healthy());
-    clocks.jumpWallClock(60_000);
-
-    assertFalse(source.observe().healthy());
-    assertFalse(source.observe().healthy());
-    assertEquals(List.of(
-        BoundedSystemLeaseTimeSource.UnhealthyReason.WALL_MONOTONIC_DISCONTINUITY),
-        reportedReasons);
+    assertEquals(1, reasons.size());
   }
 
   @Test
-  void failsClosedWhenUpperBoundOverflows() {
-    var clocks = new MutableClocks(Long.MAX_VALUE - 500);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
+  void rejectsMonotonicRegressionAndWallTimeOverflow() {
+    var regressedClocks = new MutableClocks(10_000);
+    var regressedSource = source(regressedClocks);
+    assertTrue(regressedSource.observe().healthy());
+    regressedClocks.monotonicNanos().set(-1);
+    assertFalse(regressedSource.observe().healthy());
+    regressedClocks.monotonicNanos().set(0);
+    assertTrue(regressedSource.observe().healthy());
+
+    var overflowClocks = new MutableClocks(Long.MAX_VALUE - 500);
+    var overflowSource = source(overflowClocks);
+    assertFalse(overflowSource.observe().healthy());
+  }
+
+  @Test
+  void startsWithTheConfiguredWallClockUncertaintyBounds() {
+    var clocks = new MutableClocks(10_000);
+    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), 1, MAXIMUM_DRIFT_PPM,
         clocks.monotonicNanos()::get);
+
+    LeaseTimeObservation observation = source.observe();
+
+    assertTrue(observation.healthy());
+    assertEquals(9_999, observation.nowLowerEpochMillis());
+    assertEquals(10_001, observation.nowUpperEpochMillis());
+  }
+
+  @Test
+  void allowsWallMovementWithinTheConfiguredRateAndUncertaintyBounds() {
+    var clocks = new MutableClocks(10_000);
+    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), 1, MAXIMUM_DRIFT_PPM,
+        clocks.monotonicNanos()::get);
+    assertTrue(source.observe().healthy());
+
+    clocks.advance(1);
+    clocks.advanceWall(1);
+
+    LeaseTimeObservation observation = source.observe();
+
+    assertTrue(observation.healthy());
+    assertEquals(10_001, observation.nowLowerEpochMillis());
+    assertEquals(10_003, observation.nowUpperEpochMillis());
+  }
+
+  @Test
+  void failsClosedWhenWallClockMovementExceedsConfiguredBounds() {
+    var clocks = new MutableClocks(10_000);
+    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), 1, MAXIMUM_DRIFT_PPM,
+        clocks.monotonicNanos()::get);
+    assertTrue(source.observe().healthy());
+
+    clocks.advance(1);
+    clocks.advanceWall(5);
 
     assertFalse(source.observe().healthy());
   }
@@ -146,7 +202,7 @@ class BoundedSystemLeaseTimeSourceTest {
   @Test
   void includesClockReadWindowInUpperBoundAtConfiguredLimit() {
     var clocks = new MutableClocks(10_000);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), 1,
+    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), 1, MAXIMUM_DRIFT_PPM,
         monotonicWithReadWindow(1_000_000));
 
     LeaseTimeObservation observation = source.observe();
@@ -158,7 +214,7 @@ class BoundedSystemLeaseTimeSourceTest {
   @Test
   void allowsOnlyDriftExplainedByMonotonicSamplingWindows() {
     var clocks = new MutableClocks(10_000);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), 1,
+    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), 1, MAXIMUM_DRIFT_PPM,
         monotonicWithReadWindow(1_000_000));
     clocks.advanceWall(4);
 
@@ -171,29 +227,43 @@ class BoundedSystemLeaseTimeSourceTest {
   @Test
   void rejectsClockReadWindowBeyondConfiguredLimit() {
     var clocks = new MutableClocks(10_000);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), 1,
+    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), 1, MAXIMUM_DRIFT_PPM,
         monotonicWithReadWindow(1_000_001));
 
     assertFalse(source.observe().healthy());
   }
 
   @Test
-  void runtimeReadinessBecomesFalseAfterLeaseClockDiscontinuity() {
+  void runtimeReadinessBecomesFalseOnDiscontinuityAndTrueAfterRecovery() {
     var unavailableClocks = new MutableClocks(10_000);
     unavailableClocks.wall().setFailing(true);
-    var unavailableSource = new BoundedSystemLeaseTimeSource(unavailableClocks.wall(),
-        UNCERTAINTY_MILLIS, unavailableClocks.monotonicNanos()::get);
+    var unavailableSource = source(unavailableClocks);
     assertFalse(M3TableGroupRuntime.runtimeReady(true, Optional.of(unavailableSource)));
 
+    unavailableClocks.wall().setFailing(false);
+    assertTrue(M3TableGroupRuntime.runtimeReady(true, Optional.of(unavailableSource)));
+
     var clocks = new MutableClocks(10_000);
-    var source = new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
-        clocks.monotonicNanos()::get);
+    var source = source(clocks);
     Optional<LeaseTimeSource> leaseTime = Optional.of(source);
 
     assertTrue(M3TableGroupRuntime.runtimeReady(true, leaseTime));
     clocks.jumpWallClock(60_000);
     assertFalse(M3TableGroupRuntime.runtimeReady(true, leaseTime));
+    clocks.jumpWallClock(-60_000);
+    assertTrue(M3TableGroupRuntime.runtimeReady(true, leaseTime));
     assertFalse(M3TableGroupRuntime.runtimeReady(false, Optional.empty()));
+  }
+
+  private static BoundedSystemLeaseTimeSource source(MutableClocks clocks) {
+    return new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
+        MAXIMUM_DRIFT_PPM, clocks.monotonicNanos()::get);
+  }
+
+  private static BoundedSystemLeaseTimeSource source(MutableClocks clocks,
+      java.util.function.Consumer<BoundedSystemLeaseTimeSource.UnhealthyReason> reporter) {
+    return new BoundedSystemLeaseTimeSource(clocks.wall(), UNCERTAINTY_MILLIS,
+        MAXIMUM_DRIFT_PPM, clocks.monotonicNanos()::get, reporter);
   }
 
   private static LongSupplier monotonicWithReadWindow(long readWindowNanos) {

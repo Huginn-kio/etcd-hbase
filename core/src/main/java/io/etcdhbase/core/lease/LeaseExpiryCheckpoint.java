@@ -177,7 +177,7 @@ public record LeaseExpiryCheckpoint(long ownerEpoch, long sequence, int bucketCo
       timeFence = Math.max(timeFence, before.trustedTimeLowerEpochMillis());
       position = before.position();
     }
-    if (position.windowStopExclusive() > timeFence) {
+    if (!isClosedBy(position.windowStopExclusive(), timeFence)) {
       throw new LeaseFailure(LeaseFailure.Reason.CLOCK_UNHEALTHY);
     }
     return new LeaseExpiryCheckpoint(ownerEpoch, sequence, bucketCount, baseSequence,
@@ -223,11 +223,11 @@ public record LeaseExpiryCheckpoint(long ownerEpoch, long sequence, int bucketCo
           && after.bucket() == 0 && after.afterIdentity().isEmpty()) return;
       throw new IllegalArgumentException("Lease expiry checkpoint opened a non-contiguous window");
     }
+    if (before.bucket() == bucketCount - 1 && after.idle()
+        && after.windowStartInclusive() == before.windowStopExclusive()) return;
     if (after.windowStartInclusive() == before.windowStartInclusive()
         && after.windowStopExclusive() == before.windowStopExclusive()) {
       if (after.bucket() == before.bucket() + 1 && after.afterIdentity().isEmpty()) return;
-      if (before.bucket() == bucketCount - 1 && after.idle()
-          && after.windowStartInclusive() == before.windowStopExclusive()) return;
     }
     throw new IllegalArgumentException("Lease expiry checkpoint regressed or skipped coverage");
   }

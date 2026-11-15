@@ -94,12 +94,40 @@ class LeaseExpiryCheckpointTest {
   }
 
   @Test
+  void lastBucketCanCloseItsWindowOnlyAtTheNextWindowBoundary() {
+    var lastBucket = checkpoint(4, 11, 4,
+        new LeaseExpiryCheckpoint.Position(1_000, 5_000, 3,
+            Optional.of(candidate(4_900, 19).encode())));
+    var nextWindow = checkpoint(4, 12, 4, LeaseExpiryCheckpoint.idleAt(5_000));
+
+    LeaseExpiryCheckpoint.requireForwardProgress(lastBucket, nextWindow);
+    assertThrows(IllegalArgumentException.class,
+        () -> LeaseExpiryCheckpoint.requireForwardProgress(
+            checkpoint(4, 11, 4,
+                new LeaseExpiryCheckpoint.Position(1_000, 5_000, 2, Optional.empty())),
+            nextWindow));
+  }
+
+  @Test
   void scanStepsMustAdvanceButLeaseMutationsMayRetainTheCursor() {
     var cursor = new LeaseExpiryCheckpoint.Position(1_000, 5_000, 2, Optional.empty());
     LeaseExpiryCheckpoint.requirePositionProgress(cursor, cursor, 5_000, 4);
 
     assertThrows(IllegalArgumentException.class,
         () -> LeaseExpiryCheckpoint.requireScanProgress(cursor, cursor, 5_000, 4));
+  }
+
+  @Test
+  void leaseMutationRetainsWindowClosedAtTheTrustedTimeBoundaryWithoutNewObservation() {
+    var previous = new LeaseExpiryCheckpoint(4, 11, 4, 10, 5_000,
+        new LeaseExpiryCheckpoint.Position(4_000, 5_001, 2, Optional.empty()));
+
+    var updated = LeaseExpiryCheckpoint.afterMutation(5, 12, 4, 11,
+        Optional.of(previous), Optional.empty());
+
+    assertEquals(previous.position(), updated.position());
+    assertEquals(previous.trustedTimeLowerEpochMillis(), updated.trustedTimeLowerEpochMillis());
+    LeaseExpiryCheckpoint.requireForwardProgress(previous, updated);
   }
 
   @Test

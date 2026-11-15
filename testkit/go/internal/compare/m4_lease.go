@@ -202,7 +202,9 @@ func projectM4LeaseTerm(left, right map[string]any, leftScope string) error {
 	method, ok := left["method"].(string)
 	if !ok || right["method"] != method || method != "etcdserverpb.Lease/LeaseGrant" &&
 		method != "etcdserverpb.Lease/LeaseTimeToLive" && method != "etcdserverpb.Lease/LeaseLeases" &&
-		method != "etcdserverpb.Lease/LeaseKeepAlive" && method != "etcdserverpb.KV/Range" {
+		method != "etcdserverpb.Lease/LeaseKeepAlive" &&
+		method != "etcdserverpb.Lease/LeaseRevoke" && method != "etcdserverpb.KV/Put" &&
+		method != "etcdserverpb.KV/Range" {
 		return errors.New("method is not registered for the M4 Lease policy")
 	}
 	native, target := left, right

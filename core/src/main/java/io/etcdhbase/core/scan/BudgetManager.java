@@ -22,6 +22,43 @@ public final class BudgetManager {
     }
   }
 
+  /**
+   * Capacity carved out of total limits for bounded internal work that must remain admissible
+   * while regular accounts are saturated.
+   */
+  public record ReservedCapacity(int requests, int queued, int operations, int scanners,
+      int cleanup, long queuedBytes, long memoryBytes) {
+    public ReservedCapacity {
+      if (requests < 0 || queued < 0 || operations < 0 || scanners < 0 || cleanup < 0
+          || queuedBytes < 0 || memoryBytes < 0) {
+        throw new IllegalArgumentException("negative reserved capacity");
+      }
+    }
+
+    public static ReservedCapacity none() {
+      return new ReservedCapacity(0, 0, 0, 0, 0, 0, 0);
+    }
+
+    public ReservedCapacity plus(ReservedCapacity other) {
+      Objects.requireNonNull(other, "other");
+      return new ReservedCapacity(
+          Math.addExact(requests, other.requests),
+          Math.addExact(queued, other.queued),
+          Math.addExact(operations, other.operations),
+          Math.addExact(scanners, other.scanners),
+          Math.addExact(cleanup, other.cleanup),
+          Math.addExact(queuedBytes, other.queuedBytes),
+          Math.addExact(memoryBytes, other.memoryBytes));
+    }
+
+    private boolean fitsWithin(Limits limits) {
+      return requests <= limits.requests() && queued <= limits.queued()
+          && operations <= limits.operations() && scanners <= limits.scanners()
+          && cleanup <= limits.cleanup() && queuedBytes <= limits.queuedBytes()
+          && memoryBytes <= limits.memoryBytes();
+    }
+  }
+
   public record Reservation(long heads, long page, long io, long output, long candidates) {
     /** Existing reservations fail closed for candidate buffers until callers reserve them. */
     public Reservation(long heads, long page, long io, long output) {
@@ -78,19 +115,54 @@ public final class BudgetManager {
   private static final Work NO_WORK = new Work(0, 0, 0, 0, 0);
   private final Limits globalLimits;
   private final Limits requestLimits;
+  private final ReservedCapacity globalReservedCapacity;
+  private final Counters globalReservedUsage = new Counters();
   private final Map<String, Group> groups;
   private final Counters global = new Counters();
   private Runnable wakeup;
 
   public BudgetManager(Limits globalLimits, Map<String, Limits> groupLimits, Limits requestLimits) {
+    this(globalLimits, groupLimits, requestLimits, ReservedCapacity.none(), Map.of());
+  }
+
+  public BudgetManager(Limits globalLimits, Map<String, Limits> groupLimits, Limits requestLimits,
+      ReservedCapacity globalReservedCapacity,
+      Map<String, ReservedCapacity> groupReservedCapacity) {
     this.globalLimits = Objects.requireNonNull(globalLimits, "globalLimits");
     this.requestLimits = Objects.requireNonNull(requestLimits, "requestLimits");
+    this.globalReservedCapacity = Objects.requireNonNull(globalReservedCapacity, "globalReservedCapacity");
+    Objects.requireNonNull(groupReservedCapacity, "groupReservedCapacity");
     if (groupLimits.isEmpty() || groupLimits.size() > 64) throw new IllegalArgumentException("bounded groups required");
+    if (!globalReservedCapacity.fitsWithin(globalLimits)) {
+      throw new IllegalArgumentException("global reserved capacity exceeds total limits");
+    }
     var configured = new java.util.HashMap<String, Group>();
-    groupLimits.forEach((id, limits) -> {
+    ReservedCapacity groupCapacityTotal = ReservedCapacity.none();
+    for (var entry : groupLimits.entrySet()) {
+      String id = entry.getKey();
+      Limits limits = entry.getValue();
       if (id == null || !id.matches("[A-Za-z][A-Za-z0-9._-]{0,63}")) throw new IllegalArgumentException("invalid group ID");
-      configured.put(id, new Group(Objects.requireNonNull(limits, "group limits")));
-    });
+      Limits checkedLimits = Objects.requireNonNull(limits, "group limits");
+      ReservedCapacity reserved = Objects.requireNonNull(
+          groupReservedCapacity.getOrDefault(id, ReservedCapacity.none()), "group reserved capacity");
+      if (!reserved.fitsWithin(checkedLimits)) {
+        throw new IllegalArgumentException("group reserved capacity exceeds total limits");
+      }
+      configured.put(id, new Group(checkedLimits, reserved));
+      groupCapacityTotal = groupCapacityTotal.plus(reserved);
+    }
+    if (!configured.keySet().containsAll(groupReservedCapacity.keySet())) {
+      throw new IllegalArgumentException("reserved capacity names an unknown group");
+    }
+    if (groupCapacityTotal.requests() > globalReservedCapacity.requests()
+        || groupCapacityTotal.queued() > globalReservedCapacity.queued()
+        || groupCapacityTotal.operations() > globalReservedCapacity.operations()
+        || groupCapacityTotal.scanners() > globalReservedCapacity.scanners()
+        || groupCapacityTotal.cleanup() > globalReservedCapacity.cleanup()
+        || groupCapacityTotal.queuedBytes() > globalReservedCapacity.queuedBytes()
+        || groupCapacityTotal.memoryBytes() > globalReservedCapacity.memoryBytes()) {
+      throw new IllegalArgumentException("global reserved capacity must cover all group reserves");
+    }
     groups = Map.copyOf(configured);
   }
 
@@ -100,6 +172,26 @@ public final class BudgetManager {
   }
 
   public Account admit(String groupId, RequestScope scope, Reservation reservation, ReadLimits readLimits) throws BackendFailure {
+    return admit(groupId, scope, reservation, readLimits, false);
+  }
+
+  /**
+   * Admits bounded internal work from capacity unavailable to regular request accounts.
+   */
+  public Account admitReserved(String groupId, RequestScope scope, Reservation reservation)
+      throws BackendFailure {
+    return admitReserved(groupId, scope, reservation,
+        new ReadLimits(1_000_000, 1L << 30, 100_000, DEFAULT_PAGE_LIMIT,
+            DEFAULT_POINT_OPERATION_LIMIT));
+  }
+
+  public Account admitReserved(String groupId, RequestScope scope, Reservation reservation,
+      ReadLimits readLimits) throws BackendFailure {
+    return admit(groupId, scope, reservation, readLimits, true);
+  }
+
+  private Account admit(String groupId, RequestScope scope, Reservation reservation,
+      ReadLimits readLimits, boolean reserved) throws BackendFailure {
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(reservation, "reservation");
     Objects.requireNonNull(readLimits, "readLimits");
@@ -108,13 +200,25 @@ public final class BudgetManager {
       Group group = groups.get(groupId);
       if (group == null) throw new IllegalArgumentException("unconfigured group ID");
       checkScope(scope);
-      if (reservation.total() > requestLimits.memoryBytes()
-          || !global.canAdmit(globalLimits, reservation.total()) || !group.usage.canAdmit(group.limits, reservation.total())) {
+      boolean canAdmit = reserved
+          ? reservation.total() <= requestLimits.memoryBytes()
+              && globalReservedUsage.canAdmitReserved(globalReservedCapacity, reservation.total())
+              && group.reservedUsage.canAdmitReserved(group.reservedCapacity, reservation.total())
+          : reservation.total() <= requestLimits.memoryBytes()
+              && global.canAdmitRegular(globalLimits, globalReservedCapacity, globalReservedUsage,
+                  reservation.total())
+              && group.usage.canAdmitRegular(group.limits, group.reservedCapacity,
+                  group.reservedUsage, reservation.total());
+      if (!canAdmit) {
         throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
       }
       global.admit(reservation.total());
       group.usage.admit(reservation.total());
-      account = new Account(groupId, group, scope, reservation, readLimits);
+      if (reserved) {
+        globalReservedUsage.admit(reservation.total());
+        group.reservedUsage.admit(reservation.total());
+      }
+      account = new Account(groupId, group, scope, reservation, readLimits, reserved);
     }
     account.registration = scope.registerScopedCleanup(account);
     return account;
@@ -129,8 +233,10 @@ public final class BudgetManager {
       Group group = groups.get(groupId);
       if (group == null) throw new IllegalArgumentException("unconfigured group ID");
       checkScope(scope);
-      if (bytes > globalLimits.memoryBytes() - global.reservedBytes
-          || bytes > group.limits.memoryBytes() - group.usage.reservedBytes) {
+      long globalRegularBytes = global.reservedBytes - globalReservedUsage.reservedBytes;
+      long groupRegularBytes = group.usage.reservedBytes - group.reservedUsage.reservedBytes;
+      if (bytes > globalLimits.memoryBytes() - globalReservedCapacity.memoryBytes() - globalRegularBytes
+          || bytes > group.limits.memoryBytes() - group.reservedCapacity.memoryBytes() - groupRegularBytes) {
         throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
       }
       global.reservedBytes += bytes;
@@ -229,6 +335,7 @@ public final class BudgetManager {
     private final Group group;
     private final RequestScope scope;
     private final Reservation reservation;
+    private final boolean reserved;
     private final Counters usage = new Counters();
     private final EnumMap<Memory, Long> memory = new EnumMap<>(Memory.class);
     private RequestScope.ScopedCleanup registration;
@@ -240,12 +347,14 @@ public final class BudgetManager {
     private boolean readExhausted;
     private final CompletableFuture<Void> drained = new CompletableFuture<>();
 
-    private Account(String groupId, Group group, RequestScope scope, Reservation reservation, ReadLimits readLimits) {
+    private Account(String groupId, Group group, RequestScope scope, Reservation reservation,
+        ReadLimits readLimits, boolean reserved) {
       this.groupId = groupId;
       this.group = group;
       this.scope = scope;
       this.reservation = reservation;
       this.readLimits = readLimits;
+      this.reserved = reserved;
       for (Memory kind : Memory.values()) memory.put(kind, 0L);
     }
 
@@ -348,11 +457,21 @@ public final class BudgetManager {
       Objects.requireNonNull(work, "work");
       synchronized (BudgetManager.this) {
         requireActive();
-        if (!global.fits(globalLimits, work) || !group.usage.fits(group.limits, work) || !usage.fits(requestLimits, work)) {
+        boolean fitsCapacity = reserved
+            ? globalReservedUsage.fitsReserved(globalReservedCapacity, work)
+                && group.reservedUsage.fitsReserved(group.reservedCapacity, work)
+            : global.fitsRegular(globalLimits, globalReservedCapacity, globalReservedUsage, work)
+                && group.usage.fitsRegular(group.limits, group.reservedCapacity,
+                    group.reservedUsage, work);
+        if (!fitsCapacity || !usage.fits(requestLimits, work)) {
           return Optional.empty();
         }
         global.add(work, 1);
         group.usage.add(work, 1);
+        if (reserved) {
+          globalReservedUsage.add(work, 1);
+          group.reservedUsage.add(work, 1);
+        }
         usage.add(work, 1);
         return Optional.of(new Lease(this, work, null, 0));
       }
@@ -390,6 +509,10 @@ public final class BudgetManager {
       group.usage.requests--;
       global.reservedBytes -= reservation.total();
       group.usage.reservedBytes -= reservation.total();
+      if (reserved) {
+        globalReservedUsage.releaseAdmission(reservation.total());
+        group.reservedUsage.releaseAdmission(reservation.total());
+      }
     }
 
     private void signalDrain() {
@@ -442,6 +565,10 @@ public final class BudgetManager {
         global.add(work, -1);
         account.group.usage.add(work, -1);
         account.usage.add(work, -1);
+        if (account.reserved) {
+          globalReservedUsage.add(work, -1);
+          account.group.reservedUsage.add(work, -1);
+        }
         if (kind != null) {
           account.memory.put(kind, account.memory.get(kind) - bytes);
           global.allocatedBytes -= bytes;
@@ -466,21 +593,57 @@ public final class BudgetManager {
     }
   }
 
-  private record Group(Limits limits, Counters usage) {
-    Group(Limits limits) { this(limits, new Counters()); }
+  private static final class Group {
+    private final Limits limits;
+    private final ReservedCapacity reservedCapacity;
+    private final Counters usage = new Counters();
+    private final Counters reservedUsage = new Counters();
+
+    private Group(Limits limits, ReservedCapacity reservedCapacity) {
+      this.limits = limits;
+      this.reservedCapacity = reservedCapacity;
+    }
   }
 
   private static final class Counters {
     long requests, queued, operations, scanners, cleanup, queuedBytes, reservedBytes, allocatedBytes, retiredScanners;
     long peakScanners, peakAllocatedBytes;
 
-    boolean canAdmit(Limits limits, long bytes) {
-      return requests < limits.requests() && bytes <= limits.memoryBytes() - reservedBytes;
+    boolean canAdmitRegular(Limits limits, ReservedCapacity reserve, Counters reserveUsage,
+        long bytes) {
+      long regularRequests = requests - reserveUsage.requests;
+      long regularReservedBytes = reservedBytes - reserveUsage.reservedBytes;
+      return regularRequests < limits.requests() - reserve.requests()
+          && bytes <= limits.memoryBytes() - reserve.memoryBytes() - regularReservedBytes;
     }
     void admit(long bytes) { requests++; reservedBytes += bytes; }
+    boolean canAdmitReserved(ReservedCapacity capacity, long bytes) {
+      return requests < capacity.requests() && bytes <= capacity.memoryBytes() - reservedBytes;
+    }
+    void releaseAdmission(long bytes) { requests--; reservedBytes -= bytes; }
+    boolean fitsRegular(Limits limits, ReservedCapacity reserve, Counters reserveUsage, Work work) {
+      return work.queued() <= limits.queued() - reserve.queued() - (queued - reserveUsage.queued)
+          && work.operations() <= limits.operations() - reserve.operations()
+              - (operations - reserveUsage.operations)
+          && work.scanners() <= limits.scanners() - reserve.scanners()
+              - (scanners - reserveUsage.scanners)
+          && work.cleanup() <= limits.cleanup() - reserve.cleanup()
+              - (cleanup - reserveUsage.cleanup)
+          && work.queuedBytes() <= limits.queuedBytes() - reserve.queuedBytes()
+              - (queuedBytes - reserveUsage.queuedBytes);
+    }
+    boolean fitsReserved(ReservedCapacity capacity, Work work) {
+      return work.queued() <= capacity.queued() - queued
+          && work.operations() <= capacity.operations() - operations
+          && work.scanners() <= capacity.scanners() - scanners
+          && work.cleanup() <= capacity.cleanup() - cleanup
+          && work.queuedBytes() <= capacity.queuedBytes() - queuedBytes;
+    }
     boolean fits(Limits limits, Work work) {
-      return work.queued() <= limits.queued() - queued && work.operations() <= limits.operations() - operations
-          && work.scanners() <= limits.scanners() - scanners && work.cleanup() <= limits.cleanup() - cleanup
+      return work.queued() <= limits.queued() - queued
+          && work.operations() <= limits.operations() - operations
+          && work.scanners() <= limits.scanners() - scanners
+          && work.cleanup() <= limits.cleanup() - cleanup
           && work.queuedBytes() <= limits.queuedBytes() - queuedBytes;
     }
     void add(Work work, int sign) {

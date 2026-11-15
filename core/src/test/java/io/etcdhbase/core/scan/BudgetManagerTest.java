@@ -122,6 +122,35 @@ class BudgetManagerTest {
   }
 
   @Test
+  void reservedAdmissionSurvivesRegularRequestAndScannerSaturation() throws Exception {
+    var total = new BudgetManager.Limits(2, 0, 2, 1, 2, 0, 1000);
+    var reserve = new BudgetManager.ReservedCapacity(1, 0, 1, 1, 1, 0, 400);
+    var manager = new BudgetManager(total, Map.of("alpha", total),
+        new BudgetManager.Limits(1, 0, 2, 1, 2, 0, 1000), reserve, Map.of("alpha", reserve));
+    var regularScope = RequestScope.withoutDeadline();
+    var reservedScope = RequestScope.withoutDeadline();
+    try (regularScope; reservedScope;
+         var regular = manager.admit("alpha", regularScope,
+             new BudgetManager.Reservation(0, 1, 599, 0));
+         var reserved = manager.admitReserved("alpha", reservedScope,
+             new BudgetManager.Reservation(0, 1, 399, 0))) {
+      assertThrows(BackendFailure.class, () -> manager.admit("alpha", regularScope,
+          new BudgetManager.Reservation(0, 1, 1, 0)));
+      assertTrue(regular.tryAcquire(BudgetManager.Work.scan()).isEmpty(),
+          "regular scans cannot borrow the scanner reserved for expiry work");
+      try (var scan = reserved.tryAcquire(BudgetManager.Work.scan()).orElseThrow()) {
+        assertEquals(2, manager.snapshot().requests());
+        assertEquals(1, manager.snapshot().scanners());
+        assertThrows(BackendFailure.class, () -> manager.admitReserved("alpha", regularScope,
+            new BudgetManager.Reservation(0, 1, 1, 0)));
+      }
+    }
+    assertEquals(0, manager.snapshot().requests());
+    assertEquals(0, manager.snapshot().reservedBytes());
+    assertEquals(0, manager.snapshot().scanners());
+  }
+
+  @Test
   void headAndOutputCannotConsumeTheReservedProgressPage() throws Exception {
     var manager = new BudgetManager(GLOBAL, Map.of("alpha", GROUP), REQUEST);
     try (var scope = RequestScope.withoutDeadline(); var account = manager.admit("alpha", scope, MEMORY);

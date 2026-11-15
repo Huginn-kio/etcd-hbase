@@ -46,18 +46,22 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
   private final boolean resultsSupported;
   private final boolean auxiliarySupported;
   private final boolean leaseBindingsSupported;
+  private final boolean leaseExpiryCheckpointsSupported;
 
   HBaseSystemRecordStore(AsyncConnection connection, SystemTableBinding binding,
-      boolean resultsSupported, boolean auxiliarySupported, boolean leaseBindingsSupported) {
+      boolean resultsSupported, boolean auxiliarySupported, boolean leaseBindingsSupported,
+      boolean leaseExpiryCheckpointsSupported) {
     this.connection = connection;
     this.binding = binding;
     this.resultsSupported = resultsSupported;
     this.auxiliarySupported = auxiliarySupported;
     this.leaseBindingsSupported = leaseBindingsSupported;
+    this.leaseExpiryCheckpointsSupported = leaseExpiryCheckpointsSupported;
   }
 
   public boolean supportsAuxiliary() { return auxiliarySupported; }
   public boolean supportsLeaseBindings() { return leaseBindingsSupported; }
+  public boolean supportsLeaseExpiryCheckpoints() { return leaseExpiryCheckpointsSupported; }
 
   @Override
   public int bucket(SystemRecordType type, ByteKey identity) {
@@ -78,8 +82,10 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
               boolean supportsResults = binding.supportsResults(descriptor);
               boolean supportsAuxiliary = binding.supportsAuxiliary(descriptor);
               boolean supportsLeaseBindings = binding.supportsLeaseBindings(descriptor);
+              boolean supportsLeaseExpiryCheckpoints =
+                  binding.supportsLeaseExpiryCheckpoints(descriptor);
               return new HBaseSystemRecordStore(connection, binding, supportsResults,
-                  supportsAuxiliary, supportsLeaseBindings);
+                  supportsAuxiliary, supportsLeaseBindings, supportsLeaseExpiryCheckpoints);
             })).exceptionallyCompose(failure -> CompletableFuture.failedFuture(
                 HBaseFailures.classify(failure)));
   }
@@ -208,8 +214,15 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
       SystemRecordType type, ByteKey routePrefix, long sequence, RequestScope scope) {
     requireTypeSupported(type);
     Objects.requireNonNull(routePrefix, "routePrefix");
+    Objects.requireNonNull(scope, "scope");
+    if (sequence < 0) {
+      return CompletableFuture.failedFuture(
+          new IllegalArgumentException("system record sequence fence must be non-negative"));
+    }
+    if (sequence == 0) return CompletableFuture.completedFuture(Optional.empty());
     var bounds = switch (type) {
-      case LEASE_STATE -> binding.keyCodec().leaseVersionBounds(type, routePrefix, sequence);
+      case LEASE_STATE, LEASE_EXPIRY_CHECKPOINT ->
+          binding.keyCodec().leaseVersionBounds(type, routePrefix, sequence);
       case LEASE_BINDING -> binding.keyCodec().leaseBindingVersionBounds(routePrefix, sequence);
       default -> throw new IllegalArgumentException("system record type has no versioned seek");
     };
@@ -398,6 +411,8 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
       long actualSequence = switch (type) {
         case LEASE_STATE -> io.etcdhbase.core.lease.LeaseRecordIdentity.sequence(decoded.identity());
         case LEASE_BINDING -> io.etcdhbase.core.lease.LeaseBindingIdentity.sequence(decoded.identity());
+        case LEASE_EXPIRY_CHECKPOINT ->
+            io.etcdhbase.core.lease.LeaseExpiryCheckpoint.sequence(decoded.identity());
         default -> throw new IllegalArgumentException("system record type has no versioned sequence");
       };
       if (actualSequence > sequence) {
@@ -499,12 +514,16 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
     }
     if ((type == SystemRecordType.LEASE_STATE || type == SystemRecordType.LEASE_ENUMERATION
         || type == SystemRecordType.EXPIRY_CANDIDATE || type == SystemRecordType.AUXILIARY
-        || type == SystemRecordType.LEASE_RESULT || type == SystemRecordType.LEASE_BINDING)
+        || type == SystemRecordType.LEASE_RESULT || type == SystemRecordType.LEASE_BINDING
+        || type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT)
         && !auxiliarySupported) {
       throw new IllegalStateException("system table does not declare M4 auxiliary capability");
     }
     if (type == SystemRecordType.LEASE_BINDING && !leaseBindingsSupported) {
       throw new IllegalStateException("system table does not declare J41 Lease binding capability");
+    }
+    if (type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT && !leaseExpiryCheckpointsSupported) {
+      throw new IllegalStateException("system table does not declare J43 Lease expiry capability");
     }
   }
 

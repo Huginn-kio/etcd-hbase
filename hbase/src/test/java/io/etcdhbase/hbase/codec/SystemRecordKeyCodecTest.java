@@ -10,6 +10,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.LeaseBindingIdentity;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
@@ -32,6 +33,7 @@ class SystemRecordKeyCodecTest {
         case LEASE_STATE -> LeaseRecordIdentity.stateVersion(-7, 11);
         case LEASE_ENUMERATION -> LeaseRecordIdentity.enumeration(-7);
         case EXPIRY_CANDIDATE -> new ExpiryCandidateIdentity(1_700_000_000_000L, -7, 1, 0).encode();
+        case LEASE_EXPIRY_CHECKPOINT -> LeaseExpiryCheckpoint.versionIdentity(1);
         case LEASE_BINDING -> new LeaseBindingIdentity(-7, 2, identity, 11).encode();
         default -> identity;
       };

@@ -60,11 +60,23 @@ public final class LeaseAuxiliaryMutationPreparation {
   public CompletableFuture<Sealed> prepare(InvocationBinding invocation, ByteKey resultPayload,
       Iterator<PreparedAuxiliaryRecord> auxiliaryRecords, Supplier<CompletableFuture<Void>> finishRead,
       RequestScope scope, BudgetManager.Account account) {
+    return prepareWithMutation(invocation, resultPayload,
+        List.<PreparedCandidate>of().iterator(), List.<PreparedEvent>of().iterator(),
+        auxiliaryRecords, finishRead, scope, account);
+  }
+
+  /** Seals one RPC result with its KV candidates, ordered events, and auxiliary records. */
+  public CompletableFuture<Sealed> prepareWithMutation(InvocationBinding invocation,
+      ByteKey resultPayload, Iterator<PreparedCandidate> candidates,
+      Iterator<PreparedEvent> events, Iterator<PreparedAuxiliaryRecord> auxiliaryRecords,
+      Supplier<CompletableFuture<Void>> finishRead, RequestScope scope,
+      BudgetManager.Account account) {
+    Objects.requireNonNull(candidates, "candidates");
+    Objects.requireNonNull(events, "events");
     Objects.requireNonNull(auxiliaryRecords, "auxiliaryRecords");
     Objects.requireNonNull(finishRead, "finishRead");
     return prepareResult(invocation, resultPayload, scope, account, CANDIDATE_BYTES,
-        reference -> manifests.prepareWithResultAndAuxiliary(invocation,
-            List.<PreparedCandidate>of().iterator(), List.<PreparedEvent>of().iterator(),
+        reference -> manifests.prepareWithResultAndAuxiliary(invocation, candidates, events,
             reference, resultCatalog, auxiliaryRecords, finishRead, scope)
             .thenCompose(manifest -> invocations.transition(invocation,
                 invocation.seal(manifest.systemIdentity()), scope)

@@ -59,7 +59,7 @@ public final class LeaseTimeRules {
         : Math.min(Math.multiplyExact(state.grantedTtlSeconds(), MILLIS_PER_SECOND), remainingMillis);
   }
 
-  private static void requireHealthy(LeaseTimeObservation time) {
+  static void requireHealthy(LeaseTimeObservation time) {
     if (!Objects.requireNonNull(time, "time").healthy()) {
       throw new LeaseFailure(LeaseFailure.Reason.CLOCK_UNHEALTHY);
     }

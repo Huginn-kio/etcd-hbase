@@ -35,7 +35,10 @@ public interface SystemRecordStore {
         "system-record range scans are not available"));
   }
 
-  /** Reverse-seeks a versioned identity by stable route prefix and an inclusive sequence fence. */
+  /**
+   * Reverse-seeks a versioned identity by stable route prefix and an inclusive sequence fence.
+   * Since versioned records begin at sequence one, a zero fence has no matching record.
+   */
   default CompletableFuture<Optional<SystemRecordEntry>> latestAtOrBefore(
       SystemRecordType type, ByteKey routePrefix, long sequence, RequestScope scope) {
     return CompletableFuture.failedFuture(new UnsupportedOperationException(

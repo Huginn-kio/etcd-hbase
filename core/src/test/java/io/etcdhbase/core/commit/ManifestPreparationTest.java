@@ -12,6 +12,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
@@ -793,7 +794,12 @@ class ManifestPreparationTest {
         PreparedAuxiliaryRecord.create(invocation.transactionId(), 1, 0, 2,
             SystemRecordType.EXPIRY_CANDIDATE,
             new ExpiryCandidateIdentity(10_000, leaseId, 1, 0).encode(),
-            new ExpiryCandidateRecord(1).encode()));
+            new ExpiryCandidateRecord(1).encode()),
+        PreparedAuxiliaryRecord.create(invocation.transactionId(), 1, 0, 3,
+            SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+            LeaseExpiryCheckpoint.versionIdentity(1),
+            new LeaseExpiryCheckpoint(1, 1, 1, 0, 0,
+                LeaseExpiryCheckpoint.idleAt(0)).encode()));
 
     try (RequestScope scope = scope()) {
       ManifestRoot root = new ManifestPreparation(repository,
@@ -848,7 +854,7 @@ class ManifestPreparationTest {
       assertEquals(root, new CommitPlanVerifier(catalog, materialization, results, auxiliary,
           leasePlanVerifier)
           .verify(sealed, root, scope).join());
-      assertEquals(3, preflightCalls.get());
+      assertEquals(4, preflightCalls.get());
     }
   }
 

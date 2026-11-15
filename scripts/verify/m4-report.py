@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -27,6 +28,7 @@ TRACE_SCHEMA = "etcd-hbase-trace/v1"
 COMPARE_SUCCESS = "M4 Lease traces match the registered native comparison policy"
 J41_COMPARE_SUCCESS = "M4 Lease binding traces match the registered native comparison policy"
 J42_COMPARE_SUCCESS = "M4 KeepAlive traces match the registered native comparison policy"
+J43_COMPARE_SUCCESS = "M4 Revoke traces match the registered native comparison policy"
 REQUIRED_COMMANDS = {"go-module-lock", "go-tests", "maven-verify", "collect-maven-reports"}
 
 J40_TRACE_CASES = (
@@ -107,6 +109,109 @@ M4_STREAM_METHODS = {
     "etcdserverpb.Watch/Watch",
 }
 J42_STREAM_TERMINALS = {"keepalive-stream-a-repeat": {"kind": "eof"}}
+J43_TRACE_CASES = (
+    ("native-baseline", "etcdserverpb.Lease/LeaseLeases", "L05"),
+    ("revoke-grant-bound", "etcdserverpb.Lease/LeaseGrant", "L01"),
+    ("revoke-put-bound-key-a", "etcdserverpb.KV/Put", "P01"),
+    ("revoke-put-bound-key-b", "etcdserverpb.KV/Put", "P01"),
+    ("revoke-range-before-a", "etcdserverpb.KV/Range", "R01"),
+    ("revoke-range-before-b", "etcdserverpb.KV/Range", "R01"),
+    ("revoke-bound", "etcdserverpb.Lease/LeaseRevoke", "L03"),
+    ("revoke-range-after-a", "etcdserverpb.KV/Range", "R01"),
+    ("revoke-range-after-b", "etcdserverpb.KV/Range", "R01"),
+    ("revoke-ttl-after", "etcdserverpb.Lease/LeaseTimeToLive", "L04"),
+    ("revoke-missing", "etcdserverpb.Lease/LeaseRevoke", "L03"),
+    ("revoke-grant-empty", "etcdserverpb.Lease/LeaseGrant", "L01"),
+    ("revoke-empty", "etcdserverpb.Lease/LeaseRevoke", "L03"),
+    ("revoke-empty-ttl", "etcdserverpb.Lease/LeaseTimeToLive", "L04"),
+    ("expiry-grant", "etcdserverpb.Lease/LeaseGrant", "L01"),
+    ("expiry-put-bound-key-a", "etcdserverpb.KV/Put", "P01"),
+    ("expiry-put-bound-key-b", "etcdserverpb.KV/Put", "P01"),
+    ("expiry-range-before-a", "etcdserverpb.KV/Range", "R01"),
+    ("expiry-range-before-b", "etcdserverpb.KV/Range", "R01"),
+    ("expiry-ttl-after", "etcdserverpb.Lease/LeaseTimeToLive", "L04"),
+    ("expiry-range-after-a", "etcdserverpb.KV/Range", "R01"),
+    ("expiry-range-after-b", "etcdserverpb.KV/Range", "R01"),
+)
+J43_GO_TESTS = {
+    "cmd/m4driver": {
+        "TestRunNativeLeaseRevokeWritesFreshTraceAndVerifiableMetadata",
+        "TestCompareRevokeRejectsCorruptOrEmptyTrace",
+    },
+    "internal/scenario": {
+        "TestM4LeaseRevokeScenarioMatchesItsPinnedNativeOracle",
+        "TestLoadM4LeaseRevokeSuiteRejectsMissingOrChangedCoverage",
+    },
+    "internal/compare": {
+        "TestCompareM4LeaseRevokeRequiresOneRevisionForAllBoundKeys",
+        "TestCompareM4LeaseRevokeRejectsChangedTerminalState",
+    },
+}
+J43_JAVA_CLASS_MODULES = {
+    "io.etcdhbase.core.lease.LeaseExpiryCheckpointTest": "core",
+    "io.etcdhbase.core.lease.LeaseExpiryStepCommandTest": "core",
+    "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT": "hbase",
+    "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest": "server",
+    "io.etcdhbase.server.commit.LeaseExpiryStepExecutorTest": "server",
+    "io.etcdhbase.server.commit.LeaseExpiryWorkerTest": "server",
+    "io.etcdhbase.server.commit.LeaseRevocationExecutorTest": "server",
+    "io.etcdhbase.server.commit.LeaseRenewalExecutorTest": "server",
+    "io.etcdhbase.server.M4LeaseKeepAliveRpcIT": "server",
+    "io.etcdhbase.server.M4LeaseRevokeRpcIT": "server",
+    "io.etcdhbase.server.M4MixedLeaseBenchmarkIT": "server",
+}
+J43_JAVA_CLASSES = set(J43_JAVA_CLASS_MODULES)
+J43_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT": {
+        "seeksLatestExpiryCheckpointAtTheReadBarrier",
+    },
+    "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest": {
+        "wallClockStepPausesTrustedTimeUntilTheClockReturnsToItsMonotonicTrajectory",
+        "backwardWallClockStepAlsoPausesUntilTheClockCatchesUp",
+        "rejectsMonotonicRegressionAndWallTimeOverflow",
+    },
+    "io.etcdhbase.server.commit.LeaseExpiryStepExecutorTest": {
+        "scanUsesItsPinnedSequenceToCoverCandidatesWrittenAfterThePriorCheckpoint",
+        "candidateSequenceCannotBeZeroOrUseANegativeBarrier",
+        "expiryPageBudgetRemainsReservedUntilThePhysicalScanDrains",
+        "synchronousScanFailureReleasesPageBudgetAfterScopeDrain",
+    },
+    "io.etcdhbase.server.commit.LeaseExpiryWorkerTest": {
+        "successfulCloseWaitsForBothCleanupAndPhysicalProducerCompletion",
+        "staleExpiryWorkerDoesNotForwardAfterOwnerChangesDuringCheckpointRead",
+        "asynchronousCheckpointReadFailureClosesPreviouslyEstablishedOwnerReadiness",
+        "healthyStandbyWorkerSignalsInitialReadinessWithoutAnOwnerCheckpoint",
+    },
+    "io.etcdhbase.server.commit.LeaseRenewalExecutorTest": {
+        "expiredActiveLeaseUsesTheAtomicRevocationResultForKeepAlive",
+        "failedExpiryRevocationCannotTurnIntoASuccessfulKeepAliveResponse",
+    },
+    "io.etcdhbase.server.commit.LeaseRevocationExecutorTest": {
+        "unhealthyClockAtSelectionRejectsAnEarlierExpiryObservation",
+        "lowerBoundBeforeDeadlineRejectsAnEarlierExpiryObservation",
+        "healthyLowerBoundAtDeadlineAllowsExpirySelection",
+    },
+    "io.etcdhbase.server.M4LeaseRevokeRpcIT": {
+        "realGoLeaseRevokeMatchesNativeAcrossLayouts",
+        "expiryCheckpointResumesAfterRuntimeRestart",
+        "revokeAndKeepAliveRaceHasOneDurableTerminalOutcome",
+        "staleExpiryCandidatesPreserveReboundAndUnleasedRecreatedKeys",
+        "largeLeaseRevokeDeletesEveryBindingInOneRevision",
+    },
+    "io.etcdhbase.server.M4MixedLeaseBenchmarkIT": {
+        "emitsMixedLeaseLoadEvidenceAtIncreasingConcurrency",
+    },
+}
+J29_4_SOURCE_FILES = (
+    "core/src/main/java/io/etcdhbase/core/lease/LeaseExpiryCheckpoint.java",
+    "server/src/main/java/io/etcdhbase/server/commit/LeaseExpiryWorker.java",
+    "server/src/main/java/io/etcdhbase/server/commit/LeaseRevocationExecutor.java",
+    "server/src/main/java/io/etcdhbase/server/observability/RequestMetrics.java",
+    "server/src/test/java/io/etcdhbase/server/M4LeaseRpcIT.java",
+    "server/src/test/java/io/etcdhbase/server/M4MixedLeaseBenchmarkIT.java",
+    "scripts/verify/m4-report.py",
+    "testkit/cases/m4-cases.json",
+)
 J40_GO_TESTS = {
     "cmd/m4driver": {
         "TestRunNativeLeaseWritesFreshTraceAndVerifiableMetadata",
@@ -450,6 +555,9 @@ def validate_registry_document(document: object) -> dict[str, object]:
     j42 = task_map.get("J42")
     if j42 is not None:
         _validate_j42_registration(j42)
+    j43 = task_map.get("J43")
+    if j43 is not None:
+        _validate_j43_registration(j43)
     return document
 
 
@@ -684,6 +792,75 @@ def _validate_j42_registration(task: dict[str, object]) -> None:
         raise ReportError("J42 must compare native KeepAlive with both HBase layouts")
     if evidence.get("compare_logs") != ["keepalive-history.log", "keepalive-native.log"]:
         raise ReportError("J42 comparison log registration changed")
+
+
+def _validate_j43_registration(task: dict[str, object]) -> None:
+    if (task.get("api_ids") != ["L01", "L03", "L04", "L05", "P01", "R01"]
+            or task.get("scenario") != "m4-lease-revoke-v1"
+            or task.get("manifest") != "m4-lease-revoke.yaml"
+            or task.get("artifact_subdir") != "j43"):
+        raise ReportError("J43 API, scenario, or evidence directory changed")
+    traces = task["trace_cases"]
+    if any(not isinstance(item, dict) for item in traces):
+        raise ReportError("J43 Revoke trace case is malformed")
+    if [(item.get("id"), item.get("method"), item.get("api_id")) for item in traces] != list(J43_TRACE_CASES):
+        raise ReportError("J43 Revoke and expiry trace coverage is missing, reordered, or changed")
+
+    go_tests: dict[str, set[str]] = {}
+    for package in task["go_tests"]:
+        if not isinstance(package, dict) or not isinstance(package.get("package"), str):
+            raise ReportError("J43 Go test registration is malformed")
+        names = package.get("tests")
+        if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
+            raise ReportError("J43 Go package has no named required tests")
+        if package["package"] in go_tests:
+            raise ReportError("J43 Go package is registered more than once")
+        go_tests[package["package"]] = set(names)
+    if any(not expected.issubset(go_tests.get(package, set()))
+           for package, expected in J43_GO_TESTS.items()):
+        raise ReportError("J43 Go Revoke regression coverage is incomplete")
+
+    java_classes: set[str] = set()
+    java_methods: dict[str, set[str]] = {}
+    java_modules: dict[str, str] = {}
+    for suite in task["maven_tests"]:
+        if not isinstance(suite, dict):
+            raise ReportError("J43 Maven test registration is malformed")
+        module, kind, class_name, tests = (
+            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
+        )
+        if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
+            raise ReportError("J43 Maven test registration has an invalid module, kind, or class")
+        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
+            raise ReportError("J43 Maven suite has no named required tests")
+        java_classes.add(class_name)
+        previous_module = java_modules.setdefault(class_name, module)
+        if previous_module != module:
+            raise ReportError("J43 Maven suite is registered in multiple modules")
+        java_methods.setdefault(class_name, set()).update(tests)
+    if not J43_JAVA_CLASSES.issubset(java_classes):
+        raise ReportError("J43 expiry, Revoke, race, or mixed-load suites are not registered")
+    if any(java_modules.get(class_name) != module
+           for class_name, module in J43_JAVA_CLASS_MODULES.items()):
+        raise ReportError("J43 Java suites must be collected from their declared modules")
+    if any(not methods.issubset(java_methods.get(class_name, set()))
+           for class_name, methods in J43_CRITICAL_JAVA_TESTS.items()):
+        raise ReportError("J43 checkpoint, clock, race, or mixed-load regression coverage is incomplete")
+
+    evidence = task["evidence"]
+    native = evidence["native"]
+    target_layouts = {
+        (target.get("scope"), target.get("layout"), target.get("embedded_native"))
+        for target in evidence["targets"] if isinstance(target, dict)
+    }
+    if (native.get("scope"), native.get("layout"), native.get("embedded_native")) != (
+        "native-etcd", "", True
+    ) or target_layouts != {
+        ("target-hbase", "HISTORY", False), ("target-hbase", "NATIVE", False)
+    }:
+        raise ReportError("J43 must compare native Lease Revoke with both HBase layouts")
+    if evidence.get("compare_logs") != ["revoke-history.log", "revoke-native.log"]:
+        raise ReportError("J43 comparison log registration changed")
 
 
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, object]:
@@ -1094,6 +1271,7 @@ def _read_trace(
             "oversized-ttl": "OutOfRange",
             "binding-invalid-lease-atomicity": "NotFound",
             "binding-invalid-lease-put": "NotFound",
+            "revoke-missing": "NotFound",
         }.get(expected_case_id)
         if expected_error is not None:
             if (not isinstance(record["error"], dict)
@@ -1371,6 +1549,8 @@ def _scenario_hashes(
         prefix += "bindings/"
     elif task.get("id") == "J42":
         prefix += "keepalive/"
+    elif task.get("id") == "J43":
+        prefix += "revoke/"
     prefix_hash = hashlib.sha256(prefix.encode()).hexdigest()
     return suite_hash, prefix_hash
 
@@ -1419,11 +1599,185 @@ def _validate_comparison_evidence(evidence_root: Path, task: dict[str, object]) 
     success_marker = {
         "J41": J41_COMPARE_SUCCESS,
         "J42": J42_COMPARE_SUCCESS,
+        "J43": J43_COMPARE_SUCCESS,
     }.get(task.get("id"), COMPARE_SUCCESS)
     for compare_log in task["evidence"]["compare_logs"]:
         path = evidence_root / compare_log
         if not path.is_file() or success_marker not in path.read_text(encoding="utf-8"):
             raise ReportError(f"M4 native comparison {compare_log} is missing or failed")
+
+
+def _validate_j29_4_evidence(repository: Path, evidence_root: Path,
+                             run: dict[str, object]) -> dict[str, object]:
+    path = evidence_root / "mixed-lease-load.json"
+    report = read_json(path)
+    if not isinstance(report, dict):
+        raise ReportError("J29.4 mixed Lease load evidence is missing or malformed")
+    if (report.get("schema") != "etcd-hbase-m4-j29.4/v1"
+            or report.get("status") != "passed"
+            or report.get("run_id") != run["run_id"]
+            or report.get("source_commit") != run["source_commit"]
+            or report.get("scope") != "public-local-minicluster"
+            or report.get("protocol") != PROTOCOL
+            or report.get("target_capacity_accepted") is not False
+            or report.get("physical_hbase_rpc_bytes_collected") is not False
+            or report.get("recovery_reserve_usage_measured") is not False):
+        raise ReportError("J29.4 evidence does not match the M4 run identity or scope")
+
+    source_files = report.get("source_files")
+    if not isinstance(source_files, dict) or set(source_files) != set(J29_4_SOURCE_FILES):
+        raise ReportError("J29.4 source file manifest is incomplete")
+    source_digest = hashlib.sha256()
+    for relative in J29_4_SOURCE_FILES:
+        recorded_hash = source_files.get(relative)
+        source_path = repository / relative
+        if (not isinstance(recorded_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", recorded_hash)
+                or not source_path.is_file() or source_path.is_symlink()):
+            raise ReportError("J29.4 source file hash is malformed or references an unsafe path")
+        actual_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        if recorded_hash != actual_hash:
+            raise ReportError(f"J29.4 source file changed after measurement: {relative}")
+        source_digest.update(relative.encode("utf-8"))
+        source_digest.update(b"\0")
+        source_digest.update(recorded_hash.encode("ascii"))
+        source_digest.update(b"\0")
+    if report.get("source_sha256") != source_digest.hexdigest():
+        raise ReportError("J29.4 aggregate source SHA-256 does not match its file manifest")
+
+    reserve = report.get("recovery_reserve")
+    reserve_fields = (
+        "requests", "queued", "operations", "scanners", "cleanup", "queued_bytes",
+        "memory_bytes", "expiry_worker_memory_bytes", "expiry_worker_read_physical_rows",
+        "expiry_worker_read_cell_bytes",
+    )
+    if (not isinstance(reserve, dict) or reserve.get("scope") != "configured-per-table-group"
+            or reserve.get("runtime_usage_peak_measured") is not False):
+        raise ReportError("J29.4 recovery reserve is missing or overstates runtime measurements")
+    for field in reserve_fields:
+        minimum = 0 if field in {"queued", "queued_bytes"} else 1
+        value = reserve.get(field)
+        if type(value) is not int or value < minimum:
+            raise ReportError("J29.4 recovery reserve values are incomplete or invalid")
+
+    layouts = report.get("layouts")
+    if not isinstance(layouts, list) or len(layouts) != 2:
+        raise ReportError("J29.4 must include exactly two HBase layout runs")
+    observed_layouts: set[str] = set()
+    for layout_report in layouts:
+        if not isinstance(layout_report, dict):
+            raise ReportError("J29.4 layout evidence is malformed")
+        layout = layout_report.get("layout")
+        rows = layout_report.get("concurrency")
+        if layout not in {"HISTORY", "NATIVE"} or layout in observed_layouts:
+            raise ReportError("J29.4 layout is missing, duplicated, or unsupported")
+        observed_layouts.add(layout)
+        if not isinstance(rows, list) or len(rows) != 3:
+            raise ReportError("J29.4 concurrency evidence must contain three rows per layout")
+        if [row.get("concurrency") if isinstance(row, dict) else None for row in rows] != [1, 2, 4]:
+            raise ReportError("J29.4 concurrency levels must be 1, 2, and 4 in order")
+        for row in rows:
+            if row.get("layout") != layout:
+                raise ReportError("J29.4 row layout differs from its parent evidence")
+            for field in (
+                "concurrency", "iterations_per_worker", "elapsed_nanos", "keepalive_requests",
+                "keepalive_responses", "selected_renewals", "business_puts", "combined_operations",
+                "keepalive_client_rpc_p99_samples", "owner_queue_wait_samples",
+                "owner_queue_wait_total_nanos", "owner_queue_wait_mean_nanos",
+                "renewal_logical_hbase_client_operations", "renewal_logical_hbase_request_payload_bytes",
+                "unknown_outcomes", "request_proto_bytes", "response_proto_bytes",
+            ):
+                value = row.get(field)
+                minimum = 1 if field in {
+                    "concurrency", "elapsed_nanos", "keepalive_requests", "keepalive_responses",
+                    "selected_renewals", "business_puts", "combined_operations",
+                    "keepalive_client_rpc_p99_samples", "owner_queue_wait_samples",
+                    "renewal_logical_hbase_client_operations", "renewal_logical_hbase_request_payload_bytes",
+                    "request_proto_bytes", "response_proto_bytes",
+                } else 0
+                if type(value) is not int or value < minimum:
+                    raise ReportError(f"J29.4 metric {field} is missing or invalid")
+            requests = row["keepalive_requests"]
+            puts = row["business_puts"]
+            if (row["keepalive_responses"] != requests or row["selected_renewals"] != requests
+                    or row["owner_queue_wait_samples"] != requests
+                    or row["keepalive_client_rpc_p99_samples"] != requests
+                    or puts != requests or row["combined_operations"] != requests + puts
+                    or row["unknown_outcomes"] != 0):
+                raise ReportError("J29.4 workload counts contradict the observed RPCs")
+            if row["owner_queue_wait_mean_nanos"] != row["owner_queue_wait_total_nanos"] // requests:
+                raise ReportError("J29.4 owner queue mean contradicts its sample count and total")
+            if row["run_mode"] == "fixed-iterations":
+                if row["concurrency"] == 4 or row["iterations_per_worker"] != 24:
+                    raise ReportError("J29.4 fixed workload profile changed")
+                if requests != row["concurrency"] * row["iterations_per_worker"]:
+                    raise ReportError("J29.4 fixed workload did not complete all worker iterations")
+            elif row["run_mode"] == "until-expiry-revocation":
+                if row["concurrency"] != 4 or row["iterations_per_worker"] != 0:
+                    raise ReportError("J29.4 expiry overlap profile changed")
+                _validate_j29_4_expiry(row.get("expiry"))
+            else:
+                raise ReportError("J29.4 workload run mode is unsupported")
+            _validate_j29_4_latency(row.get("keepalive_client_rpc_latency_nanos"), requests)
+            _validate_j29_4_latency(row.get("business_put_client_rpc_latency_nanos"), puts)
+            for field, expected in (
+                ("logical_hbase_operations_per_renewal",
+                 row["renewal_logical_hbase_client_operations"] / requests),
+                ("logical_hbase_request_payload_bytes_per_renewal",
+                 row["renewal_logical_hbase_request_payload_bytes"] / requests),
+            ):
+                value = row.get(field)
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(value) or not math.isclose(value, expected, rel_tol=1e-12)):
+                    raise ReportError(f"J29.4 metric {field} contradicts the recorded totals")
+
+    if observed_layouts != {"HISTORY", "NATIVE"}:
+        raise ReportError("J29.4 does not cover both HBase layouts")
+
+    takeover = report.get("owner_takeover")
+    if (not isinstance(takeover, dict)
+            or takeover.get("scenario") != "two-runtime-mtls-owner-takeover"
+            or takeover.get("new_owner") != "owner-b"):
+        raise ReportError("J29.4 two-runtime owner takeover evidence is missing")
+    old_epoch = takeover.get("old_owner_epoch")
+    new_epoch = takeover.get("new_owner_epoch")
+    elapsed_millis = takeover.get("elapsed_millis")
+    if (type(old_epoch) is not int or old_epoch < 1 or type(new_epoch) is not int
+            or new_epoch <= old_epoch or type(elapsed_millis) is not int or elapsed_millis < 0):
+        raise ReportError("J29.4 owner takeover epoch or elapsed time is invalid")
+    return {"layouts": sorted(observed_layouts), "concurrency": [1, 2, 4],
+            "owner_takeover_millis": elapsed_millis}
+
+
+def _validate_j29_4_latency(value: object, expected_samples: int) -> None:
+    if not isinstance(value, dict) or value.get("samples") != expected_samples:
+        raise ReportError("J29.4 RPC latency sample count is missing or inconsistent")
+    samples = [value.get(field) for field in ("p50_nanos", "p95_nanos", "p99_nanos")]
+    if any(type(sample) is not int or sample < 0 for sample in samples):
+        raise ReportError("J29.4 RPC latency percentile is invalid")
+    if not samples[0] <= samples[1] <= samples[2]:
+        raise ReportError("J29.4 RPC latency percentiles are out of order")
+
+
+def _validate_j29_4_expiry(value: object) -> None:
+    fields = (
+        "active_workers_at_revoke", "revocations", "stale_candidates", "candidates",
+        "scan_rows", "scan_bytes", "retries", "trusted_delay_samples",
+        "missing_trusted_delay_samples", "trusted_delay_total_millis",
+        "observed_deadline_to_revoke_millis", "owner_epoch", "checkpoint_sequence",
+        "window_stop_exclusive",
+    )
+    if not isinstance(value, dict) or value.get("expired_during_mixed_load") is not True:
+        raise ReportError("J29.4 expiry was not observed during the mixed workload")
+    for field in fields:
+        raw = value.get(field)
+        minimum = 1 if field in {
+            "active_workers_at_revoke", "revocations", "stale_candidates", "candidates",
+            "scan_rows", "owner_epoch", "checkpoint_sequence",
+        } else 0
+        if type(raw) is not int or raw < minimum:
+            raise ReportError(f"J29.4 expiry metric {field} is missing or invalid")
+    if value["trusted_delay_samples"] + value["missing_trusted_delay_samples"] != value["revocations"]:
+        raise ReportError("J29.4 expiry delay sample accounting is inconsistent")
 
 
 def validate_artifact(repository: Path, artifact: Path, registry: dict[str, object]) -> dict[str, object]:
@@ -1438,6 +1792,7 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
     _validate_native_evidence(evidence_root, run, task, suite_hash, prefix_hash)
     layouts = _validate_target_evidence(evidence_root, run, task, suite_hash, prefix_hash)
     _validate_comparison_evidence(evidence_root, task)
+    j29_4 = _validate_j29_4_evidence(repository, evidence_root, run) if task["id"] == "J43" else None
     summary = {
         "task": run["tasks"][0],
         "run_id": run_id,
@@ -1451,6 +1806,10 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
     }
     if task["id"] == "J42":
         summary.update(_validate_j42_runtime_metrics(artifact))
+    if j29_4 is not None:
+        summary["j29_4_layouts"] = j29_4["layouts"]
+        summary["j29_4_concurrency"] = j29_4["concurrency"]
+        summary["owner_takeover_millis"] = j29_4["owner_takeover_millis"]
     return summary
 
 

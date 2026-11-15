@@ -9,6 +9,7 @@ public final class CommitState {
   public static final int FORMAT_VERSION = 1;
   public static final int AUXILIARY_FORMAT_VERSION = 2;
   public static final int LEASE_BINDING_FORMAT_VERSION = 3;
+  public static final int LEASE_EXPIRY_FORMAT_VERSION = 4;
   public static final int MAX_OWNER_INSTANCE_BYTES = 128;
 
   private final ByteKey profileFingerprint;
@@ -41,7 +42,8 @@ public final class CommitState {
     this.ownerInstance = Objects.requireNonNull(ownerInstance, "ownerInstance");
     this.publication = Objects.requireNonNull(publication, "publication");
     if (formatVersion != FORMAT_VERSION && formatVersion != AUXILIARY_FORMAT_VERSION
-        && formatVersion != LEASE_BINDING_FORMAT_VERSION) {
+        && formatVersion != LEASE_BINDING_FORMAT_VERSION
+        && formatVersion != LEASE_EXPIRY_FORMAT_VERSION) {
       throw new IllegalArgumentException("unknown commit control format");
     }
     this.formatVersion = formatVersion;
@@ -97,6 +99,7 @@ public final class CommitState {
   public int formatVersion() { return formatVersion; }
   public boolean supportsAuxiliaryRecords() { return formatVersion >= AUXILIARY_FORMAT_VERSION; }
   public boolean supportsLeaseBindings() { return formatVersion >= LEASE_BINDING_FORMAT_VERSION; }
+  public boolean supportsLeaseExpiryCheckpoints() { return formatVersion >= LEASE_EXPIRY_FORMAT_VERSION; }
   public ByteKey profileFingerprint() { return profileFingerprint; }
   public Optional<String> ownerInstance() { return ownerInstance; }
   public long ownerEpoch() { return ownerEpoch; }
@@ -130,6 +133,20 @@ public final class CommitState {
       throw new IllegalStateException("control state cannot enable Lease bindings while work is pending");
     }
     return new CommitState(LEASE_BINDING_FORMAT_VERSION, profileFingerprint, ownerInstance,
+        Math.addExact(ownerEpoch, 1), ownerLeaseDeadlineEpochMillis, nextStateVersion(),
+        publishedSequence, publishedRevision, finalizedSequence, finalizedRevision,
+        publication, compactRevision);
+  }
+
+  /** Fences J41 owners before J43 persists expiry checkpoints and runs automatic revocation. */
+  public CommitState upgradeLeaseExpiryFormat(
+      String expectedOwner, long expectedEpoch, long nowMillis) {
+    requireOwner(expectedOwner, expectedEpoch);
+    if (formatVersion != LEASE_BINDING_FORMAT_VERSION || publication.isPresent()
+        || ownerLeaseExpired(nowMillis)) {
+      throw new IllegalStateException("control state cannot enable Lease expiry while work is pending");
+    }
+    return new CommitState(LEASE_EXPIRY_FORMAT_VERSION, profileFingerprint, ownerInstance,
         Math.addExact(ownerEpoch, 1), ownerLeaseDeadlineEpochMillis, nextStateVersion(),
         publishedSequence, publishedRevision, finalizedSequence, finalizedRevision,
         publication, compactRevision);

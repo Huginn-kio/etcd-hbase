@@ -1,6 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.lease.LeaseExpiryStepCommand;
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -12,8 +13,13 @@ public final class MutationOperationEnvelope {
   private static final byte[] LEASE_GRANT_V1 = {0, 'L', 'G', 1};
   private static final byte[] LEASE_EXPIRE_EMPTY_V1 = {0, 'L', 'E', 1};
   private static final byte[] LEASE_KEEP_ALIVE_V1 = {0, 'L', 'K', 1};
+  private static final byte[] LEASE_REVOKE_V1 = {0, 'L', 'R', 1};
+  private static final byte[] LEASE_EXPIRY_STEP_V1 = {0, 'L', 'X', 1};
 
-  public enum Kind { PUT, TRANSACTION, DELETE_RANGE, LEASE_GRANT, LEASE_EXPIRE_EMPTY, LEASE_KEEP_ALIVE }
+  public enum Kind {
+    PUT, TRANSACTION, DELETE_RANGE, LEASE_GRANT, LEASE_EXPIRE_EMPTY, LEASE_KEEP_ALIVE,
+    LEASE_REVOKE, LEASE_EXPIRY_STEP
+  }
 
   private MutationOperationEnvelope() {}
 
@@ -31,6 +37,15 @@ public final class MutationOperationEnvelope {
 
   public static ByteKey leaseKeepAlive(byte[] payload) {
     return tagged(LEASE_KEEP_ALIVE_V1, payload);
+  }
+
+  public static ByteKey leaseRevoke(byte[] payload) {
+    return tagged(LEASE_REVOKE_V1, payload);
+  }
+
+  /** Internal bounded command carrying an expected checkpoint and one scan result. */
+  public static ByteKey leaseExpiryStep(byte[] payload) {
+    return tagged(LEASE_EXPIRY_STEP_V1, payload);
   }
 
   /** Encodes an internal empty-Lease expiry candidate identity, not an etcd wire RPC. */
@@ -74,6 +89,15 @@ public final class MutationOperationEnvelope {
       return Kind.LEASE_EXPIRE_EMPTY;
     }
     if (Arrays.equals(LEASE_KEEP_ALIVE_V1, prefix)) return Kind.LEASE_KEEP_ALIVE;
+    if (Arrays.equals(LEASE_REVOKE_V1, prefix)) return Kind.LEASE_REVOKE;
+    if (Arrays.equals(LEASE_EXPIRY_STEP_V1, prefix)) {
+      if (bytes.length <= LEASE_EXPIRY_STEP_V1.length) {
+        throw new IllegalArgumentException("empty Lease expiry step envelope");
+      }
+      LeaseExpiryStepCommand.decode(ByteKey.copyOf(
+          Arrays.copyOfRange(bytes, LEASE_EXPIRY_STEP_V1.length, bytes.length)));
+      return Kind.LEASE_EXPIRY_STEP;
+    }
     throw new IllegalArgumentException("unsupported mutation operation envelope");
   }
 
@@ -109,5 +133,32 @@ public final class MutationOperationEnvelope {
     }
     byte[] bytes = operation.bytes();
     return Arrays.copyOfRange(bytes, LEASE_KEEP_ALIVE_V1.length, bytes.length);
+  }
+
+  public static byte[] leaseRevokeBytes(ByteKey operation) {
+    if (kind(operation) != Kind.LEASE_REVOKE) {
+      throw new IllegalArgumentException("operation is not a Lease Revoke");
+    }
+    return payload(operation, LEASE_REVOKE_V1);
+  }
+
+  public static byte[] leaseExpiryStepBytes(ByteKey operation) {
+    if (kind(operation) != Kind.LEASE_EXPIRY_STEP) {
+      throw new IllegalArgumentException("operation is not a Lease expiry step");
+    }
+    return payload(operation, LEASE_EXPIRY_STEP_V1);
+  }
+
+  private static byte[] payload(ByteKey operation, byte[] tag) {
+    byte[] bytes = operation.bytes();
+    return Arrays.copyOfRange(bytes, tag.length, bytes.length);
+  }
+
+  private static boolean startsWith(byte[] bytes, byte[] prefix) {
+    if (bytes.length < prefix.length) return false;
+    for (int index = 0; index < prefix.length; index++) {
+      if (bytes[index] != prefix[index]) return false;
+    }
+    return true;
   }
 }

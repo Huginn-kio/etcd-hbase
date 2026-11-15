@@ -21,9 +21,11 @@ import io.etcdhbase.core.commit.ResultIdentity;
 import io.etcdhbase.core.commit.ResultPage;
 import io.etcdhbase.core.commit.ResultPreparation;
 import io.etcdhbase.core.commit.ResultRepository;
+import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.lease.LeaseGrantResult;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.request.RequestScope;
@@ -47,19 +49,23 @@ class LeaseGrantPreparationTest {
     try (Fixture fixture = new Fixture()) {
       AtomicBoolean readFinished = new AtomicBoolean();
       var sealed = fixture.preparation.prepare(fixture.invocation, fixture.state,
-          fixture.scope, fixture.account, () -> {
+          fixture.checkpoint, fixture.scope, fixture.account, () -> {
             readFinished.set(true);
             return CompletableFuture.completedFuture(null);
           }).join();
       assertTrue(readFinished.get());
       assertEquals(InvocationBinding.State.SEALED, sealed.invocation().state());
       assertFalse(sealed.manifest().containsKeyChanges());
-      assertEquals(3, sealed.manifest().auxiliaryReference().orElseThrow().itemCount());
+      assertEquals(4, sealed.manifest().auxiliaryReference().orElseThrow().itemCount());
       assertTrue(sealed.manifest().resultReference().isPresent());
-      assertEquals(3, fixture.records.size());
+      assertEquals(4, fixture.records.size());
       var stateRecord = fixture.records.values().stream()
           .filter(record -> record.ordinal() == 0).findFirst().orElseThrow();
       assertEquals(fixture.state, LeaseStateMessages.decode(stateRecord.payload()));
+      var checkpointRecord = fixture.records.values().stream()
+          .filter(record -> record.targetType() == SystemRecordType.LEASE_EXPIRY_CHECKPOINT)
+          .findFirst().orElseThrow();
+      assertEquals(fixture.checkpoint, LeaseExpiryCheckpoint.decode(checkpointRecord.payload()));
       assertEquals(new LeaseGrantResult(-7, 30, 1),
           LeaseGrantResultMessages.decode(ByteKey.copyOf(fixture.results.page.payload())));
     }
@@ -69,7 +75,7 @@ class LeaseGrantPreparationTest {
   void failedReadProtectionDoesNotSealOrAdvanceInvocation() throws Exception {
     try (Fixture fixture = new Fixture()) {
       assertThrows(CompletionException.class, () -> fixture.preparation.prepare(
-          fixture.invocation, fixture.state, fixture.scope, fixture.account,
+          fixture.invocation, fixture.state, fixture.checkpoint, fixture.scope, fixture.account,
           () -> CompletableFuture.failedFuture(new IllegalStateException("lost pin"))).join());
       assertEquals(0, fixture.seals);
       assertEquals(InvocationBinding.State.PREPARING, fixture.current.get().state());
@@ -104,6 +110,8 @@ class LeaseGrantPreparationTest {
     private final InvocationBinding invocation = InvocationBinding.begin(InvocationId.create(),
         ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]), TransactionId.create(), 1, 0, 1);
     private final LeaseState state = LeaseState.grant(new LeaseIdentity(-7, 1), 30, 40_000, 1);
+    private final LeaseExpiryCheckpoint checkpoint = new LeaseExpiryCheckpoint(1, 1, 4,
+        0, 0, new LeaseExpiryCheckpoint.Position(0, 1, 0, Optional.empty()));
     private final AtomicReference<InvocationBinding> current = new AtomicReference<>(invocation);
     private final Map<ByteKey, PreparedAuxiliaryRecord> records = new ConcurrentHashMap<>();
     private final Map<ByteKey, AuxiliaryPage> pages = new ConcurrentHashMap<>();

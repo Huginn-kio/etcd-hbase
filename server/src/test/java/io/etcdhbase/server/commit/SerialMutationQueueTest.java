@@ -8,6 +8,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
@@ -154,6 +156,103 @@ class SerialMutationQueueTest {
       activeWork.complete("finish");
       activeScope.close();
       rejectedScope.close();
+      closeAndAssertDrained(queue);
+    }
+  }
+
+  @Test
+  void reservedControlSlotAcceptsRevocationBehindAnActiveMutation() throws Exception {
+    var queue = new SerialMutationQueue(0, 100, 1, 100, Duration.ofSeconds(10));
+    var activeScope = RequestScope.withoutDeadline();
+    var reservedScope = RequestScope.withoutDeadline();
+    var fullReservedScope = RequestScope.withoutDeadline();
+    var regularScope = RequestScope.withoutDeadline();
+    var activeWork = new CompletableFuture<String>();
+    var activeStarted = new CountDownLatch(1);
+    var reservedStarted = new CountDownLatch(1);
+    try {
+      var active = queue.submit(10, activeScope, ignored -> {
+        activeStarted.countDown();
+        return activeWork;
+      });
+      assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
+      assertCategory(BackendFailure.Category.RESOURCE_LIMIT,
+          queue.submit(10, regularScope, ignored -> CompletableFuture.completedFuture("rejected")));
+      var reserved = queue.submitReserved(10, reservedScope, ignored -> {
+        reservedStarted.countDown();
+        return CompletableFuture.completedFuture("revoke");
+      });
+      assertCategory(BackendFailure.Category.RESOURCE_LIMIT,
+          queue.submitReserved(10, fullReservedScope,
+              ignored -> CompletableFuture.completedFuture("over-reserved")));
+      assertEquals(1, queue.snapshot().waiting());
+      assertEquals(20, queue.snapshot().retainedBytes());
+
+      activeWork.complete("mutation");
+      assertEquals("mutation", active.get(5, TimeUnit.SECONDS));
+      assertTrue(reservedStarted.await(5, TimeUnit.SECONDS));
+      assertEquals("revoke", reserved.get(5, TimeUnit.SECONDS));
+      assertEquals(0, queue.snapshot().retainedBytes());
+    } finally {
+      activeWork.complete("finish");
+      activeScope.close();
+      reservedScope.close();
+      fullReservedScope.close();
+      regularScope.close();
+      closeAndAssertDrained(queue);
+    }
+  }
+
+  @Test
+  void controlAndRegularWorkAlternateWhenBothQueuesRemainPopulated() throws Exception {
+    var queue = new SerialMutationQueue(2, 100, 2, 100, Duration.ofSeconds(10));
+    var activeScope = RequestScope.withoutDeadline();
+    var regularScope = RequestScope.withoutDeadline();
+    var firstReservedScope = RequestScope.withoutDeadline();
+    var secondReservedScope = RequestScope.withoutDeadline();
+    var activeWork = new CompletableFuture<String>();
+    var firstReservedWork = new CompletableFuture<String>();
+    var order = java.util.Collections.synchronizedList(new ArrayList<String>());
+    var activeStarted = new CountDownLatch(1);
+    var firstReservedStarted = new CountDownLatch(1);
+    var secondReservedStarted = new CountDownLatch(1);
+    try {
+      var active = queue.submit(10, activeScope, ignored -> {
+        order.add("active");
+        activeStarted.countDown();
+        return activeWork;
+      });
+      assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
+      var regular = queue.submit(10, regularScope, ignored -> {
+        order.add("regular");
+        return CompletableFuture.completedFuture("regular");
+      });
+      var firstReserved = queue.submitReserved(10, firstReservedScope, ignored -> {
+        order.add("reserved-1");
+        firstReservedStarted.countDown();
+        return firstReservedWork;
+      });
+      activeWork.complete("active");
+      assertEquals("active", active.get(5, TimeUnit.SECONDS));
+      assertTrue(firstReservedStarted.await(5, TimeUnit.SECONDS));
+      var secondReserved = queue.submitReserved(10, secondReservedScope, ignored -> {
+        order.add("reserved-2");
+        secondReservedStarted.countDown();
+        return CompletableFuture.completedFuture("reserved-2");
+      });
+      firstReservedWork.complete("reserved-1");
+      assertEquals("reserved-1", firstReserved.get(5, TimeUnit.SECONDS));
+      assertEquals("regular", regular.get(5, TimeUnit.SECONDS));
+      assertTrue(secondReservedStarted.await(5, TimeUnit.SECONDS));
+      assertEquals("reserved-2", secondReserved.get(5, TimeUnit.SECONDS));
+      assertEquals(List.of("active", "reserved-1", "regular", "reserved-2"), order);
+    } finally {
+      activeWork.complete("finish");
+      firstReservedWork.complete("finish");
+      activeScope.close();
+      regularScope.close();
+      firstReservedScope.close();
+      secondReservedScope.close();
       closeAndAssertDrained(queue);
     }
   }

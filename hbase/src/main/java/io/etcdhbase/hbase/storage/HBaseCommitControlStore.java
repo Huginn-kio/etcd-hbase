@@ -32,17 +32,21 @@ public final class HBaseCommitControlStore implements CommitControlStore {
   private final SystemTableBinding binding;
   private final boolean auxiliarySupported;
   private final boolean leaseBindingsSupported;
+  private final boolean leaseExpiryCheckpointsSupported;
 
   private HBaseCommitControlStore(AsyncConnection connection, SystemTableBinding binding,
-      boolean auxiliarySupported, boolean leaseBindingsSupported) {
+      boolean auxiliarySupported, boolean leaseBindingsSupported,
+      boolean leaseExpiryCheckpointsSupported) {
     this.connection = connection;
     this.binding = binding;
     this.auxiliarySupported = auxiliarySupported;
     this.leaseBindingsSupported = leaseBindingsSupported;
+    this.leaseExpiryCheckpointsSupported = leaseExpiryCheckpointsSupported;
   }
 
   public boolean supportsAuxiliary() { return auxiliarySupported; }
   public boolean supportsLeaseBindings() { return leaseBindingsSupported; }
+  public boolean supportsLeaseExpiryCheckpoints() { return leaseExpiryCheckpointsSupported; }
 
   public static CompletableFuture<HBaseCommitControlStore> open(
       HBaseConnectionFactory factory,
@@ -55,7 +59,8 @@ public final class HBaseCommitControlStore implements CommitControlStore {
             .thenApply(descriptor -> {
               binding.validate(descriptor);
               return new HBaseCommitControlStore(connection, binding,
-                  binding.supportsAuxiliary(descriptor), binding.supportsLeaseBindings(descriptor));
+                  binding.supportsAuxiliary(descriptor), binding.supportsLeaseBindings(descriptor),
+                  binding.supportsLeaseExpiryCheckpoints(descriptor));
             }))).exceptionallyCompose(failure -> failed(failure));
   }
 
@@ -77,6 +82,7 @@ public final class HBaseCommitControlStore implements CommitControlStore {
         || initialState.finalizedSequence() != 0 || initialState.compactRevision() != 0
         || initialState.supportsAuxiliaryRecords() && !auxiliarySupported
         || initialState.supportsLeaseBindings() && !leaseBindingsSupported
+        || initialState.supportsLeaseExpiryCheckpoints() && !leaseExpiryCheckpointsSupported
         || initialState.publication().isPresent()) {
       return CompletableFuture.failedFuture(new IllegalArgumentException(
           "control initialization requires a fenced empty initial state"));
@@ -116,7 +122,13 @@ public final class HBaseCommitControlStore implements CommitControlStore {
             && auxiliarySupported && leaseBindingsSupported && state.ownerInstance().isPresent()
             && Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
                 state.upgradeLeaseBindingFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0)));
-        if (!auxiliaryUpgrade && !leaseBindingUpgrade) {
+        boolean leaseExpiryUpgrade = state.formatVersion() == CommitState.LEASE_BINDING_FORMAT_VERSION
+            && replacement.formatVersion() == CommitState.LEASE_EXPIRY_FORMAT_VERSION
+            && auxiliarySupported && leaseBindingsSupported && leaseExpiryCheckpointsSupported
+            && state.ownerInstance().isPresent()
+            && Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
+                state.upgradeLeaseExpiryFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0)));
+        if (!auxiliaryUpgrade && !leaseBindingUpgrade && !leaseExpiryUpgrade) {
           return CompletableFuture.failedFuture(new IllegalArgumentException("invalid control format upgrade"));
         }
       } catch (IllegalArgumentException | IllegalStateException | ArithmeticException failure) {

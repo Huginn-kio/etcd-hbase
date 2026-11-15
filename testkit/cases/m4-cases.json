@@ -760,7 +760,118 @@
         ],
         "compare_logs": ["keepalive-history.log", "keepalive-native.log"]
       }
+    },
+    {
+      "id": "J43",
+      "artifact_subdir": "j43",
+      "api_ids": ["L01", "L03", "L04", "L05", "P01", "R01"],
+      "scenario": "m4-lease-revoke-v1",
+      "manifest": "m4-lease-revoke.yaml",
+      "trace_cases": [
+        {"id": "native-baseline", "api_id": "L05", "method": "etcdserverpb.Lease/LeaseLeases"},
+        {"id": "revoke-grant-bound", "api_id": "L01", "method": "etcdserverpb.Lease/LeaseGrant"},
+        {"id": "revoke-put-bound-key-a", "api_id": "P01", "method": "etcdserverpb.KV/Put"},
+        {"id": "revoke-put-bound-key-b", "api_id": "P01", "method": "etcdserverpb.KV/Put"},
+        {"id": "revoke-range-before-a", "api_id": "R01", "method": "etcdserverpb.KV/Range"},
+        {"id": "revoke-range-before-b", "api_id": "R01", "method": "etcdserverpb.KV/Range"},
+        {"id": "revoke-bound", "api_id": "L03", "method": "etcdserverpb.Lease/LeaseRevoke"},
+        {"id": "revoke-range-after-a", "api_id": "R01", "method": "etcdserverpb.KV/Range"},
+        {"id": "revoke-range-after-b", "api_id": "R01", "method": "etcdserverpb.KV/Range"},
+        {"id": "revoke-ttl-after", "api_id": "L04", "method": "etcdserverpb.Lease/LeaseTimeToLive"},
+        {"id": "revoke-missing", "api_id": "L03", "method": "etcdserverpb.Lease/LeaseRevoke"},
+        {"id": "revoke-grant-empty", "api_id": "L01", "method": "etcdserverpb.Lease/LeaseGrant"},
+        {"id": "revoke-empty", "api_id": "L03", "method": "etcdserverpb.Lease/LeaseRevoke"},
+        {"id": "revoke-empty-ttl", "api_id": "L04", "method": "etcdserverpb.Lease/LeaseTimeToLive"},
+        {"id": "expiry-grant", "api_id": "L01", "method": "etcdserverpb.Lease/LeaseGrant"},
+        {"id": "expiry-put-bound-key-a", "api_id": "P01", "method": "etcdserverpb.KV/Put"},
+        {"id": "expiry-put-bound-key-b", "api_id": "P01", "method": "etcdserverpb.KV/Put"},
+        {"id": "expiry-range-before-a", "api_id": "R01", "method": "etcdserverpb.KV/Range"},
+        {"id": "expiry-range-before-b", "api_id": "R01", "method": "etcdserverpb.KV/Range"},
+        {"id": "expiry-ttl-after", "api_id": "L04", "method": "etcdserverpb.Lease/LeaseTimeToLive"},
+        {"id": "expiry-range-after-a", "api_id": "R01", "method": "etcdserverpb.KV/Range"},
+        {"id": "expiry-range-after-b", "api_id": "R01", "method": "etcdserverpb.KV/Range"}
+      ],
+      "go_tests": [
+        {"package": "cmd/m4driver", "tests": [
+          "TestRunNativeLeaseRevokeWritesFreshTraceAndVerifiableMetadata",
+          "TestCompareRevokeRejectsCorruptOrEmptyTrace"
+        ]},
+        {"package": "internal/scenario", "tests": [
+          "TestM4LeaseRevokeScenarioMatchesItsPinnedNativeOracle",
+          "TestLoadM4LeaseRevokeSuiteRejectsMissingOrChangedCoverage"
+        ]},
+        {"package": "internal/compare", "tests": [
+          "TestCompareM4LeaseRevokeRequiresOneRevisionForAllBoundKeys",
+          "TestCompareM4LeaseRevokeRejectsChangedTerminalState"
+        ]},
+        {"package": "internal/trace", "tests": [
+          "TestReadJSONLRejectsInvalidOrderingAndSecrets",
+          "TestStreamTerminalCannotContradictItsOutcome"
+        ]}
+      ],
+      "maven_tests": [
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.lease.LeaseExpiryCheckpointTest", "tests": [
+          "closedWindowIncludesDeadlineEqualToTrustedLowerBound",
+          "rejectsSkippedBucketsAndHorizonExtensionBeforeTheActiveWindowIsComplete",
+          "scanStepsMustAdvanceButLeaseMutationsMayRetainTheCursor"
+        ]},
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.lease.LeaseExpiryStepCommandTest", "tests": [
+          "roundTripsInitialAndCurrentCheckpointRequests",
+          "rejectsNegativeSequenceAndMalformedEncoding"
+        ]},
+        {"module": "hbase", "kind": "failsafe", "class": "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT", "tests": [
+          "seeksLatestExpiryCheckpointAtTheReadBarrier"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest", "tests": [
+          "wallClockStepPausesTrustedTimeUntilTheClockReturnsToItsMonotonicTrajectory",
+          "backwardWallClockStepAlsoPausesUntilTheClockCatchesUp",
+          "rejectsMonotonicRegressionAndWallTimeOverflow"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.LeaseExpiryStepExecutorTest", "tests": [
+          "scanUsesItsPinnedSequenceToCoverCandidatesWrittenAfterThePriorCheckpoint",
+          "candidateSequenceCannotBeZeroOrUseANegativeBarrier",
+          "expiryPageBudgetRemainsReservedUntilThePhysicalScanDrains",
+          "synchronousScanFailureReleasesPageBudgetAfterScopeDrain"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.LeaseExpiryWorkerTest", "tests": [
+          "successfulCloseWaitsForBothCleanupAndPhysicalProducerCompletion",
+          "staleExpiryWorkerDoesNotForwardAfterOwnerChangesDuringCheckpointRead",
+          "cleanupExecutorRejectionStillWaitsForPhysicalProducerDrain",
+          "asynchronousCheckpointReadFailureClosesPreviouslyEstablishedOwnerReadiness",
+          "healthyStandbyWorkerSignalsInitialReadinessWithoutAnOwnerCheckpoint"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.LeaseRevocationExecutorTest", "tests": [
+          "unhealthyClockAtSelectionRejectsAnEarlierExpiryObservation",
+          "lowerBoundBeforeDeadlineRejectsAnEarlierExpiryObservation",
+          "healthyLowerBoundAtDeadlineAllowsExpirySelection"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.LeaseRenewalExecutorTest", "tests": [
+          "expiredActiveLeaseUsesTheAtomicRevocationResultForKeepAlive",
+          "failedExpiryRevocationCannotTurnIntoASuccessfulKeepAliveResponse"
+        ]},
+        {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseKeepAliveRpcIT", "tests": [
+          "expiredActiveLeaseIsRejectedUntilDurableRevocation"
+        ]},
+        {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseRevokeRpcIT", "tests": [
+          "realGoLeaseRevokeMatchesNativeAcrossLayouts",
+          "expiryCheckpointResumesAfterRuntimeRestart",
+          "revokeAndKeepAliveRaceHasOneDurableTerminalOutcome",
+          "staleExpiryCandidatesPreserveReboundAndUnleasedRecreatedKeys",
+          "largeLeaseRevokeDeletesEveryBindingInOneRevision"
+        ]},
+        {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4MixedLeaseBenchmarkIT", "tests": [
+          "emitsMixedLeaseLoadEvidenceAtIncreasingConcurrency"
+        ]}
+      ],
+      "evidence": {
+        "native": {"scope": "native-etcd", "layout": "", "embedded_native": true},
+        "targets": [
+          {"scope": "target-hbase", "layout": "HISTORY", "embedded_native": false},
+          {"scope": "target-hbase", "layout": "NATIVE", "embedded_native": false}
+        ],
+        "compare_logs": ["revoke-history.log", "revoke-native.log"]
+      }
     }
   ],
-  "pending_tasks": ["J43","J44","J45","J46","J47","J29.4"]
+  "pending_tasks": ["J44","J45","J46","J47","J29.4"]
 }

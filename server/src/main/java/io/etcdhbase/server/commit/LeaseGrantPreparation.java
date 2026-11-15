@@ -12,6 +12,7 @@ import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
 import io.etcdhbase.core.lease.LeaseGrantResult;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.request.RequestScope;
@@ -49,10 +50,11 @@ public final class LeaseGrantPreparation {
 
   /** The caller owns the serial lane, fixed view and all service-scope cleanup. */
   public CompletableFuture<Sealed> prepare(InvocationBinding invocation, LeaseState state,
-      RequestScope scope, BudgetManager.Account account,
+      LeaseExpiryCheckpoint checkpoint, RequestScope scope, BudgetManager.Account account,
       Supplier<CompletableFuture<Void>> finishPinnedRead) {
     Objects.requireNonNull(invocation, "invocation");
     Objects.requireNonNull(state, "state");
+    Objects.requireNonNull(checkpoint, "checkpoint");
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(account, "account");
     Objects.requireNonNull(finishPinnedRead, "finishPinnedRead");
@@ -60,19 +62,22 @@ public final class LeaseGrantPreparation {
         || state.status() != LeaseState.Status.ACTIVE || state.renewalGeneration() != 0
         || state.boundKeyCount() != 0 || state.boundKeyBytes() != 0 || state.revokeCostBytes() != 0
         || invocation.baseSequence() == Long.MAX_VALUE
-        || state.sequence() != invocation.baseSequence() + 1) {
+        || state.sequence() != invocation.baseSequence() + 1
+        || checkpoint.ownerEpoch() != invocation.preparedOwnerEpoch()
+        || checkpoint.sequence() != state.sequence()
+        || checkpoint.protectedSequence() != invocation.baseSequence()) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid new Grant preparation"));
     }
     var result = new LeaseGrantResult(state.identity().leaseId(), state.grantedTtlSeconds(),
         invocation.baseRevision());
     return auxiliaryMutations.prepare(invocation,
-        LeaseGrantResultMessages.encode(result), auxiliaryRecords(invocation, state).iterator(),
+        LeaseGrantResultMessages.encode(result), auxiliaryRecords(invocation, state, checkpoint).iterator(),
         finishPinnedRead, scope, account)
         .thenApply(sealed -> new Sealed(sealed.invocation(), sealed.manifest()));
   }
 
   private static List<PreparedAuxiliaryRecord> auxiliaryRecords(
-      InvocationBinding invocation, LeaseState state) {
+      InvocationBinding invocation, LeaseState state, LeaseExpiryCheckpoint checkpoint) {
     long leaseId = state.identity().leaseId();
     long sequence = state.sequence();
     var expiry = new ExpiryCandidateIdentity(state.deadlineEpochMillis(), leaseId,
@@ -86,6 +91,9 @@ public final class LeaseGrantPreparation {
             LeaseRecordIdentity.enumeration(leaseId), new LeaseEnumerationPointer(sequence).encode()),
         PreparedAuxiliaryRecord.create(invocation.transactionId(), invocation.preparedOwnerEpoch(),
             invocation.baseSequence(), 2, SystemRecordType.EXPIRY_CANDIDATE,
-            expiry.encode(), new ExpiryCandidateRecord(sequence).encode()));
+            expiry.encode(), new ExpiryCandidateRecord(sequence).encode()),
+        PreparedAuxiliaryRecord.create(invocation.transactionId(), invocation.preparedOwnerEpoch(),
+            invocation.baseSequence(), 3, SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+            LeaseExpiryCheckpoint.versionIdentity(sequence), checkpoint.encode()));
   }
 }

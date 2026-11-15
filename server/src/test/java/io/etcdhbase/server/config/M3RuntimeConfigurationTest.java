@@ -39,6 +39,7 @@ class M3RuntimeConfigurationTest {
       assertTrue(activation.m4LeaseApiEnabled());
       assertEquals(5, activation.leaseMinTtlSeconds());
       assertEquals(1_000, activation.leaseClockUncertaintyMs());
+      assertEquals(1_000, activation.leaseClockMaxDriftPpm());
       assertEquals(1_024, activation.leaseCostLimits().maximumBindings());
       assertEquals(4L << 20, activation.leaseCostLimits().maximumKeyBytes());
       assertEquals(32L << 20, activation.leaseCostLimits().maximumRevokeCostBytes());
@@ -76,7 +77,7 @@ class M3RuntimeConfigurationTest {
   }
 
   @Test
-  void m4ActivationRequiresExplicitMinimumTtlAndClockBound() {
+  void m4ActivationRequiresExplicitMinimumTtlAndClockBounds() {
     String enabled = valid().replace("\"pin_lease_ms\":60000",
         "\"pin_lease_ms\":60000,\"m4_lease_api_enabled\":true");
     assertThrows(IllegalArgumentException.class, () -> load(enabled));
@@ -84,7 +85,8 @@ class M3RuntimeConfigurationTest {
         "\"m4_lease_api_enabled\":true", "\"m4_lease_api_enabled\":true,\"lease_min_ttl_seconds\":5")));
     assertThrows(IllegalArgumentException.class, () -> load(valid().replace(
         "\"pin_lease_ms\":60000", "\"pin_lease_ms\":60000,\"m4_lease_api_enabled\":true,"
-            + "\"lease_min_ttl_seconds\":5,\"lease_clock_uncertainty_ms\":0")));
+            + "\"lease_min_ttl_seconds\":5,\"lease_clock_uncertainty_ms\":1,"
+            + "\"lease_clock_max_drift_ppm\":0")));
   }
 
   @Test
@@ -107,15 +109,18 @@ class M3RuntimeConfigurationTest {
         "\"pin_lease_ms\":60000,\"m4_lease_api_enabled\":true,"
             + "\"lease_min_ttl_seconds\":5,\"lease_clock_uncertainty_ms\":1000");
     assertThrows(IllegalArgumentException.class, () -> load(enabled));
+    String withClockRate = enabled.replace("\"lease_clock_uncertainty_ms\":1000",
+        "\"lease_clock_uncertainty_ms\":1000,\"lease_clock_max_drift_ppm\":1000");
+    assertThrows(IllegalArgumentException.class, () -> load(withClockRate));
     for (String field : new String[] {"lease_maximum_bindings", "lease_maximum_key_bytes",
         "lease_maximum_revoke_cost_bytes"}) {
-      String withOneLimit = enabled.replace("\"lease_clock_uncertainty_ms\":1000",
-          "\"lease_clock_uncertainty_ms\":1000,\"" + field + "\":1");
+      String withOneLimit = withClockRate.replace("\"lease_clock_max_drift_ppm\":1000",
+          "\"lease_clock_max_drift_ppm\":1000,\"" + field + "\":1");
       assertThrows(IllegalArgumentException.class, () -> load(withOneLimit));
     }
-    assertThrows(IllegalArgumentException.class, () -> load(enabled.replace(
-        "\"lease_clock_uncertainty_ms\":1000",
-        "\"lease_clock_uncertainty_ms\":1000,\"lease_maximum_bindings\":1025,"
+    assertThrows(IllegalArgumentException.class, () -> load(withClockRate.replace(
+        "\"lease_clock_max_drift_ppm\":1000",
+        "\"lease_clock_max_drift_ppm\":1000,\"lease_maximum_bindings\":1025,"
             + "\"lease_maximum_key_bytes\":4194304,\"lease_maximum_revoke_cost_bytes\":33554432")));
   }
 

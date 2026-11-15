@@ -4,6 +4,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.LeaseBindingIdentity;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.spi.salt.SaltStrategy;
 import java.nio.ByteBuffer;
@@ -172,13 +173,22 @@ public final class SystemRecordKeyCodec {
     return new ScanBounds(start, startInclusive, prefixEnd(prefix), false, false);
   }
 
-  /** Reverse-seeks one Lease state history at or below the requested sequence. */
+  /** Reverse-seeks one Lease state or expiry-checkpoint history at the requested sequence. */
   public ScanBounds leaseVersionBounds(SystemRecordType type, ByteKey routePrefix, long sequence) {
-    if (type != SystemRecordType.LEASE_STATE || routePrefix.length() != LeaseRecordIdentity.ROUTE_BYTES
-        || sequence <= 0) {
+    int routeBytes = switch (type) {
+      case LEASE_STATE -> LeaseRecordIdentity.ROUTE_BYTES;
+      case LEASE_EXPIRY_CHECKPOINT -> LeaseExpiryCheckpoint.ROUTE_BYTES;
+      default -> -1;
+    };
+    int identityBytes = switch (type) {
+      case LEASE_STATE -> LeaseRecordIdentity.IDENTITY_BYTES;
+      case LEASE_EXPIRY_CHECKPOINT -> LeaseExpiryCheckpoint.IDENTITY_BYTES;
+      default -> -1;
+    };
+    if (routeBytes < 0 || routePrefix.length() != routeBytes || sequence <= 0) {
       throw new IllegalArgumentException("invalid lease-version seek");
     }
-    return versionBounds(type, routePrefix, sequence, LeaseRecordIdentity.IDENTITY_BYTES);
+    return versionBounds(type, routePrefix, sequence, identityBytes);
   }
 
   /** Reverse-seeks one key's Lease binding history at or below the requested sequence. */
@@ -357,6 +367,11 @@ public final class SystemRecordKeyCodec {
     }
     if (type == SystemRecordType.EXPIRY_CANDIDATE) {
       return ExpiryCandidateIdentity.leaseRoute(ByteKey.copyOf(identity)).bytes();
+    }
+    if (type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT) {
+      long sequence = LeaseExpiryCheckpoint.sequence(ByteKey.copyOf(identity));
+      if (sequence <= 0) throw new IllegalArgumentException("invalid Lease expiry checkpoint sequence");
+      return Arrays.copyOf(identity, LeaseExpiryCheckpoint.ROUTE_BYTES);
     }
     if (type != SystemRecordType.CANDIDATE) return identity;
     if (identity.length <= 16 + Integer.BYTES) {

@@ -3,6 +3,7 @@ package io.etcdhbase.core.commit;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
@@ -92,6 +93,74 @@ public final class LeaseReadView {
     return completion.whenComplete((ignored, failure) -> reader.close()).copy();
   }
 
+  /** Reads the checkpoint version visible at this pinned M2 sequence, including its overlay. */
+  public CompletableFuture<Optional<LeaseExpiryCheckpoint>> expiryCheckpoint(
+      PinnedReadView pinned, RequestScope scope, ManifestCatalog.ProofReadBudget metadataBudget) {
+    Objects.requireNonNull(pinned, "pinned");
+    Objects.requireNonNull(scope, "scope");
+    Objects.requireNonNull(metadataBudget, "metadataBudget");
+    if (!pinned.belongsTo(scope) || !pinned.protectsAuxiliary()
+        || !metadataBudget.belongsTo(scope)) {
+      return CompletableFuture.failedFuture(
+          new IllegalArgumentException("Lease expiry checkpoint requires an auxiliary-protected view"));
+    }
+    PinnedReadView.ReaderLease reader;
+    try {
+      reader = pinned.retainReader();
+    } catch (RuntimeException failure) {
+      return CompletableFuture.failedFuture(failure);
+    }
+    ReadView view = pinned.view();
+    CompletableFuture<Optional<LeaseExpiryCheckpoint>> operation;
+    try {
+      operation = pinned.renew(scope)
+          .thenCompose(ignored -> readStableCheckpoint(view, scope, metadataBudget))
+          .thenCompose(base -> overlayCheckpoint(view, base, pinned, scope, metadataBudget));
+    } catch (RuntimeException | Error failure) {
+      reader.close();
+      if (failure instanceof Error fatal) throw fatal;
+      return CompletableFuture.failedFuture(failure);
+    }
+    return operation.thenApply(value -> {
+      requireActive(pinned, scope);
+      return value;
+    }).whenComplete((ignored, failure) -> reader.close()).copy();
+  }
+
+  private CompletableFuture<Optional<LeaseExpiryCheckpoint>> readStableCheckpoint(
+      ReadView view, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    if (view.finalizedSequence() == 0) return CompletableFuture.completedFuture(Optional.empty());
+    return budget.readMeasured(ManifestCatalog.PROOF_SYSTEM_RECORD_ENVELOPE,
+        value -> value.map(SystemRecordEntry::encodedBytes).orElse(0L),
+        () -> records.latestAtOrBefore(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+            LeaseExpiryCheckpoint.routePrefix(), view.finalizedSequence(), scope))
+        .thenApply(entry -> entry.map(value -> validateCheckpoint(
+            value.identity(), value.value(), view.finalizedSequence())));
+  }
+
+  private CompletableFuture<Optional<LeaseExpiryCheckpoint>> overlayCheckpoint(
+      ReadView view, Optional<LeaseExpiryCheckpoint> base, PinnedReadView pinned,
+      RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    if (view.selectedRoot().isEmpty()
+        || view.selectedRoot().orElseThrow().auxiliaryReference().isEmpty()) {
+      return CompletableFuture.completedFuture(base);
+    }
+    var selected = new java.util.concurrent.atomic.AtomicReference<LeaseExpiryCheckpoint>();
+    return manifests.forEachAuxiliary(view.selectedRoot().orElseThrow(), scope, budget, record -> {
+      requireActive(pinned, scope);
+      if (record.targetType() == SystemRecordType.LEASE_EXPIRY_CHECKPOINT) {
+        LeaseExpiryCheckpoint checkpoint = validateCheckpoint(record.targetIdentity(),
+            record.payload(), view.barrierSequence());
+        if (!record.targetIdentity().equals(
+            LeaseExpiryCheckpoint.versionIdentity(view.barrierSequence()))
+            || !selected.compareAndSet(null, checkpoint)) {
+          throw new IllegalStateException("selected Lease expiry checkpoint is duplicated or out of sequence");
+        }
+      }
+      return CompletableFuture.completedFuture(null);
+    }).thenApply(ignored -> selected.get() == null ? base : Optional.of(selected.get()));
+  }
+
   private CompletableFuture<Optional<LeaseState>> findAtBarrier(
       PinnedReadView pinned, long leaseId, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
     requireActive(pinned, scope);
@@ -152,6 +221,16 @@ public final class LeaseReadView {
       throw new IllegalStateException("lease state differs from its identity or read barrier");
     }
     return state;
+  }
+
+  private LeaseExpiryCheckpoint validateCheckpoint(ByteKey identity, ByteKey payload,
+      long upperSequence) {
+    long sequence = LeaseExpiryCheckpoint.sequence(identity);
+    LeaseExpiryCheckpoint checkpoint = LeaseExpiryCheckpoint.decode(payload);
+    if (sequence > upperSequence || checkpoint.sequence() != sequence) {
+      throw new IllegalStateException("Lease expiry checkpoint differs from its read barrier");
+    }
+    return checkpoint;
   }
 
   private static void requireActive(PinnedReadView pinned, RequestScope scope) {

@@ -58,6 +58,30 @@ class CommitStateTest {
   }
 
   @Test
+  void leaseExpiryUpgradeFencesBindingWritersBeforeEnablingCheckpointProgress() {
+    var bindings = CommitState.initial(FINGERPRINT, 7).claimOwner("owner-a", 10, 100)
+        .upgradeAuxiliaryFormat("owner-a", 1, 11)
+        .upgradeLeaseBindingFormat("owner-a", 2, 12);
+    var expiryEnabled = bindings.upgradeLeaseExpiryFormat("owner-a", 3, 13);
+
+    assertEquals(CommitState.LEASE_EXPIRY_FORMAT_VERSION, expiryEnabled.formatVersion());
+    assertTrue(expiryEnabled.supportsAuxiliaryRecords());
+    assertTrue(expiryEnabled.supportsLeaseBindings());
+    assertTrue(expiryEnabled.supportsLeaseExpiryCheckpoints());
+    assertEquals(4, expiryEnabled.ownerEpoch());
+    assertEquals(bindings.stateVersion() + 1, expiryEnabled.stateVersion());
+    assertEquals(bindings.publishedSequence(), expiryEnabled.publishedSequence());
+    assertEquals(bindings.publishedRevision(), expiryEnabled.publishedRevision());
+    assertThrows(IllegalStateException.class,
+        () -> expiryEnabled.heartbeat("owner-a", 3, 200));
+    assertThrows(IllegalStateException.class,
+        () -> bindings.upgradeLeaseExpiryFormat("owner-a", 2, 13));
+    assertThrows(IllegalStateException.class,
+        () -> bindings.publish(slot(0, 7, false, 3))
+            .upgradeLeaseExpiryFormat("owner-a", 3, 13));
+  }
+
+  @Test
   void metadataOnlyPublicationDoesNotAdvanceRevisionAndKeyChangesAdvanceItOnce() {
     CommitState owned = CommitState.initial(FINGERPRINT, 7).claimOwner("owner-a", 1, 100);
 
