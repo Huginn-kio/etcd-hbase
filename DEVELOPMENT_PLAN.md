@@ -813,7 +813,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J40/J31。
   - 完成标准：Put WithLease 与提交原子性正确；A 换绑 B、删除后重建、旧 generation 和 revoke 竞争均不误删；多角色注册全有或全无。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=代码与公开临时验证完成；负责人=Codex；完成日期=2026-11-14；PR/commit=PR #48（head 见 PR）；验证=M4 J41 public profile passed（Temurin JDK 21、Go 294 项、Java 870 项、39 个原生 trace、HISTORY/NATIVE MiniCluster；最终报告保留于本地 artifact）；评审人=Reidddddd；评审结论=待评审；目标环境及 M4 阶段验收=未完成。
+  - 跟踪：状态=代码与公开临时验证完成；负责人=Codex；完成日期=2026-11-15；PR/commit=PR #48（最新 head 见 PR）；验证=M4 J41 public profile passed（Temurin JDK 21、Go 294 项、Java 880 项、39 个原生 trace、HISTORY/NATIVE MiniCluster；零失败、零跳过；报告保留于本地 artifact）；评审人=Reidddddd；评审结论=待评审；目标环境及 M4 阶段验收=未完成。
 
 - [ ] **J42｜KeepAlive 双向流与持久化后回复**
   - 依赖：J40/J41。
