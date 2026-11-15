@@ -18,7 +18,9 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.LeaseFailure;
+import io.etcdhbase.core.lease.LeaseRenewalVersion;
 import io.etcdhbase.core.lease.LeaseState;
+import io.etcdhbase.core.lease.LeaseTimeObservation;
 import io.etcdhbase.core.lease.LeaseTimeRules;
 import io.etcdhbase.core.lease.LeaseTimeSource;
 import io.etcdhbase.core.request.RequestScope;
@@ -30,6 +32,7 @@ import io.etcdhbase.grpc.protocol.LeaseTimeToLiveResponseMapper;
 import io.etcdhbase.grpc.protocol.ResponseHeaderFactory;
 import io.etcdhbase.server.config.M3MemoryReservations;
 import io.etcdhbase.hbase.codec.LeaseGrantResultMessages;
+import io.etcdhbase.hbase.codec.LeaseKeepAliveResultMessages;
 import io.etcdhbase.server.observability.RequestMetrics;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.grpc.stub.StreamObserver;
@@ -326,17 +329,21 @@ public final class LeaseGateway {
       BudgetManager.Account account, CompletableFuture<LeaseKeepAliveStream.Delivery> result,
       Runnable finish) {
     Rpc.LeaseKeepAliveResponse response;
+    Optional<LeaseRenewalVersion> renewalVersion;
     try (resolved) {
-      var buffer = resolved.payload().buffer();
-      var bytes = new byte[buffer.remaining()];
-      buffer.get(bytes);
-      response = Rpc.LeaseKeepAliveResponse.parseFrom(bytes);
+      LeaseKeepAliveResultMessages.Decoded durableResult =
+          LeaseKeepAliveResultMessages.decode(resolved.payload().buffer());
+      response = Rpc.LeaseKeepAliveResponse.parseFrom(durableResult.response().bytes());
+      renewalVersion = durableResult.renewalVersion();
       if (!response.hasHeader() || response.getID() != request.getID() || response.getTTL() < 0
           || response.getTTL() > LeaseTimeRules.MAX_TTL_SECONDS
           || response.getHeader().getClusterId() != clusterId
           || response.getHeader().getMemberId() == 0
           || response.getHeader().getRevision() != resolved.revision()
-          || resolved.containsKeyChanges()) {
+          || resolved.containsKeyChanges()
+          || (response.getTTL() > 0) != renewalVersion.isPresent()
+          || (renewalVersion.isPresent()
+              && renewalVersion.orElseThrow().identity().leaseId() != response.getID())) {
         throw new BackendFailure(BackendFailure.Category.UNKNOWN);
       }
       // etcd fills this header at the serving RPC endpoint before renewing through its lessor.
@@ -358,9 +365,11 @@ public final class LeaseGateway {
       return;
     }
     Rpc.LeaseKeepAliveResponse resolvedResponse = response;
+    LeaseRenewalVersion expectedRenewalVersion = renewalVersion.orElseThrow();
     completeKeepAliveDelivery(resolvedResponse,
         () -> readCurrentKeepAliveLease(request.getID(), scope, account)
-            .thenAccept(state -> validateKeepAliveLease(state, resolvedResponse.getTTL())),
+            .thenAccept(state -> validateKeepAliveLease(state, expectedRenewalVersion,
+                resolvedResponse.getTTL(), time.observe())),
         account, result, finish);
   }
 
@@ -382,12 +391,13 @@ public final class LeaseGateway {
         });
   }
 
-  private void validateKeepAliveLease(LeaseState state, long responseTtlSeconds) {
-    if (state.status() != LeaseState.Status.ACTIVE
+  static void validateKeepAliveLease(LeaseState state, LeaseRenewalVersion expectedVersion,
+      long responseTtlSeconds, LeaseTimeObservation observedTime) {
+    if (!expectedVersion.matches(state)
         || state.grantedTtlSeconds() != responseTtlSeconds) {
       throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
-    long remainingMillis = LeaseTimeRules.remainingTtlMillis(state, time.observe());
+    long remainingMillis = LeaseTimeRules.remainingTtlMillis(state, observedTime);
     if (!LeaseKeepAliveTiming.canSendPositiveResponse(responseTtlSeconds, remainingMillis)) {
       throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }

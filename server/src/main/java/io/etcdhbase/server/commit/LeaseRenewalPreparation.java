@@ -10,13 +10,16 @@ import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
+import io.etcdhbase.core.lease.LeaseRenewalVersion;
 import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.hbase.codec.LeaseKeepAliveResultMessages;
 import io.etcdhbase.hbase.codec.LeaseStateMessages;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
@@ -76,7 +79,9 @@ public final class LeaseRenewalPreparation {
           new IllegalArgumentException("invalid KeepAlive result preparation"));
     }
 
-    ByteKey responsePayload = ByteKey.copyOf(response.toByteArray());
+    ByteKey responsePayload = LeaseKeepAliveResultMessages.encode(
+        ByteKey.copyOf(response.toByteArray()), renewedState == null
+            ? Optional.empty() : Optional.of(LeaseRenewalVersion.from(renewedState)));
     if (renewedState == null) {
       if (response.getTTL() != 0) {
         return CompletableFuture.failedFuture(

@@ -340,6 +340,14 @@ message LeaseGrantResult {
   optional int64 revision = 4;
 }
 
+message LeaseKeepAliveResult {
+  optional uint32 format_version = 1;
+  optional bytes response = 2;
+  optional int64 lease_id = 3;
+  optional int64 incarnation = 4;
+  optional int64 renewal_generation = 5;
+}
+
 message LeaseBindingPayload {
   optional uint32 format_version = 1;
   optional int64 lease_id = 2;

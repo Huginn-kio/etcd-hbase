@@ -6,6 +6,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import etcdserverpb.Rpc;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.lease.LeaseIdentity;
+import io.etcdhbase.core.lease.LeaseRenewalVersion;
+import io.etcdhbase.core.lease.LeaseState;
+import io.etcdhbase.core.lease.LeaseTimeObservation;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.server.observability.RequestMetrics;
 import io.grpc.stub.ServerCallStreamObserver;
@@ -19,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class LeaseKeepAliveStreamTest {
@@ -178,38 +183,48 @@ class LeaseKeepAliveStreamTest {
   }
 
   @Test
-  void rechecksAuthoritativeLeaseStateAfterBackpressureBeforeSendingPositiveResponse()
+  void rejectsBackpressuredResponseAfterLeaseIdIsRevokedAndRegrantedWithSameTtl()
       throws Exception {
     var observer = new RecordingObserver();
     observer.ready = false;
-    var leaseActive = new AtomicBoolean(true);
+    long nowEpochMillis = 50_000;
+    long ttlSeconds = 15;
+    var originalRenewal = LeaseState.grant(
+        new LeaseIdentity(28, 1), ttlSeconds, nowEpochMillis + 15_000, 1)
+        .renew(nowEpochMillis + 15_000, 2);
+    var revoked = originalRenewal.revoke(3);
+    var regranted = LeaseState.grant(
+        new LeaseIdentity(28, 2), ttlSeconds, nowEpochMillis + 15_000, 4)
+        .renew(nowEpochMillis + 15_000, 5);
+    var currentLease = new AtomicReference<>(originalRenewal);
+    var responseVersion = LeaseRenewalVersion.from(originalRenewal);
     var validationCalls = new AtomicInteger();
     var releases = new AtomicInteger();
     try (var scope = RequestScope.withoutDeadline(); var timers = timers()) {
       var stream = new LeaseKeepAliveStream(observer, scope, Runnable::run, timers,
           request -> CompletableFuture.completedFuture(new LeaseKeepAliveStream.Delivery(
-              Rpc.LeaseKeepAliveResponse.newBuilder().setID(request.getID()).setTTL(15).build(),
-              releases::incrementAndGet, () -> {
-                validationCalls.incrementAndGet();
-                if (!leaseActive.get()) {
-                  return CompletableFuture.failedFuture(
-                      new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE)));
-                }
-                return CompletableFuture.completedFuture(null);
-              })), new RequestMetrics());
+              Rpc.LeaseKeepAliveResponse.newBuilder().setID(request.getID())
+                  .setTTL(ttlSeconds).build(), releases::incrementAndGet, () -> {
+                    validationCalls.incrementAndGet();
+                    LeaseGateway.validateKeepAliveLease(currentLease.get(), responseVersion,
+                        ttlSeconds,
+                        new LeaseTimeObservation(nowEpochMillis, nowEpochMillis, true));
+                  })), new RequestMetrics());
       stream.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(28).build());
 
       assertEquals(0, validationCalls.get(),
           "the authoritative state check must wait until the response can be sent");
       assertTrue(observer.responses.isEmpty());
 
-      leaseActive.set(false); // Revoke commits while the positive TTL response is backpressured.
+      currentLease.set(revoked);
+      currentLease.set(regranted);
       observer.ready = true;
       observer.readyHandler.run();
 
       assertTrue(observer.failed.await(2, TimeUnit.SECONDS));
       assertEquals(1, validationCalls.get());
-      assertTrue(observer.responses.isEmpty(), "a revoked lease must not receive a positive TTL");
+      assertTrue(observer.responses.isEmpty(),
+          "the previous Lease incarnation must not receive a positive TTL after ID reuse");
       assertEquals(io.grpc.Status.Code.UNAVAILABLE,
           ((io.grpc.StatusRuntimeException) observer.failure).getStatus().getCode());
       assertEquals(1, releases.get());

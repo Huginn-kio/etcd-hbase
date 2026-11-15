@@ -71,6 +71,23 @@ class LeaseStateTest {
   }
 
   @Test
+  void renewalVersionRejectsRegrantAndLaterRenewalOfTheSameLeaseId() {
+    var first = LeaseState.grant(new LeaseIdentity(7, 1), 30, 40_000, 2)
+        .renew(70_000, 3);
+    var regranted = LeaseState.grant(new LeaseIdentity(7, 2), 30, 70_000, 4)
+        .renew(100_000, 5);
+    var renewedAgain = first.renew(100_000, 4);
+    var responseVersion = LeaseRenewalVersion.from(first);
+
+    assertTrue(responseVersion.matches(first));
+    assertFalse(responseVersion.matches(regranted),
+        "the same numeric ID and TTL can identify a different Lease lifetime");
+    assertFalse(responseVersion.matches(renewedAgain),
+        "a later renewal generation must not be mistaken for the selected response version");
+    assertFalse(responseVersion.matches(first.revoke(4)));
+  }
+
+  @Test
   void refusesToRevokeWithoutAnAtomicDeletionPlanForExistingBindings() {
     var lease = new LeaseState(new LeaseIdentity(7, 1), 30, 40_000, 0,
         LeaseState.Status.ACTIVE, 2, 1, 10, 20);
