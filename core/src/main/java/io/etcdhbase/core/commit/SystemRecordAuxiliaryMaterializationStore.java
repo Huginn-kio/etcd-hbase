@@ -94,46 +94,57 @@ public final class SystemRecordAuxiliaryMaterializationStore
 
   private CompletableFuture<ApplyResult> compareAndAdvance(PreparedAuxiliaryRecord record,
       Optional<ByteKey> current, int attempt, RequestScope scope) {
-    if (current.isPresent()) {
-      LeaseEnumerationPointer observed = LeaseEnumerationPointer.decode(current.orElseThrow());
-      LeaseEnumerationPointer replacement = LeaseEnumerationPointer.decode(record.payload());
-      if (observed.sequence() > replacement.sequence()) return completed(ApplyResult.SUPERSEDED);
-      if (observed.sequence() == replacement.sequence()) {
-        if (!current.orElseThrow().equals(record.payload())) {
-          return failed(conflict("same-sequence lease pointer has different bytes"));
-        }
-        return completed(ApplyResult.ALREADY_APPLIED);
-      }
-    }
+    Optional<ApplyResult> existing = resolveExistingPointer(record, current);
+    if (existing.isPresent()) return completed(existing.orElseThrow());
     return records.compareAndSet(SystemRecordType.LEASE_ENUMERATION, record.targetIdentity(),
         current, record.payload(), scope).handle((updated, failure) -> new CasResult(updated, failure))
-        .thenCompose(result -> {
-          if (result.failure() == null && Boolean.TRUE.equals(result.updated())) {
-            return completed(ApplyResult.APPLIED);
-          }
-          if (result.failure() == null) return updatePointer(record, attempt + 1, scope);
-          Throwable failure = CompletionFailures.unwrapCompletion(result.failure());
-          return records.read(SystemRecordType.LEASE_ENUMERATION, record.targetIdentity(), scope)
-              .handle((observed, readFailure) -> {
-                if (readFailure != null) {
-                  Throwable unwrapped = CompletionFailures.unwrapCompletion(readFailure);
-                  if (unwrapped != failure) failure.addSuppressed(unwrapped);
-                  throw new java.util.concurrent.CompletionException(failure);
-                }
-                if (observed.isPresent()) {
-                  LeaseEnumerationPointer pointer = LeaseEnumerationPointer.decode(observed.orElseThrow());
-                  LeaseEnumerationPointer expected = LeaseEnumerationPointer.decode(record.payload());
-                  if (pointer.sequence() == expected.sequence()
-                      && observed.orElseThrow().equals(record.payload())) return ApplyResult.ALREADY_APPLIED;
-                  if (pointer.sequence() > expected.sequence()) return ApplyResult.SUPERSEDED;
-                }
-                if (isUnknown(failure)) {
-                  return null;
-                }
-                throw new java.util.concurrent.CompletionException(failure);
-              }).thenCompose(resolution -> resolution == null
-                  ? updatePointer(record, attempt + 1, scope) : completed(resolution));
-        });
+        .thenCompose(result -> finishPointerCas(record, attempt, scope, result));
+  }
+
+  private Optional<ApplyResult> resolveExistingPointer(
+      PreparedAuxiliaryRecord record, Optional<ByteKey> existing) {
+    if (existing.isEmpty()) return Optional.empty();
+    ByteKey current = existing.orElseThrow();
+    long observedSequence = LeaseEnumerationPointer.decode(current).sequence();
+    LeaseEnumerationPointer replacement = LeaseEnumerationPointer.decode(record.payload());
+    if (observedSequence > replacement.sequence()) return Optional.of(ApplyResult.SUPERSEDED);
+    if (observedSequence < replacement.sequence()) return Optional.empty();
+    if (!current.equals(record.payload())) {
+      throw conflict("same-sequence lease pointer has different bytes");
+    }
+    return Optional.of(ApplyResult.ALREADY_APPLIED);
+  }
+
+  private CompletableFuture<ApplyResult> finishPointerCas(PreparedAuxiliaryRecord record,
+      int attempt, RequestScope scope, CasResult result) {
+    if (result.failure() == null && Boolean.TRUE.equals(result.updated())) {
+      return completed(ApplyResult.APPLIED);
+    }
+    if (result.failure() == null) return updatePointer(record, attempt + 1, scope);
+    return reconcilePointerCasFailure(record, attempt, scope, result.failure());
+  }
+
+  private CompletableFuture<ApplyResult> reconcilePointerCasFailure(PreparedAuxiliaryRecord record,
+      int attempt, RequestScope scope, Throwable casFailure) {
+    Throwable originalFailure = CompletionFailures.unwrapCompletion(casFailure);
+    return records.read(SystemRecordType.LEASE_ENUMERATION, record.targetIdentity(), scope)
+        .handle((observed, readFailure) -> resolvePointerAfterCasFailure(
+            record, originalFailure, observed, readFailure))
+        .thenCompose(resolution -> resolution.isPresent()
+            ? completed(resolution.orElseThrow()) : updatePointer(record, attempt + 1, scope));
+  }
+
+  private Optional<ApplyResult> resolvePointerAfterCasFailure(PreparedAuxiliaryRecord record,
+      Throwable casFailure, Optional<ByteKey> observed, Throwable readFailure) {
+    if (readFailure != null) {
+      Throwable unwrapped = CompletionFailures.unwrapCompletion(readFailure);
+      if (unwrapped != casFailure) casFailure.addSuppressed(unwrapped);
+      throw new java.util.concurrent.CompletionException(casFailure);
+    }
+    Optional<ApplyResult> resolution = resolveExistingPointer(record, observed);
+    if (resolution.isPresent()) return resolution;
+    if (isUnknown(casFailure)) return Optional.empty();
+    throw new java.util.concurrent.CompletionException(casFailure);
   }
 
   private static void validatePointerBeforeSelection(

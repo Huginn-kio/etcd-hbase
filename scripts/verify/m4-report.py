@@ -448,46 +448,78 @@ def _testsuite_elements(path: Path) -> list[ET.Element]:
     raise ReportError(f"Maven XML report {path.name} has an unknown root")
 
 
-def _validate_java_tests(artifact: Path, task: dict[str, object]) -> int:
-    suites: dict[str, tuple[str, str, set[str]]] = {}
-    report_count = 0
+def _java_test_report_paths(artifact: Path) -> list[tuple[str, str, Path]]:
+    reports = []
     for module in sorted(JAVA_MODULES):
         for kind in sorted(JAVA_KINDS):
             directory = artifact / module / "target" / f"{kind}-reports"
-            for path in sorted(directory.glob("TEST-*.xml")) if directory.is_dir() else []:
-                report_count += 1
-                for suite in _testsuite_elements(path):
-                    name = suite.get("name")
-                    if not name or name in suites:
-                        raise ReportError("Maven report has an empty or duplicate suite name")
-                    try:
-                        counts = {
-                            field: int(suite.get(field, "-1"))
-                            for field in ("tests", "failures", "errors", "skipped")
-                        }
-                    except ValueError as error:
-                        raise ReportError("Maven report has a non-numeric counter") from error
-                    cases = suite.findall("testcase")
-                    if (counts["tests"] < 1 or counts["tests"] != len(cases)
-                            or counts["failures"] or counts["errors"] or counts["skipped"]):
-                        raise ReportError("Maven report is empty, failed, inconsistent, or skipped")
-                    if any(case.find(tag) is not None for case in cases for tag in ("failure", "error", "skipped")):
-                        raise ReportError("Maven testcase contains failure, error, or skip evidence")
-                    suites[name] = (module, kind, {case.get("name", "") for case in cases})
-    if report_count == 0:
-        raise ReportError("Maven XML evidence is missing")
+            if directory.is_dir():
+                reports.extend((module, kind, path) for path in sorted(directory.glob("TEST-*.xml")))
+    return reports
 
-    required_by_class: dict[str, tuple[str, str, set[str]]] = {}
+
+def _java_testcase_names(suite: ET.Element) -> set[str]:
+    cases = suite.findall("testcase")
+    try:
+        counts = {
+            field: int(suite.get(field, "-1"))
+            for field in ("tests", "failures", "errors", "skipped")
+        }
+    except ValueError as error:
+        raise ReportError("Maven report has a non-numeric counter") from error
+    if (counts["tests"] < 1 or counts["tests"] != len(cases)
+            or counts["failures"] or counts["errors"] or counts["skipped"]):
+        raise ReportError("Maven report is empty, failed, inconsistent, or skipped")
+    if any(_java_testcase_has_failure(case) for case in cases):
+        raise ReportError("Maven testcase contains failure, error, or skip evidence")
+    return {case.get("name", "") for case in cases}
+
+
+def _java_testcase_has_failure(testcase: ET.Element) -> bool:
+    return any(testcase.find(tag) is not None for tag in ("failure", "error", "skipped"))
+
+
+def _read_java_test_report(path: Path, module: str, kind: str) -> dict[str, tuple[str, str, set[str]]]:
+    suites = {}
+    for suite in _testsuite_elements(path):
+        name = suite.get("name")
+        if not name or name in suites:
+            raise ReportError("Maven report has an empty or duplicate suite name")
+        suites[name] = (module, kind, _java_testcase_names(suite))
+    return suites
+
+
+def _required_java_suites(task: dict[str, object]) -> dict[str, tuple[str, str, set[str]]]:
+    required: dict[str, tuple[str, str, set[str]]] = {}
     for item in task["maven_tests"]:
         class_name = item["class"]
-        required_by_class.setdefault(class_name, (item["module"], item["kind"], set()))
-        required_by_class[class_name][2].update(item["tests"])
-    for class_name, (module, kind, required_names) in required_by_class.items():
+        required.setdefault(class_name, (item["module"], item["kind"], set()))
+        required[class_name][2].update(item["tests"])
+    return required
+
+
+def _validate_required_java_suites(
+    task: dict[str, object], suites: dict[str, tuple[str, str, set[str]]],
+) -> None:
+    for class_name, (module, kind, required_names) in _required_java_suites(task).items():
         actual = suites.get(class_name)
         if actual is None or actual[:2] != (module, kind):
             raise ReportError(f"required Maven suite {class_name} is missing")
         if not required_names.issubset(actual[2]):
             raise ReportError(f"required Maven test cases are missing in {class_name}")
+
+
+def _validate_java_tests(artifact: Path, task: dict[str, object]) -> int:
+    reports = _java_test_report_paths(artifact)
+    if not reports:
+        raise ReportError("Maven XML evidence is missing")
+    suites: dict[str, tuple[str, str, set[str]]] = {}
+    for module, kind, path in reports:
+        observed = _read_java_test_report(path, module, kind)
+        if suites.keys() & observed.keys():
+            raise ReportError("Maven report has an empty or duplicate suite name")
+        suites.update(observed)
+    _validate_required_java_suites(task, suites)
     return sum(len(item[2]) for item in suites.values())
 
 

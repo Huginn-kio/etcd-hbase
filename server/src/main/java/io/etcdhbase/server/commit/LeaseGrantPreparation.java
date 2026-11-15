@@ -47,10 +47,6 @@ public final class LeaseGrantPreparation {
     this.auxiliaryMutations = Objects.requireNonNull(auxiliaryMutations, "auxiliaryMutations");
   }
 
-  LeaseAuxiliaryMutationPreparation auxiliaryMutations() {
-    return auxiliaryMutations;
-  }
-
   /** The caller owns the serial lane, fixed view and all service-scope cleanup. */
   public CompletableFuture<Sealed> prepare(InvocationBinding invocation, LeaseState state,
       RequestScope scope, BudgetManager.Account account,
