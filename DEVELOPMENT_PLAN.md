@@ -819,7 +819,9 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J40/J41。
   - 完成标准：成功回复后的 TTL 承诺在故障/切换下成立；纯续约不增长 KV revision 或产生 session PUT；记录每次续约写放大，合并窗口先证明。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=代码与公开临时验证完成；负责人=Codex；完成日期=2026-11-14；PR/commit=[PR #49](https://github.com/Reidddddd/etcd-hbase/pull/49)；验证入口=`scripts/verify/m4.sh --scope public --task J42`；报告保留于本地 `.artifacts/m4/j42-pr-head-final-20261114`；作者自审=完成；独立复核=完成（两项问题已修正并加入回归测试）；评审人/结论=`Reidddddd` / 待评审；目标环境与 M4 阶段验收=未完成。
+  - 跟踪：状态=公开实现与公开 MiniCluster 验证完成，维护者 review 待处理；负责人=Codex；完成日期=2026-11-16；PR/commit=[PR #49](https://github.com/Reidddddd/etcd-hbase/pull/49)；评审人/结论=`Reidddddd` / 待评审；目标环境与 M4 阶段验收=未完成。
+  - 公开验证：源代码 head=`ec15546`、base=`cf3354a`、Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J42` 状态=passed，Go 测试 308 项、Maven XML 报告 161 份合计 932 项，J42 gRPC/MiniCluster 测试 6 项；失败、错误、跳过均为 0；HISTORY/NATIVE 两种布局在该 profile 内验证。证据目录留本地 `.artifacts/m4/j42-restacked-j41-de55-fix1-20261116`。
+  - 作者自审=完成；独立复核=已完成（两项发现已修正并加入回归测试）。
 
 - [ ] **J43｜ExpiryWorker、时间窗口索引、Revoke 与撤销恢复**
   - 依赖：J33/J41/J42。
