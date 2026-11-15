@@ -35,7 +35,6 @@ import io.etcdhbase.hbase.codec.LeaseBindingMessages;
 import io.etcdhbase.hbase.connection.HBaseRequestContext;
 import io.etcdhbase.hbase.error.HBaseFailures;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
-import io.etcdhbase.hbase.storage.HBaseSystemRecordStore;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.observability.RequestMetrics;

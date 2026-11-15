@@ -107,8 +107,10 @@ class M4ReportTest(unittest.TestCase):
             artifact = Path(temporary)
             self._write_valid_artifact(artifact)
             trace_path = artifact / "target-history-trace.jsonl"
-            trace_path.write_text("{broken}\n", encoding="utf-8")
-            with self.assertRaises(m4_report.ReportError):
+            trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
+            trace_lines[0] = "{broken}"
+            trace_path.write_text("".join(f"{line}\n" for line in trace_lines), encoding="utf-8")
+            with self.assertRaisesRegex(m4_report.ReportError, "target-history-trace.jsonl line 1 is invalid"):
                 m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
 
         with tempfile.TemporaryDirectory() as temporary:

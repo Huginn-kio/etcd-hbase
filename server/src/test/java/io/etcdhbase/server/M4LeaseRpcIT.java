@@ -36,7 +36,6 @@ import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import org.apache.hadoop.hbase.TableName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 

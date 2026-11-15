@@ -169,6 +169,13 @@ def _validate_task_shape(task: dict[str, object]) -> None:
 
 
 def _validate_j40_registration(task: dict[str, object]) -> None:
+    _validate_j40_api_and_trace(task)
+    _validate_j40_go_tests(task["go_tests"])
+    _validate_j40_java_tests(task["maven_tests"])
+    _validate_j40_evidence(task["evidence"])
+
+
+def _validate_j40_api_and_trace(task: dict[str, object]) -> None:
     if (task.get("api_ids") != ["L01", "L04", "L05"]
             or task.get("scenario") != "m4-lease-v1"
             or task.get("manifest") != "m4-lease.yaml"):
@@ -181,23 +188,28 @@ def _validate_j40_registration(task: dict[str, object]) -> None:
     if any(not isinstance(item.get("api_id"), str) or not item["api_id"] for item in traces):
         raise ReportError("J40 trace case has no API mapping")
 
+
+def _validate_j40_go_tests(registrations: list[dict[str, object]]) -> None:
     go_tests: dict[str, set[str]] = {}
-    for package in task["go_tests"]:
+    for package in registrations:
         if not isinstance(package, dict) or not isinstance(package.get("package"), str):
             raise ReportError("M4 Go test registration is malformed")
         names = package.get("tests")
         if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
             raise ReportError("M4 Go package has no named required tests")
-        if package["package"] in go_tests:
+        package_name = package["package"]
+        if package_name in go_tests:
             raise ReportError("M4 Go package is registered more than once")
-        go_tests[package["package"]] = set(names)
+        go_tests[package_name] = set(names)
     if any(not expected.issubset(go_tests.get(package, set()))
            for package, expected in J40_GO_TESTS.items()):
         raise ReportError("J40 Go regression coverage is incomplete")
 
+
+def _validate_j40_java_tests(registrations: list[dict[str, object]]) -> None:
     java_classes: set[str] = set()
     java_methods: dict[str, set[str]] = {}
-    for suite in task["maven_tests"]:
+    for suite in registrations:
         if not isinstance(suite, dict):
             raise ReportError("M4 Maven test registration is malformed")
         module, kind, class_name, tests = (
@@ -215,7 +227,8 @@ def _validate_j40_registration(task: dict[str, object]) -> None:
            for class_name, methods in J40_CRITICAL_JAVA_TESTS.items()):
         raise ReportError("J40 clock, binding, TTL projection, bounded-scan, or real RPC test is not registered")
 
-    evidence = task["evidence"]
+
+def _validate_j40_evidence(evidence: dict[str, object]) -> None:
     native = evidence["native"]
     targets = evidence["targets"]
     if (native.get("scope"), native.get("layout"), native.get("embedded_native")) != (
@@ -446,11 +459,11 @@ def _read_trace(path: Path, expected_cases: list[dict[str, object]], scope: str)
     if len(lines) != len(expected_cases):
         raise ReportError(f"M4 trace {path.name} does not contain every registered case")
     expected_ordinals: dict[str, int] = {}
-    for line, expected in zip(lines, expected_cases):
+    for line_number, (line, expected) in enumerate(zip(lines, expected_cases), start=1):
         try:
             record = json.loads(line, object_pairs_hook=_unique_object)
         except (json.JSONDecodeError, ReportError) as error:
-            raise ReportError(f"M4 trace {path.name} line {ordinal} is invalid") from error
+            raise ReportError(f"M4 trace {path.name} line {line_number} is invalid") from error
         required_fields = {
             "schema", "case_id", "ordinal", "method", "request", "response", "error",
             "stream_terminal", "evidence_scope", "elapsed_ns",
@@ -496,7 +509,9 @@ def _validate_run_metadata(
         raise ReportError(f"M4 driver metadata {path.name} does not match this run")
 
 
-def validate_artifact(repository: Path, artifact: Path, registry: dict[str, object]) -> dict[str, object]:
+def _load_run_and_task(
+    artifact: Path, registry: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
     run = read_json(artifact / "run.json")
     if not isinstance(run, dict):
         raise ReportError("M4 run manifest is malformed")
@@ -509,6 +524,11 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
     task = next((item for item in registry["tasks"] if item["id"] == task_id), None)
     if task is None:
         raise ReportError("M4 run task is not registered")
+    _validate_run_identity(artifact, run)
+    return run, task
+
+
+def _validate_run_identity(artifact: Path, run: dict[str, object]) -> None:
     run_id = run.get("run_id")
     source_commit = run.get("source_commit")
     if (not isinstance(run_id, str) or run_id != artifact.name
@@ -520,9 +540,10 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
             or not isinstance(run.get("finished_at"), str)):
         raise ReportError("M4 run identity or source binding is invalid")
 
-    _validate_commands(artifact, run)
-    go_test_count = _validate_go_tests(artifact, task)
-    java_test_count = _validate_java_tests(artifact, task)
+
+def _scenario_hashes(
+    repository: Path, task: dict[str, object], run_id: str,
+) -> tuple[str, str]:
     manifest_name = task.get("manifest")
     if not isinstance(manifest_name, str) or Path(manifest_name).name != manifest_name:
         raise ReportError("registered M4 scenario manifest path is unsafe")
@@ -532,46 +553,75 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
     except OSError as error:
         raise ReportError("registered M4 scenario manifest is missing") from error
     prefix_hash = hashlib.sha256(f"etcd-hbase-m4-test/{run_id}/".encode()).hexdigest()
+    return suite_hash, prefix_hash
 
+
+def _validate_native_evidence(
+    artifact: Path, run: dict[str, object], task: dict[str, object],
+    suite_hash: str, prefix_hash: str,
+) -> None:
     expected_cases = task["trace_cases"]
-    native = task["evidence"]["native"]
-    native_bytes = _read_trace(artifact / "native-trace.jsonl", expected_cases, native["scope"])
+    descriptor = task["evidence"]["native"]
+    trace_bytes = _read_trace(artifact / "native-trace.jsonl", expected_cases, descriptor["scope"])
     _validate_run_metadata(
-        artifact / "native-metadata.json", run=run, descriptor=native, trace_bytes=native_bytes,
+        artifact / "native-metadata.json", run=run, descriptor=descriptor, trace_bytes=trace_bytes,
         suite_hash=suite_hash, prefix_hash=prefix_hash, layout="",
     )
-    native_log = artifact / "native.log"
-    if not native_log.is_file() or "M4 Lease scenario passed" not in native_log.read_text(encoding="utf-8"):
+    log_path = artifact / "native.log"
+    if not log_path.is_file() or "M4 Lease scenario passed" not in log_path.read_text(encoding="utf-8"):
         raise ReportError("native Go Lease run has no success record")
 
+
+def _validate_target_evidence(
+    artifact: Path, run: dict[str, object], task: dict[str, object],
+    suite_hash: str, prefix_hash: str,
+) -> list[str]:
+    expected_cases = task["trace_cases"]
     layouts: list[str] = []
     for descriptor in task["evidence"]["targets"]:
         layout = descriptor["layout"]
         suffix = layout.lower()
-        trace_bytes = _read_trace(artifact / f"target-{suffix}-trace.jsonl", expected_cases, descriptor["scope"])
+        trace_bytes = _read_trace(
+            artifact / f"target-{suffix}-trace.jsonl", expected_cases, descriptor["scope"]
+        )
         _validate_run_metadata(
             artifact / f"target-{suffix}-metadata.json", run=run, descriptor=descriptor,
             trace_bytes=trace_bytes, suite_hash=suite_hash, prefix_hash=prefix_hash, layout=layout,
         )
-        target_log = artifact / f"target-{suffix}.log"
-        if not target_log.is_file() or "M4 Lease scenario passed" not in target_log.read_text(encoding="utf-8"):
+        log_path = artifact / f"target-{suffix}.log"
+        if not log_path.is_file() or "M4 Lease scenario passed" not in log_path.read_text(encoding="utf-8"):
             raise ReportError(f"target Go Lease run for {layout} has no success record")
         layouts.append(layout)
+    return layouts
 
+
+def _validate_comparison_evidence(artifact: Path, task: dict[str, object]) -> None:
     for compare_log in task["evidence"]["compare_logs"]:
         path = artifact / compare_log
         if not path.is_file() or COMPARE_SUCCESS not in path.read_text(encoding="utf-8"):
             raise ReportError(f"M4 native comparison {compare_log} is missing or failed")
 
+
+def validate_artifact(repository: Path, artifact: Path, registry: dict[str, object]) -> dict[str, object]:
+    run, task = _load_run_and_task(artifact, registry)
+    _validate_commands(artifact, run)
+    go_test_count = _validate_go_tests(artifact, task)
+    java_test_count = _validate_java_tests(artifact, task)
+    run_id = run["run_id"]
+    source_commit = run["source_commit"]
+    suite_hash, prefix_hash = _scenario_hashes(repository, task, run_id)
+    _validate_native_evidence(artifact, run, task, suite_hash, prefix_hash)
+    layouts = _validate_target_evidence(artifact, run, task, suite_hash, prefix_hash)
+    _validate_comparison_evidence(artifact, task)
     return {
-        "task": task_id,
+        "task": run["tasks"][0],
         "run_id": run_id,
         "source_commit": source_commit,
         "base_commit": run["base_commit"],
         "evidence_class": "official-clean" if run["worktree_clean"] else "development-dirty",
         "go_test_count": go_test_count,
         "java_test_count": java_test_count,
-        "native_trace_cases": len(expected_cases),
+        "native_trace_cases": len(task["trace_cases"]),
         "target_layouts": sorted(layouts),
     }
 

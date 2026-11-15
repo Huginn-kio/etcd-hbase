@@ -14,7 +14,6 @@ import io.etcdhbase.core.commit.InvocationRepository;
 import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.ManifestPreparation;
 import io.etcdhbase.core.commit.ManifestRepository;
-import io.etcdhbase.core.commit.ManifestRoot;
 import io.etcdhbase.core.commit.PreparedAuxiliaryRecord;
 import io.etcdhbase.core.commit.ResultCatalog;
 import io.etcdhbase.core.commit.ResultDirectory;

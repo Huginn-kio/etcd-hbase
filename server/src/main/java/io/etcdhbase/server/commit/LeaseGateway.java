@@ -11,7 +11,6 @@ import io.etcdhbase.core.commit.LeaseReadView;
 import io.etcdhbase.core.commit.ManifestCatalog;
 import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.MutationOperationEnvelope;
-import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.PinnedReadView;
 import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.error.BackendFailure;
@@ -280,90 +279,145 @@ public final class LeaseGateway {
     RequestScope scope = RequestScopeInterceptor.currentScope();
     var terminal = new AtomicBoolean();
     var drained = new CompletableFuture<Void>();
-    if (!scope.startIfOpen(() -> scope.trackPhysicalProducer(drained))) return;
-    BudgetManager.Account account;
+    if (!registerReadProducer(scope, drained)) return;
     try {
-      account = budgets.admit(tableGroup, scope, memory);
-      worker.execute(() -> {
-        CompletableFuture<T> result;
-        try {
-          result = Objects.requireNonNull(operation.apply(scope, account), "Lease read future");
-        } catch (RuntimeException | Error failure) {
-          drained.complete(null);
-          signalError(scope, observer, terminal, failure);
-          if (failure instanceof Error fatal) throw fatal;
-          return;
-        }
-        result.whenComplete((response, failure) -> {
-          try {
-            worker.execute(() -> {
-              try {
-                if (failure != null) {
-                  signalError(scope, observer, terminal, CompletionFailures.unwrapCompletion(failure));
-                } else if (response != null) {
-                  send(response, responseSize.applyAsInt(response), scope, account, observer, terminal);
-                }
-              } finally {
-                drained.complete(null);
-              }
-            });
-          } catch (RuntimeException rejected) {
-            drained.complete(null);
-            signalError(scope, observer, terminal,
-                new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT, rejected));
-          }
-        });
-      });
+      BudgetManager.Account account = budgets.admit(tableGroup, scope, memory);
+      scheduleRead(scope, account, operation, responseSize, observer, terminal, drained);
     } catch (BackendFailure | RuntimeException failure) {
-      drained.complete(null);
-      signalError(scope, observer, terminal, failure);
+      settleReadFailure(scope, observer, terminal, drained, failure);
     } catch (Error fatal) {
-      drained.complete(null);
-      signalError(scope, observer, terminal, fatal);
+      settleReadFailure(scope, observer, terminal, drained, fatal);
       throw fatal;
     }
   }
 
-  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readTimeToLive(
-      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account) {
-    return readTimeToLive(request, scope, account, true);
+  private static boolean registerReadProducer(RequestScope scope, CompletableFuture<Void> drained) {
+    return scope.startIfOpen(() -> scope.trackPhysicalProducer(drained));
+  }
+
+  private <T> void scheduleRead(RequestScope scope, BudgetManager.Account account,
+      BiFunction<RequestScope, BudgetManager.Account, CompletableFuture<T>> operation,
+      java.util.function.ToIntFunction<T> responseSize, StreamObserver<T> observer,
+      AtomicBoolean terminal, CompletableFuture<Void> drained) {
+    worker.execute(() -> runReadOperation(scope, account, operation, responseSize, observer, terminal, drained));
+  }
+
+  private <T> void runReadOperation(RequestScope scope, BudgetManager.Account account,
+      BiFunction<RequestScope, BudgetManager.Account, CompletableFuture<T>> operation,
+      java.util.function.ToIntFunction<T> responseSize, StreamObserver<T> observer,
+      AtomicBoolean terminal, CompletableFuture<Void> drained) {
+    CompletableFuture<T> operationResult;
+    try {
+      operationResult = Objects.requireNonNull(operation.apply(scope, account), "Lease read future");
+    } catch (RuntimeException | Error failure) {
+      settleReadFailure(scope, observer, terminal, drained, failure);
+      if (failure instanceof Error fatal) throw fatal;
+      return;
+    }
+    operationResult.whenComplete((response, failure) -> dispatchReadCompletion(
+        response, failure, responseSize, scope, account, observer, terminal, drained));
+  }
+
+  private <T> void dispatchReadCompletion(T response, Throwable failure,
+      java.util.function.ToIntFunction<T> responseSize, RequestScope scope,
+      BudgetManager.Account account, StreamObserver<T> observer, AtomicBoolean terminal,
+      CompletableFuture<Void> drained) {
+    try {
+      worker.execute(() -> completeRead(response, failure, responseSize, scope, account,
+          observer, terminal, drained));
+    } catch (RuntimeException rejected) {
+      settleReadFailure(scope, observer, terminal, drained,
+          new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT, rejected));
+    }
+  }
+
+  private <T> void completeRead(T response, Throwable failure,
+      java.util.function.ToIntFunction<T> responseSize, RequestScope scope,
+      BudgetManager.Account account, StreamObserver<T> observer, AtomicBoolean terminal,
+      CompletableFuture<Void> drained) {
+    try {
+      if (failure != null) {
+        signalError(scope, observer, terminal, CompletionFailures.unwrapCompletion(failure));
+      } else if (response != null) {
+        send(response, responseSize.applyAsInt(response), scope, account, observer, terminal);
+      }
+    } finally {
+      drained.complete(null);
+    }
+  }
+
+  private static void settleReadFailure(RequestScope scope, StreamObserver<?> observer,
+      AtomicBoolean terminal, CompletableFuture<Void> drained, Throwable failure) {
+    drained.complete(null);
+    signalError(scope, observer, terminal, failure);
   }
 
   private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readTimeToLive(
+      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account) {
+    if (request.getID() == 0) {
+      return readAllLeaseTimeToLive(request, scope);
+    }
+    return readLeaseTimeToLive(request, scope, account, true);
+  }
+
+  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readAllLeaseTimeToLive(
+      Rpc.LeaseTimeToLiveRequest request, RequestScope scope) {
+    return views.openAuxiliary(authorizationDigest, scope).thenCompose(pin ->
+        leaseReads.finish(pin, scope).thenApply(ignored ->
+            projectTimeToLive(request, Optional.empty(), pin, time.observe(), List.of())));
+  }
+
+  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> readLeaseTimeToLive(
       Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
       boolean resolveExpiredEmpty) {
-    if (request.getID() == 0) {
-      return views.openAuxiliary(authorizationDigest, scope).thenCompose(pin ->
-          leaseReads.finish(pin, scope).thenApply(ignored ->
-              projectTimeToLive(request, Optional.empty(), pin, time.observe(), List.of())));
-    }
     var proof = new ManifestCatalog.ProofReadBudget(scope, account, 64, MAX_METADATA_BYTES);
     return views.openAuxiliary(authorizationDigest, scope).thenCompose(pin ->
         leaseReads.find(pin, request.getID(), scope, proof)
-            .thenCompose(found -> {
-              var clock = time.observe();
-              if (found.isPresent() && found.orElseThrow().status() == LeaseState.Status.ACTIVE
-                  && LeaseTimeRules.isExpired(found.orElseThrow(), clock)) {
-                LeaseState expired = found.orElseThrow();
-                if (expired.boundKeyCount() != 0 || expired.boundKeyBytes() != 0
-                    || expired.revokeCostBytes() != 0) {
-                  return CompletableFuture.failedFuture(
-                      new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-                }
-                if (resolveExpiredEmpty) {
-                  return expireEmptyLease(expired, scope, account)
-                      .thenCompose(ignored -> readTimeToLive(request, scope, account, false));
-                }
-              }
-              if (!request.getKeys() || found.isEmpty()
-                  || found.orElseThrow().status() != LeaseState.Status.ACTIVE) {
-                return CompletableFuture.completedFuture(
-                    projectTimeToLive(request, found, pin, clock, List.of()));
-              }
-              return leaseBindings.read(pin, found.orElseThrow(), scope, account, proof)
-                  .thenApply(keys -> projectTimeToLive(request, found, pin, clock, keys));
-            })
+            .thenCompose(found -> projectLeaseTimeToLive(
+                request, scope, account, pin, proof, found, resolveExpiredEmpty))
             .thenCompose(response -> leaseReads.finish(pin, scope).thenApply(ignored -> response)));
+  }
+
+  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> projectLeaseTimeToLive(
+      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
+      PinnedReadView pin, ManifestCatalog.ProofReadBudget proof, Optional<LeaseState> found,
+      boolean resolveExpiredEmpty) {
+    var clock = time.observe();
+    if (found.isPresent()) {
+      LeaseState state = found.orElseThrow();
+      if (state.status() == LeaseState.Status.ACTIVE && LeaseTimeRules.isExpired(state, clock)) {
+        return resolveExpiredEmptyLeaseTimeToLive(
+            request, scope, account, pin, proof, found, clock, state, resolveExpiredEmpty);
+      }
+    }
+    return projectLeaseKeys(request, scope, account, pin, proof, found, clock);
+  }
+
+  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> resolveExpiredEmptyLeaseTimeToLive(
+      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
+      PinnedReadView pin, ManifestCatalog.ProofReadBudget proof, Optional<LeaseState> found,
+      io.etcdhbase.core.lease.LeaseTimeObservation clock, LeaseState expired,
+      boolean resolveExpiredEmpty) {
+    if (expired.boundKeyCount() != 0 || expired.boundKeyBytes() != 0 || expired.revokeCostBytes() != 0) {
+      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
+    if (!resolveExpiredEmpty) {
+      return projectLeaseKeys(request, scope, account, pin, proof, found, clock);
+    }
+    return expireEmptyLease(expired, scope, account)
+        .thenCompose(ignored -> readLeaseTimeToLive(request, scope, account, false));
+  }
+
+  private CompletableFuture<Rpc.LeaseTimeToLiveResponse> projectLeaseKeys(
+      Rpc.LeaseTimeToLiveRequest request, RequestScope scope, BudgetManager.Account account,
+      PinnedReadView pin, ManifestCatalog.ProofReadBudget proof, Optional<LeaseState> found,
+      io.etcdhbase.core.lease.LeaseTimeObservation clock) {
+    if (!request.getKeys() || found.isEmpty()
+        || found.orElseThrow().status() != LeaseState.Status.ACTIVE) {
+      return CompletableFuture.completedFuture(projectTimeToLive(request, found, pin, clock, List.of()));
+    }
+    return leaseBindings.read(pin, found.orElseThrow(), scope, account, proof)
+        .thenApply(keys -> projectTimeToLive(request, found, pin, clock, keys));
   }
 
   private CompletableFuture<Void> expireEmptyLease(LeaseState state, RequestScope scope,

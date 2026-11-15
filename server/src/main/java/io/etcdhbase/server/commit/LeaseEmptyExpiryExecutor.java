@@ -15,7 +15,6 @@ import io.etcdhbase.core.commit.PreparedAuxiliaryRecord;
 import io.etcdhbase.core.commit.ReadViewService;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.error.BackendFailure;
-import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.lease.LeaseEnumerationPointer;
@@ -30,7 +29,6 @@ import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.time.Clock;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 
