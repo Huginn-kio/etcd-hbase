@@ -807,7 +807,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [x] **J40.1** 优先：Grant、基本 TimeToLive 和持久化租约状态，支撑注册/续约闭环。
     - [x] **J40.2** 完整：ID 碰撞、管理列表、TTL keys 和全部矩阵选项，首版全部验收。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=代码与公开临时验证完成；负责人=Codex；完成日期=2026-11-14；PR/commit=[PR #47](https://github.com/Reidddddd/etcd-hbase/pull/47) / `a467e99`；验证=M4 J40 public profile passed（Temurin JDK 21、Maven 105 个单测、M4LeaseRpcIT、Go 原生对照及两种布局）；评审人=Reidddddd；评审结论=等待评审；目标环境与 M4 阶段验收=未完成。
+  - 跟踪：状态=代码与公开临时验证完成；负责人=Codex；完成日期=2026-11-15；PR/代码验证 head=[PR #47](https://github.com/Reidddddd/etcd-hbase/pull/47) / `27000de`；验证=M4 J40 public profile passed（Temurin JDK 21、Go 273 项、Java 852 项、149 份 Maven 报告、11 条原生 trace、HISTORY/NATIVE MiniCluster；零失败、零跳过）；评审人=Reidddddd；评审结论=等待评审；目标环境与 M4 阶段验收=未完成。
 
 - [ ] **J41｜绑定/换绑、附着与撤销顺序及多角色注册联动**
   - 依赖：J40/J31。
