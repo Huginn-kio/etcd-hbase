@@ -33,6 +33,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /** Runs a single bounded expiry step at a time while this table-group runtime owns M2. */
 public final class LeaseExpiryWorker {
@@ -230,7 +231,7 @@ public final class LeaseExpiryWorker {
 
     CompletableFuture<StepOutcome> operation;
     try {
-      operation = inspectCheckpoint(token, observation, scope)
+      operation = inspectCheckpoint(token, observation, scope, account)
           .thenCompose(status -> {
             if (!status.shouldStep()) return CompletableFuture.completedFuture(StepOutcome.IDLE);
             if (!sameOwner(token)) return CompletableFuture.completedFuture(StepOutcome.RETRY);
@@ -298,15 +299,9 @@ public final class LeaseExpiryWorker {
   }
 
   CompletableFuture<CheckpointStatus> inspectCheckpoint(
-      CommitOwnerService.OwnerToken token, LeaseTimeObservation observation, RequestScope scope) {
-    final CompletableFuture<Optional<ControlSnapshot>> read;
-    try {
-      read = Objects.requireNonNull(control.read(scope), "Lease expiry control read");
-    } catch (RuntimeException | Error failure) {
-      markCheckpointUnhealthy();
-      if (failure instanceof Error fatal) throw fatal;
-      return CompletableFuture.failedFuture(failure);
-    }
+      CommitOwnerService.OwnerToken token, LeaseTimeObservation observation, RequestScope scope,
+      BudgetManager.Account account) {
+    final CompletableFuture<Optional<ControlSnapshot>> read = readCheckpointControl(scope, account);
     CompletableFuture<CheckpointStatus> inspection = read.thenCompose(snapshot -> {
       if (snapshot.isEmpty()) {
         markCheckpointUnhealthy();
@@ -323,8 +318,7 @@ public final class LeaseExpiryWorker {
       long sequence = state.finalizedSequence();
       CompletableFuture<Optional<SystemRecordEntry>> latest = sequence == 0
           ? CompletableFuture.completedFuture(Optional.empty())
-          : records.latestAtOrBefore(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
-              checkpointPrefix, sequence, scope);
+          : readLatestCheckpoint(sequence, scope, account);
       return latest.thenApply(entry -> checkpointStatus(entry, sequence, token, observation));
     });
     return inspection.whenComplete((status, failure) -> {
@@ -334,6 +328,103 @@ public final class LeaseExpiryWorker {
         completeInitialReadinessIfReady();
       }
     });
+  }
+
+  private CompletableFuture<Optional<ControlSnapshot>> readCheckpointControl(
+      RequestScope scope, BudgetManager.Account account) {
+    final ReadReservation reservation;
+    try {
+      reservation = reserveAndChargeRead(account, LeaseBudgetProfile.EXPIRY_CONTROL_READ_WORK,
+          LeaseBudgetProfile.MAX_EXPIRY_CONTROL_READ_BYTES,
+          budget -> budget.chargeInternalPointRead(
+              LeaseBudgetProfile.MAX_EXPIRY_CONTROL_READ_BYTES));
+    } catch (BackendFailure | RuntimeException | Error failure) {
+      markCheckpointUnhealthy();
+      if (failure instanceof Error fatal) throw fatal;
+      return CompletableFuture.failedFuture(failure);
+    }
+    return runReservedRead(reservation, () -> control.read(scope), "Lease expiry control read");
+  }
+
+  private CompletableFuture<Optional<SystemRecordEntry>> readLatestCheckpoint(
+      long sequence, RequestScope scope, BudgetManager.Account account) {
+    final ReadReservation reservation;
+    try {
+      reservation = reserveAndChargeRead(account, LeaseBudgetProfile.EXPIRY_CHECKPOINT_SCAN_WORK,
+          LeaseBudgetProfile.MAX_EXPIRY_CHECKPOINT_READ_BYTES,
+          budget -> budget.chargeInternalScanPage(1,
+              LeaseBudgetProfile.MAX_EXPIRY_CHECKPOINT_RECORD_BYTES, 1));
+    } catch (BackendFailure | RuntimeException | Error failure) {
+      markCheckpointUnhealthy();
+      if (failure instanceof Error fatal) throw fatal;
+      return CompletableFuture.failedFuture(failure);
+    }
+    CompletableFuture<Optional<SystemRecordEntry>> read = runReservedRead(reservation,
+        () -> records.latestAtOrBefore(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+            checkpointPrefix, sequence, scope), "Lease expiry checkpoint scan");
+    return read.thenApply(entry -> {
+      long bytes = entry.map(SystemRecordEntry::encodedBytes).orElse(0L);
+      if (bytes > LeaseBudgetProfile.MAX_EXPIRY_CHECKPOINT_RECORD_BYTES) {
+        throw new IllegalStateException("Lease expiry checkpoint exceeds its encoded size limit");
+      }
+      return entry;
+    });
+  }
+
+  private static ReadReservation reserveAndChargeRead(BudgetManager.Account account,
+      BudgetManager.Work work, long maximumReadBytes, ReadCharge charge) throws BackendFailure {
+    ReadReservation reservation = reserveRead(account, work, maximumReadBytes);
+    try {
+      charge.charge(account);
+      return reservation;
+    } catch (BackendFailure | RuntimeException | Error failure) {
+      reservation.close();
+      throw failure;
+    }
+  }
+
+  private static ReadReservation reserveRead(BudgetManager.Account account,
+      BudgetManager.Work work, long maximumReadBytes) throws BackendFailure {
+    BudgetManager.Lease io = account.tryRetain(BudgetManager.Memory.IO,
+        maximumReadBytes).orElseThrow(LeaseExpiryWorker::resourceLimit);
+    try {
+      BudgetManager.Lease capacity = account.tryAcquire(work)
+          .orElseThrow(LeaseExpiryWorker::resourceLimit);
+      return new ReadReservation(io, capacity);
+    } catch (BackendFailure | RuntimeException | Error failure) {
+      io.close();
+      throw failure;
+    }
+  }
+
+  private static <T> CompletableFuture<T> runReservedRead(ReadReservation reservation,
+      Supplier<CompletableFuture<T>> operation, String description) {
+    final CompletableFuture<T> read;
+    try {
+      read = Objects.requireNonNull(operation.get(), description);
+    } catch (RuntimeException | Error failure) {
+      reservation.close();
+      if (failure instanceof Error fatal) throw fatal;
+      return CompletableFuture.failedFuture(failure);
+    }
+    return read.whenComplete((ignored, failure) -> reservation.close());
+  }
+
+  private record ReadReservation(BudgetManager.Lease io, BudgetManager.Lease capacity)
+      implements AutoCloseable {
+    private ReadReservation {
+      Objects.requireNonNull(io, "io");
+      Objects.requireNonNull(capacity, "capacity");
+    }
+
+    @Override
+    public void close() {
+      try {
+        capacity.close();
+      } finally {
+        io.close();
+      }
+    }
   }
 
   private void completeInitialReadinessIfReady() {
@@ -413,6 +504,15 @@ public final class LeaseExpiryWorker {
 
   private LeaseTimeObservation observeClock() {
     return Objects.requireNonNull(time.observe(), "Lease time observation");
+  }
+
+  private static BackendFailure resourceLimit() {
+    return new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+  }
+
+  @FunctionalInterface
+  private interface ReadCharge {
+    void charge(BudgetManager.Account account) throws BackendFailure;
   }
 
   private enum StepOutcome { IDLE, PROGRESSED, RETRY }

@@ -1,5 +1,6 @@
 package io.etcdhbase.server.commit;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -18,6 +19,7 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.LeaseTimeObservation;
 import io.etcdhbase.core.lease.LeaseTimeSource;
 import io.etcdhbase.core.request.RequestScope;
@@ -29,6 +31,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -104,14 +107,13 @@ class LeaseExpiryWorkerTest {
           if (scheduledCount.getAndIncrement() > 0) retryScheduled.countDown();
           return future;
         });
-    BudgetManager.Limits limits = new BudgetManager.Limits(2, 0, 2, 1, 2, 0, 64L << 10);
-    BudgetManager budgets = new BudgetManager(limits, java.util.Map.of("test-group", limits), limits);
+    BudgetManager budgets = reservedWorkerBudgets();
     var identity = new AuthorizedBackendIdentity("test-provider", "test-subject", "fixture-context",
         new AuthenticationScope("test-group", "test-profile"), Set.of("test-group"), 0);
     LeaseTimeObservation observation = new LeaseTimeObservation(1_000, 1_000, true);
     var worker = new LeaseExpiryWorker("test-group", ByteKey.copyOf(new byte[32]), 4,
         10_000, control, records, owner, relay, identity, (LeaseTimeSource) () -> observation,
-        budgets, new BudgetManager.Reservation(1, 1, 1, 1, 1), Runnable::run, timer,
+        budgets, LeaseBudgetProfile.EXPIRY_WORKER_MEMORY, Runnable::run, timer,
         Clock.fixed(Instant.ofEpochMilli(1_000), ZoneOffset.UTC), new RequestMetrics());
 
     worker.start();
@@ -129,7 +131,7 @@ class LeaseExpiryWorkerTest {
   }
 
   @Test
-  void asynchronousCheckpointReadFailureClosesPreviouslyEstablishedOwnerReadiness() {
+  void asynchronousCheckpointReadFailureClosesPreviouslyEstablishedOwnerReadiness() throws Exception {
     CommitOwnerService.OwnerToken token = new CommitOwnerService.OwnerToken("owner-a", 7);
     M3OwnerLease owner = mock(M3OwnerLease.class);
     when(owner.currentToken()).thenReturn(Optional.of(token));
@@ -151,27 +153,116 @@ class LeaseExpiryWorkerTest {
     AuthorizedBackendIdentity identity = new AuthorizedBackendIdentity("test-provider", "test-subject",
         "fixture-context", new AuthenticationScope("test-group", "test-profile"),
         Set.of("test-group"), 0);
+    BudgetManager budgets = regularWorkerBudgets();
     var worker = new LeaseExpiryWorker("test-group", ByteKey.copyOf(new byte[32]), 4,
         10_000, control, records, owner, mock(MutationRelay.class), identity,
-        (LeaseTimeSource) () -> observation, mock(BudgetManager.class),
-        new BudgetManager.Reservation(1, 1, 1, 1, 1), Runnable::run, timer,
+        (LeaseTimeSource) () -> observation, budgets,
+        LeaseBudgetProfile.EXPIRY_WORKER_MEMORY, Runnable::run, timer,
         Clock.fixed(Instant.ofEpochMilli(1_000), ZoneOffset.UTC), new RequestMetrics());
 
     CompletableFuture<Void> initialReadiness = worker.initialReadiness();
     worker.start();
     try (RequestScope scope = RequestScope.withoutDeadline()) {
-      assertFalse(initialReadiness.isDone(),
-          "an owner runtime must not become ready before its persisted checkpoint is inspected");
-      worker.inspectCheckpoint(token, observation, scope).join();
-      initialReadiness.join();
-      assertTrue(worker.isReady(), "a valid checkpoint read establishes readiness for this owner epoch");
+      try (BudgetManager.Account account = budgets.admit("test-group", scope,
+          LeaseBudgetProfile.EXPIRY_WORKER_MEMORY, LeaseBudgetProfile.EXPIRY_WORKER_READ_LIMITS)) {
+        assertFalse(initialReadiness.isDone(),
+            "an owner runtime must not become ready before its persisted checkpoint is inspected");
+        worker.inspectCheckpoint(token, observation, scope, account).join();
+        initialReadiness.join();
+        assertTrue(worker.isReady(),
+            "a valid checkpoint read establishes readiness for this owner epoch");
 
-      CompletionException failure = assertThrows(CompletionException.class,
-          () -> worker.inspectCheckpoint(token, observation, scope).join());
-      assertTrue(failure.getCause() instanceof IllegalStateException);
-      assertFalse(worker.isReady(), "an asynchronous checkpoint read failure must revoke readiness");
+        CompletionException failure = assertThrows(CompletionException.class,
+            () -> worker.inspectCheckpoint(token, observation, scope, account).join());
+        assertTrue(failure.getCause() instanceof IllegalStateException);
+        assertFalse(worker.isReady(), "an asynchronous checkpoint read failure must revoke readiness");
+        assertEquals(0, budgets.snapshot().operations());
+        assertEquals(0, budgets.snapshot().scanners());
+        assertEquals(0, budgets.snapshot().cleanup());
+      }
     } finally {
       worker.stop();
+    }
+  }
+
+  @Test
+  void checkpointScanHoldsItsRealBudgetUntilTheUnderlyingReadCompletes() throws Exception {
+    CommitOwnerService.OwnerToken token = new CommitOwnerService.OwnerToken("owner-a", 7);
+    M3OwnerLease owner = mock(M3OwnerLease.class);
+    CommitControlStore control = mock(CommitControlStore.class);
+    CommitState state = checkpointState(1);
+    when(control.read(any(RequestScope.class))).thenReturn(CompletableFuture.completedFuture(
+        Optional.of(new ControlSnapshot(state, new byte[] {1}))));
+    CompletableFuture<Optional<io.etcdhbase.core.commit.SystemRecordEntry>> checkpointRead =
+        new CompletableFuture<>();
+    SystemRecordStore records = mock(SystemRecordStore.class);
+    when(records.latestAtOrBefore(eq(SystemRecordType.LEASE_EXPIRY_CHECKPOINT),
+        any(ByteKey.class), eq(1L), any(RequestScope.class))).thenReturn(checkpointRead);
+    BudgetManager budgets = regularWorkerBudgets();
+    AuthorizedBackendIdentity identity = new AuthorizedBackendIdentity("test-provider", "test-subject",
+        "fixture-context", new AuthenticationScope("test-group", "test-profile"),
+        Set.of("test-group"), 0);
+    LeaseTimeObservation observation = new LeaseTimeObservation(1_000, 1_000, true);
+    var worker = new LeaseExpiryWorker("test-group", ByteKey.copyOf(new byte[32]), 4,
+        10_000, control, records, owner, mock(MutationRelay.class), identity,
+        (LeaseTimeSource) () -> observation, budgets, LeaseBudgetProfile.EXPIRY_WORKER_MEMORY,
+        Runnable::run, mock(ScheduledExecutorService.class),
+        Clock.fixed(Instant.ofEpochMilli(1_000), ZoneOffset.UTC), new RequestMetrics());
+
+    try (RequestScope scope = RequestScope.withoutDeadline();
+         BudgetManager.Account account = budgets.admit("test-group", scope,
+             LeaseBudgetProfile.EXPIRY_WORKER_MEMORY,
+             LeaseBudgetProfile.EXPIRY_WORKER_READ_LIMITS)) {
+      CompletableFuture<?> inspection = worker.inspectCheckpoint(token, observation, scope, account);
+
+      assertFalse(inspection.isDone(), "the checkpoint scanner remains pending at the barrier");
+      assertEquals(1, budgets.snapshot().operations());
+      assertEquals(1, budgets.snapshot().scanners());
+      assertEquals(1, budgets.snapshot().cleanup());
+      assertEquals(LeaseBudgetProfile.MAX_EXPIRY_CHECKPOINT_READ_BYTES,
+          budgets.snapshot().allocatedBytes());
+
+      checkpointRead.complete(Optional.empty());
+      inspection.join();
+
+      assertEquals(0, budgets.snapshot().operations());
+      assertEquals(0, budgets.snapshot().scanners());
+      assertEquals(0, budgets.snapshot().cleanup());
+      assertEquals(0, budgets.snapshot().allocatedBytes());
+    }
+  }
+
+  @Test
+  void checkpointBudgetRejectionReleasesReservedReadBeforeStartingHBaseGet() throws Exception {
+    CommitOwnerService.OwnerToken token = new CommitOwnerService.OwnerToken("owner-a", 7);
+    CommitControlStore control = mock(CommitControlStore.class);
+    SystemRecordStore records = mock(SystemRecordStore.class);
+    BudgetManager.Limits limits = new BudgetManager.Limits(1, 0, 2, 1, 2, 0, 2L << 20);
+    BudgetManager budgets = new BudgetManager(limits, Map.of("test-group", limits), limits);
+    BudgetManager.ReadLimits readLimits = new BudgetManager.ReadLimits(1,
+        LeaseBudgetProfile.MAX_EXPIRY_CONTROL_READ_BYTES - 1, 1, 1, 1);
+    AuthorizedBackendIdentity identity = new AuthorizedBackendIdentity("test-provider", "test-subject",
+        "fixture-context", new AuthenticationScope("test-group", "test-profile"),
+        Set.of("test-group"), 0);
+    LeaseTimeObservation observation = new LeaseTimeObservation(1_000, 1_000, true);
+    var worker = new LeaseExpiryWorker("test-group", ByteKey.copyOf(new byte[32]), 4,
+        10_000, control, records, mock(M3OwnerLease.class), mock(MutationRelay.class), identity,
+        (LeaseTimeSource) () -> observation, budgets, LeaseBudgetProfile.EXPIRY_WORKER_MEMORY,
+        Runnable::run, mock(ScheduledExecutorService.class),
+        Clock.fixed(Instant.ofEpochMilli(1_000), ZoneOffset.UTC), new RequestMetrics());
+
+    try (RequestScope scope = RequestScope.withoutDeadline();
+         BudgetManager.Account account = budgets.admit("test-group", scope,
+             LeaseBudgetProfile.EXPIRY_WORKER_MEMORY, readLimits)) {
+      CompletionException failure = assertThrows(CompletionException.class,
+          () -> worker.inspectCheckpoint(token, new LeaseTimeObservation(1_000, 1_000, true),
+              scope, account).join());
+      assertTrue(failure.getCause() instanceof BackendFailure);
+      verify(control, never()).read(any(RequestScope.class));
+      assertEquals(0, budgets.snapshot().operations());
+      assertEquals(0, budgets.snapshot().scanners());
+      assertEquals(0, budgets.snapshot().cleanup());
+      assertEquals(0, budgets.snapshot().allocatedBytes());
     }
   }
 
@@ -212,5 +303,19 @@ class LeaseExpiryWorkerTest {
     when(state.publication()).thenReturn(Optional.empty());
     when(state.finalizedSequence()).thenReturn(finalizedSequence);
     return state;
+  }
+
+  private static BudgetManager regularWorkerBudgets() {
+    BudgetManager.Limits limits = new BudgetManager.Limits(2, 0, 4, 2, 4, 0, 2L << 20);
+    return new BudgetManager(limits, Map.of("test-group", limits), limits);
+  }
+
+  private static BudgetManager reservedWorkerBudgets() {
+    var capacity = LeaseBudgetProfile.perGroupCapacity(1_572_864);
+    var limits = new BudgetManager.Limits(capacity.requests(), capacity.queued(),
+        capacity.operations(), capacity.scanners(), capacity.cleanup(), capacity.queuedBytes(),
+        capacity.memoryBytes());
+    return new BudgetManager(limits, Map.of("test-group", limits), limits,
+        capacity, Map.of("test-group", capacity));
   }
 }

@@ -13,7 +13,7 @@ public record LeaseExpiryCheckpoint(long ownerEpoch, long sequence, int bucketCo
   private static final byte[] VALUE_MAGIC = {'L', 'E', 'C', 1};
   public static final int ROUTE_BYTES = IDENTITY_PREFIX.length;
   public static final int IDENTITY_BYTES = ROUTE_BYTES + Long.BYTES;
-  private static final int MAX_ENCODED_BYTES = 128;
+  public static final int MAX_ENCODED_BYTES = 128;
   private static final int MAX_BUCKETS = 65_536;
 
   /** The next deadline window and salt bucket to scan. {@code afterIdentity} is exclusive. */

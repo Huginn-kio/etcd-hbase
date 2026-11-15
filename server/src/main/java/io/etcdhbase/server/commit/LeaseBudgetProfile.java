@@ -1,7 +1,10 @@
 package io.etcdhbase.server.commit;
 
 import io.etcdhbase.core.commit.ManifestCatalog;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.hbase.codec.CommitControlMessages;
+import io.etcdhbase.hbase.storage.HBaseSystemRecordStore;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +19,14 @@ public final class LeaseBudgetProfile {
       new BudgetManager.Reservation(4L << 10, 64L << 10, 1L << 20, 0, 0);
   public static final BudgetManager.ReadLimits EXPIRY_WORKER_READ_LIMITS =
       new BudgetManager.ReadLimits(16, 1L << 20, 4, 4, 16);
+  static final BudgetManager.Work EXPIRY_CONTROL_READ_WORK =
+      new BudgetManager.Work(0, 1, 0, 0, 0);
+  static final BudgetManager.Work EXPIRY_CHECKPOINT_SCAN_WORK = BudgetManager.Work.scan();
+  static final long MAX_EXPIRY_CONTROL_READ_BYTES = CommitControlMessages.MAX_CONTROL_BYTES;
+  static final long MAX_EXPIRY_CHECKPOINT_READ_BYTES =
+      HBaseSystemRecordStore.MAX_EXPIRY_CHECKPOINT_SCAN_BYTES;
+  static final long MAX_EXPIRY_CHECKPOINT_RECORD_BYTES =
+      LeaseExpiryCheckpoint.IDENTITY_BYTES + LeaseExpiryCheckpoint.MAX_ENCODED_BYTES;
 
   private LeaseBudgetProfile() {}
 
@@ -30,7 +41,9 @@ public final class LeaseBudgetProfile {
 
   public static BudgetManager.ReservedCapacity perGroupCapacity(int maximumEtcdRequestBytes) {
     BudgetManager.Reservation leaseRequest = ownerMutationReservation(maximumEtcdRequestBytes);
-    return new BudgetManager.ReservedCapacity(2, 0, 2, 1, 2, 0,
+    // HISTORY Revoke peaks at 3 operations / 2 scanners / 3 cleanup leases. A checkpoint scan
+    // can overlap it and adds 1 / 1 / 1; the preceding control Get is sequential.
+    return new BudgetManager.ReservedCapacity(2, 0, 4, 3, 4, 0,
         Math.addExact(leaseRequest.total(), EXPIRY_WORKER_MEMORY.total()));
   }
 

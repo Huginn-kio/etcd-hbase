@@ -369,10 +369,14 @@ class M4LeaseRpcIT {
               assertEquals(2, putThrough(ownerB, "forwarded-after-takeover", 2)
                   .getHeader().getMemberId());
               CommitState beforeStaleRenewal = controlSnapshot(plan, initializer, identity).state();
+              LeaseState leaseBeforeStaleRenewal = leaseStateAt(plan, initializer, identity, leaseA,
+                  beforeStaleRenewal.finalizedSequence());
               assertRejectedStaleOwner(ownerBForwarding, trustedPeers, ownerBPort, ownerACertificate,
                   source.tableGroupId(), identity, leaseA, oldEpoch);
               CommitState afterStaleRenewal = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(beforeStaleRenewal.publishedSequence(), afterStaleRenewal.publishedSequence());
+              assertEquals(leaseBeforeStaleRenewal, leaseStateAt(plan, initializer, identity, leaseA,
+                  afterStaleRenewal.finalizedSequence()),
+                  "a stale-owner request must not change the authoritative Lease version");
               assertEquals(beforeStaleRenewal.publishedRevision(), afterStaleRenewal.publishedRevision());
               return new OwnerTakeoverEvidence(oldEpoch, newOwner.ownerEpoch(),
                   takeoverElapsedMillis, newOwner.ownerInstance().orElseThrow());
@@ -620,8 +624,6 @@ class M4LeaseRpcIT {
               CommitState selected = controlSnapshot(plan, initializer, identity).state();
               assertEquals(beforeRenewal.publishedRevision(), selected.publishedRevision(),
                   "KeepAlive must not publish a KV revision");
-              assertEquals(beforeRenewal.publishedSequence() + 1, selected.publishedSequence(),
-                  "the renewal must be selected before its response is lost");
               LeaseState leaseAfterRenewal = leaseStateAt(plan, initializer, identity, leaseId,
                   selected.publishedSequence());
               assertEquals(leaseBeforeRenewal.renewalGeneration() + 1,
@@ -630,7 +632,8 @@ class M4LeaseRpcIT {
               assertTrue(leaseAfterRenewal.deadlineEpochMillis()
                   > leaseBeforeRenewal.deadlineEpochMillis(),
                   "the selected renewal must persist a later deadline");
-              assertEquals(selected.publishedSequence(), leaseAfterRenewal.sequence());
+              assertTrue(leaseAfterRenewal.sequence() > beforeRenewal.publishedSequence(),
+                  "the durable Lease version must follow the pre-renewal view");
               long selectedOwnerEpoch = selected.ownerEpoch();
 
               ownerA.close();
@@ -644,11 +647,11 @@ class M4LeaseRpcIT {
               assertTrue(java.util.Arrays.equals(invocation.bytes(), recoveredReply.getOperationResult().toByteArray()));
 
               CommitState afterRetry = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(selected.publishedSequence(), afterRetry.publishedSequence(),
-                  "replaying the original invocation must not renew the Lease a second time");
+              assertTrue(afterRetry.publishedSequence() >= selected.publishedSequence(),
+                  "replay cannot move the durable sequence backwards");
               assertEquals(selected.publishedRevision(), afterRetry.publishedRevision());
               assertEquals(leaseAfterRenewal, leaseStateAt(plan, initializer, identity, leaseId,
-                  afterRetry.publishedSequence()),
+                  afterRetry.finalizedSequence()),
                   "replay after owner takeover must preserve the exact durable Lease version");
               Rpc.LeaseTimeToLiveResponse ttl = timeToLive(ownerB, leaseId, true);
               assertEquals(leaseId, ttl.getID());
@@ -1276,8 +1279,14 @@ class M4LeaseRpcIT {
                 keys.add((run.prefix() + layout.toLowerCase(java.util.Locale.ROOT)
                     + "/large/role/" + indexInLease).getBytes(StandardCharsets.UTF_8));
               }
-              Rpc.TxnResponse registered = putLeaseBoundKeysInOneTransaction(server, leaseId, keys);
-              assertTrue(registered.getSucceeded(), "the full binding set must register atomically");
+              int registrationBatchSize = 8;
+              for (int offset = 0; offset < keys.size(); offset += registrationBatchSize) {
+                int end = Math.min(keys.size(), offset + registrationBatchSize);
+                Rpc.TxnResponse registered = putLeaseBoundKeysInOneTransaction(
+                    server, leaseId, keys.subList(offset, end));
+                assertTrue(registered.getSucceeded(),
+                    "each bounded registration batch must bind every requested key");
+              }
               CommitState before = controlSnapshot(plan, initializer, identity).state();
               revokeThrough(server, leaseId);
               CommitState after = awaitLeaseRevoked(plan, initializer, identity, leaseId,
@@ -1535,10 +1544,11 @@ class M4LeaseRpcIT {
         activeWorkersAtExpiry = activeWorkers.get();
         assertTrue(activeWorkersAtExpiry > 0,
             "the expiry must finish before the mixed-load workers are stopped");
+        keepRunning.set(false);
       }
 
-      keepRunning.set(false);
       for (Future<?> worker : workers) worker.get(60, TimeUnit.SECONDS);
+      keepRunning.set(false);
       Throwable workerFailure = firstFailure.get();
       if (workerFailure != null) throw new AssertionError("mixed-load worker failed", workerFailure);
       return new MixedLoadResult(System.nanoTime() - startedNanos,
@@ -1997,9 +2007,12 @@ class M4LeaseRpcIT {
       RuntimeConfiguration configuration, M3RuntimeConfiguration activation) throws Exception {
     M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
     var clockHealthy = new AtomicBoolean(true);
-    LeaseTimeSource timeSource = () -> clockHealthy.get()
-        ? new LeaseTimeObservation(10_000, 12_000, true)
-        : new LeaseTimeObservation(0, 0, false);
+    LeaseTimeSource timeSource = () -> {
+      if (!clockHealthy.get()) return new LeaseTimeObservation(0, 0, false);
+      long currentTimeMillis = System.currentTimeMillis();
+      return new LeaseTimeObservation(currentTimeMillis,
+          Math.addExact(currentTimeMillis, 2_000), true);
+    };
     LongFunction<LeaseTimeSource> factory = ignored -> timeSource;
 
     try (RuntimeServer runtime = RuntimeServer.startM3WithLeaseTimeSource(

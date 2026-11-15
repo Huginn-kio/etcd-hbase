@@ -6,6 +6,7 @@ import io.etcdhbase.core.commit.SystemRecordEntry;
 import io.etcdhbase.core.commit.SystemRecordPage;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.codec.SystemRecordKeyCodec;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
@@ -37,6 +38,7 @@ import org.apache.hadoop.hbase.client.Scan;
 /** Strong-read, exact-CAS adapter for immutable system records; borrowed connections stay shared. */
 public final class HBaseSystemRecordStore implements SystemRecordStore {
   public static final int MAX_RECORD_BYTES = 9 * 1024 * 1024;
+  public static final int MAX_EXPIRY_CHECKPOINT_SCAN_BYTES = 1 << 20;
   private static final int MAX_SCAN_ENTRIES = 1024;
   private static final long MAX_SCAN_BYTES = 8L << 20;
   private static final byte[] VALUE = {'r'};
@@ -232,7 +234,8 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
         .setReversed(true)
         .setLimit(1)
         .setCaching(1)
-        .setMaxResultSize(MAX_RECORD_BYTES)
+        .setMaxResultSize(type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT
+            ? MAX_EXPIRY_CHECKPOINT_SCAN_BYTES : MAX_RECORD_BYTES)
         .addFamily(binding.family());
     return scan(scan, scope, new LatestVersionCollector(type, routePrefix, sequence));
   }
@@ -417,6 +420,10 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
       };
       if (actualSequence > sequence) {
         throw new IllegalArgumentException("version seek returned a future record version");
+      }
+      if (type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT
+          && validatedValueLength(row) > LeaseExpiryCheckpoint.MAX_ENCODED_BYTES) {
+        throw new IllegalArgumentException("Lease expiry checkpoint exceeds its encoded size limit");
       }
       latest = Optional.of(new SystemRecordEntry(decoded.identity(),
           decode(row, binding.family()).orElseThrow()));
