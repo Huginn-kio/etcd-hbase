@@ -21,7 +21,8 @@ public enum SystemRecordType {
   AUXILIARY(17),
   LEASE_RESULT(18),
   LEASE_BINDING(19),
-  LEASE_EXPIRY_CHECKPOINT(20);
+  LEASE_EXPIRY_CHECKPOINT(20),
+  EVENT_REVISION_INDEX(21);
 
   private final int id;
 

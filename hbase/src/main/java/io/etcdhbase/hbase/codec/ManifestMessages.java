@@ -634,7 +634,7 @@ public final class ManifestMessages {
         .setLevel(child.level()).build();
   }
 
-  private static CommitProtos.EventPageReference encode(EventReference child) {
+  static CommitProtos.EventPageReference encode(EventReference child) {
     return CommitProtos.EventPageReference.newBuilder()
         .setIdentity(ByteString.copyFrom(child.identity().bytes()))
         .setDigest(ByteString.copyFrom(child.digest().bytes()))
@@ -661,7 +661,7 @@ public final class ManifestMessages {
         ByteKey.copyOf(message.getDigest().toByteArray()), message.getEncodedBytes());
   }
 
-  private static EventReference decodeEventReference(CommitProtos.EventPageReference message) {
+  static EventReference decodeEventReference(CommitProtos.EventPageReference message) {
     if (!message.getUnknownFields().asMap().isEmpty() || !message.hasIdentity()
         || !message.hasDigest() || !message.hasFirstOrdinal() || !message.hasLastOrdinal()
         || !message.hasItemCount() || !message.hasTotalBytes() || !message.hasLeafPageCount()

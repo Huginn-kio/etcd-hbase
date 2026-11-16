@@ -425,6 +425,13 @@ message CommitDecision {
   optional int64 base_revision = 9;
 }
 
+// This is a lookup aid; a reader must still verify the selected decision and sealed root.
+message EventRevisionIndex {
+  optional uint32 format_version = 1;
+  optional bytes decision = 2;
+  optional EventPageReference event_root = 3;
+}
+
 message RowFence {
   optional uint32 format_version = 1;
   optional uint32 row_kind = 2;
