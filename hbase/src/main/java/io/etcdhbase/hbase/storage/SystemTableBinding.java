@@ -26,6 +26,7 @@ public final class SystemTableBinding {
   private static final String AUXILIARY_FORMAT_VALUE = "1";
   private static final String LEASE_BINDING_FORMAT_VALUE = "2";
   private static final String LEASE_EXPIRY_FORMAT_VALUE = "3";
+  private static final String EVENT_INDEX_FORMAT_VALUE = "1";
   private static final Set<String> REQUIRED_RECORD_CATEGORIES =
       Set.of("CONTROL", "INVOCATION", "CANDIDATE", "MANIFEST", "DECISION", "SNAPSHOT_PIN");
   private static final Set<String> AUXILIARY_RECORD_CATEGORIES = Set.of(
@@ -33,6 +34,7 @@ public final class SystemTableBinding {
       "LEASE_RESULT", "LEASE_BINDING");
   private static final Set<String> LEASE_EXPIRY_RECORD_CATEGORIES =
       Set.of("LEASE_EXPIRY_CHECKPOINT");
+  private static final Set<String> EVENT_INDEX_RECORD_CATEGORIES = Set.of("EVENT_REVISION_INDEX");
   private final TableName table;
   private final byte[] family;
   private final String tableGroupId;
@@ -131,6 +133,38 @@ public final class SystemTableBinding {
         && LEASE_EXPIRY_FORMAT_VALUE.equals(descriptor.getValue("etcdhbase.m4.auxiliary-format"))
         && containsAllCategories(descriptor.getValue("etcdhbase.m0.record-categories"),
             LEASE_EXPIRY_RECORD_CATEGORIES);
+  }
+
+  /** Descriptor capability only; writers must also acquire the upgraded control-row fence. */
+  public boolean supportsEventRevisionIndex(TableDescriptor descriptor) {
+    return supportsLeaseExpiryCheckpoints(descriptor)
+        && EVENT_INDEX_FORMAT_VALUE.equals(descriptor.getValue("etcdhbase.m4.event-index-format"))
+        && containsAllCategories(descriptor.getValue("etcdhbase.m0.record-categories"),
+            EVENT_INDEX_RECORD_CATEGORIES);
+  }
+
+  /** Declares event-index storage independently from Lease expiry support. */
+  public TableDescriptor withEventRevisionIndexCapability(TableDescriptor descriptor) {
+    validate(descriptor);
+    if (supportsEventRevisionIndex(descriptor)) return descriptor;
+    if (!supportsLeaseExpiryCheckpoints(descriptor)) {
+      throw new IllegalStateException("event indexes require Lease expiry checkpoint capability");
+    }
+    String format = descriptor.getValue("etcdhbase.m4.event-index-format");
+    if (format != null && !EVENT_INDEX_FORMAT_VALUE.equals(format)) {
+      throw new IllegalStateException("system table declares an unsupported event index format");
+    }
+    var categories = new LinkedHashSet<>(Arrays.asList(
+        descriptor.getValue("etcdhbase.m0.record-categories").split(",", -1)));
+    categories.addAll(EVENT_INDEX_RECORD_CATEGORIES);
+    TableDescriptor upgraded = TableDescriptorBuilder.newBuilder(descriptor)
+        .setValue("etcdhbase.m0.record-categories", String.join(",", categories))
+        .setValue("etcdhbase.m4.event-index-format", EVENT_INDEX_FORMAT_VALUE)
+        .build();
+    if (!supportsEventRevisionIndex(upgraded)) {
+      throw new IllegalStateException("event index descriptor capability could not be constructed");
+    }
+    return upgraded;
   }
 
   /** Returns an additive record-category declaration for the fenced M4 capability upgrade. */

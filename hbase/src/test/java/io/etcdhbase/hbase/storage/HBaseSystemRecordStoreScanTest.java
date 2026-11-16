@@ -52,7 +52,7 @@ class HBaseSystemRecordStoreScanTest {
       return null;
     }).when(table).scan(any(Scan.class), any(AdvancedScanResultConsumer.class));
 
-    var store = new HBaseSystemRecordStore(connection, binding, true, false, false, false);
+    var store = new HBaseSystemRecordStore(connection, binding, true, false, false, false, false);
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofMinutes(1))) {
       ByteKey identity = ByteKey.copyOf(new byte[] {1});
       int bucket = binding.keyCodec().bucket(SystemRecordType.WORKSET, identity);
@@ -80,7 +80,7 @@ class HBaseSystemRecordStoreScanTest {
     var binding = new SystemTableBinding(TableName.valueOf("j40_legacy"), new byte[] {'s'},
         "j40-legacy", "j40-salt", new HashSaltStrategy());
     var store = new HBaseSystemRecordStore(mock(AsyncConnection.class), binding, true,
-        false, false, false);
+        false, false, false, false);
     ByteKey identity = io.etcdhbase.core.lease.LeaseRecordIdentity.enumeration(-7);
     assertThrows(IllegalStateException.class, () -> store.bucket(SystemRecordType.LEASE_ENUMERATION, identity));
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(1))) {
@@ -93,7 +93,7 @@ class HBaseSystemRecordStoreScanTest {
     var binding = new SystemTableBinding(TableName.valueOf("j40_auxiliary_only"), new byte[] {'s'},
         "j40-auxiliary-only", "j40-salt", new HashSaltStrategy());
     var store = new HBaseSystemRecordStore(mock(AsyncConnection.class), binding, true,
-        true, false, false);
+        true, false, false, false);
     ByteKey identity = new io.etcdhbase.core.lease.LeaseBindingIdentity(
         1, 1, ByteKey.copyOf(new byte[] {1}), 1).encode();
 
@@ -103,5 +103,16 @@ class HBaseSystemRecordStoreScanTest {
       assertThrows(IllegalStateException.class,
           () -> store.read(SystemRecordType.LEASE_BINDING, identity, scope));
     }
+  }
+
+  @Test
+  void rejectsEventIndexWhenOnlyLeaseExpiryCapabilityIsPresent() {
+    var binding = new SystemTableBinding(TableName.valueOf("j44_expiry_only"), new byte[] {'s'},
+        "j44-expiry-only", "j44-salt", new HashSaltStrategy());
+    var store = new HBaseSystemRecordStore(mock(AsyncConnection.class), binding, true,
+        true, true, true, false);
+    ByteKey identity = ByteKey.copyOf(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(1).array());
+    assertThrows(IllegalStateException.class,
+        () -> store.bucket(SystemRecordType.EVENT_REVISION_INDEX, identity));
   }
 }

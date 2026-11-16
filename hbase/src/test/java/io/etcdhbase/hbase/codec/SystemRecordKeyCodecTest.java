@@ -122,6 +122,29 @@ class SystemRecordKeyCodecTest {
   }
 
   @Test
+  void eventRevisionSeekStartsAtRequestedRevisionInEveryBucket() {
+    ByteKey first = ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(7).array());
+    int bucket = CODEC.bucket(SystemRecordType.EVENT_REVISION_INDEX, first);
+    long nextRevision = 8;
+    ByteKey next = ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(nextRevision).array());
+    while (CODEC.bucket(SystemRecordType.EVENT_REVISION_INDEX, next) != bucket) {
+      next = ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(++nextRevision).array());
+    }
+    var bounds = CODEC.eventRevisionBounds(bucket, 7, java.util.Optional.empty());
+    assertArrayEquals(CODEC.encode(SystemRecordType.EVENT_REVISION_INDEX, first), bounds.startRow());
+    assertTrue(bounds.startInclusive());
+    assertTrue(Arrays.compareUnsigned(CODEC.encode(SystemRecordType.EVENT_REVISION_INDEX, next),
+        bounds.stopRow()) < 0);
+    var resumed = CODEC.eventRevisionBounds(bucket, 7, java.util.Optional.of(next));
+    assertArrayEquals(CODEC.encode(SystemRecordType.EVENT_REVISION_INDEX, next), resumed.startRow());
+    assertFalse(resumed.startInclusive());
+    assertThrows(IllegalArgumentException.class,
+        () -> CODEC.eventRevisionBounds(bucket, 8, java.util.Optional.of(first)));
+    assertThrows(IllegalArgumentException.class,
+        () -> CODEC.eventRevisionBounds(bucket, 0, java.util.Optional.empty()));
+  }
+
+  @Test
   void expiryCandidatesSortByDeadlineAndExposeHalfOpenWindowBounds() {
     long firstLeaseId = -7;
     ByteKey first = new ExpiryCandidateIdentity(100, firstLeaseId, 1, 0).encode();

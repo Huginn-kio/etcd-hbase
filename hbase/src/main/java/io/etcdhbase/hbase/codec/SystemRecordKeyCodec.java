@@ -253,6 +253,27 @@ public final class SystemRecordKeyCodec {
     return bucketNumber(prefix);
   }
 
+  /** Seeks ordered positive event revisions independently in each salt bucket. */
+  public ScanBounds eventRevisionBounds(int bucket, long minimumRevision,
+      java.util.Optional<ByteKey> afterIdentity) {
+    Objects.requireNonNull(afterIdentity, "afterIdentity");
+    if (minimumRevision <= 0) throw new IllegalArgumentException("revision must be positive");
+    byte[] prefix = typeBucketPrefix(SystemRecordType.EVENT_REVISION_INDEX, bucket);
+    byte[] identityPrefix = ByteBuffer.allocate(prefix.length + Integer.BYTES)
+        .put(prefix).putInt(Long.BYTES).array();
+    byte[] start = ByteBuffer.allocate(identityPrefix.length + Long.BYTES)
+        .put(identityPrefix).putLong(minimumRevision).array();
+    if (afterIdentity.isPresent()) {
+      ByteKey identity = afterIdentity.orElseThrow();
+      if (identity.length() != Long.BYTES || ByteBuffer.wrap(identity.bytes()).getLong() < minimumRevision
+          || bucket(SystemRecordType.EVENT_REVISION_INDEX, identity) != bucket) {
+        throw new IllegalArgumentException("event revision resume identity is outside the requested range");
+      }
+      start = encode(SystemRecordType.EVENT_REVISION_INDEX, identity);
+    }
+    return new ScanBounds(start, afterIdentity.isEmpty(), prefixEnd(identityPrefix), false, false);
+  }
+
   /** Bounds an ordered expiration scan to a half-open deadline interval in one salt bucket. */
   public ScanBounds expiryWindowBounds(int bucket, long startDeadlineInclusive,
       long stopDeadlineExclusive, java.util.Optional<ByteKey> afterIdentity) {

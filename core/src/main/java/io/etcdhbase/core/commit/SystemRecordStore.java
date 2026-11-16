@@ -53,6 +53,13 @@ public interface SystemRecordStore {
         "expiry-window scans are not available"));
   }
 
+  /** Seeks a positive event revision in one bucket without scanning earlier revisions. */
+  default CompletableFuture<SystemRecordPage> scanEventRevisions(int bucket, long minimumRevision,
+      Optional<ByteKey> afterIdentity, int maximumEntries, long maximumBytes, RequestScope scope) {
+    return CompletableFuture.failedFuture(new UnsupportedOperationException(
+        "event-revision scans are not available"));
+  }
+
   /** Reads only the versioned binding range for one Lease incarnation. */
   default CompletableFuture<SystemRecordPage> scanLeaseBindings(long leaseId, long incarnation,
       Optional<ByteKey> afterIdentity, int maximumEntries, long maximumBytes, RequestScope scope) {

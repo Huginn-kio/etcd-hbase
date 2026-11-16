@@ -54,6 +54,17 @@ class SystemTableBindingTest {
     assertTrue(BINDING.supportsAuxiliary(withExpiry));
     assertTrue(BINDING.supportsLeaseBindings(withExpiry));
     assertTrue(BINDING.supportsLeaseExpiryCheckpoints(withExpiry));
+    assertFalse(BINDING.supportsEventRevisionIndex(withExpiry));
+    var withEventIndex = BINDING.withEventRevisionIndexCapability(withExpiry);
+    assertTrue(BINDING.supportsEventRevisionIndex(withEventIndex));
+    assertTrue(BINDING.supportsLeaseExpiryCheckpoints(withEventIndex));
+    assertThrows(IllegalStateException.class,
+        () -> BINDING.withEventRevisionIndexCapability(withLeaseBindings));
+    var unknownEventIndex = TableDescriptorBuilder.newBuilder(withExpiry)
+        .setValue("etcdhbase.m4.event-index-format", "2").build();
+    assertFalse(BINDING.supportsEventRevisionIndex(unknownEventIndex));
+    assertThrows(IllegalStateException.class,
+        () -> BINDING.withEventRevisionIndexCapability(unknownEventIndex));
     var unknownAuxiliary = TableDescriptorBuilder.newBuilder(withResult)
         .setValue("etcdhbase.m4.auxiliary-format", "4").build();
     assertFalse(BINDING.supportsAuxiliary(unknownAuxiliary));

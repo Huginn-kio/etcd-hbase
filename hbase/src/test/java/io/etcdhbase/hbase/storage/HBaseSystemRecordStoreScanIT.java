@@ -2,6 +2,7 @@ package io.etcdhbase.hbase.storage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -72,6 +73,54 @@ class HBaseSystemRecordStoreScanIT {
       assertEquals(1, last.entries().size());
       assertTrue(last.exhausted());
       assertEquals(12, last.encodedBytes());
+    }
+  }
+
+  @Test
+  void seeksEventRevisionsWithinOneBucketAndResumesExclusively() throws Exception {
+    try (M1TestEnvironment environment = M1TestEnvironment.start(1);
+        RequestScope scope = RequestScope.withTimeout(Duration.ofMinutes(3))) {
+      SystemTableBinding binding = createEventIndexCapableSystemTable(environment);
+      SystemRecordStore records = HBaseSystemRecordStore.open(
+          environment.factory(), environment.identity(), binding, scope).join();
+      var identities = new ArrayList<ByteKey>();
+      int bucket = -1;
+      for (long revision = 1; identities.size() < 4; revision++) {
+        ByteKey identity = ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(revision).array());
+        int candidateBucket = records.bucket(SystemRecordType.EVENT_REVISION_INDEX, identity);
+        if (bucket < 0) bucket = candidateBucket;
+        if (bucket == candidateBucket) identities.add(identity);
+      }
+      for (ByteKey identity : identities) {
+        assertEquals(SystemRecordStore.CreateResult.CREATED,
+            records.createIfAbsent(SystemRecordType.EVENT_REVISION_INDEX, identity,
+                ByteKey.copyOf(new byte[] {1}), scope).join());
+      }
+      long minimum = ByteBuffer.wrap(identities.get(1).bytes()).getLong();
+      SystemRecordPage first = records.scanEventRevisions(bucket, minimum,
+          java.util.Optional.empty(), 2, 128, scope).join();
+      assertEquals(identities.subList(1, 3),
+          first.entries().stream().map(SystemRecordEntry::identity).toList());
+      assertFalse(first.exhausted());
+      SystemRecordPage last = records.scanEventRevisions(bucket, minimum,
+          first.lastIdentity(), 2, 128, scope).join();
+      assertEquals(List.of(identities.get(3)),
+          last.entries().stream().map(SystemRecordEntry::identity).toList());
+      assertTrue(last.exhausted());
+
+      ByteKey invalid = null;
+      for (long revision = -1; revision >= -100_000 && invalid == null; revision--) {
+        ByteKey candidate = ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(revision).array());
+        if (records.bucket(SystemRecordType.EVENT_REVISION_INDEX, candidate) == bucket) {
+          invalid = candidate;
+        }
+      }
+      assertNotNull(invalid, "fixture must produce an invalid revision in the selected bucket");
+      records.createIfAbsent(SystemRecordType.EVENT_REVISION_INDEX, invalid,
+          ByteKey.copyOf(new byte[] {1}), scope).join();
+      assertThrows(CompletionException.class, () -> records.scanEventRevisions(
+          records.bucket(SystemRecordType.EVENT_REVISION_INDEX, identities.getFirst()), minimum,
+          last.lastIdentity(), 2, 128, scope).join());
     }
   }
 
@@ -250,6 +299,16 @@ class HBaseSystemRecordStoreScanIT {
 
   private static SystemTableBinding createLeaseCapableSystemTable(
       M1TestEnvironment environment, boolean leaseBindings, boolean expiryCheckpoints) throws Exception {
+    return createSystemTable(environment, leaseBindings, expiryCheckpoints, false);
+  }
+
+  private static SystemTableBinding createEventIndexCapableSystemTable(
+      M1TestEnvironment environment) throws Exception {
+    return createSystemTable(environment, true, true, true);
+  }
+
+  private static SystemTableBinding createSystemTable(M1TestEnvironment environment,
+      boolean leaseBindings, boolean expiryCheckpoints, boolean eventIndexes) throws Exception {
     String suffix = UUID.randomUUID().toString().replace("-", "");
     String group = "j40-scan-" + suffix;
     String saltProfileId = "j40-salt-" + suffix;
@@ -270,6 +329,7 @@ class HBaseSystemRecordStoreScanIT {
         .setValue("etcdhbase.m0.record-categories", RECORD_CATEGORIES)
         .setValue("etcdhbase.m4.auxiliary-format", expiryCheckpoints ? "3" : leaseBindings ? "2" : "1")
         .build();
+    if (eventIndexes) descriptor = binding.withEventRevisionIndexCapability(descriptor);
     environment.create(table, descriptor, salt.splitKeys().toArray(byte[][]::new));
     return binding;
   }
