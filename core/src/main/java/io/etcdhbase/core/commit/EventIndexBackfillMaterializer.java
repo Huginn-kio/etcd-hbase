@@ -60,6 +60,11 @@ public final class EventIndexBackfillMaterializer {
               || state.finalizedRevision() != checkpoint.upperRevision())) {
         throw new IllegalStateException("initial backfill window differs from the finalized barrier");
       }
+      if (!materialize && previousRevision.isEmpty()) {
+        return EventIndexBackfillCapture.verifyBoundaries(checkpoint, sequence ->
+            decisions.read(sequence, scope).thenApply(decision -> decision.orElseThrow(
+                () -> new IllegalStateException("captured legacy decision is missing"))));
+      }
       return processLegacy(checkpoint, previousRevision, scope, materialize);
     });
   }

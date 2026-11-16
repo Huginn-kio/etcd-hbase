@@ -4,6 +4,7 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 /** Verifies the retained legacy interval while its initial event pin remains registered. */
 public final class EventIndexBackfillCapture {
@@ -37,7 +38,7 @@ public final class EventIndexBackfillCapture {
             return;
           }
           try {
-            validate(checkpoint, scope, budget)
+            verifyBoundaries(checkpoint, sequence -> read(sequence, scope, budget))
                 .thenCompose(ignored -> window.checkPublication(checkpoint, checkpoint.ownerEpoch(),
                     checkpoint.sequence(), budget))
                 .whenComplete((ignored, validationFailure) -> {
@@ -57,8 +58,9 @@ public final class EventIndexBackfillCapture {
     return output;
   }
 
-  private CompletableFuture<Void> validate(EventIndexBackfillCheckpoint checkpoint,
-      RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+  /** Shared by capture and preflight so the published window cannot omit retained history. */
+  static CompletableFuture<Void> verifyBoundaries(EventIndexBackfillCheckpoint checkpoint,
+      Function<Long, CompletableFuture<CommitDecision>> read) {
     if (checkpoint.upperSequence() == 0) {
       if (checkpoint.firstSequence() != 1 || checkpoint.firstBaseRevision() != checkpoint.upperRevision()) {
         return CompletableFuture.failedFuture(new IllegalStateException("invalid empty legacy boundary"));
@@ -68,20 +70,23 @@ public final class EventIndexBackfillCapture {
     if (checkpoint.firstSequence() > checkpoint.upperSequence()) {
       return CompletableFuture.failedFuture(new IllegalStateException("retained legacy history is missing"));
     }
-    return read(checkpoint.firstSequence(), scope, budget).thenCompose(first -> {
-      if (first.baseRevision() != checkpoint.firstBaseRevision()) {
+    return read.apply(checkpoint.firstSequence()).thenCompose(first -> {
+      if (first.sequence() != checkpoint.firstSequence()
+          || first.baseRevision() != checkpoint.firstBaseRevision()) {
         throw new IllegalStateException("first legacy decision differs from the captured revision");
       }
       if (checkpoint.firstSequence() == 1) return CompletableFuture.completedFuture(null);
-      return read(checkpoint.firstSequence() - 1, scope, budget).thenAccept(previous -> {
-        if (previous.revision() != first.baseRevision()
+      return read.apply(checkpoint.firstSequence() - 1).thenAccept(previous -> {
+        if (previous.sequence() != checkpoint.firstSequence() - 1
+            || previous.revision() != first.baseRevision()
             || previous.revision() >= checkpoint.compactRevision()) {
           throw new IllegalStateException("captured interval skips retained legacy history");
         }
       });
-    }).thenCompose(ignored -> read(checkpoint.upperSequence(), scope, budget))
+    }).thenCompose(ignored -> read.apply(checkpoint.upperSequence()))
         .thenAccept(last -> {
-          if (last.revision() != checkpoint.upperRevision()) {
+          if (last.sequence() != checkpoint.upperSequence()
+              || last.revision() != checkpoint.upperRevision()) {
             throw new IllegalStateException("last legacy decision differs from the captured revision");
           }
         });

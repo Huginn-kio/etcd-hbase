@@ -133,19 +133,19 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
         10, 10, legacyRoot.systemIdentity(), legacyRoot.digest(), false);
     var control = new BackfillControl(4);
     var materialization = materializationWithBackfill(records, control, legacyRoot, legacyDecision);
-    var initial = new EventIndexBackfillCheckpoint(1, 5, 2, 4, 2, 10, 10, 11, 0);
+    var initial = new EventIndexBackfillCheckpoint(1, 5, 2, 4, 2, 10, 10, 11, 11);
     TransactionId firstTransaction = TransactionId.create();
     var first = eventCheckpointRecord(firstTransaction, initial);
     try (RequestScope scope = scope()) {
       var skippedInitial = eventCheckpointRecord(TransactionId.create(),
-          new EventIndexBackfillCheckpoint(1, 5, 2, 4, 3, 10, 10, 11, 0));
+          new EventIndexBackfillCheckpoint(1, 5, 2, 4, 3, 10, 10, 11, 11));
       assertThrows(CompletionException.class, () -> materialization.preflight(skippedInitial, scope).join());
       materialization.preflight(first, scope).join();
       control.sequence = 5;
       assertEquals(AuxiliaryMaterializationStore.ApplyResult.APPLIED,
           materialization.applySelected(decision(firstTransaction, 5), first, scope).join());
 
-      var next = new EventIndexBackfillCheckpoint(1, 6, 2, 4, 3, 10, 10, 11, 0);
+      var next = new EventIndexBackfillCheckpoint(1, 6, 2, 4, 3, 10, 10, 11, 11);
       TransactionId secondTransaction = TransactionId.create();
       var second = eventCheckpointRecord(secondTransaction, next);
       materialization.preflight(second, scope).join();
@@ -157,10 +157,10 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
           materialization.applySelected(decision(secondTransaction, 6), second, scope).join());
 
       var skipped = eventCheckpointRecord(TransactionId.create(),
-          new EventIndexBackfillCheckpoint(1, 7, 2, 4, 5, 10, 11, 11, 0));
+          new EventIndexBackfillCheckpoint(1, 7, 2, 4, 5, 10, 11, 11, 11));
       assertThrows(CompletionException.class, () -> materialization.preflight(skipped, scope).join());
       var changedWindow = eventCheckpointRecord(TransactionId.create(),
-          new EventIndexBackfillCheckpoint(1, 7, 1, 4, 4, 10, 10, 11, 0));
+          new EventIndexBackfillCheckpoint(1, 7, 1, 4, 4, 10, 10, 11, 11));
       assertThrows(CompletionException.class, () -> materialization.preflight(changedWindow, scope).join());
       assertThrows(CompletionException.class,
           () -> materialization.applySelected(decision(TransactionId.create(), 6), second, scope).join());
@@ -228,9 +228,15 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
 
   private static SystemRecordAuxiliaryMaterializationStore materializationWithBackfill(
       MemorySystemRecordStore records, CommitControlStore control, ManifestRoot root, CommitDecision decision) {
+    CommitDecision previous = new CommitDecision(TransactionId.create(), InvocationId.create(), 1,
+        10, 10, root.systemIdentity(), root.digest(), false);
+    CommitDecision upper = new CommitDecision(TransactionId.create(), InvocationId.create(), 4,
+        10, 11, root.systemIdentity(), root.digest(), true);
     CommitDecisionRepository decisions = new CommitDecisionRepository() {
       @Override public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope scope) {
-        return CompletableFuture.completedFuture(sequence == decision.sequence() ? Optional.of(decision) : Optional.empty());
+        return CompletableFuture.completedFuture(sequence == decision.sequence() ? Optional.of(decision)
+            : sequence == previous.sequence() ? Optional.of(previous)
+            : sequence == upper.sequence() ? Optional.of(upper) : Optional.empty());
       }
       @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
           CommitDecision value, RequestScope scope) { throw new UnsupportedOperationException(); }
@@ -263,7 +269,7 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
     private BackfillControl(long sequence) { this.sequence = sequence; }
     @Override public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
       var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, ByteKey.copyOf(new byte[32]),
-          Optional.of("owner"), 1, 100, 1, sequence, 11, sequence, 11, Optional.empty(), 0);
+          Optional.of("owner"), 1, 100, 1, sequence, 11, sequence, 11, Optional.empty(), 11);
       return CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(state, new byte[] {1})));
     }
     @Override public CompletableFuture<Boolean> initializeIfAbsent(CommitState state, RequestScope scope) {

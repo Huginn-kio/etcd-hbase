@@ -24,11 +24,27 @@ class EventIndexMaterializerTest {
     var sequence = new java.util.concurrent.atomic.AtomicLong(4);
     var materializer = backfill(fixture, new MemoryIndexes(), sequence, true);
     var stale = new EventIndexBackfillCheckpoint(1, 5, 3, 3, 3, 10, 10, 11, 0);
-    var current = new EventIndexBackfillCheckpoint(1, 5, 5, 4, 5, 11, 11, 11, 0);
+    var empty = new EventIndexBackfillCheckpoint(1, 1, 1, 0, 1, 11, 11, 11, 0);
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       assertThrows(CompletionException.class,
           () -> materializer.preflight(stale, OptionalLong.empty(), scope).join());
-      materializer.preflight(current, OptionalLong.empty(), scope).join();
+      backfill(fixture, new MemoryIndexes(), new java.util.concurrent.atomic.AtomicLong(0), true)
+          .preflight(empty, OptionalLong.empty(), scope).join();
+    }
+  }
+
+  @Test
+  void initialCheckpointCannotSkipOrInventRetainedDecisionBoundaries() {
+    Fixture fixture = new Fixture();
+    var sequence = new java.util.concurrent.atomic.AtomicLong(3);
+    var materializer = backfill(fixture, new MemoryIndexes(), sequence, true);
+    var missingPredecessor = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
+    var missingFirst = new EventIndexBackfillCheckpoint(1, 4, 1, 3, 1, 10, 10, 11, 0);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      assertThrows(CompletionException.class,
+          () -> materializer.preflight(missingPredecessor, OptionalLong.empty(), scope).join());
+      assertThrows(CompletionException.class,
+          () -> materializer.preflight(missingFirst, OptionalLong.empty(), scope).join());
     }
   }
 
