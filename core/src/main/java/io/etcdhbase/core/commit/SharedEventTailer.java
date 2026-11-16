@@ -31,6 +31,7 @@ public final class SharedEventTailer implements AutoCloseable {
   private final int maximumRevisionEvents;
   private final long maximumRevisionBytes;
   private final Set<Subscription> subscriptions = new HashSet<>();
+  private final EventSubscriptionIndex<Subscription> subscriptionIndex = new EventSubscriptionIndex<>();
   private final List<Buffered> buffered = new ArrayList<>();
   private long sequence;
   private long revision;
@@ -80,6 +81,7 @@ public final class SharedEventTailer implements AutoCloseable {
     }
     var subscription = new Subscription(range, account, maximumEvents, maximumBytes);
     subscriptions.add(subscription);
+    subscriptionIndex.add(subscription, range);
     return new SubscriptionStart(subscription, sequence, revision);
   }
 
@@ -178,7 +180,11 @@ public final class SharedEventTailer implements AutoCloseable {
   private synchronized Step finishRevision() {
     requireOpen();
     try {
-      for (Subscription subscription : List.copyOf(subscriptions)) subscription.offer(buffered, activeDecision);
+      Set<Subscription> matches = new HashSet<>();
+      for (Buffered event : buffered) {
+        subscriptionIndex.forEachMatch(event.event().current().key(), matches::add);
+      }
+      for (Subscription subscription : matches) subscription.offer(buffered, activeDecision);
     } catch (RuntimeException | Error failure) {
       close();
       throw failure;
@@ -278,6 +284,7 @@ public final class SharedEventTailer implements AutoCloseable {
       if (termination != null) return;
       termination = reason;
       subscriptions.remove(this);
+      subscriptionIndex.remove(this, range);
       while (!pending.isEmpty()) pending.removeFirst().close();
       pendingBytes = 0;
     }

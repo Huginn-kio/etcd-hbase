@@ -941,6 +941,46 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void sharedTailerDeliversOnlyMatchingPointAndRangeSubscriptions() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope watchScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope readScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account tailMemory = fixture.account(tailScope);
+         BudgetManager.Account watchMemory = fixture.account(watchScope);
+         BudgetManager.Account readMemory = fixture.account(readScope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+      var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 5, 4, 8192)) {
+        ByteKey firstKey = fixture.first.current().key();
+        ByteKey secondKey = fixture.second.current().key();
+        var first = tailer.subscribe(KeyRange.point(firstKey), watchMemory, 4, 8192);
+        var second = tailer.subscribe(KeyRange.between(firstKey, secondKey), watchMemory, 4, 8192);
+        var missing = tailer.subscribe(KeyRange.point(ByteKey.copyOf(new byte[] {'c'})), watchMemory, 4, 8192);
+        var cancelled = tailer.subscribe(KeyRange.all(), watchMemory, 4, 8192);
+        cancelled.close();
+        tailer.step(readScope, new ManifestCatalog.ProofReadBudget(readScope, readMemory, 10, 1024L << 20)).join();
+        tailer.step(readScope, new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join();
+        tailer.step(readScope, new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join();
+        tailer.step(readScope, new ManifestCatalog.ProofReadBudget(readScope, readMemory, 1, 512L << 20)).join();
+        try (var pointEvent = first.poll().orElseThrow(); var rangeEvent = second.poll().orElseThrow()) {
+          assertEquals(firstKey, pointEvent.event().current().key());
+          assertEquals(firstKey, rangeEvent.event().current().key());
+        }
+        assertTrue(first.poll().isEmpty());
+        assertTrue(second.poll().isEmpty());
+        assertTrue(missing.poll().isEmpty());
+        assertTrue(cancelled.poll().isEmpty());
+        assertEquals(2, fixture.eventReads.get());
+      }
+    }
+  }
+
+  @Test
   void sharedTailerDoesNotPublishAnIncompleteCorruptRevision() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
