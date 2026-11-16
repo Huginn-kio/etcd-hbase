@@ -823,11 +823,13 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 公开验证：源代码 head=`ec15546`、base=`cf3354a`、Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J42` 状态=passed，Go 测试 308 项、Maven XML 报告 161 份合计 932 项，J42 gRPC/MiniCluster 测试 6 项；失败、错误、跳过均为 0；HISTORY/NATIVE 两种布局在该 profile 内验证。证据目录留本地 `.artifacts/m4/j42-restacked-j41-de55-fix1-20261116`。
   - 作者自审=完成；独立复核=已完成（两项发现已修正并加入回归测试）。
 
-- [ ] **J43｜ExpiryWorker、时间窗口索引、Revoke 与撤销恢复**
+- [x] **J43｜ExpiryWorker、时间窗口索引、Revoke 与撤销恢复**
   - 依赖：J33/J41/J42。
   - 完成标准：限定到期窗口与持久化水位补查，不扫描全部业务 KV；核对 generation 并统一提交删除/PrevKV/事件；多副本任务接管、旧 worker 返回与 Pod 重建不误删，记录到期延迟和陈旧索引。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=实现及公开验证进行中；负责人=项目贡献者；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=公开实现与公开 MiniCluster 验证完成，维护者 review 待处理；负责人=项目贡献者；完成日期=2026-11-16；PR/commit=对应 J43 PR；评审人/结论=`Reidddddd` / 待评审；目标环境与 M4 阶段验收=未完成。
+  - 公开验证：代码提交 `03f07f694e3acab4c90c9da17acbe94f59c15dba` 在干净工作树上运行 `scripts/verify/m4.sh --scope public --task J43`，Go 测试 316 项、Java 测试 981 项、22 条原生 trace，HISTORY/NATIVE 两种布局；失败、错误与跳过均为 0。J29.4 覆盖并发 1、2、4；原始报告保留本地。
+  - 作者自审=完成；独立复核=完成；维护者正式 review=待处理。
 
 - [ ] **J44｜已提交事件页、共享 EventTailer 与事件读取预算**
   - 依赖：J23/J24。
