@@ -125,6 +125,42 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
   }
 
   @Test
+  void eventBackfillCheckpointRequiresContiguousSelectedProgress() {
+    var records = new MemorySystemRecordStore();
+    var materialization = materialization(records);
+    var initial = new EventIndexBackfillCheckpoint(1, 5, 2, 4, 2, 10, 10, 11, 0);
+    TransactionId firstTransaction = TransactionId.create();
+    var first = eventCheckpointRecord(firstTransaction, initial);
+    try (RequestScope scope = scope()) {
+      var skippedInitial = eventCheckpointRecord(TransactionId.create(),
+          new EventIndexBackfillCheckpoint(1, 5, 2, 4, 3, 10, 10, 11, 0));
+      assertThrows(CompletionException.class, () -> materialization.preflight(skippedInitial, scope).join());
+      materialization.preflight(first, scope).join();
+      assertEquals(AuxiliaryMaterializationStore.ApplyResult.APPLIED,
+          materialization.applySelected(decision(firstTransaction, 5), first, scope).join());
+
+      var next = new EventIndexBackfillCheckpoint(1, 6, 2, 4, 3, 10, 10, 11, 0);
+      TransactionId secondTransaction = TransactionId.create();
+      var second = eventCheckpointRecord(secondTransaction, next);
+      materialization.preflight(second, scope).join();
+      records.failNextCreateAfterApply = true;
+      assertThrows(CompletionException.class,
+          () -> materialization.applySelected(decision(secondTransaction, 6), second, scope).join());
+      assertEquals(AuxiliaryMaterializationStore.ApplyResult.ALREADY_APPLIED,
+          materialization.applySelected(decision(secondTransaction, 6), second, scope).join());
+
+      var skipped = eventCheckpointRecord(TransactionId.create(),
+          new EventIndexBackfillCheckpoint(1, 7, 2, 4, 5, 10, 11, 11, 0));
+      assertThrows(CompletionException.class, () -> materialization.preflight(skipped, scope).join());
+      var changedWindow = eventCheckpointRecord(TransactionId.create(),
+          new EventIndexBackfillCheckpoint(1, 7, 1, 4, 4, 10, 10, 11, 0));
+      assertThrows(CompletionException.class, () -> materialization.preflight(changedWindow, scope).join());
+      assertThrows(CompletionException.class,
+          () -> materialization.applySelected(decision(TransactionId.create(), 6), second, scope).join());
+    }
+  }
+
+  @Test
   void preflightRejectsStateWithDifferentIdentityOrSequence() {
     var records = new MemorySystemRecordStore();
     TransactionId transactionId = TransactionId.create();
@@ -206,6 +242,13 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
         LeaseExpiryCheckpoint.versionIdentity(sequence), checkpoint.encode());
   }
 
+  private static PreparedAuxiliaryRecord eventCheckpointRecord(TransactionId transactionId,
+      EventIndexBackfillCheckpoint checkpoint) {
+    return PreparedAuxiliaryRecord.create(transactionId, checkpoint.ownerEpoch(), checkpoint.sequence() - 1, 0,
+        SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,
+        EventIndexBackfillCheckpoint.versionIdentity(checkpoint.sequence()), checkpoint.encode());
+  }
+
   private static CommitDecision decision(TransactionId transactionId, long sequence) {
     return new CommitDecision(transactionId, InvocationId.create(), sequence, 1, 1,
         ByteKey.copyOf(new byte[] {1}), ByteKey.copyOf(new byte[32]), false);
@@ -263,7 +306,8 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
     @Override
     public CompletableFuture<Optional<SystemRecordEntry>> latestAtOrBefore(SystemRecordType type,
         ByteKey routePrefix, long sequence, RequestScope scope) {
-      if (type != SystemRecordType.LEASE_EXPIRY_CHECKPOINT) {
+      if (type != SystemRecordType.LEASE_EXPIRY_CHECKPOINT
+          && type != SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT) {
         return CompletableFuture.failedFuture(new UnsupportedOperationException(type.name()));
       }
       return CompletableFuture.completedFuture(rows.entrySet().stream()
@@ -271,10 +315,14 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
               && entry.getKey().identity().length() >= routePrefix.length()
               && Arrays.equals(entry.getKey().identity().bytes(), 0, routePrefix.length(),
                   routePrefix.bytes(), 0, routePrefix.length()))
-          .filter(entry -> LeaseExpiryCheckpoint.sequence(entry.getKey().identity()) <= sequence)
-          .max(java.util.Comparator.comparingLong(entry ->
-              LeaseExpiryCheckpoint.sequence(entry.getKey().identity())))
+          .filter(entry -> checkpointSequence(type, entry.getKey().identity()) <= sequence)
+          .max(java.util.Comparator.comparingLong(entry -> checkpointSequence(type, entry.getKey().identity())))
           .map(entry -> new SystemRecordEntry(entry.getKey().identity(), entry.getValue())));
+    }
+
+    private long checkpointSequence(SystemRecordType type, ByteKey identity) {
+      return type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT
+          ? LeaseExpiryCheckpoint.sequence(identity) : EventIndexBackfillCheckpoint.sequence(identity);
     }
 
     private ByteKey value(SystemRecordType type, ByteKey identity) {

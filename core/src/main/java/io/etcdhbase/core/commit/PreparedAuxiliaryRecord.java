@@ -81,7 +81,8 @@ public final class PreparedAuxiliaryRecord {
         || type == SystemRecordType.EXPIRY_CANDIDATE
         || type == SystemRecordType.LEASE_RESULT
         || type == SystemRecordType.LEASE_BINDING
-        || type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT;
+        || type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT
+        || type == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT;
   }
 
   private static ByteKey calculateDigest(TransactionId transactionId, long ownerEpoch,

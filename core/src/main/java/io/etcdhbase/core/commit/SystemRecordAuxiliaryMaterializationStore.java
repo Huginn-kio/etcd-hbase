@@ -53,6 +53,8 @@ public final class SystemRecordAuxiliaryMaterializationStore
         validatePointerBeforeSelection(record, existing);
       } else if (record.targetType() == SystemRecordType.LEASE_EXPIRY_CHECKPOINT) {
         return validateCheckpointBeforeSelection(record, existing, scope);
+      } else if (record.targetType() == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT) {
+        return validateEventCheckpointBeforeSelection(record, existing, scope);
       } else if (existing.isPresent() && !existing.orElseThrow().equals(record.payload())) {
         throw conflict("immutable auxiliary target already has different bytes");
       }
@@ -219,8 +221,43 @@ public final class SystemRecordAuxiliaryMaterializationStore
           throw new IllegalArgumentException("Lease expiry checkpoint differs from its selection");
         }
       }
+      case EVENT_INDEX_BACKFILL_CHECKPOINT -> {
+        EventIndexBackfillCheckpoint checkpoint = EventIndexBackfillCheckpoint.decode(record.payload());
+        if (!record.targetIdentity().equals(EventIndexBackfillCheckpoint.versionIdentity(targetSequence))
+            || checkpoint.sequence() != targetSequence || checkpoint.ownerEpoch() != record.ownerEpoch()) {
+          throw new IllegalArgumentException("event backfill checkpoint differs from its selection");
+        }
+      }
       default -> throw new IllegalArgumentException("unsupported auxiliary target type");
     }
+  }
+
+  private CompletableFuture<Void> validateEventCheckpointBeforeSelection(PreparedAuxiliaryRecord record,
+      Optional<ByteKey> existing, RequestScope scope) {
+    EventIndexBackfillCheckpoint replacement = EventIndexBackfillCheckpoint.decode(record.payload());
+    if (existing.isPresent() && !existing.orElseThrow().equals(record.payload())) {
+      return CompletableFuture.failedFuture(conflict("same-sequence event backfill checkpoints differ"));
+    }
+    return records.latestAtOrBefore(SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,
+        EventIndexBackfillCheckpoint.routePrefix(), record.baseSequence(), scope).thenAccept(previous -> {
+      if (previous.isEmpty()) {
+        if (replacement.nextSequence() != replacement.firstSequence()) {
+          throw conflict("initial event backfill checkpoint must start at the captured boundary");
+        }
+        return;
+      }
+      SystemRecordEntry entry = previous.orElseThrow();
+      EventIndexBackfillCheckpoint current = EventIndexBackfillCheckpoint.decode(entry.value());
+      if (EventIndexBackfillCheckpoint.sequence(entry.identity()) != current.sequence()
+          || current.sequence() > record.baseSequence()) {
+        throw conflict("stored event backfill checkpoint differs from its identity or read barrier");
+      }
+      try {
+        EventIndexBackfillCheckpoint.requireForwardProgress(current, replacement);
+      } catch (IllegalArgumentException stale) {
+        throw conflict("event backfill checkpoint does not advance protected durable progress");
+      }
+    });
   }
 
   private CompletableFuture<Void> validateCheckpointBeforeSelection(PreparedAuxiliaryRecord record,
