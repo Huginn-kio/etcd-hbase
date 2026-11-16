@@ -120,11 +120,7 @@ public final class CommitPublisher {
       beforeSelection.run();
       return control.compareAndSet(observed, selected, scope)
           .handle((updated, failure) -> new CasResult(updated, failure))
-<<<<<<< HEAD
-          .thenCompose(result -> resolveAttempt(invocation, owner, manifest, scope, beforeSelection, attempt, result));
-=======
-          .thenCompose(result -> resolveAttempt(invocation, owner, verified, scope, attempt, result));
->>>>>>> 5cb128ec (fix(j44): 将回填压缩边界绑定到发布 CAS)
+          .thenCompose(result -> resolveAttempt(invocation, owner, verified, scope, beforeSelection, attempt, result));
     });
   }
 
@@ -155,11 +151,7 @@ public final class CommitPublisher {
           && state.publishedSequence() == invocation.baseSequence()
           && state.publishedRevision() == invocation.baseRevision()
           && state.publication().isEmpty()) {
-<<<<<<< HEAD
-        return attempt(invocation, owner, manifest, scope, beforeSelection, attempt + 1);
-=======
-        return attempt(invocation, owner, verified, scope, attempt + 1);
->>>>>>> 5cb128ec (fix(j44): 将回填压缩边界绑定到发布 CAS)
+        return attempt(invocation, owner, verified, scope, beforeSelection, attempt + 1);
       }
       return outcomes.resolve(invocation, scope);
     });

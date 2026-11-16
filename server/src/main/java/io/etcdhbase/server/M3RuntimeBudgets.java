@@ -60,10 +60,12 @@ final class M3RuntimeBudgets {
       long minimumLeaseMemory = Math.addExact(
           M3MemoryReservations.minimumLeaseMemory(groups.size(), activation.maxEtcdRequestBytes()),
           globalReserve.memoryBytes());
-      if (memory < minimumLeaseMemory) {
-        throw new IllegalArgumentException("M4 memory_bytes must leave at least " + minimumLeaseMemory
+      long minimum = Math.addExact(minimumLeaseMemory,
+          LeaseBudgetProfile.eventBackfillMinimumMemory());
+      if (memory < minimum) {
+        throw new IllegalArgumentException("M4 memory_bytes must leave at least " + minimum
             + " after owner transport reservation for recovery accounts, Lease request/owner pairs, "
-            + "and reserved expiry capacity");
+            + "expiry capacity, and one complete event backfill cycle");
       }
     }
     int cleanup = Math.addExact(operations, scanners);

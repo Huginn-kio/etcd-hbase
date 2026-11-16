@@ -17,6 +17,11 @@ public final class LeaseBudgetProfile {
           ManifestCatalog.maximumProofReadPageBytes(), 16L << 20, 64L << 20);
   public static final BudgetManager.Reservation EXPIRY_WORKER_MEMORY =
       new BudgetManager.Reservation(4L << 10, 64L << 10, 1L << 20, 0, 0);
+  public static final BudgetManager.Reservation RECOVERY_MEMORY =
+      new BudgetManager.Reservation(64L << 10, 64L << 10, 2L << 20, 8L << 20, 48L << 20);
+  // The protected window and the nested legacy reader each own a separate scope and account.
+  static final BudgetManager.Reservation EVENT_BACKFILL_MEMORY = new BudgetManager.Reservation(
+      8192, 8192, 2 * ManifestCatalog.maximumProofReadPageBytes(), 8192, 2L << 20);
   public static final BudgetManager.ReadLimits EXPIRY_WORKER_READ_LIMITS =
       new BudgetManager.ReadLimits(16, 1L << 20, 4, 4, 16);
   static final BudgetManager.Work EXPIRY_CONTROL_READ_WORK =
@@ -29,6 +34,11 @@ public final class LeaseBudgetProfile {
       LeaseExpiryCheckpoint.IDENTITY_BYTES + LeaseExpiryCheckpoint.MAX_ENCODED_BYTES;
 
   private LeaseBudgetProfile() {}
+
+  /** Minimum regular memory for one backfill cycle, excluding recovery and Lease reserves. */
+  public static long eventBackfillMinimumMemory() {
+    return Math.multiplyExact(2, EVENT_BACKFILL_MEMORY.total());
+  }
 
   /** Covers the binding page plus the expiry candidate page retained during automatic revocation. */
   public static BudgetManager.Reservation ownerMutationReservation(int maximumEtcdRequestBytes) {

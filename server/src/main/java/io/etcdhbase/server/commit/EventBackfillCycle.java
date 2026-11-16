@@ -35,8 +35,7 @@ final class EventBackfillCycle {
   private static final long MAX_PROOF_BYTES = MAX_PROOF_PAGES * ManifestCatalog.maximumProofReadPageBytes();
   private static final int MAX_EVENTS_PER_SEQUENCE = 4096;
   // Proof callbacks can retain one page while starting the next control or manifest read.
-  private static final BudgetManager.Reservation RESERVATION = new BudgetManager.Reservation(
-      8192, 8192, 2 * ManifestCatalog.maximumProofReadPageBytes(), 8192, 2L << 20);
+  private static final BudgetManager.Reservation RESERVATION = LeaseBudgetProfile.EVENT_BACKFILL_MEMORY;
   private static final BudgetManager.ReadLimits READ_LIMITS =
       new BudgetManager.ReadLimits(MAX_PROOF_PAGES, MAX_PROOF_BYTES, MAX_PROOF_PAGES,
           MAX_PROOF_PAGES, MAX_PROOF_PAGES);

@@ -80,7 +80,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static final BudgetManager.Reservation LEASE_REQUEST_MEMORY =
       LeaseBudgetProfile.LEASE_REQUEST_MEMORY;
   private static final BudgetManager.Reservation RECOVERY_MEMORY =
-      M3MemoryReservations.RECOVERY;
+      LeaseBudgetProfile.RECOVERY_MEMORY;
   private static final Executor CLEANUP = task -> Thread.ofVirtual().name("m3-runtime-cleanup").start(task);
   private static final BiFunction<Long, Integer, LeaseTimeSource> SYSTEM_LEASE_TIME_SOURCE =
       (uncertaintyMillis, maximumDriftPpm) -> new BoundedSystemLeaseTimeSource(
@@ -537,7 +537,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   }
 
   private record BusinessComponents(PutOwnerProcessor putProcessor, TxnOwnerProcessor txnProcessor,
-      TxnReadExecutor txnReads, RequestMetrics metrics, Optional<LeaseComponents> lease) {}
+      TxnReadExecutor txnReads, RequestMetrics metrics, Optional<LeaseComponents> lease,
+      CommitPublisher publisher) {}
 
   private record LeaseComponents(LeaseGrantOwnerProcessor grantProcessor,
       LeaseRenewalOwnerProcessor renewalProcessor,
@@ -602,7 +603,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     if (cacheLimits.isPresent()) pending.createCache(plan, stores, budgets, cacheLimits.orElseThrow());
     var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),
         connections, plan.primary(), pending.worker, scans, txnLimits, metrics, Optional.ofNullable(pending.cache));
-    return new BusinessComponents(putProcessor, txnProcessor, txnReads, metrics, lease);
+    return new BusinessComponents(putProcessor, txnProcessor, txnReads, metrics, lease, publisher);
   }
 
   private static LeaseComponents assembleLease(M3TableGroupPlan plan,
@@ -767,6 +768,14 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           LeaseBudgetProfile.EXPIRY_WORKER_MEMORY, pending.worker, pending.leaseTimers, Clock.systemUTC(),
           business.metrics());
       pending.startExpiryWorker(expiryWorker);
+      var backfillPreparation = new EventBackfillPreparation(new LeaseAuxiliaryMutationPreparation(
+          new ResultPreparation(stores.resultRepository()), stores.results(),
+          new ManifestPreparation(stores.manifestRepository(), new ManifestPreparation.Limits(0, 0, 0, 0)),
+          invocations));
+      var backfill = new EventBackfillCycle(plan.source().tableGroupId(), stores, pending.eventPins,
+          invocations, backfillPreparation, business.publisher(), budgets, authorization, Clock.systemUTC());
+      pending.startBackfillWorker(new EventBackfillWorker(
+          pending.queue, pending.leaseTimers, owner::currentToken, backfill::run, business.metrics()));
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
         txnGateway::range), leaseService);
@@ -884,7 +893,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   }
 
   /** Owns all lanes until their real producers, timers, workers, and reserved recovery capacity drain. */
-  private static final class Pending {
+  static final class Pending {
     private final RequestScope startup;
     private final RequestScope recoveryScope = RequestScope.withoutDeadline();
     private final CompletableFuture<Void> ownerResolved = new CompletableFuture<>();
@@ -901,9 +910,11 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     private ScheduledExecutorService leaseTimers;
     private ScheduledThreadPoolExecutor ownedLeaseTimers;
     private volatile LeaseExpiryWorker expiryWorker;
+    private volatile EventBackfillWorker backfillWorker;
     private volatile boolean leaseEnabled;
+    private boolean ownerLost;
 
-    private Pending(RequestScope startup, ScheduledExecutorService leaseTimers) {
+    Pending(RequestScope startup, ScheduledExecutorService leaseTimers) {
       this.startup = startup;
       this.leaseTimers = leaseTimers;
     }
@@ -966,12 +977,21 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       if (!ownerStarted) ownerResolved.complete(null);
     }
 
-    private synchronized void startExpiryWorker(LeaseExpiryWorker worker) {
+    synchronized void startExpiryWorker(LeaseExpiryWorker worker) {
       Objects.requireNonNull(worker, "worker");
-      if (closing.get() || expiryWorker != null) {
+      if (closing.get() || ownerLost || expiryWorker != null) {
         throw new IllegalStateException("Lease expiry worker cannot be installed now");
       }
       expiryWorker = worker;
+      worker.start();
+    }
+
+    synchronized void startBackfillWorker(EventBackfillWorker worker) {
+      Objects.requireNonNull(worker, "worker");
+      if (closing.get() || ownerLost || backfillWorker != null) {
+        throw new IllegalStateException("event backfill worker cannot be installed now");
+      }
+      backfillWorker = worker;
       worker.start();
     }
 
@@ -985,9 +1005,12 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       return current.initialReadiness();
     }
 
-    private void ownerLost() {
+    synchronized void ownerLost() {
+      ownerLost = true;
       LeaseExpiryWorker current = expiryWorker;
       if (current != null) current.stop();
+      EventBackfillWorker backfill = backfillWorker;
+      if (backfill != null) backfill.stop();
       SerialMutationQueue currentQueue = queue;
       if (currentQueue != null) currentQueue.close();
     }
@@ -1000,17 +1023,23 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     }
 
     private void close() {
-      if (!closing.compareAndSet(false, true)) return;
-      try {
-        LeaseExpiryWorker expiry = expiryWorker;
-        if (expiry != null) expiry.stop();
-      } catch (RuntimeException | Error failure) {
-        shutdownFailure = failure;
-      }
-      try {
-        if (queue != null) queue.close();
-      } catch (RuntimeException | Error failure) {
-        shutdownFailure = merge(shutdownFailure, failure);
+      synchronized (this) {
+        if (!closing.compareAndSet(false, true)) return;
+        try {
+          if (expiryWorker != null) expiryWorker.stop();
+        } catch (RuntimeException | Error failure) {
+          shutdownFailure = failure;
+        }
+        try {
+          if (backfillWorker != null) backfillWorker.stop();
+        } catch (RuntimeException | Error failure) {
+          shutdownFailure = merge(shutdownFailure, failure);
+        }
+        try {
+          if (queue != null) queue.close();
+        } catch (RuntimeException | Error failure) {
+          shutdownFailure = merge(shutdownFailure, failure);
+        }
       }
       try {
         Thread.ofVirtual().name("m3-runtime-drain").start(this::drain);
@@ -1025,6 +1054,9 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       Throwable failure = shutdownFailure;
       try {
         if (expiryWorker != null) expiryWorker.drained().join();
+      } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
+      try {
+        if (backfillWorker != null) backfillWorker.drained().join();
       } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
       try {
         if (queue != null) queue.drained().join();

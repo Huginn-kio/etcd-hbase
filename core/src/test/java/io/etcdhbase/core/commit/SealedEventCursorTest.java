@@ -28,6 +28,30 @@ import org.junit.jupiter.api.Test;
 
 class SealedEventCursorTest {
   @Test
+  void exhaustedRegistryAttemptsRemainFencedAfterOwnerReplacement() {
+    var state = new Fixture().finalizedState();
+    for (int attempt = 0; attempt < CommitState.MAX_EVENT_REGISTRY_ATTEMPTS; attempt++) {
+      byte[] namespace = new byte[16];
+      namespace[0] = (byte) attempt;
+      state = state.reserveEventRegistry("owner", state.ownerEpoch(), 20, ByteKey.copyOf(namespace));
+    }
+    ByteKey pending = state.pendingEventRegistryNamespace().orElseThrow();
+    state = state.claimOwner("replacement", 100, 200);
+    var control = new MutableControl(state);
+    var records = new MemoryRecords();
+    try (var scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var upgrade = new EventHistoryRegistryUpgrade(records, control,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)),
+          Clock.fixed(Instant.ofEpochMilli(101), ZoneOffset.UTC));
+      var owner = new CommitOwnerService.OwnerToken("replacement", state.ownerEpoch());
+      assertThrows(CompletionException.class, () -> upgrade.upgrade(owner, scope).join());
+      assertEquals(CommitState.MAX_EVENT_REGISTRY_ATTEMPTS, control.state.eventRegistryAttempts());
+      assertEquals(Optional.of(pending), control.state.pendingEventRegistryNamespace());
+      assertTrue(records.rows.isEmpty(), "exhausted reservation must not start staging");
+    }
+  }
+
+  @Test
   void cancelledRegistryAttemptDoesNotSelectAfterItsPhysicalWritesDrain() {
     var records = new MemoryRecords();
     var control = new MutableControl(new Fixture().finalizedState());

@@ -174,9 +174,12 @@ class M4LeaseRpcIT {
               assertTrue(state.supportsEventRevisionIndex());
               registryNamespace = state.eventRegistryNamespace().orElseThrow();
               var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
-              assertTrue(new HBaseEventRevisionIndexRepository(records)
-                  .read(legacyRevision, scope).join().isEmpty(),
-                  "old history requires backfill before historical Watch can be enabled");
+              var legacyIndex = awaitBackfilledIndex(records, legacyRevision, scope);
+              var legacyDecision = new HBaseCommitDecisionRepository(records)
+                  .read(legacyIndex.decision().sequence(), scope).join().orElseThrow();
+              var legacyRoot = new HBaseManifestRepository(records)
+                  .readRoot(legacyDecision.manifestRoot(), scope).join().orElseThrow();
+              legacyIndex.verifySelected(legacyDecision, legacyRoot);
               var index = new HBaseEventRevisionIndexRepository(records)
                   .read(revision, scope).join().orElseThrow();
               var decision = new HBaseCommitDecisionRepository(records)
@@ -206,6 +209,17 @@ class M4LeaseRpcIT {
         }
       }
     }
+  }
+
+  private static io.etcdhbase.core.commit.EventRevisionIndex awaitBackfilledIndex(
+      HBaseSystemRecordStore records, long revision, RequestScope scope) throws Exception {
+    var indexes = new HBaseEventRevisionIndexRepository(records);
+    while (!scope.isDeadlineExceeded()) {
+      var found = indexes.read(revision, scope).join();
+      if (found.isPresent()) return found.orElseThrow();
+      Thread.sleep(50);
+    }
+    throw new AssertionError("legacy event index was not backfilled before the deadline");
   }
 
   @Test

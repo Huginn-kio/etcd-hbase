@@ -3,6 +3,7 @@ package io.etcdhbase.server.observability;
 import static io.etcdhbase.grpc.RequestCompletionRecorder.MethodClass;
 import static io.etcdhbase.grpc.RequestCompletionRecorder.Outcome;
 
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.grpc.RequestCompletionRecorder;
 import java.time.Duration;
@@ -49,6 +50,10 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   private final LongAdder leaseExpiryDelayMillis = new LongAdder();
   private final LongAdder leaseExpiryDelaySamplesMissing = new LongAdder();
   private final LongAdder leaseExpiryRetries = new LongAdder();
+  private final LongAdder eventBackfillSteps = new LongAdder();
+  private final LongAdder eventBackfillCompletions = new LongAdder();
+  private final LongAdder eventBackfillResourceFailures = new LongAdder();
+  private final LongAdder eventBackfillOtherFailures = new LongAdder();
   private final AtomicLong leaseExpiryOwnerEpoch = new AtomicLong();
   private final AtomicLong leaseExpiryCheckpointSequence = new AtomicLong();
   private final AtomicLong leaseExpiryWindowStopExclusive = new AtomicLong();
@@ -205,6 +210,27 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   }
 
   public void recordLeaseExpiryCandidate() { leaseExpiryCandidates.increment(); }
+
+  public void recordEventBackfillStep(boolean complete) {
+    eventBackfillSteps.increment();
+    if (complete) eventBackfillCompletions.increment();
+  }
+
+  public void recordEventBackfillFailure(BackendFailure.Category category) {
+    if (Objects.requireNonNull(category, "category") == BackendFailure.Category.RESOURCE_LIMIT) {
+      eventBackfillResourceFailures.increment();
+    } else {
+      eventBackfillOtherFailures.increment();
+    }
+  }
+
+  public EventBackfillSnapshot eventBackfill() {
+    return new EventBackfillSnapshot(eventBackfillSteps.sum(), eventBackfillCompletions.sum(),
+        eventBackfillResourceFailures.sum(), eventBackfillOtherFailures.sum());
+  }
+
+  public record EventBackfillSnapshot(long steps, long completions,
+      long resourceFailures, long otherFailures) {}
 
   public void recordLeaseExpiryStaleCandidate() { leaseExpiryStaleCandidates.increment(); }
 

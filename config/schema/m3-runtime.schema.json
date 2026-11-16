@@ -14,7 +14,10 @@
     "heartbeat_ms": {"type": "integer", "minimum": 100, "maximum": 200000},
     "startup_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 600000},
     "shutdown_timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 600000},
-    "memory_bytes": {"type": "integer", "minimum": 268435456, "maximum": 1099511627776},
+    "memory_bytes": {
+      "type": "integer", "minimum": 268435456, "maximum": 1099511627776,
+      "description": "启用 M4 时，扣除 owner 转发内存后还需容纳各表组恢复与 Lease 预留，以及一次事件回填的两个读取账户；实际最低值在启动时按配置计算。"
+    },
     "max_etcd_request_bytes": {"type": "integer", "minimum": 1, "maximum": 4194304},
     "pin_shards": {"type": "integer", "minimum": 1, "maximum": 256},
     "pin_slots_per_shard": {"type": "integer", "minimum": 1, "maximum": 512},
