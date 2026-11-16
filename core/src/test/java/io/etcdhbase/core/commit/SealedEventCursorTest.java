@@ -344,6 +344,60 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void backfillProposesProgressOnlyAfterEveryEventIsVerified() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
+    var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+        Optional.of("owner"), 1, 100, 1, 4, 11, 4, 11, Optional.empty(), 0);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        var step = EventIndexBackfillStep.open(fixture.sequenceReader(pins, state, Optional.empty()),
+            fixture.control(state), checkpoint, fixture.digest, 1, 5, scope, budget).join();
+        for (int i = 0; i < 2; i++) {
+          assertTrue(step.next(new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20))
+              .join().isEmpty());
+        }
+        var proposal = step.next(new ManifestCatalog.ProofReadBudget(scope, account, 1, 512L << 20))
+            .join().orElseThrow();
+        assertTrue(proposal.checkpoint().complete());
+        assertEquals(EventRevisionIndex.fromSelected(fixture.decision, fixture.root), proposal.index().orElseThrow());
+        assertThrows(CompletionException.class,
+            () -> step.next(new ManifestCatalog.ProofReadBudget(scope, account, 1, 512L << 20)).join());
+      }
+    }
+  }
+
+  @Test
+  void backfillRejectsMissingEventPageWithoutAdvancingCheckpoint() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
+    var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+        Optional.of("owner"), 1, 100, 1, 4, 11, 4, 11, Optional.empty(), 0);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var step = EventIndexBackfillStep.open(fixture.sequenceReader(pins, state, Optional.empty()),
+            fixture.control(state), checkpoint, fixture.digest, 1, 5, scope,
+            new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20)).join();
+        assertTrue(step.next(new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20)).join().isEmpty());
+        fixture.missingPage = true;
+        assertThrows(CompletionException.class,
+            () -> step.next(new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20)).join());
+        assertEquals(3, checkpoint.nextSequence());
+        assertTrue(scope.isClosed());
+      }
+    }
+  }
+
+  @Test
   void legacyReaderAllowsMissingIndexOnlyInsideCapturedUnchangedWindow() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
