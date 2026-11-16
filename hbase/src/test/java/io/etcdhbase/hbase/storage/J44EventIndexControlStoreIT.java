@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.EventIndexBackfillCheckpoint;
 import io.etcdhbase.core.commit.SystemRecordType;
@@ -84,8 +85,8 @@ class J44EventIndexControlStoreIT {
 
       var records = M1TestEnvironment.await(HBaseSystemRecordStore.open(
           environment.factory(), environment.identity(), binding, scope));
-      var first = new EventIndexBackfillCheckpoint(1, 8, 2, 7, 2, 10, 10, 11, 4);
-      var second = new EventIndexBackfillCheckpoint(1, 9, 2, 7, 3, 10, 10, 11, 4);
+      var first = new EventIndexBackfillCheckpoint(1, 8, 2, 7, 2, 10, 10, 11, 4, ByteKey.copyOf(new byte[16]));
+      var second = new EventIndexBackfillCheckpoint(1, 9, 2, 7, 3, 10, 10, 11, 4, ByteKey.copyOf(new byte[16]));
       var type = SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT;
       records.createIfAbsent(type, EventIndexBackfillCheckpoint.versionIdentity(8), first.encode(), scope).join();
       records.createIfAbsent(type, EventIndexBackfillCheckpoint.versionIdentity(9), second.encode(), scope).join();

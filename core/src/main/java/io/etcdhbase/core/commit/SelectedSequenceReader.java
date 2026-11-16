@@ -55,6 +55,9 @@ public final class SelectedSequenceReader {
     if (checkpoint.complete()) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("event backfill is already complete"));
     }
+    if (!checkpoint.registryIdentity().equals(pins.registryIdentity())) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("event backfill registry differs"));
+    }
     return open(checkpoint.nextSequence(), checkpoint.currentRevision(), authorizationDigest,
         scope, budget, Optional.of(checkpoint));
   }

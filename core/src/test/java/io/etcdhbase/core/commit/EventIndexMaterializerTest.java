@@ -23,8 +23,8 @@ class EventIndexMaterializerTest {
     Fixture fixture = new Fixture();
     var sequence = new java.util.concurrent.atomic.AtomicLong(4);
     var materializer = backfill(fixture, new MemoryIndexes(), sequence, true);
-    var stale = new EventIndexBackfillCheckpoint(1, 5, 3, 3, 3, 10, 10, 11, 0);
-    var empty = new EventIndexBackfillCheckpoint(1, 1, 1, 0, 1, 11, 11, 11, 0);
+    var stale = new EventIndexBackfillCheckpoint(1, 5, 3, 3, 3, 10, 10, 11, 0, ByteKey.copyOf(new byte[16]));
+    var empty = new EventIndexBackfillCheckpoint(1, 1, 1, 0, 1, 11, 11, 11, 0, ByteKey.copyOf(new byte[16]));
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       assertThrows(CompletionException.class,
           () -> materializer.preflight(stale, OptionalLong.empty(), scope).join());
@@ -38,8 +38,8 @@ class EventIndexMaterializerTest {
     Fixture fixture = new Fixture();
     var sequence = new java.util.concurrent.atomic.AtomicLong(3);
     var materializer = backfill(fixture, new MemoryIndexes(), sequence, true);
-    var missingPredecessor = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
-    var missingFirst = new EventIndexBackfillCheckpoint(1, 4, 1, 3, 1, 10, 10, 11, 0);
+    var missingPredecessor = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0, ByteKey.copyOf(new byte[16]));
+    var missingFirst = new EventIndexBackfillCheckpoint(1, 4, 1, 3, 1, 10, 10, 11, 0, ByteKey.copyOf(new byte[16]));
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       assertThrows(CompletionException.class,
           () -> materializer.preflight(missingPredecessor, OptionalLong.empty(), scope).join());
@@ -54,7 +54,7 @@ class EventIndexMaterializerTest {
     MemoryIndexes indexes = new MemoryIndexes();
     var sequence = new java.util.concurrent.atomic.AtomicLong(4);
     var materializer = backfill(fixture, indexes, sequence, true);
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 5, 3, 3, 4, 10, 11, 11, 0);
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 5, 3, 3, 4, 10, 11, 11, 0, ByteKey.copyOf(new byte[16]));
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       assertThrows(CompletionException.class, () -> materializer.apply(checkpoint, scope).join());
       sequence.set(3);
@@ -82,8 +82,8 @@ class EventIndexMaterializerTest {
     MemoryIndexes indexes = new MemoryIndexes();
     var sequence = new java.util.concurrent.atomic.AtomicLong(4);
     var backfill = backfill(fixture, indexes, sequence, true);
-    var previous = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 5, 3, 3, 4, 10, 11, 11, 0);
+    var previous = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0, ByteKey.copyOf(new byte[16]));
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 5, 3, 3, 4, 10, 11, 11, 0, ByteKey.copyOf(new byte[16]));
     TransactionId transaction = TransactionId.create();
     var record = PreparedAuxiliaryRecord.create(transaction, 1, 4, 0,
         SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,

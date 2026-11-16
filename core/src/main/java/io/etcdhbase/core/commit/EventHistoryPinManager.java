@@ -14,6 +14,9 @@ public final class EventHistoryPinManager {
 
   private EventHistoryPinManager(SnapshotPinManager registry) { this.registry = registry; }
 
+  /** Identifies the immutable registry generation whose protections must be recovered. */
+  public ByteKey registryIdentity() { return registry.registryIdentity(); }
+
   /** Initializes only after exclusive verification that the event registry is new. */
   public static CompletableFuture<EventHistoryPinManager> initializeFresh(SystemRecordStore records,
       SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {

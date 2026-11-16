@@ -133,19 +133,19 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
         10, 10, legacyRoot.systemIdentity(), legacyRoot.digest(), false);
     var control = new BackfillControl(4);
     var materialization = materializationWithBackfill(records, control, legacyRoot, legacyDecision);
-    var initial = new EventIndexBackfillCheckpoint(1, 5, 2, 4, 2, 10, 10, 11, 11);
+    var initial = new EventIndexBackfillCheckpoint(1, 5, 2, 4, 2, 10, 10, 11, 11, ByteKey.copyOf(new byte[16]));
     TransactionId firstTransaction = TransactionId.create();
     var first = eventCheckpointRecord(firstTransaction, initial);
     try (RequestScope scope = scope()) {
       var skippedInitial = eventCheckpointRecord(TransactionId.create(),
-          new EventIndexBackfillCheckpoint(1, 5, 2, 4, 3, 10, 10, 11, 11));
+          new EventIndexBackfillCheckpoint(1, 5, 2, 4, 3, 10, 10, 11, 11, ByteKey.copyOf(new byte[16])));
       assertThrows(CompletionException.class, () -> materialization.preflight(skippedInitial, scope).join());
       materialization.preflight(first, scope).join();
       control.sequence = 5;
       assertEquals(AuxiliaryMaterializationStore.ApplyResult.APPLIED,
           materialization.applySelected(decision(firstTransaction, 5), first, scope).join());
 
-      var next = new EventIndexBackfillCheckpoint(1, 6, 2, 4, 3, 10, 10, 11, 11);
+      var next = new EventIndexBackfillCheckpoint(1, 6, 2, 4, 3, 10, 10, 11, 11, ByteKey.copyOf(new byte[16]));
       TransactionId secondTransaction = TransactionId.create();
       var second = eventCheckpointRecord(secondTransaction, next);
       materialization.preflight(second, scope).join();
@@ -157,10 +157,10 @@ class SystemRecordAuxiliaryMaterializationStoreTest {
           materialization.applySelected(decision(secondTransaction, 6), second, scope).join());
 
       var skipped = eventCheckpointRecord(TransactionId.create(),
-          new EventIndexBackfillCheckpoint(1, 7, 2, 4, 5, 10, 11, 11, 11));
+          new EventIndexBackfillCheckpoint(1, 7, 2, 4, 5, 10, 11, 11, 11, ByteKey.copyOf(new byte[16])));
       assertThrows(CompletionException.class, () -> materialization.preflight(skipped, scope).join());
       var changedWindow = eventCheckpointRecord(TransactionId.create(),
-          new EventIndexBackfillCheckpoint(1, 7, 1, 4, 4, 10, 10, 11, 11));
+          new EventIndexBackfillCheckpoint(1, 7, 1, 4, 4, 10, 10, 11, 11, ByteKey.copyOf(new byte[16])));
       assertThrows(CompletionException.class, () -> materialization.preflight(changedWindow, scope).join());
       assertThrows(CompletionException.class,
           () -> materialization.applySelected(decision(TransactionId.create(), 6), second, scope).join());

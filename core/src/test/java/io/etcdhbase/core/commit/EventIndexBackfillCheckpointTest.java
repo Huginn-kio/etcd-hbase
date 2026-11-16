@@ -14,11 +14,15 @@ class EventIndexBackfillCheckpointTest {
 
   @Test
   void advancesContiguousMetadataAndKvDecisionsAndSurvivesEncoding() {
-    var initial = new EventIndexBackfillCheckpoint(1, 8, 2, 7, 2, 10, 10, 11, 4);
+    var initial = new EventIndexBackfillCheckpoint(1, 8, 2, 7, 2, 10, 10, 11, 4, ByteKey.copyOf(new byte[16]));
     var metadata = decision(2, 10, false);
     var advanced = initial.advance(1, 9, metadata);
     EventIndexBackfillCheckpoint.requireForwardProgress(initial, advanced);
     assertEquals(advanced, EventIndexBackfillCheckpoint.decode(advanced.encode()));
+    var otherRegistry = new EventIndexBackfillCheckpoint(1, 9, 2, 7, 3, 10, 10, 11, 4,
+        ByteKey.copyOf(new byte[] {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}));
+    assertThrows(IllegalArgumentException.class,
+        () -> EventIndexBackfillCheckpoint.requireForwardProgress(initial, otherRegistry));
     assertEquals(9, EventIndexBackfillCheckpoint.sequence(EventIndexBackfillCheckpoint.versionIdentity(9)));
     assertFalse(advanced.complete());
     for (long sequence = 3; sequence <= 7; sequence++) {
@@ -30,12 +34,12 @@ class EventIndexBackfillCheckpointTest {
 
   @Test
   void rejectsGapsRegressionsAndFalseCompletion() {
-    var initial = new EventIndexBackfillCheckpoint(2, 8, 2, 7, 2, 10, 10, 11, 4);
+    var initial = new EventIndexBackfillCheckpoint(2, 8, 2, 7, 2, 10, 10, 11, 4, ByteKey.copyOf(new byte[16]));
     assertThrows(IllegalArgumentException.class, () -> initial.advance(2, 9, decision(3, 10, false)));
     assertThrows(IllegalArgumentException.class, () -> initial.advance(1, 9, decision(2, 10, false)));
     assertThrows(IllegalArgumentException.class, () -> initial.advance(2, 8, decision(2, 10, false)));
     assertThrows(IllegalArgumentException.class,
-        () -> new EventIndexBackfillCheckpoint(2, 9, 2, 7, 8, 10, 10, 11, 4));
+        () -> new EventIndexBackfillCheckpoint(2, 9, 2, 7, 8, 10, 10, 11, 4, ByteKey.copyOf(new byte[16])));
     assertThrows(IllegalArgumentException.class, () -> EventIndexBackfillCheckpoint.decode(ByteKey.copyOf(new byte[2])));
     assertThrows(IllegalArgumentException.class,
         () -> EventIndexBackfillCheckpoint.sequence(ByteKey.copyOf(new byte[EventIndexBackfillCheckpoint.IDENTITY_BYTES])));

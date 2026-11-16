@@ -42,6 +42,8 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     this.registryId = registryId;
   }
 
+  ByteKey registryIdentity() { return registryId; }
+
   /** Opens an established registry or resumes an initialization with a durable witness. */
   public static CompletableFuture<SnapshotPinManager> open(SystemRecordStore records,
       SnapshotPinConfiguration configuration, RequestScope scope) {

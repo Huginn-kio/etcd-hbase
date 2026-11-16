@@ -876,7 +876,7 @@ class ManifestPreparationTest {
     var resultDirectory = ResultDirectory.create(identity, List.of(ResultPageReference.from(resultPage)));
     resultRepository.page = resultPage;
     resultRepository.directory = resultDirectory;
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 1, 1, 0, 1, 1, 1, 1, 0);
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 1, 1, 0, 1, 1, 1, 1, 0, ByteKey.copyOf(new byte[16]));
     var record = PreparedAuxiliaryRecord.create(preparing.transactionId(), 1, 0, 0,
         SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,
         EventIndexBackfillCheckpoint.versionIdentity(1), checkpoint.encode());

@@ -27,8 +27,8 @@ import org.junit.jupiter.api.Test;
 class LeaseReadViewTest {
   @Test
   void backfillReadUsesSelectedCheckpointAtThePinnedBarrier() throws Exception {
-    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0);
-    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0);
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0, ByteKey.copyOf(new byte[16]));
+    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0, ByteKey.copyOf(new byte[16]));
     try (Fixture fixture = new Fixture(stable, selected); var budget = new EnumerationBudget(fixture.scope)) {
       var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
       assertEquals(selected, reader.read(fixture.pinned, fixture.scope, budget.metadata).join().orElseThrow());
@@ -38,8 +38,8 @@ class LeaseReadViewTest {
 
   @Test
   void backfillReadRejectsCorruptOrDiscontinuousCheckpoints() throws Exception {
-    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0);
-    var skipped = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 3, 1, 2, 2, 0);
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0, ByteKey.copyOf(new byte[16]));
+    var skipped = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 3, 1, 2, 2, 0, ByteKey.copyOf(new byte[16]));
     try (Fixture fixture = new Fixture(stable, skipped); var budget = new EnumerationBudget(fixture.scope)) {
       var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
       assertThrows(CompletionException.class, () -> reader.read(fixture.pinned, fixture.scope, budget.metadata).join());
@@ -54,8 +54,8 @@ class LeaseReadViewTest {
 
   @Test
   void cancelledBackfillReadHoldsItsPinUntilPhysicalReadFinishes() throws Exception {
-    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0);
-    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0);
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0, ByteKey.copyOf(new byte[16]));
+    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0, ByteKey.copyOf(new byte[16]));
     try (Fixture fixture = new Fixture(stable, selected); var budget = new EnumerationBudget(fixture.scope)) {
       fixture.records.blocked = new CompletableFuture<>();
       var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
@@ -70,8 +70,8 @@ class LeaseReadViewTest {
 
   @Test
   void backfillReadDoesNotReturnAfterProtectionExpires() throws Exception {
-    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0);
-    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0);
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0, ByteKey.copyOf(new byte[16]));
+    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0, ByteKey.copyOf(new byte[16]));
     try (Fixture fixture = new Fixture(stable, selected); var budget = new EnumerationBudget(fixture.scope)) {
       fixture.pin.failRenewAt = 2;
       var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));

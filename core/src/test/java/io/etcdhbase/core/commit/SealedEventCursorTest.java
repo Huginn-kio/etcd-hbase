@@ -347,12 +347,12 @@ class SealedEventCursorTest {
   void backfillProposesProgressOnlyAfterEveryEventIsVerified() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
     var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
         Optional.of("owner"), 1, 100, 1, 4, 11, 4, 11, Optional.empty(), 0);
     try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       var pins = EventHistoryPinManager.initializeFresh(records,
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0, pins.registryIdentity());
       try (RequestScope windowScope = RequestScope.withTimeout(Duration.ofSeconds(5));
            BudgetManager.Account windowAccount = fixture.account(windowScope);
            RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
@@ -388,13 +388,18 @@ class SealedEventCursorTest {
   void capturesHistoryProtectionBeforeInitialCheckpointSelection() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
     try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
          BudgetManager.Account account = fixture.account(scope)) {
       var pins = EventHistoryPinManager.initializeFresh(records,
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0, pins.registryIdentity());
+      var checkpointTemplate = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0, ByteKey.copyOf(new byte[16]));
       var control = fixture.control(fixture.finalizedState());
+      assertThrows(CompletionException.class, () -> EventBackfillWindow.openCapture(pins, control,
+          checkpointTemplate, fixture.digest, scope,
+          new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20)).join());
+      assertTrue(pins.readBoundary(setup).join().protections().isEmpty());
       var window = EventBackfillWindow.openCapture(pins, control, checkpoint, fixture.digest, scope,
           new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20)).join();
       assertFalse(pins.readBoundary(setup).join().protections().isEmpty());
@@ -409,12 +414,12 @@ class SealedEventCursorTest {
   void initialCaptureRejectsAnOutdatedUpperBoundary() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 2, 2, 2, 10, 10, 10, 0);
     try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
          BudgetManager.Account account = fixture.account(scope)) {
       var pins = EventHistoryPinManager.initializeFresh(records,
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 2, 2, 2, 10, 10, 10, 0, pins.registryIdentity());
       assertThrows(CompletionException.class, () -> EventBackfillWindow.openCapture(pins,
           fixture.control(fixture.finalizedState()), checkpoint, fixture.digest, scope,
           new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20)).join());
@@ -427,7 +432,6 @@ class SealedEventCursorTest {
     CommitDecision previous = new CommitDecision(TransactionId.create(), InvocationId.create(),
         2, 10, 10, fixture.key, fixture.digest, false);
     var records = new MemoryRecords();
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 11);
     var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
         Optional.of("owner"), 1, 100, 1, 3, 11, 3, 11, Optional.empty(), 11);
     var decisions = fixture.decisionsBySequence(Map.of(2L, previous, 3L, fixture.decision));
@@ -436,6 +440,7 @@ class SealedEventCursorTest {
          BudgetManager.Account account = fixture.account(scope)) {
       var pins = EventHistoryPinManager.initializeFresh(records,
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 11, pins.registryIdentity());
       var capture = new EventIndexBackfillCapture(pins, fixture.control(state), decisions);
       var window = capture.open(checkpoint, fixture.digest, scope,
           new ManifestCatalog.ProofReadBudget(scope, account, 16, 1024L << 20)).join();
@@ -451,12 +456,12 @@ class SealedEventCursorTest {
     CommitDecision previous = new CommitDecision(TransactionId.create(), InvocationId.create(),
         2, 10, 10, fixture.key, fixture.digest, false);
     var records = new MemoryRecords();
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 10);
     var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
         Optional.of("owner"), 1, 100, 1, 3, 11, 3, 11, Optional.empty(), 10);
     try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       var pins = EventHistoryPinManager.initializeFresh(records,
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 10, pins.registryIdentity());
       for (var decisions : List.of(fixture.decisionsBySequence(Map.of(2L, previous, 3L, fixture.decision)),
           fixture.decisionsBySequence(Map.of(2L, previous)))) {
         try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
@@ -473,12 +478,12 @@ class SealedEventCursorTest {
   void backfillRejectsMissingEventPageWithoutAdvancingCheckpoint() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
     var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
         Optional.of("owner"), 1, 100, 1, 4, 11, 4, 11, Optional.empty(), 0);
     try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       var pins = EventHistoryPinManager.initializeFresh(records,
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0, pins.registryIdentity());
       try (RequestScope windowScope = RequestScope.withTimeout(Duration.ofSeconds(5));
            BudgetManager.Account windowAccount = fixture.account(windowScope);
            RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
@@ -508,7 +513,6 @@ class SealedEventCursorTest {
   void losingWindowProtectionPreventsBackfillProposal() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
     var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
         Optional.of("owner"), 1, 100, 1, 4, 11, 4, 11, Optional.empty(), 0);
     try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
@@ -518,6 +522,7 @@ class SealedEventCursorTest {
          BudgetManager.Account account = fixture.account(scope)) {
       var pins = EventHistoryPinManager.initializeFresh(records,
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0, pins.registryIdentity());
       var window = EventBackfillWindow.open(pins, fixture.control(state), checkpoint, fixture.digest,
           windowScope, new ManifestCatalog.ProofReadBudget(windowScope, windowAccount, 3, 512L << 20)).join();
       var step = EventIndexBackfillStep.open(fixture.sequenceReader(pins, state, Optional.empty()),
@@ -541,15 +546,19 @@ class SealedEventCursorTest {
   void legacyReaderAllowsMissingIndexOnlyInsideCapturedUnchangedWindow() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
-    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
     var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
         Optional.of("owner"), 1, 100, 1, 4, 11, 4, 11, Optional.empty(), 0);
     try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
       var pins = EventHistoryPinManager.initializeFresh(records,
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0, pins.registryIdentity());
       try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
            BudgetManager.Account account = fixture.account(scope)) {
         var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        var wrongRegistry = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0,
+            ByteKey.copyOf(new byte[16]));
+        assertThrows(CompletionException.class, () -> fixture.sequenceReader(pins, state, Optional.empty())
+            .openLegacy(wrongRegistry, fixture.digest, scope, budget).join());
         var selected = fixture.sequenceReader(pins, state, Optional.empty())
             .openLegacy(checkpoint, fixture.digest, scope, budget).join().orElseThrow();
         assertEquals(EventRevisionIndex.fromSelected(fixture.decision, fixture.root), selected.index().orElseThrow());

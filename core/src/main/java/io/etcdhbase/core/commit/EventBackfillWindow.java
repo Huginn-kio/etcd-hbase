@@ -48,7 +48,8 @@ public final class EventBackfillWindow implements AutoCloseable {
     Objects.requireNonNull(checkpoint, "checkpoint");
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(budget, "budget");
-    if (!capture && checkpoint.complete() || !budget.belongsTo(scope)) {
+    if (!capture && checkpoint.complete() || !budget.belongsTo(scope)
+        || !checkpoint.registryIdentity().equals(pins.registryIdentity())) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid event backfill protection request"));
     }
     long firstRevision = checkpoint.firstBaseRevision() == Long.MAX_VALUE
@@ -107,6 +108,7 @@ public final class EventBackfillWindow implements AutoCloseable {
         || checkpoint.firstBaseRevision() != captured.firstBaseRevision()
         || checkpoint.upperRevision() != captured.upperRevision()
         || checkpoint.compactRevision() != captured.compactRevision()
+        || !checkpoint.registryIdentity().equals(captured.registryIdentity())
         || checkpoint.nextSequence() < captured.nextSequence()) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("event backfill window differs from its protection"));
     }
