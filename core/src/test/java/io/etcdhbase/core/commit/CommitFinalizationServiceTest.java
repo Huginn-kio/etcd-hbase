@@ -58,6 +58,25 @@ class CommitFinalizationServiceTest {
   }
 
   @Test
+  void upgradedControlCannotFinalizeKeyChangeWithoutEventIndexWriter() {
+    Fixture fixture = new Fixture(SystemRecordStore.CreateResult.ALREADY_PRESENT, true, false);
+    CommitState state = fixture.control.state;
+    fixture.control.state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION,
+        state.profileFingerprint(), state.ownerInstance(), state.ownerEpoch(),
+        state.ownerLeaseDeadlineEpochMillis(), state.stateVersion(), state.publishedSequence(),
+        state.publishedRevision(), state.finalizedSequence(), state.finalizedRevision(),
+        state.publication(), state.compactRevision());
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pending = new CommitOutcomeResolver.Resolution(
+          CommitOutcomeResolver.State.SELECTED_PENDING, Optional.of(fixture.decision), Optional.empty());
+      assertThrows(ExecutionException.class,
+          () -> fixture.service.finish(fixture.invocation, pending, scope).get());
+      assertEquals(0, fixture.control.state.finalizedSequence());
+      assertTrue(fixture.control.state.publication().isPresent());
+    }
+  }
+
+  @Test
   void failedMaterializationDoesNotAdvanceFinalizedSequence() {
     Fixture fixture = new Fixture(SystemRecordStore.CreateResult.ALREADY_PRESENT, true, true);
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {

@@ -28,6 +28,7 @@ class CommitControlMessagesTest {
     var upgraded = legacy.upgradeAuxiliaryFormat("owner-a", 1, 11);
     var bindingEnabled = upgraded.upgradeLeaseBindingFormat("owner-a", 2, 12);
     var expiryEnabled = bindingEnabled.upgradeLeaseExpiryFormat("owner-a", 3, 13);
+    var eventIndexEnabled = expiryEnabled.upgradeEventIndexFormat("owner-a", 4, 14);
     var oldWire = CommitProtos.CommitControlState.parseFrom(CommitControlMessages.encode(legacy));
     var newWire = CommitProtos.CommitControlState.parseFrom(CommitControlMessages.encode(upgraded));
     var bindingWire = CommitProtos.CommitControlState.parseFrom(CommitControlMessages.encode(bindingEnabled));
@@ -38,9 +39,10 @@ class CommitControlMessagesTest {
     assertEquals(3, bindingWire.getFormatVersion());
     assertStateEquals(bindingEnabled, roundTrip(bindingEnabled));
     assertThrows(IllegalArgumentException.class, () -> CommitControlMessages.decode(
-        expiryWire.toBuilder().setFormatVersion(5).build().toByteArray()));
+        expiryWire.toBuilder().setFormatVersion(6).build().toByteArray()));
     assertEquals(4, expiryWire.getFormatVersion());
     assertStateEquals(expiryEnabled, roundTrip(expiryEnabled));
+    assertStateEquals(eventIndexEnabled, roundTrip(eventIndexEnabled));
   }
 
   @Test

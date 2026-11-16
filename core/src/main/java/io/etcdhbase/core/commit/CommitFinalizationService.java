@@ -19,6 +19,7 @@ public final class CommitFinalizationService implements CommitFinalizer {
   private final MaterializationStore materialization;
   private final ResultCatalog results;
   private final AuxiliaryMaterializationStore auxiliaryMaterialization;
+  private final EventIndexMaterializer eventIndexes;
 
   public CommitFinalizationService(
       CommitControlStore control,
@@ -49,6 +50,16 @@ public final class CommitFinalizationService implements CommitFinalizer {
       MaterializationStore materialization,
       ResultCatalog results,
       AuxiliaryMaterializationStore auxiliaryMaterialization) {
+    this(control, outcomes, decisions, manifests, materialization, results,
+        auxiliaryMaterialization, null);
+  }
+
+  /** Enables mandatory event-index materialization for upgraded table groups. */
+  public CommitFinalizationService(
+      CommitControlStore control, CommitOutcomeResolver outcomes,
+      CommitDecisionRepository decisions, ManifestCatalog manifests,
+      MaterializationStore materialization, ResultCatalog results,
+      AuxiliaryMaterializationStore auxiliaryMaterialization, EventRevisionIndexRepository eventIndexes) {
     this.control = Objects.requireNonNull(control, "control");
     this.outcomes = Objects.requireNonNull(outcomes, "outcomes");
     this.decisions = Objects.requireNonNull(decisions, "decisions");
@@ -56,6 +67,7 @@ public final class CommitFinalizationService implements CommitFinalizer {
     this.materialization = Objects.requireNonNull(materialization, "materialization");
     this.results = results;
     this.auxiliaryMaterialization = auxiliaryMaterialization;
+    this.eventIndexes = eventIndexes == null ? null : new EventIndexMaterializer(eventIndexes);
   }
 
   @Override
@@ -82,7 +94,8 @@ public final class CommitFinalizationService implements CommitFinalizer {
       return archiveDecision(decision, serviceScope, 0)
           .thenCompose(ignored -> readAndValidateManifest(invocation, decision, serviceScope))
           .thenCompose(root -> applyCandidates(invocation, decision, root, serviceScope)
-              .thenCompose(ignored -> applyAuxiliary(invocation, root, decision, serviceScope)))
+              .thenCompose(ignored -> applyAuxiliary(invocation, root, decision, serviceScope))
+              .thenCompose(ignored -> materializeEventIndex(decision, root, serviceScope)))
           .thenCompose(ignored -> finalizeControl(invocation, decision, serviceScope, 0));
     });
   }
@@ -190,6 +203,22 @@ public final class CommitFinalizationService implements CommitFinalizer {
                       "auxiliary pointer was superseded before this commit was finalized")));
         }))
         .thenApply(ignored -> null);
+  }
+
+  private CompletableFuture<Void> materializeEventIndex(
+      CommitDecision decision, ManifestRoot root, RequestScope scope) {
+    return control.read(scope).thenCompose(found -> {
+      CommitState state = found.orElseThrow(
+          () -> new IllegalStateException("authoritative M2 control state is missing")).state();
+      if (!state.supportsEventRevisionIndex() || !decision.containsKeyChanges()) {
+        return CompletableFuture.completedFuture(null);
+      }
+      if (eventIndexes == null) {
+        return CompletableFuture.failedFuture(new IllegalStateException(
+            "upgraded finalizer is not equipped to materialize event indexes"));
+      }
+      return eventIndexes.apply(decision, root, scope);
+    });
   }
 
   private CompletableFuture<CommitOutcomeResolver.Resolution> finalizeControl(

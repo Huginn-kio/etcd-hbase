@@ -19,6 +19,7 @@ import io.etcdhbase.hbase.codec.LeaseBindingMessages;
 import io.etcdhbase.hbase.codec.LeaseStateMessages;
 import io.etcdhbase.hbase.connection.HBaseRequestContext;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
+import io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepository;
 import io.etcdhbase.hbase.storage.HBaseCommitDecisionRepository;
 import io.etcdhbase.hbase.storage.HBaseInvocationRepository;
 import io.etcdhbase.hbase.storage.HBaseManifestRepository;
@@ -210,7 +211,7 @@ public final class TableGroupStores {
     var auxiliaryMaterialization = new SystemRecordAuxiliaryMaterializationStore(records,
         LeaseStateMessages::decode, LeaseBindingMessages::decode);
     var finalizer = new CommitFinalizationService(control, outcomes, decisions, manifests,
-        materialization, results, auxiliaryMaterialization);
+        materialization, results, auxiliaryMaterialization, new HBaseEventRevisionIndexRepository(records));
     var views = new ReadViewService(control, manifests, pins, system.profileFingerprint());
     var invocationResults = new InvocationResultResolver(invocations, outcomes, manifests, results);
     return new TableGroupStores(records, control, invocations, manifestRepository, manifests,

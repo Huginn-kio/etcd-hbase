@@ -82,6 +82,26 @@ class CommitStateTest {
   }
 
   @Test
+  void eventIndexUpgradeFencesOldOwnerAndRejectsPendingOrExpiredWork() {
+    var expiry = CommitState.initial(FINGERPRINT, 7).claimOwner("owner-a", 10, 100)
+        .upgradeAuxiliaryFormat("owner-a", 1, 11)
+        .upgradeLeaseBindingFormat("owner-a", 2, 12)
+        .upgradeLeaseExpiryFormat("owner-a", 3, 13);
+    var upgraded = expiry.upgradeEventIndexFormat("owner-a", 4, 14);
+
+    assertTrue(upgraded.supportsEventRevisionIndex());
+    assertTrue(upgraded.supportsLeaseExpiryCheckpoints());
+    assertEquals(5, upgraded.ownerEpoch());
+    assertEquals(expiry.publishedSequence(), upgraded.publishedSequence());
+    assertEquals(expiry.finalizedRevision(), upgraded.finalizedRevision());
+    assertThrows(IllegalStateException.class, () -> upgraded.heartbeat("owner-a", 4, 200));
+    assertThrows(IllegalStateException.class, () -> expiry.upgradeEventIndexFormat("owner-a", 3, 14));
+    assertThrows(IllegalStateException.class, () -> expiry.upgradeEventIndexFormat("owner-a", 4, 100));
+    assertThrows(IllegalStateException.class,
+        () -> expiry.publish(slot(0, 7, false, 4)).upgradeEventIndexFormat("owner-a", 4, 14));
+  }
+
+  @Test
   void metadataOnlyPublicationDoesNotAdvanceRevisionAndKeyChangesAdvanceItOnce() {
     CommitState owned = CommitState.initial(FINGERPRINT, 7).claimOwner("owner-a", 1, 100);
 
