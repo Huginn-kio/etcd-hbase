@@ -680,10 +680,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static void verifyExistingLeaseLimits(M3TableGroupPlan plan,
       M3RuntimeConfiguration activation, BudgetManager budgets, TableGroupStores stores,
       ByteKey authorization, LeaseComponents lease, RequestScope startup) throws Exception {
-    BudgetManager.Reservation scanReservation = new BudgetManager.Reservation(
-        LEASE_REQUEST_MEMORY.heads(), LEASE_REQUEST_MEMORY.page(), LEASE_REQUEST_MEMORY.io(),
-        32L << 20, LEASE_REQUEST_MEMORY.candidates());
-    var account = budgets.admit(plan.source().tableGroupId(), startup, scanReservation,
+    var account = budgets.admit(plan.source().tableGroupId(), startup, LeaseBudgetProfile.startupLeaseScanMemory(),
         new BudgetManager.ReadLimits(100_000, 64L << 20, 100_000, 100_000, 100_000));
     try {
       var proof = new ManifestCatalog.ProofReadBudget(startup, account, 100_000, 64L << 20);

@@ -40,6 +40,12 @@ public final class LeaseBudgetProfile {
     return Math.multiplyExact(2, EVENT_BACKFILL_MEMORY.total());
   }
 
+  /** One sequential startup scan verifies that existing Lease records fit the configured limits. */
+  public static BudgetManager.Reservation startupLeaseScanMemory() {
+    return new BudgetManager.Reservation(LEASE_REQUEST_MEMORY.heads(), LEASE_REQUEST_MEMORY.page(),
+        LEASE_REQUEST_MEMORY.io(), 32L << 20, LEASE_REQUEST_MEMORY.candidates());
+  }
+
   /** Covers the binding page plus the expiry candidate page retained during automatic revocation. */
   public static BudgetManager.Reservation ownerMutationReservation(int maximumEtcdRequestBytes) {
     BudgetManager.Reservation bindingRead =
