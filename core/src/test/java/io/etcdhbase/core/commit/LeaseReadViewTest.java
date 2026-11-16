@@ -44,18 +44,32 @@ class LeaseReadViewTest {
   }
 
   @Test
-  void completedBackfillReleasesWindowAndMismatchedRegistryFailsClosed() throws Exception {
+  void selectedCompletionStillRetainsHistoryUntilFinalized() throws Exception {
     var registry = ByteKey.copyOf(new byte[16]);
     var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 2, 1, 2, 2, 0, registry);
     var complete = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 3, 1, 2, 2, 0, registry);
     try (Fixture fixture = new Fixture(stable, complete); var budget = new EnumerationBudget(fixture.scope)) {
       var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
       var candidate = new SnapshotGcBoundary(10, 10, List.of());
-      assertEquals(candidate, reader.retainPendingHistory(candidate, registry, fixture.pinned,
-          fixture.scope, budget.metadata).join());
+      var retained = reader.retainPendingHistory(candidate, registry, fixture.pinned,
+          fixture.scope, budget.metadata).join();
+      assertEquals(2, retained.safeRevision());
+      assertEquals(1, retained.safeSequence());
       var wrongRegistry = ByteKey.copyOf(new byte[] {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
       assertThrows(CompletionException.class, () -> reader.retainPendingHistory(candidate, wrongRegistry,
           fixture.pinned, fixture.scope, budget.metadata).join());
+    }
+  }
+
+  @Test
+  void finalizedCompletionReleasesBackfillWindow() throws Exception {
+    var registry = ByteKey.copyOf(new byte[16]);
+    var complete = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 3, 1, 2, 2, 0, registry);
+    try (Fixture fixture = new Fixture(complete); var budget = new EnumerationBudget(fixture.scope)) {
+      var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
+      var candidate = new SnapshotGcBoundary(10, 10, List.of());
+      assertEquals(candidate, reader.retainPendingHistory(candidate, registry, fixture.pinned,
+          fixture.scope, budget.metadata).join());
     }
   }
 
@@ -463,6 +477,15 @@ class LeaseReadViewTest {
       var view = new ReadView(ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]),
           4, 3, 2, 2, 0, Optional.of(decision), Optional.of(root), 1);
       manifests = new Manifests(List.of(record), page, directory);
+      pinned = new PinnedReadView(view, pin, scope, true);
+    }
+
+    private Fixture(EventIndexBackfillCheckpoint stable) {
+      records.checkpointRows.put(EventIndexBackfillCheckpoint.versionIdentity(stable.sequence()), stable.encode());
+      manifests = new Manifests(List.of(), null, null);
+      var view = new ReadView(ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]),
+          stable.sequence(), stable.sequence(), stable.upperRevision(), stable.upperRevision(), 0,
+          Optional.empty(), Optional.empty(), 1);
       pinned = new PinnedReadView(view, pin, scope, true);
     }
 

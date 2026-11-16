@@ -50,8 +50,7 @@ public final class EventIndexBackfillReader {
 
   /**
    * Applies a selected, incomplete backfill window to a candidate event GC boundary.
-   * The caller must acquire the current auxiliary view after collecting the pin boundary and
-   * fence older publication attempts before using the result for physical collection.
+   * Until an initial checkpoint is selected, no legacy event history may be reclaimed.
    */
   public CompletableFuture<SnapshotGcBoundary> retainPendingHistory(SnapshotGcBoundary candidate,
       ByteKey registryIdentity, PinnedReadView pinned, RequestScope scope,
@@ -62,12 +61,14 @@ public final class EventIndexBackfillReader {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid event pin registry identity"));
     }
     return read(pinned, scope, budget).thenApply(checkpoint -> {
-      if (checkpoint.isEmpty()) return candidate;
+      if (checkpoint.isEmpty()) return new SnapshotGcBoundary(0, 0, candidate.protections());
       EventIndexBackfillCheckpoint window = checkpoint.orElseThrow();
       if (!window.registryIdentity().equals(registryIdentity)) {
         throw new IllegalStateException("event backfill registry differs from the GC registry");
       }
-      if (window.complete()) return candidate;
+      // The final selected step may still need its legacy event during recovery. Only a
+      // finalized completion proves that index materialization has finished.
+      if (window.complete() && window.sequence() <= pinned.view().finalizedSequence()) return candidate;
       long firstRevision = window.firstBaseRevision() == Long.MAX_VALUE
           ? Long.MAX_VALUE : window.firstBaseRevision() + 1;
       return new SnapshotGcBoundary(Math.min(candidate.safeRevision(), firstRevision),

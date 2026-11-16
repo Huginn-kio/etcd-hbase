@@ -42,7 +42,7 @@ public final class EventHistoryPinManager {
         requirement.eventRoot().map(EventReference::digest), scope);
   }
 
-  /** Candidate physical event GC boundary; callers must also check Compact and producer ownership. */
+  /** Candidate pin boundary only; use EventHistoryRetention before physical event collection. */
   public CompletableFuture<SnapshotGcBoundary> advanceRegistrationFloors(
       long revision, long sequence, RequestScope scope) {
     return registry.advanceRegistrationFloors(revision, sequence, scope);

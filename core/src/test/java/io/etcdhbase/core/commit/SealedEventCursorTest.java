@@ -26,6 +26,110 @@ import org.junit.jupiter.api.Test;
 
 class SealedEventCursorTest {
   @Test
+  void eventCollectionWaitsForBackfillAndRetainsSelectedWindowAcrossReopen() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 4, Duration.ofMinutes(1));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var snapshotPins = SnapshotPinManager.initializeFresh(records, configuration, setup).join();
+      var eventPins = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), setup).join();
+      var manifests = new ManifestCatalog(fixture.repository());
+      var views = new ReadViewService(fixture.control(fixture.finalizedState()),
+          manifests, snapshotPins, fixture.digest);
+      var retention = new EventHistoryRetention(eventPins, views, new EventIndexBackfillReader(records, manifests));
+
+      var beforeCapture = collectionBoundary(retention, fixture);
+      assertEquals(0, beforeCapture.safeSequence());
+      assertEquals(0, beforeCapture.safeRevision());
+
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 11, 0,
+          eventPins.registryIdentity());
+      records.createIfAbsent(SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,
+          EventIndexBackfillCheckpoint.versionIdentity(3), checkpoint.encode(), setup).join();
+      var reopened = EventHistoryPinManager.open(records, configuration, Clock.systemUTC(), setup).join();
+      var afterRestart = new EventHistoryRetention(reopened, views,
+          new EventIndexBackfillReader(records, manifests));
+      var pending = collectionBoundary(afterRestart, fixture);
+      assertEquals(1, pending.safeSequence());
+      assertEquals(2, pending.safeRevision());
+      assertTrue(pending.protections().isEmpty());
+
+      var complete = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 3, 1, 11, 11, 0,
+          eventPins.registryIdentity());
+      records.createIfAbsent(SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,
+          EventIndexBackfillCheckpoint.versionIdentity(4), complete.encode(), setup).join();
+      var finalized = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+          Optional.of("owner"), 1, 100, 2, 4, 11, 4, 11, Optional.empty(), 0);
+      var currentViews = new ReadViewService(fixture.control(finalized), manifests, snapshotPins, fixture.digest);
+      var finished = collectionBoundary(new EventHistoryRetention(reopened, currentViews,
+          new EventIndexBackfillReader(records, manifests)), fixture);
+      assertEquals(100, finished.safeSequence());
+      assertEquals(100, finished.safeRevision());
+    }
+  }
+
+  private static SnapshotGcBoundary collectionBoundary(EventHistoryRetention retention, Fixture fixture)
+      throws Exception {
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account account = fixture.account(scope)) {
+      var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 512L << 20);
+      return retention.advance(100, 100, fixture.digest, scope, budget).join();
+    }
+  }
+
+  @Test
+  void captureSelectedAfterGcReadCannotRaiseAbsentCheckpointBoundary() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 4, Duration.ofMinutes(1));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account account = fixture.account(scope)) {
+      var snapshotPins = SnapshotPinManager.initializeFresh(records, configuration, setup).join();
+      var eventPins = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), setup).join();
+      var manifests = new ManifestCatalog(fixture.repository());
+      var views = new ReadViewService(fixture.control(fixture.finalizedState()), manifests, snapshotPins, fixture.digest);
+      var retention = new EventHistoryRetention(eventPins, views, new EventIndexBackfillReader(records, manifests));
+      records.pendingCheckpointRead = new CompletableFuture<>();
+      var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 512L << 20);
+      var collecting = retention.advance(100, 100, fixture.digest, scope, budget);
+      assertFalse(collecting.isDone());
+
+      var newlySelected = new EventIndexBackfillCheckpoint(1, 4, 1, 3, 1, 1, 1, 11, 0,
+          eventPins.registryIdentity());
+      records.createIfAbsent(SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,
+          EventIndexBackfillCheckpoint.versionIdentity(4), newlySelected.encode(), setup).join();
+      records.pendingCheckpointRead.complete(Optional.empty());
+      var boundary = collecting.join();
+      assertEquals(0, boundary.safeSequence());
+      assertEquals(0, boundary.safeRevision());
+    }
+  }
+
+  @Test
+  void cancellingCollectionStopsThePendingCheckpointRead() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 4, Duration.ofMinutes(1));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account account = fixture.account(scope)) {
+      var snapshotPins = SnapshotPinManager.initializeFresh(records, configuration, setup).join();
+      var eventPins = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), setup).join();
+      var manifests = new ManifestCatalog(fixture.repository());
+      var views = new ReadViewService(fixture.control(fixture.finalizedState()), manifests, snapshotPins, fixture.digest);
+      var retention = new EventHistoryRetention(eventPins, views, new EventIndexBackfillReader(records, manifests));
+      records.pendingCheckpointRead = new CompletableFuture<>();
+      var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 512L << 20);
+      var collecting = retention.advance(100, 100, fixture.digest, scope, budget);
+      assertTrue(collecting.cancel(false));
+      assertTrue(scope.isCancelled());
+      records.pendingCheckpointRead.complete(Optional.empty());
+      assertEquals(0, eventPins.readBoundary(setup).join().safeSequence());
+    }
+  }
+
+  @Test
   void readsEventsInOrderWithPauseAndBoundedPageReads() throws Exception {
     Fixture fixture = new Fixture();
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
@@ -766,10 +870,25 @@ class SealedEventCursorTest {
     private final Map<ByteKey, ByteKey> rows = new HashMap<>();
     private CompletableFuture<Boolean> pauseNextCas;
     private CompletableFuture<Boolean> pausedCas;
+    private CompletableFuture<Optional<SystemRecordEntry>> pendingCheckpointRead;
     @Override public int bucket(SystemRecordType type, ByteKey identity) { return 0; }
     @Override public synchronized CompletableFuture<Optional<ByteKey>> read(
         SystemRecordType type, ByteKey identity, RequestScope scope) {
       return CompletableFuture.completedFuture(Optional.ofNullable(rows.get(identity)));
+    }
+    @Override public synchronized CompletableFuture<Optional<SystemRecordEntry>> latestAtOrBefore(
+        SystemRecordType type, ByteKey route, long sequence, RequestScope scope) {
+      if (type != SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT) {
+        throw new UnsupportedOperationException("unsupported versioned record");
+      }
+      if (pendingCheckpointRead != null) return pendingCheckpointRead;
+      return CompletableFuture.completedFuture(rows.entrySet().stream()
+          .filter(row -> row.getKey().length() == EventIndexBackfillCheckpoint.IDENTITY_BYTES)
+          .filter(row -> java.util.Arrays.equals(route.bytes(),
+              java.util.Arrays.copyOf(row.getKey().bytes(), route.length())))
+          .filter(row -> EventIndexBackfillCheckpoint.sequence(row.getKey()) <= sequence)
+          .max(Map.Entry.comparingByKey())
+          .map(row -> new SystemRecordEntry(row.getKey(), row.getValue())));
     }
     @Override public synchronized CompletableFuture<CreateResult> createIfAbsent(
         SystemRecordType type, ByteKey identity, ByteKey value, RequestScope scope) {
