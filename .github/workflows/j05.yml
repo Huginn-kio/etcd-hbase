@@ -17,11 +17,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  maven-dependencies:
+    uses: ./.github/workflows/maven-dependencies.yml
   salt-and-initialization:
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
     name: Java 21 salt profiles and real HBase initialization
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: 确认依赖准备成功
+        env:
+          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+        run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -33,5 +41,16 @@ jobs:
           java-version: '21'
           jdk-file: ${{ runner.temp }}/j05-temurin-jdk.tar.gz
           cache: maven
+          cache-read-only: true
+          cache-dependency-path: |
+            **/pom.xml
+            .mvn/maven.config
+            .mvn/wrapper/maven-wrapper.properties
+            build/dependency-lock.json
+            build/maven-settings-public.xml
+            scripts/dev/mvn21.sh
+            scripts/dev/maven-repository.sh
+            scripts/dev/prepare-maven-dependencies.py
+            .github/workflows/maven-dependencies.yml
       - name: Verify salt routing, confirmed initialization, recovery and real HBase identities
         run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" scripts/verify/j05.sh --scope public

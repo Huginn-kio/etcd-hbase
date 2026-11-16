@@ -10,11 +10,19 @@ concurrency:
   group: j24-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
+  maven-dependencies:
+    uses: ./.github/workflows/maven-dependencies.yml
   materialization:
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
     name: J24 MiniCluster commit materialization
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
+      - name: 确认依赖准备成功
+        env:
+          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+        run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -26,5 +34,16 @@ jobs:
           java-version: '21'
           jdk-file: ${{ runner.temp }}/j24-jdk.tar.gz
           cache: maven
+          cache-read-only: true
+          cache-dependency-path: |
+            **/pom.xml
+            .mvn/maven.config
+            .mvn/wrapper/maven-wrapper.properties
+            build/dependency-lock.json
+            build/maven-settings-public.xml
+            scripts/dev/mvn21.sh
+            scripts/dev/maven-repository.sh
+            scripts/dev/prepare-maven-dependencies.py
+            .github/workflows/maven-dependencies.yml
       - name: 验证 J24 HISTORY 与 NATIVE MiniCluster 物化和 fencing
         run: ETCD_HBASE_JDK21_HOME="$JAVA_HOME" bash scripts/verify/j24.sh

@@ -22,6 +22,20 @@ scripts/verify/m0.sh --scope public
 
 Maven SNAPSHOT 依赖安装到本工作树专用的 `.artifacts/m0/j09/maven-repository`，避免其他工作树覆盖同坐标产物。运行入口对本工作树加排他锁。Go 仅使用公开 proxy/checksum 服务，禁用私有包配置、VCS 回退和自动升级 toolchain。公开构建不需要目标凭据或扩展工程；J00 已接受的静态调用审计另有固定来源报告，此入口不重新克隆完整 Milvus 工程。
 
+### Maven 缓存与下载限流
+
+使用 Maven 共享缓存的 CI 工作流先调用同一提交中的 `maven-dependencies.yml`，依赖准备成功后才启动原有测试任务。准备失败会使原有检查明确失败，不会把依赖失败变成成功的跳过状态。J09 完整交付继续使用上述专用仓库，保持 SNAPSHOT 隔离。
+
+缓存键同时覆盖所有 POM、依赖锁、Maven Wrapper、公共仓库设置、下载参数和准备脚本。只有准备任务先完成整个 reactor 的外部依赖、插件及动态制品下载后，才保存这一版本的缓存；测试任务使用相同键恢复，并设置 `cache-read-only: true`，防止缓存服务故障时由只执行部分构建的消费者写入不完整缓存。新键避免继续复用旧的、不完整且无法追加保存的精确命中缓存。准备过程不安装本工程的 SNAPSHOT 制品。
+
+`scripts/dev/prepare-maven-dependencies.py` 除了执行锁定插件的 `go-offline`，还从已有依赖锁补齐动态下载的 protoc、gRPC 代码生成器、配置解析库和隔离 HBase 进程依赖，并核验全部显式制品 SHA-256。JUnit provider 和 Platform launcher 分别跟随已锁定的 Surefire/Failsafe 及 JUnit 6 版本补齐。普通依赖和插件预解析本身不能证明这些执行期依赖已经缓存。
+
+`.mvn/maven.config` 将普通制品下载并发降为 2；缓存准备进一步降为 1。Resolver 对 429/503 等传输失败最多重试 4 次，无服务端等待提示时从 15 秒开始递增等待，间隔上限 60 秒，并保留其 `Retry-After` 处理。不会重新执行失败的测试来制造通过。跨工作流的冷缓存准备仍可能并发，GitHub 托管 runner 的出口及 Central 的服务端策略也不受本项目控制，因此这些措施不承诺永久消除 429。
+
+`python3 scripts/verify/test_maven_resilience.py` 使用锁定 Maven 和本地 HTTP 制品仓库验证连续 429 后恢复、持续 429 的终止边界及 404 不重试，并检查缓存键和准备失败门禁。它需要 `ETCD_HBASE_JDK21_HOME` 或 `JAVA_HOME` 指向锁定 JDK，不访问真实业务数据。
+
+若后续接入 Nexus/Artifactory，需要先提供 GitHub CI 可访问的实际 HTTPS 代理服务，并明确访问方式和凭据 secret 名称。当前公开验证仍强制 Central 且不使用私有凭据；代理服务尚未配置或部署，接入时需同步维护对应构建路径和策略校验。
+
 完整公开验证退出 `0`。本机 Docker CLI 或默认本地 daemon 不可用时，其他检查仍执行并记录镜像 `unavailable`，最终退出 `2`、状态 `partial`；失败检查退出非零。镜像配置文件存在或其他检查成功都不能代替实际镜像验证。J09 公开 CI 在 Ubuntu 上要求完整入口及索引复核均成功，不跳过镜像测试。
 
 ## 2 运行包与镜像边界
