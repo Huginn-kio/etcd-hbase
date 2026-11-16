@@ -831,8 +831,23 @@ class M4LeaseRpcIT {
       HBaseBackendIdentityProvider provider,
       io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
       long leaseId, long afterSequence, Duration timeout) throws Exception {
+    return awaitLeaseRevoked(plan, provider, identity, leaseId, afterSequence, timeout, null);
+  }
+
+  private static CommitState awaitLeaseRevoked(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      long leaseId, long afterSequence, Duration timeout,
+      AtomicReference<Throwable> abortOnFailure) throws Exception {
     long deadline = Math.addExact(System.nanoTime(), timeout.toNanos());
     while (System.nanoTime() < deadline) {
+      if (abortOnFailure != null) {
+        Throwable workerFailure = abortOnFailure.get();
+        if (workerFailure != null) {
+          throw new AssertionError("mixed-load worker failed before Lease expiry completed",
+              workerFailure);
+        }
+      }
       CommitState state = controlSnapshot(plan, provider, identity).state();
       if (state.finalizedSequence() > afterSequence) {
         LeaseState lease = latestLeaseStateAtOrBefore(plan, provider, identity, leaseId,
@@ -1446,10 +1461,12 @@ class M4LeaseRpcIT {
       String layout, int concurrency, String phase) throws Exception {
     List<Long> leaseIds = new ArrayList<>(concurrency);
     for (int worker = 0; worker < concurrency; worker++) {
-      long leaseId = leaseIdForPrefix(run.prefix(), "mixed-" + layout + "-" + phase + "-" + worker);
+      long leaseId = leaseIdForPrefix(run.prefix(),
+          "mixed-" + layout + "-" + phase + "-concurrency-" + concurrency + "-worker-" + worker);
       grantThrough(server, leaseId, 120);
       byte[] key = (run.prefix() + "mixed/" + layout.toLowerCase(java.util.Locale.ROOT)
-          + "/" + phase + "/role/" + worker).getBytes(StandardCharsets.UTF_8);
+          + "/" + phase + "/concurrency/" + concurrency + "/role/" + worker)
+          .getBytes(StandardCharsets.UTF_8);
       putLeaseBoundKey(server, key, leaseId);
       leaseIds.add(leaseId);
     }
@@ -1532,7 +1549,7 @@ class M4LeaseRpcIT {
             "all mixed-load workers must start before waiting for expiry");
         try {
           expiryState = awaitLeaseRevoked(plan, initializer, identity, expiringLeaseId,
-              afterExpirySequence, Duration.ofSeconds(45));
+              afterExpirySequence, Duration.ofSeconds(45), firstFailure);
         } catch (AssertionError timeoutOrFailure) {
           Throwable workerFailure = firstFailure.get();
           if (workerFailure != null) {
