@@ -204,12 +204,12 @@ class M4LeaseRpcIT {
             .anyMatch(lease -> lease.getID() == leaseId));
         assertEquals(Status.Code.FAILED_PRECONDITION,
             assertThrows(StatusRuntimeException.class, () -> client.leaseGrant(request)).getStatus().getCode());
-        long sequence = controlSnapshot(plan, initializer, identity).state().publishedSequence();
+        long revision = controlSnapshot(plan, initializer, identity).state().publishedRevision();
         armed.set(true);
         var ttlRequest = Rpc.LeaseTimeToLiveRequest.newBuilder().setID(leaseId).setKeys(true).build();
         assertEquals(Status.Code.UNAVAILABLE,
             assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
-        assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
+        assertEquals(revision, controlSnapshot(plan, initializer, identity).state().publishedRevision());
         armed.set(false);
         healthy.set(true);
         assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
@@ -218,7 +218,10 @@ class M4LeaseRpcIT {
         armed.set(true);
         assertEquals(Status.Code.UNAVAILABLE,
             assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
-        assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
+        assertEquals(revision, controlSnapshot(plan, initializer, identity).state().publishedRevision());
+        assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId),
+            "an unhealthy or rewound clock must not revoke a live Lease");
         armed.set(false);
         now.set(20_000);
         long expiredTtl = client.leaseTimeToLive(ttlRequest).getTTL();
