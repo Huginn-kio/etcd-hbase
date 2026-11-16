@@ -17,6 +17,7 @@ import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.CommitOwnerService;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.commit.PublicationSlot;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.error.BackendFailure;
@@ -180,6 +181,53 @@ class LeaseExpiryWorkerTest {
         assertEquals(0, budgets.snapshot().scanners());
         assertEquals(0, budgets.snapshot().cleanup());
       }
+    } finally {
+      worker.stop();
+    }
+  }
+
+  @Test
+  void pendingPublicationPreservesOnlyAnEstablishedCheckpointForTheSameOwner() throws Exception {
+    var token = new CommitOwnerService.OwnerToken("owner-a", 7);
+    M3OwnerLease owner = mock(M3OwnerLease.class);
+    when(owner.currentToken()).thenReturn(Optional.of(token));
+    CommitState pending = checkpointState(0);
+    when(pending.publication()).thenReturn(Optional.of(mock(PublicationSlot.class)));
+    CommitState stable = checkpointState(0);
+    CommitState otherOwner = checkpointState(0);
+    when(otherOwner.ownerEpoch()).thenReturn(8L);
+    CommitControlStore control = mock(CommitControlStore.class);
+    when(control.read(any(RequestScope.class))).thenReturn(
+        CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(pending, new byte[] {1}))),
+        CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(stable, new byte[] {2}))),
+        CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(pending, new byte[] {3}))),
+        CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(otherOwner, new byte[] {4}))));
+    SystemRecordStore records = mock(SystemRecordStore.class);
+    ScheduledExecutorService timer = mock(ScheduledExecutorService.class);
+    when(timer.schedule(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS)))
+        .thenReturn(mock(ScheduledFuture.class));
+    var observation = new LeaseTimeObservation(1_000, 1_000, true);
+    var identity = new AuthorizedBackendIdentity("test-provider", "test-subject", "fixture-context",
+        new AuthenticationScope("test-group", "test-profile"), Set.of("test-group"), 0);
+    BudgetManager budgets = regularWorkerBudgets();
+    var worker = new LeaseExpiryWorker("test-group", ByteKey.copyOf(new byte[32]), 4,
+        10_000, control, records, owner, mock(MutationRelay.class), identity,
+        () -> observation, budgets, LeaseBudgetProfile.EXPIRY_WORKER_MEMORY, Runnable::run, timer,
+        Clock.fixed(Instant.ofEpochMilli(1_000), ZoneOffset.UTC), new RequestMetrics());
+
+    worker.start();
+    try (RequestScope scope = RequestScope.withoutDeadline();
+         BudgetManager.Account account = budgets.admit("test-group", scope,
+             LeaseBudgetProfile.EXPIRY_WORKER_MEMORY, LeaseBudgetProfile.EXPIRY_WORKER_READ_LIMITS)) {
+      worker.inspectCheckpoint(token, observation, scope, account).join();
+      assertFalse(worker.isReady(), "a new owner must inspect a finalized checkpoint first");
+      worker.inspectCheckpoint(token, observation, scope, account).join();
+      assertTrue(worker.isReady());
+      worker.inspectCheckpoint(token, observation, scope, account).join();
+      assertTrue(worker.isReady(), "a pending commit must not discard the current owner's proof");
+      worker.inspectCheckpoint(token, observation, scope, account).join();
+      assertFalse(worker.isReady(), "an owner epoch mismatch must invalidate the proof");
+      verify(records, never()).latestAtOrBefore(any(), any(), anyLong(), any());
     } finally {
       worker.stop();
     }

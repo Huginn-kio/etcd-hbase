@@ -102,7 +102,7 @@ public final class LeaseRenewalOwnerProcessor implements MutationForwardReceiver
     }
     final BudgetManager.Account account;
     try {
-      account = budgets.admit(tableGroup, scope, reservation);
+      account = budgets.admitReserved(tableGroup, scope, reservation);
     } catch (BackendFailure failure) {
       return unknown(failure.category());
     }

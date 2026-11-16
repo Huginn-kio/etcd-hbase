@@ -544,10 +544,13 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         leaseCosts, plan.primary().codec().saltProfile().bucketCount());
     var allocator = new LeaseIdAllocator(
         () -> ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE), 16);
+    LeaseCostAdmission.Limits leaseLimits = activation.leaseCostLimits();
+    // Lease-only mutations may seal one tombstone and DELETE event per admitted binding.
     var mutationPreparation = new LeaseAuxiliaryMutationPreparation(
         new ResultPreparation(stores.resultRepository()), stores.results(),
         new ManifestPreparation(stores.manifestRepository(),
-            new ManifestPreparation.Limits(0, 0, 0, 0)), invocations);
+            new ManifestPreparation.Limits(leaseLimits.maximumBindings(), 0,
+                leaseLimits.maximumBindings(), leaseLimits.maximumRevokeCostBytes())), invocations);
     var preparation = new LeaseGrantPreparation(mutationPreparation);
     var executor = new LeaseGrantExecutor(plan.source().tableGroupId(),
         plan.system().profileFingerprint(), stores.control(), stores.views(), leaseReads, allocator,
@@ -558,7 +561,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         budgets, LEASE_REQUEST_MEMORY, executor, stores.outcomes(), invocations, Clock.systemUTC());
     var revocationExecutor = new LeaseRevocationExecutor(plan.source().tableGroupId(),
         plan.system().profileFingerprint(), stores.clusterId(), activation.memberIdBits(),
-        stores.control(), stores.views(), leaseReads, bindings, bindingPlanner, leaseCosts,
+        stores.control(), stores.views(), stores.records(), leaseReads, bindings, bindingPlanner, leaseCosts,
         mutationPreparation, publisher, connections, plan.primary(), pending.worker,
         Clock.systemUTC(), time, metrics);
     var renewalExecutor = new LeaseRenewalExecutor(plan.source().tableGroupId(),

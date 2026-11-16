@@ -14,6 +14,7 @@ import io.etcdhbase.core.commit.LeaseReadView;
 import io.etcdhbase.core.commit.ManifestCatalog;
 import io.etcdhbase.core.commit.PinnedReadView;
 import io.etcdhbase.core.commit.ReadViewService;
+import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.lease.LeaseCostAdmission;
@@ -29,6 +30,7 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.protocol.ResponseHeaderFactory;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
+import io.etcdhbase.hbase.codec.LeaseKeepAliveResultMessages;
 import io.etcdhbase.hbase.storage.HBaseRecordStore;
 import io.etcdhbase.hbase.storage.StorageTableBinding;
 import io.etcdhbase.server.observability.RequestMetrics;
@@ -82,7 +84,7 @@ public final class LeaseRevocationExecutor {
 
   public LeaseRevocationExecutor(String tableGroup, ByteKey profileFingerprint,
       long clusterId, long memberId, CommitControlStore control, ReadViewService views,
-      LeaseReadView leases, LeaseBindingReader bindings,
+      SystemRecordStore systemRecords, LeaseReadView leases, LeaseBindingReader bindings,
       LeaseBindingMutationPlanner bindingPlanner, LeaseCostAdmission costs,
       LeaseAuxiliaryMutationPreparation preparation, CommitPublisher publisher,
       HBaseConnectionFactory connections, StorageTableBinding primary, Executor backendWorker,
@@ -92,7 +94,8 @@ public final class LeaseRevocationExecutor {
     this.control = Objects.requireNonNull(control, "control");
     this.views = Objects.requireNonNull(views, "views");
     this.leases = Objects.requireNonNull(leases, "leases");
-    this.revocations = new LeaseRevocationPreparer(leases, bindings, bindingPlanner, costs);
+    this.revocations = new LeaseRevocationPreparer(
+        leases, bindings, bindingPlanner, costs, systemRecords);
     this.preparation = Objects.requireNonNull(preparation, "preparation");
     this.publisher = Objects.requireNonNull(publisher, "publisher");
     this.connections = Objects.requireNonNull(connections, "connections");
@@ -207,7 +210,8 @@ public final class LeaseRevocationExecutor {
           .setID(leaseId)
           .setTTL(0)
           .build();
-      return ByteKey.copyOf(response.toByteArray());
+      return LeaseKeepAliveResultMessages.encode(
+          ByteKey.copyOf(response.toByteArray()), Optional.empty());
     };
     return withManagedRead(pin, scope, managed -> {
       if (!pinnedAtBase(managed.pin(), binding)) {

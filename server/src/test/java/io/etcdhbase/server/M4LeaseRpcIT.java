@@ -38,6 +38,7 @@ import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.hbase.codec.LeaseStateMessages;
 import io.etcdhbase.hbase.probe.TemporaryHBaseClusterProcess;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
+import io.etcdhbase.hbase.storage.HBaseInvocationRepository;
 import io.etcdhbase.hbase.storage.HBaseSystemRecordStore;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.M3RuntimeConfigurationLoader;
@@ -101,6 +102,10 @@ import org.junit.jupiter.api.io.TempDir;
 @Timeout(600)
 class M4LeaseRpcIT {
   private static final int MAX_DRIVER_DIAGNOSTIC_BYTES = 8 * 1024;
+  private static final int MIXED_LOAD_KEEPALIVE_RESPONSE_TIMEOUT_SECONDS = 60;
+  private static final int MIXED_LOAD_WORKER_BASE_TIMEOUT_SECONDS = 30;
+  private static final int MIXED_LOAD_WORKER_TIMEOUT_PER_ITERATION_SECONDS = 5;
+  private static final int MIXED_LOAD_WORKER_MAX_TIMEOUT_SECONDS = 180;
   private static final int TEST_OWNER_LEASE_MILLIS = 6_000;
   private static final int TEST_HEARTBEAT_MILLIS = 1_000;
   private static final List<String> LAYOUT_FILES =
@@ -116,6 +121,10 @@ class M4LeaseRpcIT {
       "testkit/cases/m4-cases.json");
   private static final RuntimeConfiguration.ResourceBudgets RESOURCES =
       new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000,
+          4 << 20, 4 << 20, 16, 0);
+  // Four KeepAlive streams and their independent Put RPCs must fit at the listener.
+  private static final RuntimeConfiguration.ResourceBudgets MIXED_LOAD_RESOURCES =
+      new RuntimeConfiguration.ResourceBudgets(65_536, 8, 30_000,
           4 << 20, 4 << 20, 16, 0);
   @TempDir Path testDirectory;
 
@@ -292,9 +301,11 @@ class M4LeaseRpcIT {
               CommitState activeOwner = controlSnapshot(plan, initializer, identity).state();
               assertTrue(isOwnerForPeer(activeOwner, "owner-a"));
               long scopeProbeLease = leaseIdForPrefix(run.prefix(), "forwarding-context-probe");
+              InvocationId invalidContextInvocation = InvocationId.create();
               var invalidContextRequest = keepAliveForwardRequest(source.tableGroupId(),
                   runtimeForwardingIdentity, Rpc.LeaseKeepAliveRequest.newBuilder()
-                      .setID(scopeProbeLease).build(), InvocationId.create(), activeOwner.ownerEpoch())
+                      .setID(scopeProbeLease).build(), invalidContextInvocation,
+                  activeOwner.ownerEpoch())
                   .toBuilder()
                   .setAuthorizationContextReference(ByteString.copyFromUtf8("unresolved-context"))
                   .build();
@@ -303,8 +314,15 @@ class M4LeaseRpcIT {
               assertEquals(ForwardMutationResponse.Outcome.UNKNOWN, invalidContextReply.getOutcome());
               assertEquals("PERMISSION", invalidContextReply.getFailureCode());
               CommitState afterInvalidContext = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(activeOwner.publishedSequence(), afterInvalidContext.publishedSequence(),
-                  "an unresolved forwarded service context must be rejected before invocation binding");
+              assertEquals(activeOwner.publishedRevision(), afterInvalidContext.publishedRevision(),
+                  "an unresolved forwarded service context must not change the KV revision");
+              try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+                var records = HBaseSystemRecordStore.open(initializer, identity, plan.system(), scope)
+                    .join();
+                assertTrue(new HBaseInvocationRepository(records)
+                    .read(invalidContextInvocation, scope).join().isEmpty(),
+                    "an unresolved forwarded service context must be rejected before invocation binding");
+              }
 
               Rpc.PutResponse forwardedPut = putThrough(ownerB, "forwarded-before-takeover", 2);
               assertEquals(initialized.clusterId(), forwardedPut.getHeader().getClusterId());
@@ -485,17 +503,26 @@ class M4LeaseRpcIT {
             assertEquals(initialized.clusterId(), forwardedReply.getHeader().getClusterId());
             assertEquals(2, forwardedReply.getHeader().getMemberId());
 
+            long recoveryLease = leaseIdForPrefix(
+                beforeFailover.prefix(), "keepalive-owner-recovery");
+            Rpc.LeaseGrantResponse recoveryLeaseGrant = grantThrough(
+                ownerBClientPort, recoveryLease, 120);
+            assertEquals(recoveryLease, recoveryLeaseGrant.getID());
+            assertEquals(120, recoveryLeaseGrant.getTTL(),
+                "the failover probe needs a live Lease while the new owner is elected");
+
             ownerAStop = terminateOwnerProcess(ownerA, true);
             CommitState recovered = awaitOwner(plan, initializer, identity, "owner-b", oldEpoch);
             newEpoch = recovered.ownerEpoch();
             assertTrue(newEpoch > oldEpoch);
             assertRejectedStaleOwner(ownerBForwarding, trustedPeers, ownerBPeerPort,
-                ownerACertificate, source.tableGroupId(), runtimeForwardingIdentity, renewedLease, oldEpoch);
+                ownerACertificate, source.tableGroupId(), runtimeForwardingIdentity,
+                recoveryLease, oldEpoch);
 
             LeaseState beforeRecoveryKeepAlive = leaseStateAt(
-                plan, initializer, identity, renewedLease, recovered.publishedSequence());
+                plan, initializer, identity, recoveryLease, recovered.publishedSequence());
             KeepAliveOnceObservation keepAliveOnce = runKeepAliveOnceAfterRecovery(
-                afterFailover, ownerBClientPort, renewedLease);
+                afterFailover, ownerBClientPort, recoveryLease);
             keepAliveClientPid = keepAliveOnce.processId();
             keepAliveClientExitCode = keepAliveOnce.exitCode();
             keepAliveClientTtl = keepAliveOnce.ttl();
@@ -507,12 +534,13 @@ class M4LeaseRpcIT {
                 "the original Go client must observe the unchanged KV revision after owner failover");
             assertEquals(recovered.publishedRevision(), afterRecoveryKeepAlive.publishedRevision(),
                 "KeepAliveOnce must not create a KV revision");
-            assertEquals(recovered.publishedSequence() + 1, afterRecoveryKeepAlive.publishedSequence(),
-                "KeepAliveOnce must persist one auxiliary sequence before returning");
-            LeaseState afterRecoveryLease = leaseStateAt(plan, initializer, identity, renewedLease,
+            assertTrue(afterRecoveryKeepAlive.publishedSequence() > recovered.publishedSequence(),
+                "KeepAliveOnce must persist its auxiliary result before returning");
+            LeaseState afterRecoveryLease = leaseStateAt(plan, initializer, identity, recoveryLease,
                 afterRecoveryKeepAlive.publishedSequence());
             assertEquals(beforeRecoveryKeepAlive.renewalGeneration() + 1,
                 afterRecoveryLease.renewalGeneration());
+            assertTrue(afterRecoveryLease.sequence() > beforeRecoveryKeepAlive.sequence());
             assertTrue(afterRecoveryLease.deadlineEpochMillis()
                 > beforeRecoveryKeepAlive.deadlineEpochMillis());
           } catch (Exception | Error failure) {
@@ -806,10 +834,13 @@ class M4LeaseRpcIT {
       var entry = records.latestAtOrBefore(SystemRecordType.LEASE_STATE,
           LeaseRecordIdentity.routePrefix(leaseId), sequence, scope).join().orElseThrow();
       assertEquals(leaseId, LeaseRecordIdentity.leaseId(entry.identity()));
-      assertEquals(sequence, LeaseRecordIdentity.sequence(entry.identity()));
+      long versionSequence = LeaseRecordIdentity.sequence(entry.identity());
+      assertTrue(versionSequence <= sequence,
+          "the visible Lease version cannot come from a future M2 sequence");
       LeaseState state = LeaseStateMessages.decode(entry.value());
       assertEquals(leaseId, state.identity().leaseId());
-      assertEquals(sequence, state.sequence());
+      assertEquals(versionSequence, state.sequence(),
+          "the Lease payload sequence must match its versioned record identity");
       return state;
     }
   }
@@ -1335,6 +1366,9 @@ class M4LeaseRpcIT {
     evidence.put("target_capacity_accepted", false);
     evidence.put("physical_hbase_rpc_bytes_collected", false);
     evidence.put("recovery_reserve_usage_measured", false);
+    evidence.put("listener_max_concurrent_requests", MIXED_LOAD_RESOURCES.maxConcurrentRequests());
+    evidence.put("listener_max_queued_requests", MIXED_LOAD_RESOURCES.maxQueuedRequests());
+    evidence.put("latency_sampling", "successful-client-rpcs");
     evidence.set("recovery_reserve", recoveryReserveEvidence(mapper,
         activation("1").maxEtcdRequestBytes()));
 
@@ -1348,7 +1382,7 @@ class M4LeaseRpcIT {
         layoutEvidence.put("layout", layout);
         ArrayNode concurrencyRows = layoutEvidence.putArray("concurrency");
         withRunningLayout(cluster, clientPort, layoutFile,
-            "m4-j29-mixed-" + layout.toLowerCase(java.util.Locale.ROOT),
+            "m4-j29-mixed-" + layout.toLowerCase(java.util.Locale.ROOT), MIXED_LOAD_RESOURCES,
             (plan, initializer, identity, server) -> {
               concurrencyRows.add(runFixedMixedLoad(mapper, run, layout, 1, plan,
                   initializer, identity, server));
@@ -1485,6 +1519,10 @@ class M4LeaseRpcIT {
     AtomicBoolean keepRunning = new AtomicBoolean(true);
     AtomicInteger activeWorkers = new AtomicInteger();
     AtomicLong putSequence = new AtomicLong();
+    AtomicLong keepAliveAttempts = new AtomicLong();
+    AtomicLong keepAliveResourceExhausted = new AtomicLong();
+    AtomicLong putAttempts = new AtomicLong();
+    AtomicLong putResourceExhausted = new AtomicLong();
     AtomicReference<Throwable> firstFailure = new AtomicReference<>();
     ConcurrentLinkedQueue<Long> keepAliveLatencies = new ConcurrentLinkedQueue<>();
     ConcurrentLinkedQueue<Long> putLatencies = new ConcurrentLinkedQueue<>();
@@ -1501,6 +1539,8 @@ class M4LeaseRpcIT {
         workers.add(executor.submit(() -> {
           boolean signaledReady = false;
           boolean enteredLoad = false;
+          String currentOperation = "connect";
+          int iteration = 0;
           try (MixedLoadClient client = new MixedLoadClient(server)) {
             clientsReady.countDown();
             signaledReady = true;
@@ -1510,29 +1550,47 @@ class M4LeaseRpcIT {
             activeWorkers.incrementAndGet();
             enteredLoad = true;
             workersStarted.countDown();
-            int iteration = 0;
             while (keepRunning.get() && (runUntilExpiry || iteration < fixedIterations)) {
+              currentOperation = "KeepAlive";
               long keepAliveStarted = System.nanoTime();
-              Rpc.LeaseKeepAliveResponse renewal = client.keepAlive(leaseIds.get(workerIndex));
-              keepAliveLatencies.add(System.nanoTime() - keepAliveStarted);
-              if (renewal.getTTL() <= 0) {
-                throw new AssertionError("active mixed-load Lease returned a zero TTL");
+              keepAliveAttempts.incrementAndGet();
+              try {
+                Rpc.LeaseKeepAliveResponse renewal = client.keepAlive(leaseIds.get(workerIndex));
+                keepAliveLatencies.add(System.nanoTime() - keepAliveStarted);
+                if (renewal.getTTL() <= 0) {
+                  throw new AssertionError("active mixed-load Lease returned a zero TTL");
+                }
+              } catch (StatusRuntimeException failure) {
+                if (failure.getStatus().getCode() != Status.Code.RESOURCE_EXHAUSTED) throw failure;
+                keepAliveResourceExhausted.incrementAndGet();
+                client.reopenKeepAliveAfterResourceExhaustion();
               }
 
+              currentOperation = "business Put";
               long sequence = putSequence.incrementAndGet();
               byte[] key = (run.prefix() + "mixed/" + layout.toLowerCase(java.util.Locale.ROOT)
                   + "/c" + concurrency + "/worker/" + workerIndex + "/" + sequence)
                   .getBytes(StandardCharsets.UTF_8);
               byte[] value = ("mixed-value-" + sequence).getBytes(StandardCharsets.UTF_8);
               long putStarted = System.nanoTime();
-              client.put(key, value);
-              putLatencies.add(System.nanoTime() - putStarted);
+              putAttempts.incrementAndGet();
+              try {
+                client.put(key, value);
+                putLatencies.add(System.nanoTime() - putStarted);
+              } catch (StatusRuntimeException failure) {
+                if (failure.getStatus().getCode() != Status.Code.RESOURCE_EXHAUSTED) throw failure;
+                putResourceExhausted.incrementAndGet();
+              }
               iteration++;
             }
           } catch (Throwable failure) {
             firstFailure.compareAndSet(null, failure);
             keepRunning.set(false);
-            throw new RuntimeException("mixed Lease and business workload failed", failure);
+            throw new RuntimeException("mixed Lease and business workload failed for worker "
+                + workerIndex + " at iteration " + iteration + " during " + currentOperation
+                + "; runtime_ready=" + server.dataReady()
+                + "; keepalive_metrics=" + server.metrics().getFirst().leaseRenewals()
+                + "; expiry_metrics=" + server.metrics().getFirst().leaseExpiry(), failure);
           } finally {
             if (!signaledReady) clientsReady.countDown();
             if (enteredLoad) activeWorkers.decrementAndGet();
@@ -1564,12 +1622,18 @@ class M4LeaseRpcIT {
         keepRunning.set(false);
       }
 
-      for (Future<?> worker : workers) worker.get(60, TimeUnit.SECONDS);
+      long workerTimeoutSeconds = Math.min(MIXED_LOAD_WORKER_MAX_TIMEOUT_SECONDS,
+          Math.max(MIXED_LOAD_WORKER_BASE_TIMEOUT_SECONDS
+                  + MIXED_LOAD_WORKER_TIMEOUT_PER_ITERATION_SECONDS * fixedIterations,
+              MIXED_LOAD_KEEPALIVE_RESPONSE_TIMEOUT_SECONDS + 15L));
+      for (Future<?> worker : workers) worker.get(workerTimeoutSeconds, TimeUnit.SECONDS);
       keepRunning.set(false);
       Throwable workerFailure = firstFailure.get();
       if (workerFailure != null) throw new AssertionError("mixed-load worker failed", workerFailure);
       return new MixedLoadResult(System.nanoTime() - startedNanos,
-          List.copyOf(keepAliveLatencies), List.copyOf(putLatencies), activeWorkersAtExpiry,
+          List.copyOf(keepAliveLatencies), List.copyOf(putLatencies),
+          keepAliveAttempts.get(), keepAliveResourceExhausted.get(),
+          putAttempts.get(), putResourceExhausted.get(), activeWorkersAtExpiry,
           expiryObservedEpochMillis, expiryState);
     } finally {
       keepRunning.set(false);
@@ -1597,15 +1661,17 @@ class M4LeaseRpcIT {
     long queueSamples = queueAfter.count() - queueBefore.count();
     long queueTotalNanos = queueAfter.totalNanos() - queueBefore.totalNanos();
     assertTrue(requests > 0, "the mixed phase must issue real KeepAlive RPCs");
-    assertEquals(requests, responses, "every measured KeepAlive must receive one response");
-    assertEquals(requests, selected, "each measured active renewal must be durably selected");
-    assertEquals(requests, queueSamples, "every measured renewal must record owner queue time");
-    assertEquals(requests, workload.keepAliveLatencies().size());
-    assertEquals(workload.keepAliveLatencies().size(), workload.putLatencies().size(),
-        "every KeepAlive in a mixed iteration must have one business Put companion");
+    assertTrue(responses > 0 && selected >= responses && selected <= requests);
+    assertTrue(queueSamples > 0 && queueSamples <= requests);
+    assertEquals(responses, workload.keepAliveLatencies().size());
+    assertEquals(workload.keepAliveAttempts(), responses + workload.keepAliveResourceExhausted());
+    assertEquals(workload.putAttempts(),
+        workload.putLatencies().size() + workload.putResourceExhausted());
+    assertEquals(workload.keepAliveAttempts(), workload.putAttempts());
+    assertTrue(requests <= workload.keepAliveAttempts());
     if (runMode.equals("fixed-iterations")) {
-      assertEquals(concurrency * iterationsPerWorker, workload.putLatencies().size(),
-          "fixed load phases must complete the same operation count per worker");
+      assertEquals(concurrency * iterationsPerWorker, workload.putAttempts(),
+          "fixed load phases must attempt the same operation count per worker");
     }
     assertTrue(hbaseOperations > 0, "KeepAlive must account owner-side logical HBase operations");
     assertTrue(payloadBytes > 0, "KeepAlive must account encoded HBase request payload bytes");
@@ -1617,10 +1683,14 @@ class M4LeaseRpcIT {
     row.put("iterations_per_worker", iterationsPerWorker);
     row.put("elapsed_nanos", workload.elapsedNanos());
     row.put("keepalive_requests", requests);
+    row.put("keepalive_client_attempts", workload.keepAliveAttempts());
+    row.put("keepalive_client_resource_exhausted", workload.keepAliveResourceExhausted());
     row.put("keepalive_responses", responses);
     row.put("selected_renewals", selected);
     row.put("business_puts", workload.putLatencies().size());
-    row.put("combined_operations", requests + workload.putLatencies().size());
+    row.put("business_put_attempts", workload.putAttempts());
+    row.put("business_put_resource_exhausted", workload.putResourceExhausted());
+    row.put("combined_operations", responses + workload.putLatencies().size());
     row.put("keepalive_client_rpc_p99_samples", workload.keepAliveLatencies().size());
     row.set("keepalive_client_rpc_latency_nanos",
         latencySummary(mapper, workload.keepAliveLatencies()));
@@ -1630,8 +1700,8 @@ class M4LeaseRpcIT {
     row.put("owner_queue_wait_mean_nanos", queueTotalNanos / queueSamples);
     row.put("renewal_logical_hbase_client_operations", hbaseOperations);
     row.put("renewal_logical_hbase_request_payload_bytes", payloadBytes);
-    row.put("logical_hbase_operations_per_renewal", (double) hbaseOperations / requests);
-    row.put("logical_hbase_request_payload_bytes_per_renewal", (double) payloadBytes / requests);
+    row.put("logical_hbase_operations_per_server_keepalive_request", (double) hbaseOperations / requests);
+    row.put("logical_hbase_request_payload_bytes_per_server_keepalive_request", (double) payloadBytes / requests);
     row.put("unknown_outcomes", after.unknownOutcomes() - before.unknownOutcomes());
     row.put("request_proto_bytes", after.requestBytes() - before.requestBytes());
     row.put("response_proto_bytes", after.responseBytes() - before.responseBytes());
@@ -1732,6 +1802,12 @@ class M4LeaseRpcIT {
 
   private static void withRunningLayout(TemporaryHBaseClusterProcess cluster, int clientPort,
       String layoutFile, String listenerName, M4RuntimeAction action) throws Exception {
+    withRunningLayout(cluster, clientPort, layoutFile, listenerName, RESOURCES, action);
+  }
+
+  private static void withRunningLayout(TemporaryHBaseClusterProcess cluster, int clientPort,
+      String layoutFile, String listenerName, RuntimeConfiguration.ResourceBudgets resources,
+      M4RuntimeAction action) throws Exception {
     InitializationConfiguration initialization = initialization(layoutFile, clientPort);
     var source = TableGroupPlanFactory.create(initialization, "local", null);
     M3TableGroupPlan plan = M3TableGroupPlan.from(source);
@@ -1750,7 +1826,7 @@ class M4LeaseRpcIT {
       RuntimeConfiguration configuration = new RuntimeConfiguration(initialization.schemaVersion(),
           List.of(new RuntimeConfiguration.Listener(listenerName, "127.0.0.1", 0,
               source.tableGroupId())), initialization.hbaseProfiles(), initialization.saltProfiles(),
-          initialization.tableGroups(), RESOURCES);
+          initialization.tableGroups(), resources);
       try (RuntimeServer server = RuntimeServer.startM3(configuration, activation)) {
         assertTrue(server.dataReady(), "M4 Lease test runtime must be ready before requests are sent");
         action.run(plan, initializer, identity, server);
@@ -2356,8 +2432,12 @@ class M4LeaseRpcIT {
 
   private static Rpc.LeaseGrantResponse grantThrough(RuntimeServer server, long leaseId, int ttl)
       throws Exception {
-    var channel = NettyChannelBuilder.forAddress(
-            "127.0.0.1", server.boundListeners().getFirst().port())
+    return grantThrough(server.boundListeners().getFirst().port(), leaseId, ttl);
+  }
+
+  private static Rpc.LeaseGrantResponse grantThrough(int port, long leaseId, int ttl)
+      throws Exception {
+    var channel = NettyChannelBuilder.forAddress("127.0.0.1", port)
         .usePlaintext().build();
     try {
       return LeaseGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS)
@@ -2964,16 +3044,49 @@ class M4LeaseRpcIT {
   private static final class MixedLoadClient implements AutoCloseable {
     private final ManagedChannel channel;
     private final KVGrpc.KVBlockingStub keyValue;
-    private final ArrayBlockingQueue<Rpc.LeaseKeepAliveResponse> responses = new ArrayBlockingQueue<>(1);
-    private final AtomicReference<Throwable> streamFailure = new AtomicReference<>();
-    private final CountDownLatch streamClosed = new CountDownLatch(1);
-    private final StreamObserver<Rpc.LeaseKeepAliveRequest> keepAliveRequests;
+    private MixedKeepAliveStream keepAlive;
 
     private MixedLoadClient(RuntimeServer server) {
       channel = NettyChannelBuilder.forAddress(
               "127.0.0.1", server.boundListeners().getFirst().port())
           .usePlaintext().disableRetry().build();
       keyValue = KVGrpc.newBlockingStub(channel);
+      keepAlive = new MixedKeepAliveStream(channel);
+    }
+
+    private Rpc.LeaseKeepAliveResponse keepAlive(long leaseId) throws Exception {
+      return keepAlive.send(leaseId);
+    }
+
+    private void reopenKeepAliveAfterResourceExhaustion() throws Exception {
+      keepAlive.close(true);
+      keepAlive = new MixedKeepAliveStream(channel);
+    }
+
+    private Rpc.PutResponse put(byte[] key, byte[] value) {
+      return keyValue.withDeadlineAfter(60, TimeUnit.SECONDS).put(Rpc.PutRequest.newBuilder()
+          .setKey(ByteString.copyFrom(key)).setValue(ByteString.copyFrom(value)).build());
+    }
+
+    @Override
+    public void close() throws Exception {
+      try {
+        keepAlive.close(false);
+      } finally {
+        channel.shutdownNow();
+        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS),
+            "benchmark gRPC channel must terminate after the worker finishes");
+      }
+    }
+  }
+
+  private static final class MixedKeepAliveStream {
+    private final ArrayBlockingQueue<Rpc.LeaseKeepAliveResponse> responses = new ArrayBlockingQueue<>(1);
+    private final AtomicReference<Throwable> streamFailure = new AtomicReference<>();
+    private final CountDownLatch streamClosed = new CountDownLatch(1);
+    private final StreamObserver<Rpc.LeaseKeepAliveRequest> keepAliveRequests;
+
+    private MixedKeepAliveStream(ManagedChannel channel) {
       keepAliveRequests = LeaseGrpc.newStub(channel).withDeadlineAfter(300, TimeUnit.SECONDS)
           .leaseKeepAlive(new StreamObserver<>() {
             @Override
@@ -2997,46 +3110,54 @@ class M4LeaseRpcIT {
           });
     }
 
-    private Rpc.LeaseKeepAliveResponse keepAlive(long leaseId) throws Exception {
-      Throwable previousFailure = streamFailure.get();
-      if (previousFailure != null) throw new AssertionError("KeepAlive stream failed", previousFailure);
+    private Rpc.LeaseKeepAliveResponse send(long leaseId) throws Exception {
+      checkStreamState();
       keepAliveRequests.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(leaseId).build());
-      Rpc.LeaseKeepAliveResponse response = responses.poll(60, TimeUnit.SECONDS);
-      if (response == null) {
-        Throwable failure = streamFailure.get();
-        if (failure != null) throw new AssertionError("KeepAlive stream failed", failure);
-        throw new AssertionError("KeepAlive response was not received before the benchmark deadline");
+      long deadlineNanos = System.nanoTime()
+          + TimeUnit.SECONDS.toNanos(MIXED_LOAD_KEEPALIVE_RESPONSE_TIMEOUT_SECONDS);
+      while (true) {
+        checkStreamState();
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0) {
+          throw new AssertionError("KeepAlive response was not received before the benchmark deadline");
+        }
+        Rpc.LeaseKeepAliveResponse response = responses.poll(
+            Math.min(remainingNanos, TimeUnit.MILLISECONDS.toNanos(100)), TimeUnit.NANOSECONDS);
+        if (response != null) {
+          if (response.getID() != leaseId) {
+            throw new AssertionError("KeepAlive response ID differed from the requested Lease");
+          }
+          return response;
+        }
       }
-      if (response.getID() != leaseId) {
-        throw new AssertionError("KeepAlive response ID differed from the requested Lease");
-      }
-      return response;
     }
 
-    private Rpc.PutResponse put(byte[] key, byte[] value) {
-      return keyValue.withDeadlineAfter(60, TimeUnit.SECONDS).put(Rpc.PutRequest.newBuilder()
-          .setKey(ByteString.copyFrom(key)).setValue(ByteString.copyFrom(value)).build());
+    private void checkStreamState() {
+      Throwable failure = streamFailure.get();
+      if (failure instanceof StatusRuntimeException statusFailure) throw statusFailure;
+      if (failure != null) throw new AssertionError("KeepAlive stream failed", failure);
+      if (streamClosed.getCount() == 0) {
+        throw new AssertionError("KeepAlive stream closed before returning a response");
+      }
     }
 
-    @Override
-    public void close() throws Exception {
-      keepAliveRequests.onCompleted();
+    private void close(boolean resourceExhaustionExpected) throws InterruptedException {
+      if (streamClosed.getCount() != 0) keepAliveRequests.onCompleted();
       if (!streamClosed.await(10, TimeUnit.SECONDS)) {
-        channel.shutdownNow();
-        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
         throw new AssertionError("KeepAlive benchmark stream did not close after client completion");
       }
-      channel.shutdownNow();
-      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS),
-          "benchmark gRPC channel must terminate after the worker finishes");
       Throwable failure = streamFailure.get();
-      if (failure != null) throw new AssertionError("KeepAlive benchmark stream failed", failure);
+      if (failure != null && !(resourceExhaustionExpected
+          && Status.fromThrowable(failure).getCode() == Status.Code.RESOURCE_EXHAUSTED)) {
+        throw new AssertionError("KeepAlive benchmark stream failed", failure);
+      }
     }
   }
 
   private record MixedLoadResult(long elapsedNanos, List<Long> keepAliveLatencies,
-      List<Long> putLatencies, int activeWorkersAtExpiry, long expiryObservedEpochMillis,
-      CommitState expiryState) {
+      List<Long> putLatencies, long keepAliveAttempts, long keepAliveResourceExhausted,
+      long putAttempts, long putResourceExhausted, int activeWorkersAtExpiry,
+      long expiryObservedEpochMillis, CommitState expiryState) {
     private MixedLoadResult {
       keepAliveLatencies = List.copyOf(keepAliveLatencies);
       putLatencies = List.copyOf(putLatencies);

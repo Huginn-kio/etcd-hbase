@@ -250,6 +250,33 @@ class M4ReportTest(unittest.TestCase):
             with self.assertRaisesRegex(m4_report.ReportError, "owner takeover epoch"):
                 m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
 
+    def test_j43_mixed_load_reports_resource_rejection_without_counting_it_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J43")
+            report_path = artifact / "j43/mixed-lease-load.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            row = report["layouts"][0]["concurrency"][1]
+            row["keepalive_client_resource_exhausted"] = 1
+            row["business_put_resource_exhausted"] = 1
+            row["keepalive_responses"] = 47
+            row["selected_renewals"] = 47
+            row["business_puts"] = 47
+            row["combined_operations"] = 94
+            row["keepalive_client_rpc_p99_samples"] = 47
+            row["keepalive_client_rpc_latency_nanos"]["samples"] = 47
+            row["business_put_client_rpc_latency_nanos"]["samples"] = 47
+            row["owner_queue_wait_samples"] = 47
+            row["owner_queue_wait_total_nanos"] = 4700
+            row["unknown_outcomes"] = 1
+            report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+            m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+            row["business_puts"] = 48
+            report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(m4_report.ReportError, "workload counts"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
     def test_j42_trace_terminals_match_registered_stream_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)
@@ -939,9 +966,13 @@ class M4ReportTest(unittest.TestCase):
                     "iterations_per_worker": iterations,
                     "elapsed_nanos": 1_000_000,
                     "keepalive_requests": requests,
+                    "keepalive_client_attempts": requests,
+                    "keepalive_client_resource_exhausted": 0,
                     "keepalive_responses": requests,
                     "selected_renewals": requests,
                     "business_puts": requests,
+                    "business_put_attempts": requests,
+                    "business_put_resource_exhausted": 0,
                     "combined_operations": requests * 2,
                     "keepalive_client_rpc_p99_samples": requests,
                     "keepalive_client_rpc_latency_nanos": {
@@ -957,8 +988,8 @@ class M4ReportTest(unittest.TestCase):
                     "owner_queue_wait_mean_nanos": 100,
                     "renewal_logical_hbase_client_operations": requests * 4,
                     "renewal_logical_hbase_request_payload_bytes": requests * 128,
-                    "logical_hbase_operations_per_renewal": 4.0,
-                    "logical_hbase_request_payload_bytes_per_renewal": 128.0,
+                    "logical_hbase_operations_per_server_keepalive_request": 4.0,
+                    "logical_hbase_request_payload_bytes_per_server_keepalive_request": 128.0,
                     "unknown_outcomes": 0,
                     "request_proto_bytes": requests * 16,
                     "response_proto_bytes": requests * 24,
@@ -980,6 +1011,9 @@ class M4ReportTest(unittest.TestCase):
             "target_capacity_accepted": False,
             "physical_hbase_rpc_bytes_collected": False,
             "recovery_reserve_usage_measured": False,
+            "listener_max_concurrent_requests": 8,
+            "listener_max_queued_requests": 0,
+            "latency_sampling": "successful-client-rpcs",
             "recovery_reserve": {
                 "scope": "configured-per-table-group",
                 "requests": 2,

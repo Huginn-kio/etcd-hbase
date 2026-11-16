@@ -363,12 +363,15 @@ public final class LeaseGateway {
           LeaseKeepAliveResultMessages.decode(resolved.payload().buffer());
       response = Rpc.LeaseKeepAliveResponse.parseFrom(durableResult.response().bytes());
       renewalVersion = durableResult.renewalVersion();
+      // An expired KeepAlive may own the atomic revoke that deletes its bound keys. Only a
+      // positive renewal promises to leave the KV revision unchanged.
+      boolean kvMutationOnPositiveRenewal = response.getTTL() > 0 && resolved.containsKeyChanges();
       if (!response.hasHeader() || response.getID() != request.getID() || response.getTTL() < 0
           || response.getTTL() > LeaseTimeRules.MAX_TTL_SECONDS
           || response.getHeader().getClusterId() != clusterId
           || response.getHeader().getMemberId() == 0
           || response.getHeader().getRevision() != resolved.revision()
-          || resolved.containsKeyChanges()
+          || kvMutationOnPositiveRenewal
           || (response.getTTL() > 0) != renewalVersion.isPresent()
           || (renewalVersion.isPresent()
               && renewalVersion.orElseThrow().identity().leaseId() != response.getID())) {

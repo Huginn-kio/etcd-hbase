@@ -311,8 +311,13 @@ public final class LeaseExpiryWorker {
       CommitState state = snapshot.orElseThrow().state();
       if (!state.supportsLeaseExpiryCheckpoints() || state.ownerEpoch() != token.epoch()
           || state.ownerInstance().filter(token.instance()::equals).isEmpty()
-          || state.ownerLeaseExpired(clock.millis()) || state.publication().isPresent()) {
+          || state.ownerLeaseExpired(clock.millis())) {
         markCheckpointUnhealthy();
+        return CompletableFuture.completedFuture(new CheckpointStatus(0, false));
+      }
+      if (state.publication().isPresent()) {
+        // A selected commit must finish before scanning, but it does not invalidate a checkpoint
+        // already verified for this owner. A new owner still waits for its first inspection.
         return CompletableFuture.completedFuture(new CheckpointStatus(0, false));
       }
       long sequence = state.finalizedSequence();

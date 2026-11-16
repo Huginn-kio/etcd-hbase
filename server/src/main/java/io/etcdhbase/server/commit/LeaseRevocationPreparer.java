@@ -9,6 +9,8 @@ import io.etcdhbase.core.commit.PinnedReadView;
 import io.etcdhbase.core.commit.PreparedAuxiliaryRecord;
 import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.PreparedEvent;
+import io.etcdhbase.core.commit.SystemRecordStore;
+import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.kv.DeletePlanner;
 import io.etcdhbase.core.lease.LeaseBindingChange;
@@ -28,6 +30,7 @@ import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -89,14 +92,17 @@ public final class LeaseRevocationPreparer {
   private final LeaseBindingReader bindings;
   private final LeaseBindingMutationPlanner bindingPlanner;
   private final LeaseCostAdmission costs;
+  private final SystemRecordStore systemRecords;
   private final DeletePlanner deletes = new DeletePlanner();
 
   public LeaseRevocationPreparer(LeaseReadView leases, LeaseBindingReader bindings,
-      LeaseBindingMutationPlanner bindingPlanner, LeaseCostAdmission costs) {
+      LeaseBindingMutationPlanner bindingPlanner, LeaseCostAdmission costs,
+      SystemRecordStore systemRecords) {
     this.leases = Objects.requireNonNull(leases, "leases");
     this.bindings = Objects.requireNonNull(bindings, "bindings");
     this.bindingPlanner = Objects.requireNonNull(bindingPlanner, "bindingPlanner");
     this.costs = Objects.requireNonNull(costs, "costs");
+    this.systemRecords = Objects.requireNonNull(systemRecords, "systemRecords");
   }
 
   /**
@@ -236,8 +242,15 @@ public final class LeaseRevocationPreparer {
     CompletableFuture<PreparedAuxiliaryPlan> operation = bindingReads.thenCompose(ignored ->
         prepareAuxiliary(identity, state, invocation, requireExpired, pinned, scope, account,
             finishPinnedRead, expiryProof, nextExpiryPosition, plan));
-    return operation.thenApply(auxiliary -> new Prepared(identity, plan.candidates, plan.events,
-        plan.changes, auxiliary.auxiliaryRecords(), retainedMemory))
+    return operation.thenApply(auxiliary -> {
+      // Candidate records are salted by transaction identity, not by the bound KV key.
+      plan.candidates.sort(Comparator
+          .comparingInt((PreparedCandidate candidate) -> systemRecords.bucket(
+              SystemRecordType.CANDIDATE, candidate.systemIdentity()))
+          .thenComparing(candidate -> candidate.record().key()));
+      return new Prepared(identity, plan.candidates, plan.events,
+          plan.changes, auxiliary.auxiliaryRecords(), retainedMemory);
+    })
         .whenComplete((prepared, failure) -> {
           if (failure != null) retainedMemory.close();
         });

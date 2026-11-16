@@ -21,6 +21,7 @@ import (
 	"github.com/Reidddddd/etcd-hbase/testkit/go/internal/compare"
 	"github.com/Reidddddd/etcd-hbase/testkit/go/internal/scenario"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc/status"
 )
 
 func main() {
@@ -85,7 +86,8 @@ func runLeaseKeepAliveOnce(parent context.Context, arguments []string, stdout, s
 	defer cancel()
 	response, err := connection.KeepAliveOnce(requestContext, clientv3.LeaseID(leaseID))
 	if err != nil {
-		return errors.New("M4 KeepAliveOnce request failed")
+		return fmt.Errorf("M4 KeepAliveOnce request failed: %s: %s",
+			status.Code(err), status.Convert(err).Message())
 	}
 	if response == nil || response.ResponseHeader == nil || response.TTL <= 0 ||
 		response.ID != clientv3.LeaseID(leaseID) {

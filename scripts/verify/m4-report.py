@@ -1621,7 +1621,10 @@ def _validate_j29_4_evidence(repository: Path, evidence_root: Path,
             or report.get("protocol") != PROTOCOL
             or report.get("target_capacity_accepted") is not False
             or report.get("physical_hbase_rpc_bytes_collected") is not False
-            or report.get("recovery_reserve_usage_measured") is not False):
+            or report.get("recovery_reserve_usage_measured") is not False
+            or report.get("listener_max_concurrent_requests") != 8
+            or report.get("listener_max_queued_requests") != 0
+            or report.get("latency_sampling") != "successful-client-rpcs"):
         raise ReportError("J29.4 evidence does not match the M4 run identity or scope")
 
     source_files = report.get("source_files")
@@ -1680,7 +1683,9 @@ def _validate_j29_4_evidence(repository: Path, evidence_root: Path,
                 raise ReportError("J29.4 row layout differs from its parent evidence")
             for field in (
                 "concurrency", "iterations_per_worker", "elapsed_nanos", "keepalive_requests",
-                "keepalive_responses", "selected_renewals", "business_puts", "combined_operations",
+                "keepalive_client_attempts", "keepalive_client_resource_exhausted",
+                "keepalive_responses", "selected_renewals", "business_puts",
+                "business_put_attempts", "business_put_resource_exhausted", "combined_operations",
                 "keepalive_client_rpc_p99_samples", "owner_queue_wait_samples",
                 "owner_queue_wait_total_nanos", "owner_queue_wait_mean_nanos",
                 "renewal_logical_hbase_client_operations", "renewal_logical_hbase_request_payload_bytes",
@@ -1688,7 +1693,8 @@ def _validate_j29_4_evidence(repository: Path, evidence_root: Path,
             ):
                 value = row.get(field)
                 minimum = 1 if field in {
-                    "concurrency", "elapsed_nanos", "keepalive_requests", "keepalive_responses",
+                    "concurrency", "elapsed_nanos", "keepalive_requests", "keepalive_client_attempts",
+                    "keepalive_responses", "business_put_attempts",
                     "selected_renewals", "business_puts", "combined_operations",
                     "keepalive_client_rpc_p99_samples", "owner_queue_wait_samples",
                     "renewal_logical_hbase_client_operations", "renewal_logical_hbase_request_payload_bytes",
@@ -1697,19 +1703,24 @@ def _validate_j29_4_evidence(repository: Path, evidence_root: Path,
                 if type(value) is not int or value < minimum:
                     raise ReportError(f"J29.4 metric {field} is missing or invalid")
             requests = row["keepalive_requests"]
+            responses = row["keepalive_responses"]
             puts = row["business_puts"]
-            if (row["keepalive_responses"] != requests or row["selected_renewals"] != requests
-                    or row["owner_queue_wait_samples"] != requests
-                    or row["keepalive_client_rpc_p99_samples"] != requests
-                    or puts != requests or row["combined_operations"] != requests + puts
-                    or row["unknown_outcomes"] != 0):
+            attempts = row["keepalive_client_attempts"]
+            queue_samples = row["owner_queue_wait_samples"]
+            if (attempts != responses + row["keepalive_client_resource_exhausted"]
+                    or row["business_put_attempts"] != puts + row["business_put_resource_exhausted"]
+                    or row["business_put_attempts"] != attempts or requests > attempts
+                    or not responses <= row["selected_renewals"] <= requests
+                    or queue_samples > requests or row["unknown_outcomes"] > requests
+                    or row["keepalive_client_rpc_p99_samples"] != responses
+                    or row["combined_operations"] != responses + puts):
                 raise ReportError("J29.4 workload counts contradict the observed RPCs")
-            if row["owner_queue_wait_mean_nanos"] != row["owner_queue_wait_total_nanos"] // requests:
+            if row["owner_queue_wait_mean_nanos"] != row["owner_queue_wait_total_nanos"] // queue_samples:
                 raise ReportError("J29.4 owner queue mean contradicts its sample count and total")
             if row["run_mode"] == "fixed-iterations":
                 if row["concurrency"] == 4 or row["iterations_per_worker"] != 24:
                     raise ReportError("J29.4 fixed workload profile changed")
-                if requests != row["concurrency"] * row["iterations_per_worker"]:
+                if attempts != row["concurrency"] * row["iterations_per_worker"]:
                     raise ReportError("J29.4 fixed workload did not complete all worker iterations")
             elif row["run_mode"] == "until-expiry-revocation":
                 if row["concurrency"] != 4 or row["iterations_per_worker"] != 0:
@@ -1717,12 +1728,12 @@ def _validate_j29_4_evidence(repository: Path, evidence_root: Path,
                 _validate_j29_4_expiry(row.get("expiry"))
             else:
                 raise ReportError("J29.4 workload run mode is unsupported")
-            _validate_j29_4_latency(row.get("keepalive_client_rpc_latency_nanos"), requests)
+            _validate_j29_4_latency(row.get("keepalive_client_rpc_latency_nanos"), responses)
             _validate_j29_4_latency(row.get("business_put_client_rpc_latency_nanos"), puts)
             for field, expected in (
-                ("logical_hbase_operations_per_renewal",
+                ("logical_hbase_operations_per_server_keepalive_request",
                  row["renewal_logical_hbase_client_operations"] / requests),
-                ("logical_hbase_request_payload_bytes_per_renewal",
+                ("logical_hbase_request_payload_bytes_per_server_keepalive_request",
                  row["renewal_logical_hbase_request_payload_bytes"] / requests),
             ):
                 value = row.get(field)
