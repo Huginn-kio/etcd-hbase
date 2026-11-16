@@ -12,6 +12,8 @@ import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.lang.reflect.Proxy;
 import java.time.Duration;
+import java.time.Clock;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -127,6 +129,32 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void cancellingEventFutureStopsCursorAndWaitsForPhysicalDrain() throws Exception {
+    Fixture fixture = new Fixture();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account account = fixture.account(scope)) {
+      AtomicInteger releases = new AtomicInteger();
+      ReadViewPinRegistry.Pin pin = new ReadViewPinRegistry.Pin() {
+        @Override public long generation() { return 1; }
+        @Override public void close() { releases.incrementAndGet(); }
+      };
+      fixture.pendingEvent = new CompletableFuture<>();
+      CompletableFuture<Void> physical = new CompletableFuture<>();
+      scope.trackPhysicalProducer(physical);
+      var cursor = new ProtectedEventCursor(fixture.cursor(scope), pin, scope);
+      var budget = new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20);
+      var result = cursor.next(budget);
+      assertTrue(result.cancel(false));
+      assertTrue(scope.isClosed());
+      assertEquals(0, releases.get());
+      fixture.pendingEvent.complete(Optional.of(fixture.first));
+      physical.complete(null);
+      cursor.releaseCompletion().toCompletableFuture().join();
+      assertEquals(1, releases.get());
+    }
+  }
+
+  @Test
   void failedPhysicalDrainKeepsProtectionAndReportsCleanupFailure() throws Exception {
     Fixture fixture = new Fixture();
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
@@ -143,6 +171,130 @@ class SealedEventCursorTest {
       assertThrows(CompletionException.class, () -> cursor.releaseCompletion().toCompletableFuture().join());
       assertEquals(0, releases.get());
     }
+  }
+
+  @Test
+  void opensOnlyAfterPinAndSelectionAreVerified() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var reader = fixture.reader(pins, fixture.decision);
+        var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+        var openingBudget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        var cursor = reader.open(index, fixture.digest, scope, openingBudget).join();
+        var eventBudget = new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20);
+        assertEquals(0, cursor.next(eventBudget).join().orElseThrow().ordinal());
+        cursor.close();
+        cursor.releaseCompletion().toCompletableFuture().join();
+      }
+    }
+  }
+
+  @Test
+  void rejectsIndexThatDoesNotMatchTheArchivedDecision() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+        var different = new CommitDecision(fixture.decision.transactionId(), InvocationId.create(),
+            fixture.decision.sequence(), fixture.decision.baseRevision(), fixture.decision.revision(),
+            fixture.decision.manifestRoot(), fixture.decision.manifestDigest(), true);
+        var openingBudget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        assertThrows(CompletionException.class,
+            () -> fixture.reader(pins, different).open(index, fixture.digest, scope, openingBudget).join());
+        assertTrue(scope.isClosed());
+      }
+    }
+  }
+
+  @Test
+  void rejectsCompactedOrAlteredEventRootsAfterPinRegistration() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), setup).join();
+      var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+      EventReference original = index.events();
+      var altered = new EventReference(original.identity(), ByteKey.copyOf(new byte[32]),
+          original.firstOrdinal(), original.lastOrdinal(), original.itemCount(),
+          original.totalBytes(), original.leafPageCount(), original.level());
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        assertThrows(CompletionException.class, () -> fixture.reader(pins, fixture.decision)
+            .open(new EventRevisionIndex(fixture.decision, altered), fixture.digest, scope, budget).join());
+      }
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+            Optional.of("owner"), 1, 100, 1, 4, 12, 4, 12, Optional.empty(), 12);
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        assertThrows(CompletionException.class, () -> fixture.reader(pins, fixture.decision, state)
+            .open(index, fixture.digest, scope, budget).join());
+      }
+    }
+  }
+
+  @Test
+  void cancellationDuringPinRegistrationReleasesLateCreatedPin() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        records.pauseNextCas = new CompletableFuture<>();
+        var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        var opening = fixture.reader(pins, fixture.decision).open(index, fixture.digest, scope, budget);
+        assertFalse(opening.isDone());
+        assertTrue(opening.cancel(false));
+        records.resumeCas();
+        assertTrue(scope.isClosed());
+        assertTrue(pins.readBoundary(setup).join().protections().isEmpty());
+      }
+    }
+  }
+
+  private static final class MemoryRecords implements SystemRecordStore {
+    private final Map<ByteKey, ByteKey> rows = new HashMap<>();
+    private CompletableFuture<Boolean> pauseNextCas;
+    private CompletableFuture<Boolean> pausedCas;
+    @Override public int bucket(SystemRecordType type, ByteKey identity) { return 0; }
+    @Override public synchronized CompletableFuture<Optional<ByteKey>> read(
+        SystemRecordType type, ByteKey identity, RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.ofNullable(rows.get(identity)));
+    }
+    @Override public synchronized CompletableFuture<CreateResult> createIfAbsent(
+        SystemRecordType type, ByteKey identity, ByteKey value, RequestScope scope) {
+      ByteKey old = rows.putIfAbsent(identity, value);
+      return CompletableFuture.completedFuture(old == null ? CreateResult.CREATED
+          : old.equals(value) ? CreateResult.ALREADY_PRESENT : CreateResult.CONFLICT);
+    }
+    @Override public synchronized CompletableFuture<Boolean> compareAndSet(SystemRecordType type,
+        ByteKey identity, Optional<ByteKey> expected, ByteKey replacement, RequestScope scope) {
+      if (!Optional.ofNullable(rows.get(identity)).equals(expected)) {
+        return CompletableFuture.completedFuture(false);
+      }
+      rows.put(identity, replacement);
+      if (pauseNextCas != null) {
+        pausedCas = pauseNextCas;
+        pauseNextCas = null;
+        return pausedCas;
+      }
+      return CompletableFuture.completedFuture(true);
+    }
+    private void resumeCas() { pausedCas.complete(true); }
   }
 
   private static final class Fixture {
@@ -174,10 +326,11 @@ class SealedEventCursorTest {
           current, Optional.empty());
     }
 
-    private SealedEventCursor cursor(RequestScope scope) {
-      ManifestRepository repository = (ManifestRepository) Proxy.newProxyInstance(
+    private ManifestRepository repository() {
+      return (ManifestRepository) Proxy.newProxyInstance(
           ManifestRepository.class.getClassLoader(), new Class<?>[] {ManifestRepository.class},
           (proxy, method, arguments) -> switch (method.getName()) {
+            case "readRoot" -> CompletableFuture.completedFuture(Optional.of(root));
             case "readEventDirectoryPage" -> CompletableFuture.completedFuture(Optional.of(directory));
             case "readEventPage" -> CompletableFuture.completedFuture(missingPage
                 ? Optional.empty() : Optional.of(page));
@@ -186,7 +339,34 @@ class SealedEventCursorTest {
                     : arguments[0].equals(first.systemIdentity()) ? first : second));
             default -> throw new UnsupportedOperationException(method.getName());
           });
-      return new SealedEventCursor(repository, decision, root, scope);
+    }
+
+    private SealedEventCursor cursor(RequestScope scope) {
+      return new SealedEventCursor(repository(), decision, root, scope);
+    }
+
+    private SelectedEventReader reader(EventHistoryPinManager pins, CommitDecision archived) {
+      var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, digest,
+          Optional.of("owner"), 1, 100, 1, 3, 11, 3, 11, Optional.empty(), 0);
+      return reader(pins, archived, state);
+    }
+
+    private SelectedEventReader reader(EventHistoryPinManager pins, CommitDecision archived, CommitState state) {
+      CommitControlStore control = (CommitControlStore) Proxy.newProxyInstance(
+          CommitControlStore.class.getClassLoader(), new Class<?>[] {CommitControlStore.class},
+          (proxy, method, arguments) -> {
+            if (method.getName().equals("read")) {
+              return CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(state, new byte[] {1})));
+            }
+            throw new UnsupportedOperationException(method.getName());
+          });
+      CommitDecisionRepository decisions = (CommitDecisionRepository) Proxy.newProxyInstance(
+          CommitDecisionRepository.class.getClassLoader(), new Class<?>[] {CommitDecisionRepository.class},
+          (proxy, method, arguments) -> {
+            if (method.getName().equals("read")) return CompletableFuture.completedFuture(Optional.of(archived));
+            throw new UnsupportedOperationException(method.getName());
+          });
+      return new SelectedEventReader(pins, control, decisions, repository());
     }
 
     private BudgetManager.Account account(RequestScope scope) throws Exception {

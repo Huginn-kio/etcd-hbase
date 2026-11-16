@@ -9,7 +9,7 @@ import java.util.concurrent.CompletionStage;
 
 /** Owns a sealed event cursor and its durable protection for a single producer scope. */
 public final class ProtectedEventCursor implements AutoCloseable {
-  private final SealedEventCursor cursor;
+  private SealedEventCursor cursor;
   private final ReadViewPinRegistry.Pin pin;
   private final RequestScope scope;
   private final CompletableFuture<Void> release = new CompletableFuture<>();
@@ -22,10 +22,31 @@ public final class ProtectedEventCursor implements AutoCloseable {
    */
   public ProtectedEventCursor(SealedEventCursor cursor, ReadViewPinRegistry.Pin pin,
       RequestScope scope) {
-    this.cursor = Objects.requireNonNull(cursor, "cursor");
+    this(pin, scope);
+    attach(cursor);
+  }
+
+  ProtectedEventCursor(ReadViewPinRegistry.Pin pin, RequestScope scope) {
     this.pin = Objects.requireNonNull(pin, "pin");
     this.scope = Objects.requireNonNull(scope, "scope");
     scope.registerCleanup(this);
+  }
+
+  synchronized void attach(SealedEventCursor cursor) {
+    Objects.requireNonNull(cursor, "cursor");
+    if (closed || scope.isClosed() || scope.isDeadlineExceeded()) {
+      cursor.close();
+      throw new IllegalStateException("event producer scope is closed");
+    }
+    if (this.cursor != null) throw new IllegalStateException("event cursor is already attached");
+    this.cursor = cursor;
+  }
+
+  synchronized CompletableFuture<Void> renew() {
+    if (closed || scope.isClosed() || scope.isDeadlineExceeded()) {
+      return CompletableFuture.failedFuture(inactive());
+    }
+    return pin.renew(scope);
   }
 
   /** Renew both before I/O and before delivery; lost protection makes the cursor terminal. */
@@ -39,6 +60,7 @@ public final class ProtectedEventCursor implements AutoCloseable {
       return CompletableFuture.failedFuture(inactive());
     }
     if (reading) return CompletableFuture.failedFuture(new IllegalStateException("event read already in flight"));
+    if (cursor == null) return CompletableFuture.failedFuture(new IllegalStateException("event cursor is not attached"));
     reading = true;
     CompletableFuture<Optional<PreparedEvent>> result;
     try {
@@ -49,7 +71,16 @@ public final class ProtectedEventCursor implements AutoCloseable {
       close();
       return CompletableFuture.failedFuture(failure);
     }
-    return result.whenComplete((ignored, failure) -> finished(failure));
+    var response = new CompletableFuture<Optional<PreparedEvent>>();
+    response.whenComplete((ignored, failure) -> {
+      if (response.isCancelled()) close();
+    });
+    result.whenComplete((event, failure) -> {
+      finished(failure);
+      if (failure != null) response.completeExceptionally(failure);
+      else response.complete(event);
+    });
+    return response;
   }
 
   private synchronized Optional<PreparedEvent> deliver(Optional<PreparedEvent> event) {
@@ -76,7 +107,7 @@ public final class ProtectedEventCursor implements AutoCloseable {
     synchronized (this) {
       if (closed) return;
       closed = true;
-      cursor.close();
+      if (cursor != null) cursor.close();
     }
     scope.close();
     scope.physicalProducersCompletion().whenComplete((ignored, producerFailure) -> {
