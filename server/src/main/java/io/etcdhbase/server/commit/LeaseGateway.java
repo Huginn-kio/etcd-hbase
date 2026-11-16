@@ -27,6 +27,7 @@ import io.etcdhbase.grpc.protocol.ErrorProjection;
 import io.etcdhbase.grpc.protocol.LeaseGrantResponseMapper;
 import io.etcdhbase.grpc.protocol.LeaseTimeToLiveResponseMapper;
 import io.etcdhbase.grpc.protocol.ResponseHeaderFactory;
+import io.etcdhbase.server.config.M3MemoryReservations;
 import io.etcdhbase.hbase.codec.LeaseGrantResultMessages;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.grpc.stub.StreamObserver;
@@ -46,8 +47,7 @@ public final class LeaseGateway {
   private static final int MAX_EXAMINED_LEASES = 100_000;
   private static final long MAX_METADATA_BYTES = 64L << 20;
   private static final long OUTPUT_OBJECT_ALLOWANCE = 256;
-  static final int BINDING_PAGE_ENTRIES = 128;
-  private static final long BINDING_PAGE_OVERHEAD_BYTES = 64L << 10;
+  static final int BINDING_PAGE_ENTRIES = M3MemoryReservations.LEASE_BINDING_PAGE_ENTRIES;
 
   private final String tableGroup;
   private final AuthorizedBackendIdentity identity;
@@ -105,15 +105,12 @@ public final class LeaseGateway {
     if (maximumEtcdRequestBytes < 1 || maximumEtcdRequestBytes > MutationForwardRequest.MAX_OPERATION_BYTES) {
       throw new IllegalArgumentException("invalid binding request limit");
     }
-    return Math.addExact(maximumEtcdRequestBytes, BINDING_PAGE_OVERHEAD_BYTES);
+    return M3MemoryReservations.leaseBindingPageBytes(maximumEtcdRequestBytes);
   }
 
   private static BudgetManager.Reservation bindingReadReservation(
       BudgetManager.Reservation base, int maximumEtcdRequestBytes) {
-    long pageBytes = LeaseBindingReader.requiredPageMemoryBytes(
-        BINDING_PAGE_ENTRIES, bindingPageBytes(maximumEtcdRequestBytes));
-    return new BudgetManager.Reservation(base.heads(), Math.max(base.page(), pageBytes),
-        base.io(), base.output(), base.candidates());
+    return M3MemoryReservations.leaseBindingRead(base, maximumEtcdRequestBytes);
   }
 
   public BiConsumer<Rpc.LeaseGrantRequest, StreamObserver<Rpc.LeaseGrantResponse>> grantHandler() {
@@ -490,9 +487,7 @@ public final class LeaseGateway {
     var proof = new ManifestCatalog.ProofReadBudget(scope, account, MAX_EXAMINED_LEASES, MAX_METADATA_BYTES);
     return views.openAuxiliary(authorizationDigest, scope).thenCompose(pin ->
         leaseEnumeration.read(pin, scope, account, proof).thenCompose(states -> {
-          var clock = time.observe();
           List<Rpc.LeaseStatus> leases = states.stream().filter(state -> state.status() == LeaseState.Status.ACTIVE)
-              .filter(state -> !LeaseTimeRules.isExpired(state, clock))
               .map(state -> Rpc.LeaseStatus.newBuilder()
                   .setID(state.identity().leaseId())
                   .build())

@@ -43,6 +43,14 @@
         ]}
       ],
       "maven_tests": [
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.CommitPublisherTest", "tests": [
+          "selectionConditionIsRecheckedAfterHandoffAndBeforeEachRetry",
+          "selectedOrUnknownCasIsResolvedWithoutRepeatingSelectionCondition"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.M3RuntimeBudgetsTest", "tests": [
+          "m4MinimumAccountsForEveryGroupAndConcurrentLeaseOwner",
+          "tableGroupsShareTheSameGlobalMemoryLimit"
+        ]},
         {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.lease.LeaseStateTest", "tests": [
           "preservesSignedWireIdAndSeparatesIncarnations",
           "grantsMinimumTtlAndRejectsOnlyValuesAboveMaximum",
@@ -139,7 +147,8 @@
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.config.M3RuntimeConfigurationTest", "tests": [
           "m4ExampleUsesExplicitLeaseTimingInputs",
-          "m4ActivationRequiresExplicitMinimumTtlAndClockBound"
+          "m4ActivationRequiresExplicitMinimumTtlAndClockBound",
+          "m4MemoryMinimumIncludesGatewayOwnerAndRecoveryReservations"
         ]},
         {"module": "hbase", "kind": "failsafe", "class": "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT", "tests": [
           "scansOneBucketInBoundedExclusiveResumePages",
@@ -147,7 +156,8 @@
           "rejectsPagesThatExceedTheirByteBudgetAndSeeksVersionsAtTheBarrier"
         ]},
         {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseRpcIT", "tests": [
-          "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts"
+          "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts",
+          "minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection"
         ]}
       ],
       "evidence": {

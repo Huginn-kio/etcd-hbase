@@ -111,7 +111,7 @@ public final class LeaseEmptyExpiryExecutor {
           .thenCompose(pin -> prepareExpiry(candidate, binding, pin, scope, account))
           .thenCompose(sealed -> currentBase(binding, owner, scope)
               .thenCompose(ignored -> publisher.publish(sealed.invocation(), owner,
-                  sealed.manifest(), scope)))
+                  sealed.manifest(), scope, () -> requireExpired(candidate))))
           .thenCompose(outcome -> outcome.state() == CommitOutcomeResolver.State.SELECTED_FINALIZED
               ? CompletableFuture.completedFuture(binding.invocationId())
               : CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN)));
@@ -181,6 +181,13 @@ public final class LeaseEmptyExpiryExecutor {
         && candidate.incarnation() == state.identity().incarnation()
         && candidate.renewalGeneration() == state.renewalGeneration()
         && candidate.deadlineEpochMillis() == state.deadlineEpochMillis();
+  }
+
+  private void requireExpired(ExpiryCandidateIdentity candidate) {
+    var observation = time.observe();
+    if (!observation.healthy() || observation.nowLowerEpochMillis() < candidate.deadlineEpochMillis()) {
+      throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
   }
 
   private static List<PreparedAuxiliaryRecord> revokedRecords(

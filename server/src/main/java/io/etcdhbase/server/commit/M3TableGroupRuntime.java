@@ -12,7 +12,6 @@ import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.LeaseBindingReader;
 import io.etcdhbase.core.commit.LeaseEnumerationReader;
 import io.etcdhbase.core.commit.LeaseReadView;
-import io.etcdhbase.core.commit.ManifestCatalog;
 import io.etcdhbase.core.commit.ManifestPreparation;
 import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
@@ -38,6 +37,7 @@ import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.observability.RequestMetrics;
+import io.etcdhbase.server.config.M3MemoryReservations;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
@@ -63,15 +63,11 @@ import java.util.function.LongFunction;
 /** Owns the local KV runtime for one validated table group; the caller owns its HBase factory. */
 public final class M3TableGroupRuntime implements AutoCloseable {
   private static final BudgetManager.Reservation REQUEST_MEMORY =
-      new BudgetManager.Reservation(64L << 10, 64L << 10, 2L << 20, 16L << 20, 64L << 20);
-  // Lease state proofs may receive a conservative system-record envelope larger than the M3
-  // point-read lane. Keep that capacity scoped to Lease RPCs so ordinary KV admission is unchanged.
-  private static final BudgetManager.Reservation LEASE_REQUEST_MEMORY = new BudgetManager.Reservation(
-      REQUEST_MEMORY.heads(), REQUEST_MEMORY.page(),
-      Math.max(REQUEST_MEMORY.io(), ManifestCatalog.maximumProofReadPageBytes()),
-      REQUEST_MEMORY.output(), REQUEST_MEMORY.candidates());
+      M3MemoryReservations.REQUEST;
+  private static final BudgetManager.Reservation LEASE_REQUEST_MEMORY =
+      M3MemoryReservations.LEASE;
   private static final BudgetManager.Reservation RECOVERY_MEMORY =
-      new BudgetManager.Reservation(64L << 10, 64L << 10, 2L << 20, 8L << 20, 48L << 20);
+      M3MemoryReservations.RECOVERY;
   private static final Executor CLEANUP = task -> Thread.ofVirtual().name("m3-runtime-cleanup").start(task);
   private static final LongFunction<LeaseTimeSource> SYSTEM_LEASE_TIME_SOURCE =
       uncertaintyMillis -> new BoundedSystemLeaseTimeSource(Clock.systemUTC(), uncertaintyMillis);

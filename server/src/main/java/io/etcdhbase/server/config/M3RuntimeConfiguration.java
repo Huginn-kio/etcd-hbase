@@ -79,6 +79,11 @@ public record M3RuntimeConfiguration(
         || m4LeaseApiEnabled && leaseClockUncertaintyMs == 0) {
       throw new IllegalArgumentException("invalid M3 runtime limits");
     }
+    long minimumLeaseMemory = M3MemoryReservations.minimumLeaseMemory(1, maxEtcdRequestBytes);
+    if (m4LeaseApiEnabled && memoryBytes < minimumLeaseMemory) {
+      throw new IllegalArgumentException("M4 memory_bytes must be at least " + minimumLeaseMemory
+          + " for one group recovery account and one Lease request/owner pair");
+    }
     new SnapshotPinConfiguration(pinShards, pinSlotsPerShard, Duration.ofMillis(pinLeaseMs));
   }
 

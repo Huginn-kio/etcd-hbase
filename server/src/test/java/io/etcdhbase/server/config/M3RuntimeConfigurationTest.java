@@ -85,6 +85,19 @@ class M3RuntimeConfigurationTest {
   }
 
   @Test
+  void m4MemoryMinimumIncludesGatewayOwnerAndRecoveryReservations() {
+    long minimum = M3MemoryReservations.minimumLeaseMemory(1, 1_572_864);
+    assertEquals(368_082_944L, minimum);
+    String enabled = valid().replace("\"pin_lease_ms\":60000",
+        "\"pin_lease_ms\":60000,\"m4_lease_api_enabled\":true,"
+            + "\"lease_min_ttl_seconds\":5,\"lease_clock_uncertainty_ms\":1000");
+    assertThrows(IllegalArgumentException.class, () -> load(enabled.replace("536870912", "268435456")));
+    assertThrows(IllegalArgumentException.class, () -> load(enabled.replace("536870912", Long.toString(minimum - 1))));
+    assertEquals(minimum, load(enabled.replace("536870912", Long.toString(minimum))).memoryBytes());
+    assertEquals(268_435_456L, load(valid().replace("536870912", "268435456")).memoryBytes());
+  }
+
+  @Test
   void rejectsInvalidIdentityLeaseAndMemoryWithoutSupplyingDefaults() {
     for (String invalid : new String[] {
         valid().replace("9223372036854775808", "0"),

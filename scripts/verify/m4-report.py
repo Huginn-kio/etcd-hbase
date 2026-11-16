@@ -82,6 +82,13 @@ J40_JAVA_CLASSES = {
     "io.etcdhbase.server.M4LeaseRpcIT",
 }
 J40_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.core.commit.CommitPublisherTest": {
+        "selectionConditionIsRecheckedAfterHandoffAndBeforeEachRetry",
+        "selectedOrUnknownCasIsResolvedWithoutRepeatingSelectionCondition",
+    },
+    "io.etcdhbase.server.M3RuntimeBudgetsTest": {
+        "m4MinimumAccountsForEveryGroupAndConcurrentLeaseOwner",
+    },
     "io.etcdhbase.core.lease.LeaseStateTest": {"deadlineUsesUpperBoundAndExpiryUsesLowerBound"},
     "io.etcdhbase.core.commit.LeaseReadViewTest": {
         "bindingReadMergesStableHistoryWithSelectedChangesAtOneBarrier"
@@ -93,7 +100,11 @@ J40_CRITICAL_JAVA_TESTS = {
         "scansOneBucketInBoundedExclusiveResumePages"
     },
     "io.etcdhbase.server.M4LeaseRpcIT": {
-        "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts"
+        "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts",
+        "minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection",
+    },
+    "io.etcdhbase.server.config.M3RuntimeConfigurationTest": {
+        "m4MemoryMinimumIncludesGatewayOwnerAndRecoveryReservations",
     },
     "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest": {
         "returnsConservativeBoundsWhileWallAndMonotonicClocksAdvanceTogether",

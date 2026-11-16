@@ -25,7 +25,10 @@ import io.etcdhbase.hbase.probe.TemporaryHBaseClusterProcess;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.M3RuntimeConfigurationLoader;
+import io.etcdhbase.server.config.M3MemoryReservations;
 import io.etcdhbase.server.config.RuntimeConfiguration;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -39,6 +42,8 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongFunction;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -67,6 +72,99 @@ class M4LeaseRpcIT {
     }
     compare(run, "HISTORY");
     compare(run, "NATIVE");
+  }
+
+  @Test
+  void minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection() throws Exception {
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      InitializationConfiguration initialization = initialization("history-table.json", clientPort);
+      var source = TableGroupPlanFactory.create(initialization, "local", null);
+      var plan = M3TableGroupPlan.from(source);
+      var authScope = new io.etcdhbase.spi.identity.AuthenticationScope(
+          source.tableGroupId(), source.hbaseProfile().id());
+      try (var initializer = new HBaseBackendIdentityProvider(source.identityProviderId(), authScope,
+              cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+              (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+              1, 1, Duration.ofSeconds(30));
+           var credentials = new io.etcdhbase.spi.identity.BackendCredentials("m4-initializer", new char[0])) {
+        var identity = authenticate(initializer, credentials, authScope);
+        var activation = minimumActivation();
+        initializeM4Layout(plan, source.fingerprint(), identity, initializer, activation);
+        var configuration = new RuntimeConfiguration(initialization.schemaVersion(),
+            List.of(new RuntimeConfiguration.Listener("m4-local", "127.0.0.1", 0, source.tableGroupId())),
+            initialization.hbaseProfiles(), initialization.saltProfiles(), initialization.tableGroups(), RESOURCES);
+        exerciseLeaseLifecycleAtMinimum(plan, initializer, identity, configuration, activation);
+      }
+    }
+  }
+
+  private static void exerciseLeaseLifecycleAtMinimum(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer, io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      RuntimeConfiguration configuration, M3RuntimeConfiguration activation) throws Exception {
+    var now = new AtomicLong(10_000);
+    var healthy = new AtomicBoolean(true);
+    var observations = new AtomicInteger();
+    var armed = new AtomicBoolean(false);
+    var rewind = new AtomicBoolean(false);
+    LeaseTimeSource time = () -> {
+      boolean observedHealthy = healthy.get();
+      long observedNow = now.get();
+      if (armed.get() && observations.incrementAndGet() == 2) {
+        if (rewind.get()) now.set(12_000);
+        else healthy.set(false);
+      }
+      return new LeaseTimeObservation(observedNow, observedNow, observedHealthy);
+    };
+    try (RuntimeServer runtime = RuntimeServer.startM3WithLeaseTimeSource(configuration, activation, ignored -> time)) {
+      var channel = NettyChannelBuilder.forAddress("127.0.0.1", runtime.boundListeners().getFirst().port())
+          .usePlaintext().build();
+      try {
+        var client = LeaseGrpc.newBlockingStub(channel).withDeadlineAfter(120, TimeUnit.SECONDS);
+        long leaseId = 12345;
+        var request = Rpc.LeaseGrantRequest.newBuilder().setID(leaseId).setTTL(5).build();
+        assertEquals(leaseId, client.leaseGrant(request).getID());
+        now.set(20_000);
+        assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId));
+        assertEquals(Status.Code.FAILED_PRECONDITION,
+            assertThrows(StatusRuntimeException.class, () -> client.leaseGrant(request)).getStatus().getCode());
+        long sequence = controlSnapshot(plan, initializer, identity).state().publishedSequence();
+        armed.set(true);
+        var ttlRequest = Rpc.LeaseTimeToLiveRequest.newBuilder().setID(leaseId).setKeys(true).build();
+        assertEquals(Status.Code.UNAVAILABLE,
+            assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
+        assertTrue(observations.get() >= 3);
+        assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
+        armed.set(false);
+        healthy.set(true);
+        assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId));
+        observations.set(0);
+        rewind.set(true);
+        armed.set(true);
+        assertEquals(Status.Code.UNAVAILABLE,
+            assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
+        assertTrue(observations.get() >= 3);
+        assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
+        armed.set(false);
+        now.set(20_000);
+        assertEquals(-1, client.leaseTimeToLive(ttlRequest).getTTL());
+        assertFalse(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId));
+        assertEquals(leaseId, client.leaseGrant(request).getID());
+      } finally {
+        channel.shutdownNow();
+        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+      }
+    }
+  }
+
+  private static M3RuntimeConfiguration minimumActivation() {
+    int maxRequest = 1_572_864;
+    return new M3RuntimeConfiguration("1", 6_000, 1_000, 60_000, 30_000,
+        M3MemoryReservations.minimumLeaseMemory(1, maxRequest), maxRequest,
+        2, 16, 60_000, false, true, 5, 1_000);
   }
 
   private static void runLayout(TemporaryHBaseClusterProcess cluster, int clientPort,

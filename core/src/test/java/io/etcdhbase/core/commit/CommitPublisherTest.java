@@ -149,6 +149,47 @@ class CommitPublisherTest {
     assertEquals(CommitOutcomeResolver.State.INDETERMINATE, result.state());
   }
 
+  @Test
+  void selectionConditionIsRecheckedAfterHandoffAndBeforeEachRetry() {
+    var allowed = new java.util.concurrent.atomic.AtomicBoolean(true);
+    Fixture delayed = new Fixture(true, ScriptedControlStore::write);
+    delayed.handoff.gate = new CompletableFuture<>();
+    var pending = delayed.publish(() -> {
+      if (!allowed.get()) throw new IllegalStateException("clock unhealthy");
+    });
+    allowed.set(false);
+    delayed.handoff.gate.complete(null);
+    assertThrows(CompletionException.class, pending::join);
+    assertEquals(0, delayed.control.casCalls.get());
+
+    allowed.set(true);
+    Fixture retry = new Fixture(true, (store, replacement) -> {
+      allowed.set(false);
+      return CompletableFuture.completedFuture(false);
+    });
+    assertThrows(CompletionException.class, () -> retry.publish(() -> {
+      if (!allowed.get()) throw new IllegalStateException("clock unhealthy");
+    }).join());
+    assertEquals(1, retry.control.casCalls.get());
+  }
+
+  @Test
+  void selectedOrUnknownCasIsResolvedWithoutRepeatingSelectionCondition() {
+    var checks = new AtomicInteger();
+    Fixture fixture = new Fixture(true, (store, replacement) -> {
+      store.current.set(replacement);
+      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+    });
+    var result = fixture.publish(() -> {
+      if (checks.incrementAndGet() > 1) throw new IllegalStateException("condition changed");
+    }).join();
+    assertEquals(CommitOutcomeResolver.State.SELECTED_PENDING, result.state());
+    assertEquals(1, checks.get());
+    var alreadySelected = fixture.publish(() -> { throw new IllegalStateException("condition changed"); }).join();
+    assertEquals(CommitOutcomeResolver.State.SELECTED_PENDING, alreadySelected.state());
+    assertEquals(1, fixture.control.casCalls.get());
+  }
+
   private static ManifestRoot root(TransactionId transactionId, long ownerEpoch) {
     return ManifestRoot.create(transactionId, ownerEpoch, 0, 1, 0, 0, Optional.empty());
   }
@@ -233,16 +274,21 @@ class CommitPublisherTest {
     private CompletableFuture<CommitOutcomeResolver.Resolution> publish() {
       return publisher.publish(invocation, owner, manifest, RequestScope.withoutDeadline());
     }
+
+    private CompletableFuture<CommitOutcomeResolver.Resolution> publish(Runnable beforeSelection) {
+      return publisher.publish(invocation, owner, manifest, RequestScope.withoutDeadline(), beforeSelection);
+    }
   }
 
   private static final class DirectHandoff implements PublicationHandoff {
     private final AtomicInteger calls = new AtomicInteger();
+    private CompletableFuture<Void> gate = CompletableFuture.completedFuture(null);
 
     @Override
     public <T> CompletableFuture<T> transfer(InvocationBinding invocation,
         RequestScope requestScope, java.util.function.Function<RequestScope, CompletableFuture<T>> work) {
       calls.incrementAndGet();
-      return work.apply(requestScope);
+      return gate.thenCompose(ignored -> work.apply(requestScope));
     }
   }
 

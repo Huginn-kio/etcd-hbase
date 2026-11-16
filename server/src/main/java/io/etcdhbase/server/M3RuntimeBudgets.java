@@ -1,6 +1,7 @@
 package io.etcdhbase.server;
 
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.server.config.M3MemoryReservations;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import java.util.LinkedHashMap;
@@ -21,6 +22,11 @@ final class M3RuntimeBudgets {
         || resources.maxConcurrentRequests() > 100_000 || resources.maxScannersPerTable() < 1
         || resources.maxScannersPerTable() > 1024 || resources.maxQueuedRequests() != 0) {
       throw new IllegalArgumentException("invalid M3 group or admission limits");
+    }
+    long minimumLeaseMemory = M3MemoryReservations.minimumLeaseMemory(groups.size(), activation.maxEtcdRequestBytes());
+    if (activation.m4LeaseApiEnabled() && activation.memoryBytes() < minimumLeaseMemory) {
+      throw new IllegalArgumentException("M4 memory_bytes must be at least " + minimumLeaseMemory
+          + " for all group recovery accounts and one Lease request/owner pair");
     }
     int requests = Math.addExact(Math.multiplyExact(resources.maxConcurrentRequests(), 2), groups.size());
     int operations = Math.addExact(Math.multiplyExact(resources.maxConcurrentRequests(), 4),

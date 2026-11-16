@@ -50,8 +50,14 @@ class M4ReportTest(unittest.TestCase):
         with self.assertRaises(m4_report.ReportError):
             m4_report.validate_registry_document(without_layout)
 
-    def test_registry_requires_nonempty_binding_and_ttl_projection_cases(self) -> None:
+    def test_registry_requires_critical_regression_cases(self) -> None:
         required_cases = {
+            "io.etcdhbase.core.commit.CommitPublisherTest":
+                "selectionConditionIsRecheckedAfterHandoffAndBeforeEachRetry",
+            "io.etcdhbase.server.M3RuntimeBudgetsTest":
+                "m4MinimumAccountsForEveryGroupAndConcurrentLeaseOwner",
+            "io.etcdhbase.server.M4LeaseRpcIT":
+                "minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection",
             "io.etcdhbase.core.commit.LeaseReadViewTest":
                 "bindingReadMergesStableHistoryWithSelectedChangesAtOneBarrier",
             "io.etcdhbase.grpc.protocol.LeaseTimeToLiveResponseMapperTest":

@@ -41,10 +41,21 @@ public final class CommitPublisher {
       CommitOwnerService.OwnerToken owner,
       ManifestRoot manifest,
       RequestScope requestScope) {
+    return publish(invocation, owner, manifest, requestScope, () -> {});
+  }
+
+  /** Runs the condition immediately before each new selection attempt, never during resolution. */
+  public CompletableFuture<CommitOutcomeResolver.Resolution> publish(
+      InvocationBinding invocation,
+      CommitOwnerService.OwnerToken owner,
+      ManifestRoot manifest,
+      RequestScope requestScope,
+      Runnable beforeSelection) {
     Objects.requireNonNull(invocation, "invocation");
     Objects.requireNonNull(owner, "owner");
     Objects.requireNonNull(manifest, "manifest");
     Objects.requireNonNull(requestScope, "requestScope");
+    Objects.requireNonNull(beforeSelection, "beforeSelection");
     if (invocation.preparedOwnerEpoch() != owner.epoch()) {
       return CompletableFuture.failedFuture(
           new IllegalArgumentException("owner token does not match the sealed invocation"));
@@ -60,7 +71,7 @@ public final class CommitPublisher {
                 new IllegalStateException("durable invocation does not own the sealed plan"));
           }
           return handoff.transfer(durable, requestScope, serviceScope ->
-              attempt(durable, owner, verified, serviceScope, 0)
+              attempt(durable, owner, verified, serviceScope, beforeSelection, 0)
                   .thenCompose(publication -> finalizer.finish(durable, publication, serviceScope)));
         }))
         .exceptionallyCompose(CommitPublisher::failed);
@@ -71,6 +82,7 @@ public final class CommitPublisher {
       CommitOwnerService.OwnerToken owner,
       ManifestRoot manifest,
       RequestScope scope,
+      Runnable beforeSelection,
       int attempt) {
     if (attempt >= MAX_CAS_ATTEMPTS) {
       return outcomes.resolve(invocation, scope);
@@ -100,9 +112,10 @@ public final class CommitPublisher {
           Math.addExact(invocation.baseRevision(), manifest.containsKeyChanges() ? 1 : 0),
           manifest.containsKeyChanges(), manifest.systemIdentity(), manifest.digest());
       CommitState selected = state.publish(slot);
+      beforeSelection.run();
       return control.compareAndSet(observed, selected, scope)
           .handle((updated, failure) -> new CasResult(updated, failure))
-          .thenCompose(result -> resolveAttempt(invocation, owner, manifest, scope, attempt, result));
+          .thenCompose(result -> resolveAttempt(invocation, owner, manifest, scope, beforeSelection, attempt, result));
     });
   }
 
@@ -111,6 +124,7 @@ public final class CommitPublisher {
       CommitOwnerService.OwnerToken owner,
       ManifestRoot manifest,
       RequestScope scope,
+      Runnable beforeSelection,
       int attempt,
       CasResult result) {
     if (result.failure() != null) {
@@ -132,7 +146,7 @@ public final class CommitPublisher {
           && state.publishedSequence() == invocation.baseSequence()
           && state.publishedRevision() == invocation.baseRevision()
           && state.publication().isEmpty()) {
-        return attempt(invocation, owner, manifest, scope, attempt + 1);
+        return attempt(invocation, owner, manifest, scope, beforeSelection, attempt + 1);
       }
       return outcomes.resolve(invocation, scope);
     });
