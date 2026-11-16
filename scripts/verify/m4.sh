@@ -176,8 +176,15 @@ run_logged() {
     "$stdout_log" "$stderr_log" "$@"
   if (( command_exit != 0 )); then
     echo "M4 command failed: $command_name (exit $command_exit)" >&2
-    tail -n 100 "$artifact_root/$stdout_log" >&2 || true
-    tail -n 100 "$artifact_root/$stderr_log" >&2 || true
+    if [[ "$command_name" == go-tests ]]; then
+      # Package completion can follow a failed test by more than 100 JSON events.
+      # Preserve the entire stream so CI retains the assertion and its context.
+      cat "$artifact_root/$stdout_log" >&2 || true
+      cat "$artifact_root/$stderr_log" >&2 || true
+    else
+      tail -n 100 "$artifact_root/$stdout_log" >&2 || true
+      tail -n 100 "$artifact_root/$stderr_log" >&2 || true
+    fi
     return "$command_exit"
   fi
 }
