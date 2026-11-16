@@ -158,8 +158,15 @@ public final class LeaseRevocationPreparer {
     }
 
     PlanBuilder plan = new PlanBuilder();
+    DirectRecordReader reader;
+    try {
+      reader = new DirectRecordReader(currentRecords, account, MAX_POINT_BYTES);
+    } catch (RuntimeException invalidReader) {
+      retainedMemory.close();
+      return CompletableFuture.failedFuture(invalidReader);
+    }
     CompletableFuture<PreparedAuxiliaryPlan> operation =
-        readBindingRows(identity, invocation, currentRecords, account, effectiveBindings, plan)
+        readBindingRows(identity, invocation, reader, effectiveBindings, plan)
             .thenCompose(ignored -> prepareAuxiliary(identity, state, invocation, requireExpired,
                 pinned, scope, account, finishPinnedRead, plan));
     return operation.thenApply(auxiliary -> new Prepared(identity, plan.candidates, plan.events,
@@ -198,14 +205,7 @@ public final class LeaseRevocationPreparer {
   }
 
   private CompletableFuture<Void> readBindingRows(LeaseIdentity identity, InvocationBinding invocation,
-      RecordStore currentRecords, BudgetManager.Account account,
-      List<LeaseBindingVersion> effectiveBindings, PlanBuilder plan) {
-    DirectRecordReader reader;
-    try {
-      reader = new DirectRecordReader(currentRecords, account, MAX_POINT_BYTES);
-    } catch (RuntimeException invalidReader) {
-      return CompletableFuture.failedFuture(invalidReader);
-    }
+      DirectRecordReader reader, List<LeaseBindingVersion> effectiveBindings, PlanBuilder plan) {
     CompletableFuture<Void> bindingReads = CompletableFuture.completedFuture(null);
     for (LeaseBindingVersion binding : effectiveBindings) {
       bindingReads = bindingReads.thenCompose(ignored -> readBinding(binding, identity, invocation,
