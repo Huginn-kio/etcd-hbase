@@ -20,6 +20,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 
 class SealedEventCursorTest {
@@ -286,6 +287,117 @@ class SealedEventCursorTest {
     }
   }
 
+  @Test
+  void sequenceReaderRequiresFinalizedIndexAndPreservesEventOrder() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var finalized = fixture.finalizedState();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var reader = fixture.sequenceReader(pins, finalized, Optional.empty());
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        assertThrows(CompletionException.class, () -> reader.open(3, 10, fixture.digest, scope, budget).join());
+      }
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+        var reader = fixture.sequenceReader(pins, finalized, Optional.of(index));
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        var selected = reader.open(3, 10, fixture.digest, scope, budget).join().orElseThrow();
+        var cursor = selected.events().orElseThrow();
+        var eventBudget = new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20);
+        assertEquals(0, cursor.next(eventBudget).join().orElseThrow().ordinal());
+        cursor.close();
+        cursor.releaseCompletion().toCompletableFuture().join();
+      }
+    }
+  }
+
+  @Test
+  void sequenceReaderMayReadSelectedSlotBeforeItsIndexIsFinalized() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var decision = fixture.decision;
+    var slot = new PublicationSlot(decision.transactionId(), decision.invocationId(), 1,
+        2, 10, 3, 11, true, decision.manifestRoot(), decision.manifestDigest());
+    var pending = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+        Optional.of("owner"), 1, 100, 1, 3, 11, 2, 10, Optional.of(slot), 0);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        var selected = fixture.sequenceReader(pins, pending, Optional.empty())
+            .open(3, 10, fixture.digest, scope, budget).join().orElseThrow();
+        var cursor = selected.events().orElseThrow();
+        var eventBudget = new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20);
+        assertEquals(0, cursor.next(eventBudget).join().orElseThrow().ordinal());
+        cursor.close();
+        cursor.releaseCompletion().toCompletableFuture().join();
+      }
+    }
+  }
+
+  @Test
+  void sequenceReaderHandlesMetadataAndWaitsWhenNoSequenceIsSelected() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var metadata = ManifestRoot.create(fixture.transaction, 1, 2, 10, 0, 0, Optional.empty());
+    var decision = new CommitDecision(fixture.transaction, InvocationId.create(),
+        3, 10, 10, metadata.systemIdentity(), metadata.digest(), false);
+    var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+        Optional.of("owner"), 1, 100, 1, 3, 10, 3, 10, Optional.empty(), 0);
+    fixture.rootReadOverride = metadata;
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 8, 1024L << 20);
+        var result = fixture.sequenceReader(pins, state, decision, () -> Optional.empty())
+            .open(3, 10, fixture.digest, scope, budget).join().orElseThrow();
+        assertEquals(decision, result.decision());
+        assertTrue(result.events().isEmpty());
+        assertTrue(scope.isClosed());
+      }
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 8, 1024L << 20);
+        assertTrue(fixture.sequenceReader(pins, state, decision, () -> Optional.empty())
+            .open(4, 10, fixture.digest, scope, budget).join().isEmpty());
+        assertTrue(scope.isClosed());
+      }
+    }
+  }
+
+  @Test
+  void sequenceReaderRereadsIndexWhenFinalizationOvertakesTheFirstLookup() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    AtomicInteger reads = new AtomicInteger();
+    var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        Supplier<Optional<EventRevisionIndex>> delayedIndex = () -> reads.incrementAndGet() == 1
+            ? Optional.empty() : Optional.of(index);
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        var selected = fixture.sequenceReader(pins, fixture.finalizedState(), fixture.decision, delayedIndex)
+            .open(3, 10, fixture.digest, scope, budget).join().orElseThrow();
+        assertEquals(2, reads.get());
+        var cursor = selected.events().orElseThrow();
+        cursor.close();
+        cursor.releaseCompletion().toCompletableFuture().join();
+      }
+    }
+  }
+
   private static final class MemoryRecords implements SystemRecordStore {
     private final Map<ByteKey, ByteKey> rows = new HashMap<>();
     private CompletableFuture<Boolean> pauseNextCas;
@@ -336,6 +448,7 @@ class SealedEventCursorTest {
         3, 10, 11, root.systemIdentity(), root.digest(), true);
     private final AtomicInteger controlReads = new AtomicInteger();
     private CommitState stateAfterRoot;
+    private ManifestRoot rootReadOverride;
     private boolean missingPage;
     private boolean wrongEvent;
     private CompletableFuture<Optional<PreparedEvent>> pendingEvent;
@@ -352,7 +465,8 @@ class SealedEventCursorTest {
       return (ManifestRepository) Proxy.newProxyInstance(
           ManifestRepository.class.getClassLoader(), new Class<?>[] {ManifestRepository.class},
           (proxy, method, arguments) -> switch (method.getName()) {
-            case "readRoot" -> CompletableFuture.completedFuture(Optional.of(root));
+            case "readRoot" -> CompletableFuture.completedFuture(
+                Optional.of(rootReadOverride != null ? rootReadOverride : root));
             case "readEventDirectoryPage" -> CompletableFuture.completedFuture(Optional.of(directory));
             case "readEventPage" -> CompletableFuture.completedFuture(missingPage
                 ? Optional.empty() : Optional.of(page));
@@ -367,14 +481,37 @@ class SealedEventCursorTest {
       return new SealedEventCursor(repository(), decision, root, scope);
     }
 
-    private SelectedEventReader reader(EventHistoryPinManager pins, CommitDecision archived) {
-      var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, digest,
+    private CommitState finalizedState() {
+      return CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, digest,
           Optional.of("owner"), 1, 100, 1, 3, 11, 3, 11, Optional.empty(), 0);
-      return reader(pins, archived, state);
+    }
+
+    private SelectedEventReader reader(EventHistoryPinManager pins, CommitDecision archived) {
+      return reader(pins, archived, finalizedState());
     }
 
     private SelectedEventReader reader(EventHistoryPinManager pins, CommitDecision archived, CommitState state) {
-      CommitControlStore control = (CommitControlStore) Proxy.newProxyInstance(
+      return new SelectedEventReader(pins, control(state), decisions(archived), repository());
+    }
+
+    private SelectedSequenceReader sequenceReader(EventHistoryPinManager pins, CommitState state,
+        Optional<EventRevisionIndex> index) {
+      return sequenceReader(pins, state, decision, () -> index);
+    }
+
+    private SelectedSequenceReader sequenceReader(EventHistoryPinManager pins, CommitState state,
+        CommitDecision archived, Supplier<Optional<EventRevisionIndex>> index) {
+      EventRevisionIndexRepository indexes = (EventRevisionIndexRepository) Proxy.newProxyInstance(
+          EventRevisionIndexRepository.class.getClassLoader(), new Class<?>[] {EventRevisionIndexRepository.class},
+          (proxy, method, arguments) -> {
+            if (method.getName().equals("read")) return CompletableFuture.completedFuture(index.get());
+            throw new UnsupportedOperationException(method.getName());
+          });
+      return new SelectedSequenceReader(pins, control(state), decisions(archived), repository(), indexes);
+    }
+
+    private CommitControlStore control(CommitState state) {
+      return (CommitControlStore) Proxy.newProxyInstance(
           CommitControlStore.class.getClassLoader(), new Class<?>[] {CommitControlStore.class},
           (proxy, method, arguments) -> {
             if (method.getName().equals("read")) {
@@ -384,13 +521,15 @@ class SealedEventCursorTest {
             }
             throw new UnsupportedOperationException(method.getName());
           });
-      CommitDecisionRepository decisions = (CommitDecisionRepository) Proxy.newProxyInstance(
+    }
+
+    private CommitDecisionRepository decisions(CommitDecision archived) {
+      return (CommitDecisionRepository) Proxy.newProxyInstance(
           CommitDecisionRepository.class.getClassLoader(), new Class<?>[] {CommitDecisionRepository.class},
           (proxy, method, arguments) -> {
             if (method.getName().equals("read")) return CompletableFuture.completedFuture(Optional.of(archived));
             throw new UnsupportedOperationException(method.getName());
           });
-      return new SelectedEventReader(pins, control, decisions, repository());
     }
 
     private BudgetManager.Account account(RequestScope scope) throws Exception {
