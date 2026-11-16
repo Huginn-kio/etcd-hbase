@@ -535,6 +535,22 @@
           ]
         },
         {
+          "module": "core",
+          "kind": "surefire",
+          "class": "io.etcdhbase.core.lease.LeaseBindingStatePlannerTest",
+          "tests": [
+            "attachingUpdatingAndRecreatingChargeOnlyNewBindingHistory",
+            "rebindingAndUnbindingChargeEachLeaseItsOwnHistoryVersion",
+            "revocationRemovesLiveCostsAndRetainsHistoryAndExpiryIdentity",
+            "revocationCannotLeaveLiveBindingsOrReservedCost",
+            "emptyRevocationRetainsAlreadyChargedHistory",
+            "attachmentReservesFutureUnbindAtTheExactCapacityBoundary",
+            "resultsAreOrderedImmutableAndDoNotRetainRequestState",
+            "invalidBaseAndAccountingUnderflowFailWithoutAPlan",
+            "bindingCountOverflowDoesNotWrapIntoAnAdmissiblePlan"
+          ]
+        },
+        {
           "module": "server",
           "kind": "surefire",
           "class": "io.etcdhbase.server.commit.LeaseBindingMutationPlannerTest",

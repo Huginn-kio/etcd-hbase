@@ -22,7 +22,9 @@ scripts/verify/m0.sh --scope public
 
 Maven SNAPSHOT 依赖安装到本工作树专用的 `.artifacts/m0/j09/maven-repository`，避免其他工作树覆盖同坐标产物。运行入口对本工作树加排他锁。Go 仅使用公开 proxy/checksum 服务，禁用私有包配置、VCS 回退和自动升级 toolchain。公开构建不需要目标凭据或扩展工程；J00 已接受的静态调用审计另有固定来源报告，此入口不重新克隆完整 Milvus 工程。
 
-### Maven 缓存与下载限流
+完整公开验证退出 `0`。本机 Docker CLI 或默认本地 daemon 不可用时，其他检查仍执行并记录镜像 `unavailable`，最终退出 `2`、状态 `partial`；失败检查退出非零。镜像配置文件存在或其他检查成功都不能代替实际镜像验证。J09 公开 CI 在 Ubuntu 上要求完整入口及索引复核均成功，不跳过镜像测试。
+
+### 1.1 Maven 缓存与下载限流
 
 使用 Maven 共享缓存的 CI 工作流先调用同一提交中的 `maven-dependencies.yml`，依赖准备成功后才启动原有测试任务。准备失败会使原有检查明确失败，不会把依赖失败变成成功的跳过状态。J09 完整交付继续使用上述专用仓库，保持 SNAPSHOT 隔离。
 
@@ -35,8 +37,6 @@ Maven SNAPSHOT 依赖安装到本工作树专用的 `.artifacts/m0/j09/maven-rep
 `python3 scripts/verify/test_maven_resilience.py` 使用锁定 Maven 和本地 HTTP 制品仓库验证连续 429 后恢复、持续 429 的终止边界及 404 不重试，并检查缓存键和准备失败门禁。它需要 `ETCD_HBASE_JDK21_HOME` 或 `JAVA_HOME` 指向锁定 JDK，不访问真实业务数据。
 
 若后续接入 Nexus/Artifactory，需要先提供 GitHub CI 可访问的实际 HTTPS 代理服务，并明确访问方式和凭据 secret 名称。当前公开验证仍强制 Central 且不使用私有凭据；代理服务尚未配置或部署，接入时需同步维护对应构建路径和策略校验。
-
-完整公开验证退出 `0`。本机 Docker CLI 或默认本地 daemon 不可用时，其他检查仍执行并记录镜像 `unavailable`，最终退出 `2`、状态 `partial`；失败检查退出非零。镜像配置文件存在或其他检查成功都不能代替实际镜像验证。J09 公开 CI 在 Ubuntu 上要求完整入口及索引复核均成功，不跳过镜像测试。
 
 ## 2 运行包与镜像边界
 

@@ -184,6 +184,7 @@ J41_GO_TESTS = {
     },
 }
 J41_JAVA_CLASSES = {
+    "io.etcdhbase.core.lease.LeaseBindingStatePlannerTest",
     "io.etcdhbase.core.commit.LeaseBindingFormatUpgradeTest",
     "io.etcdhbase.core.commit.CommitFinalizationServiceTest",
     "io.etcdhbase.core.kv.LeaseBindingChangeSetTest",
@@ -201,6 +202,17 @@ J41_JAVA_CLASSES = {
     "io.etcdhbase.server.config.M3RuntimeConfigurationTest",
 }
 J41_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.core.lease.LeaseBindingStatePlannerTest": {
+        "attachingUpdatingAndRecreatingChargeOnlyNewBindingHistory",
+        "rebindingAndUnbindingChargeEachLeaseItsOwnHistoryVersion",
+        "revocationRemovesLiveCostsAndRetainsHistoryAndExpiryIdentity",
+        "revocationCannotLeaveLiveBindingsOrReservedCost",
+        "emptyRevocationRetainsAlreadyChargedHistory",
+        "attachmentReservesFutureUnbindAtTheExactCapacityBoundary",
+        "resultsAreOrderedImmutableAndDoNotRetainRequestState",
+        "invalidBaseAndAccountingUnderflowFailWithoutAPlan",
+        "bindingCountOverflowDoesNotWrapIntoAnAdmissiblePlan",
+    },
     "io.etcdhbase.core.kv.LeaseBindingChangeSetTest": {
         "deleteAndUnleasedRecreationRetainTheOriginalUnbind"
     },

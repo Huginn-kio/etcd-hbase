@@ -86,11 +86,11 @@ class M4ReportTest(unittest.TestCase):
     def test_both_registries_reject_malformed_maven_suites(self) -> None:
         invalid_suites = (
             None,
-            {"module": "outside", "kind": "unit", "class": "Extra", "tests": ["test"]},
+            {"module": "outside", "kind": "surefire", "class": "Extra", "tests": ["test"]},
             {"module": "core", "kind": "unknown", "class": "Extra", "tests": ["test"]},
-            {"module": "core", "kind": "unit", "class": 1, "tests": ["test"]},
-            {"module": "core", "kind": "unit", "class": "Extra", "tests": []},
-            {"module": "core", "kind": "unit", "class": "Extra", "tests": [1]},
+            {"module": "core", "kind": "surefire", "class": 1, "tests": ["test"]},
+            {"module": "core", "kind": "surefire", "class": "Extra", "tests": []},
+            {"module": "core", "kind": "surefire", "class": "Extra", "tests": [1]},
         )
         for task_id in ("J40", "J41"):
             for invalid in invalid_suites:
@@ -146,6 +146,8 @@ class M4ReportTest(unittest.TestCase):
 
     def test_j41_registry_requires_binding_plan_and_owner_fence_regressions(self) -> None:
         required = {
+            "io.etcdhbase.core.lease.LeaseBindingStatePlannerTest":
+                "attachmentReservesFutureUnbindAtTheExactCapacityBoundary",
             "io.etcdhbase.server.commit.LeaseBindingMutationPlannerTest":
                 "revokedStateUpdatesDoNotWriteNewExpiryCandidates",
             "io.etcdhbase.server.commit.M3OwnerLeaseTest":
