@@ -146,6 +146,8 @@ class M4ReportTest(unittest.TestCase):
 
     def test_j41_registry_requires_binding_plan_and_owner_fence_regressions(self) -> None:
         required = {
+            "io.etcdhbase.server.commit.LeaseRevocationPreparerTest":
+                "cancelledWaiterReclaimsALateSuccessfulPreparedResult",
             "io.etcdhbase.core.lease.LeaseBindingStatePlannerTest":
                 "attachmentReservesFutureUnbindAtTheExactCapacityBoundary",
             "io.etcdhbase.server.commit.LeaseBindingMutationPlannerTest":

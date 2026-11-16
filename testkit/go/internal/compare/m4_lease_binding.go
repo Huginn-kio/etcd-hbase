@@ -76,8 +76,8 @@ func CompareM4LeaseBindingRecords(left, right []trace.Record) error {
 		return fmt.Errorf("M4 binding trace has left=%d right=%d records, expected %d",
 			len(left), len(right), len(m4LeaseBindingCases))
 	}
-	nativeMaximumTTL := make(map[string]int64)
-	targetMaximumTTL := make(map[string]int64)
+	nativeMinimumTTL := make(map[string]int64)
+	targetMinimumTTL := make(map[string]int64)
 	nativeGrantedTTL := make(map[string]int64)
 	targetGrantedTTL := make(map[string]int64)
 	for index, expected := range m4LeaseBindingCases {
@@ -133,11 +133,11 @@ func CompareM4LeaseBindingRecords(left, right []trace.Record) error {
 			// Independent scenarios have different HBase/native execution times; keep raw TTL
 			// evidence, but compare its bounds and within-run progress instead of wall seconds.
 			if err := validateM4BindingRemainingTTL(expected.id, "native", leftResponse,
-				nativeMaximumTTL, nativeGrantedTTL); err != nil {
+				nativeMinimumTTL, nativeGrantedTTL); err != nil {
 				return err
 			}
 			if err := validateM4BindingRemainingTTL(expected.id, "target", rightResponse,
-				targetMaximumTTL, targetGrantedTTL); err != nil {
+				targetMinimumTTL, targetGrantedTTL); err != nil {
 				return err
 			}
 			if err := normalizeM4LeaseBindingKeys(leftResponse, expected.id); err != nil {
@@ -161,7 +161,7 @@ func CompareM4LeaseBindingRecords(left, right []trace.Record) error {
 }
 
 func validateM4BindingRemainingTTL(caseID, side string, response map[string]any,
-	maximumTTL, grantedTTLs map[string]int64) error {
+	minimumTTL, grantedTTLs map[string]int64) error {
 	leaseName := m4BindingLeaseName(caseID)
 	ttl := responseInt64(response, "ttl")
 	grantedTTL := responseInt64(response, "grantedTTL")
@@ -172,12 +172,13 @@ func validateM4BindingRemainingTTL(caseID, side string, response map[string]any,
 	if previousGrant, exists := grantedTTLs[leaseName]; exists && previousGrant != grantedTTL {
 		return fmt.Errorf("%s %s changed the Lease granted TTL", side, caseID)
 	}
-	if maximumObserved, exists := maximumTTL[leaseName]; exists &&
-		ttl > maximumObserved && ttl-maximumObserved > 1 {
+	if minimumObserved, exists := minimumTTL[leaseName]; exists &&
+		ttl > minimumObserved && ttl-minimumObserved > 1 {
 		return fmt.Errorf("%s %s increased remaining TTL without a KeepAlive", side, caseID)
 	}
-	if ttl > maximumTTL[leaseName] {
-		maximumTTL[leaseName] = ttl
+	// Keep the low watermark: one-second rounding must not accumulate into renewal.
+	if previous, exists := minimumTTL[leaseName]; !exists || ttl < previous {
+		minimumTTL[leaseName] = ttl
 	}
 	grantedTTLs[leaseName] = grantedTTL
 	return nil

@@ -122,21 +122,36 @@ public final class LeaseRevocationPreparer {
           "Lease revocation requires the invocation's unselected auxiliary-protected view"));
     }
 
-    return leases.find(pinned, identity.leaseId(), scope, metadataBudget).thenCompose(found -> {
-      LeaseState state = found.orElseThrow(() -> new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
-      if (!state.identity().equals(identity) || state.status() != LeaseState.Status.ACTIVE) {
-        return CompletableFuture.failedFuture(new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
+    CompletableFuture<Prepared> operation = leases.find(pinned, identity.leaseId(), scope, metadataBudget)
+        .thenCompose(found -> {
+          LeaseState state = found.orElseThrow(() -> new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
+          if (!state.identity().equals(identity) || state.status() != LeaseState.Status.ACTIVE) {
+            return CompletableFuture.failedFuture(new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
+          }
+          try {
+            costs.requireExistingStateFits(state);
+          } catch (BackendFailure invalidState) {
+            return CompletableFuture.failedFuture(invalidState);
+          }
+          return bindings.readBindings(pinned, state, scope, account, metadataBudget)
+              .thenCompose(effectiveBindings -> prepareRows(identity, state, invocation,
+                  requireExpired, pinned, currentRecords, scope, account,
+                  finishPinnedRead, effectiveBindings));
+        });
+    return deliverPrepared(operation);
+  }
+
+  /** Cancellation or a caller-supplied fallback cannot abandon the producer's retained memory. */
+  private static CompletableFuture<Prepared> deliverPrepared(CompletableFuture<Prepared> owner) {
+    CompletableFuture<Prepared> response = new CompletableFuture<>();
+    owner.whenComplete((prepared, failure) -> {
+      if (failure != null) {
+        response.completeExceptionally(failure);
+      } else if (!response.complete(prepared)) {
+        prepared.close();
       }
-      try {
-        costs.requireExistingStateFits(state);
-      } catch (BackendFailure invalidState) {
-        return CompletableFuture.failedFuture(invalidState);
-      }
-      return bindings.readBindings(pinned, state, scope, account, metadataBudget)
-          .thenCompose(effectiveBindings -> prepareRows(identity, state, invocation,
-              requireExpired, pinned, currentRecords, scope, account,
-              finishPinnedRead, effectiveBindings));
-    }).copy();
+    });
+    return response;
   }
 
   private CompletableFuture<Prepared> prepareRows(LeaseIdentity identity, LeaseState state,
@@ -267,7 +282,13 @@ public final class LeaseRevocationPreparer {
           } catch (RuntimeException | Error failure) {
             return CompletableFuture.failedFuture(failure);
           }
-          return finish.thenApply(ignored -> new PreparedAuxiliaryPlan(auxiliary));
+          return finish.thenCompose(ignored -> {
+            // A successful pin completion may arrive after cancellation or the request deadline.
+            if (scope.isClosed() || scope.isDeadlineExceeded()) {
+              return CompletableFuture.failedFuture(inactive(scope));
+            }
+            return CompletableFuture.completedFuture(new PreparedAuxiliaryPlan(auxiliary));
+          });
         });
   }
 

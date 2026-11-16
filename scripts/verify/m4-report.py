@@ -176,6 +176,10 @@ J41_GO_TESTS = {
         "TestCompareM4LeaseBindingRecordsRejectsRevisionAndPartialResult",
         "TestCompareM4LeaseBindingRecordsRejectsInvalidTtlAndUnexpectedRenewal",
         "TestCompareM4LeaseBindingRequiresNotFoundForInvalidLeaseOperations",
+        "TestCompareM4LeaseBindingRejectsTtlRecoveryAfterDecrease",
+        "TestCompareM4LeaseBindingRejectsAccumulatedTtlTolerance",
+        "TestCompareM4LeaseBindingAllowsBoundedRoundingAfterDecrease",
+        "TestCompareM4LeaseBindingTracksTwoLeaseClocksIndependently",
     },
     "internal/trace": {
         "TestSnapshotProtoPreservesBinaryAndInt64Values",
@@ -184,6 +188,7 @@ J41_GO_TESTS = {
     },
 }
 J41_JAVA_CLASSES = {
+    "io.etcdhbase.server.commit.LeaseRevocationPreparerTest",
     "io.etcdhbase.core.lease.LeaseBindingStatePlannerTest",
     "io.etcdhbase.core.commit.LeaseBindingFormatUpgradeTest",
     "io.etcdhbase.core.commit.CommitFinalizationServiceTest",
@@ -202,6 +207,18 @@ J41_JAVA_CLASSES = {
     "io.etcdhbase.server.config.M3RuntimeConfigurationTest",
 }
 J41_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.server.commit.LeaseRevocationPreparerTest": {
+        "preparesConsistentDeletesPrevKvUnbindsAndTerminalStateUntilClosed",
+        "secondKvReadFailureRejectsTheWholeResultAndReleasesReservations",
+        "mismatchedKvLeaseOrCreateRevisionRejectsTheWholeResult",
+        "readerConstructionFailureReleasesTheAlreadyRetainedCandidateMemory",
+        "insufficientCandidateCapacityFailsBeforeReadingKv",
+        "finishFailureReleasesAllPreparedMemoryWithoutReturningAPartialPlan",
+        "throwingFinishSupplierReleasesAllPreparedMemory",
+        "cancellationKeepsPinAndBudgetUntilThePhysicalKvReadStops",
+        "cancelledWaiterReclaimsALateSuccessfulPreparedResult",
+        "cancellationDuringPinFinishCannotReturnASuccessfulPlan",
+    },
     "io.etcdhbase.core.lease.LeaseBindingStatePlannerTest": {
         "attachingUpdatingAndRecreatingChargeOnlyNewBindingHistory",
         "rebindingAndUnbindingChargeEachLeaseItsOwnHistoryVersion",

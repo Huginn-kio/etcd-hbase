@@ -403,7 +403,11 @@
             "TestCompareM4LeaseBindingRecordsRejectsMissingOrDuplicateTtlKeys",
             "TestCompareM4LeaseBindingRecordsRejectsRevisionAndPartialResult",
             "TestCompareM4LeaseBindingRecordsRejectsInvalidTtlAndUnexpectedRenewal",
-            "TestCompareM4LeaseBindingRequiresNotFoundForInvalidLeaseOperations"
+            "TestCompareM4LeaseBindingRequiresNotFoundForInvalidLeaseOperations",
+            "TestCompareM4LeaseBindingRejectsTtlRecoveryAfterDecrease",
+            "TestCompareM4LeaseBindingRejectsAccumulatedTtlTolerance",
+            "TestCompareM4LeaseBindingAllowsBoundedRoundingAfterDecrease",
+            "TestCompareM4LeaseBindingTracksTwoLeaseClocksIndependently"
           ]
         },
         {
@@ -548,6 +552,23 @@
             "resultsAreOrderedImmutableAndDoNotRetainRequestState",
             "invalidBaseAndAccountingUnderflowFailWithoutAPlan",
             "bindingCountOverflowDoesNotWrapIntoAnAdmissiblePlan"
+          ]
+        },
+        {
+          "module": "server",
+          "kind": "surefire",
+          "class": "io.etcdhbase.server.commit.LeaseRevocationPreparerTest",
+          "tests": [
+            "preparesConsistentDeletesPrevKvUnbindsAndTerminalStateUntilClosed",
+            "secondKvReadFailureRejectsTheWholeResultAndReleasesReservations",
+            "mismatchedKvLeaseOrCreateRevisionRejectsTheWholeResult",
+            "readerConstructionFailureReleasesTheAlreadyRetainedCandidateMemory",
+            "insufficientCandidateCapacityFailsBeforeReadingKv",
+            "finishFailureReleasesAllPreparedMemoryWithoutReturningAPartialPlan",
+            "throwingFinishSupplierReleasesAllPreparedMemory",
+            "cancellationKeepsPinAndBudgetUntilThePhysicalKvReadStops",
+            "cancelledWaiterReclaimsALateSuccessfulPreparedResult",
+            "cancellationDuringPinFinishCannotReturnASuccessfulPlan"
           ]
         },
         {

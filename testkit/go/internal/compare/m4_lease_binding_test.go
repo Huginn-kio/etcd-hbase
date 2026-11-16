@@ -3,6 +3,7 @@ package compare
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Reidddddd/etcd-hbase/testkit/go/internal/trace"
@@ -91,6 +92,68 @@ func TestCompareM4LeaseBindingRecordsRejectsInvalidTtlAndUnexpectedRenewal(t *te
 			t.Fatal("a multi-second TTL increase without KeepAlive was accepted")
 		}
 	})
+}
+
+func TestCompareM4LeaseBindingRejectsTtlRecoveryAfterDecrease(t *testing.T) {
+	for _, side := range []string{"native", "target"} {
+		t.Run(side, func(t *testing.T) {
+			left, right := bindingTraceFixture(20), bindingTraceFixture(20)
+			bindingTTLProgress(left, "a", 20, 10, 9)
+			bindingTTLProgress(right, "a", 20, 10, 9)
+			bad := right
+			if side == "native" {
+				bad = left
+			}
+			bindingTTLProgress(bad, "a", 20, 10, 19)
+			if err := CompareM4LeaseBindingRecords(left, right); err == nil {
+				t.Fatal("a decrease followed by a multi-second recovery was normalized away")
+			}
+		})
+	}
+}
+
+func TestCompareM4LeaseBindingRejectsAccumulatedTtlTolerance(t *testing.T) {
+	left, right := bindingTraceFixture(20), bindingTraceFixture(20)
+	bindingTTLProgress(left, "a", 20, 10, 9, 8)
+	bindingTTLProgress(right, "a", 20, 10, 11, 12)
+	if err := CompareM4LeaseBindingRecords(left, right); err == nil {
+		t.Fatal("successive one-second increases accumulated into an accepted renewal")
+	}
+}
+
+func TestCompareM4LeaseBindingAllowsBoundedRoundingAfterDecrease(t *testing.T) {
+	left, right := bindingTraceFixture(20), bindingTraceFixture(20)
+	bindingTTLProgress(left, "a", 20, 10, 9, 10, 9)
+	bindingTTLProgress(right, "a", 18, 12, 13, 12, 13)
+	if err := CompareM4LeaseBindingRecords(left, right); err != nil {
+		t.Fatalf("one-second rounding around each run's observed progress was rejected: %v", err)
+	}
+}
+
+func TestCompareM4LeaseBindingTracksTwoLeaseClocksIndependently(t *testing.T) {
+	left, right := bindingTraceFixture(20), bindingTraceFixture(20)
+	bindingTTLProgress(left, "a", 20, 10, 9)
+	bindingTTLProgress(left, "b", 45, 44, 43)
+	bindingTTLProgress(right, "a", 30, 12, 11)
+	bindingTTLProgress(right, "b", 50, 49, 48)
+	if err := CompareM4LeaseBindingRecords(left, right); err != nil {
+		t.Fatalf("independent Lease clocks affected one another: %v", err)
+	}
+}
+
+func bindingTTLProgress(records []trace.Record, lease string, ttls ...int) {
+	index := 0
+	for position, expected := range m4LeaseBindingCases {
+		if !strings.HasPrefix(expected.id, "binding-ttl-"+lease+"-") {
+			continue
+		}
+		remaining := ttls[len(ttls)-1]
+		if index < len(ttls) {
+			remaining = ttls[index]
+		}
+		records[position].Response = bindingTtlResponse(remaining, bindingExpectedKeys(expected.id))
+		index++
+	}
 }
 
 func TestCompareM4LeaseBindingRequiresNotFoundForInvalidLeaseOperations(t *testing.T) {
