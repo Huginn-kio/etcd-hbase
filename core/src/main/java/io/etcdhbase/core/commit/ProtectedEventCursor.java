@@ -80,15 +80,19 @@ public final class ProtectedEventCursor implements AutoCloseable {
     }
     scope.close();
     scope.physicalProducersCompletion().whenComplete((ignored, producerFailure) -> {
+      if (producerFailure != null) {
+        release.completeExceptionally(producerFailure);
+        return;
+      }
       try {
         pin.close();
         pin.releaseCompletion().whenComplete((released, releaseFailure) -> {
-          if (producerFailure != null) release.completeExceptionally(producerFailure);
-          else if (releaseFailure != null) release.completeExceptionally(releaseFailure);
+          if (releaseFailure != null) release.completeExceptionally(releaseFailure);
           else release.complete(null);
         });
-      } catch (RuntimeException failure) {
+      } catch (RuntimeException | Error failure) {
         release.completeExceptionally(failure);
+        if (failure instanceof Error fatal) throw fatal;
       }
     });
   }

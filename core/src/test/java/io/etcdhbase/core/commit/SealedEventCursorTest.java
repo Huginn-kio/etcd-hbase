@@ -126,6 +126,25 @@ class SealedEventCursorTest {
     }
   }
 
+  @Test
+  void failedPhysicalDrainKeepsProtectionAndReportsCleanupFailure() throws Exception {
+    Fixture fixture = new Fixture();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      AtomicInteger releases = new AtomicInteger();
+      ReadViewPinRegistry.Pin pin = new ReadViewPinRegistry.Pin() {
+        @Override public long generation() { return 1; }
+        @Override public void close() { releases.incrementAndGet(); }
+      };
+      CompletableFuture<Void> physical = new CompletableFuture<>();
+      scope.trackPhysicalProducer(physical);
+      var cursor = new ProtectedEventCursor(fixture.cursor(scope), pin, scope);
+      cursor.close();
+      physical.completeExceptionally(new IllegalStateException("producer drain failed"));
+      assertThrows(CompletionException.class, () -> cursor.releaseCompletion().toCompletableFuture().join());
+      assertEquals(0, releases.get());
+    }
+  }
+
   private static final class Fixture {
     private final TransactionId transaction = TransactionId.create();
     private final PreparedEvent first = event(0, (byte) 'a');
