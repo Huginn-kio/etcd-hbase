@@ -827,9 +827,9 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J33/J41/J42。
   - 完成标准：限定到期窗口与持久化水位补查，不扫描全部业务 KV；核对 generation 并统一提交删除/PrevKV/事件；多副本任务接管、旧 worker 返回与 Pod 重建不误删，记录到期延迟和陈旧索引。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=公开实现与公开 MiniCluster 验证完成，维护者 review 待处理；负责人=项目贡献者；完成日期=2026-11-16；PR/commit=对应 J43 PR；评审人/结论=`Reidddddd` / 待评审；目标环境与 M4 阶段验收=未完成。
-  - 公开验证：代码提交 `03f07f694e3acab4c90c9da17acbe94f59c15dba` 在干净工作树上运行 `scripts/verify/m4.sh --scope public --task J43`，Go 测试 316 项、Java 测试 981 项、22 条原生 trace，HISTORY/NATIVE 两种布局；失败、错误与跳过均为 0。J29.4 覆盖并发 1、2、4；原始报告保留本地。
-  - 作者自审=完成；独立复核=完成；维护者正式 review=待处理。
+  - 跟踪：状态=公开实现与公开 MiniCluster 验证完成，维护者 review 待处理；负责人=项目贡献者；完成日期=2026-11-17；PR/commit=[PR #50](https://github.com/Reidddddd/etcd-hbase/pull/50)；评审人/结论=`Reidddddd` / 待评审；目标环境与 M4 阶段验收=未完成。
+  - 公开验证：代码提交 `981ec5b6c129fbdf592c46cfa70f9b0cae48e55d`、upstream base `e7e05a912807ea527c2ada8e3fd9ffa88584ca9d`，运行 `scripts/verify/m4.sh --scope public --task J43`，Go 测试 322 项、Maven XML 报告 172 份合计 Java 测试 1006 项、22 条原生 trace；HISTORY/NATIVE 两种布局与 J29.4 并发 1、2、4 均覆盖，失败、错误和跳过均为 0。原始报告保留本地 `.artifacts/m4/j43-final-20261116-6`。
+  - 作者自审=完成；独立复核=当前 head 复核中；维护者正式 review=待处理。
 
 - [ ] **J44｜已提交事件页、共享 EventTailer 与事件读取预算**
   - 依赖：J23/J24。
