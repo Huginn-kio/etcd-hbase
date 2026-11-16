@@ -181,7 +181,7 @@ class M4LeaseRpcIT {
     var rewind = new AtomicBoolean(false);
     LeaseTimeSource time = () -> {
       if (armed.get()) {
-        if (rewind.get()) now.set(12_000);
+        if (rewind.get()) now.set(11_000);
         else healthy.set(false);
       }
       long observedNow = now.get();
@@ -197,7 +197,9 @@ class M4LeaseRpcIT {
         long leaseId = 12345;
         var request = Rpc.LeaseGrantRequest.newBuilder().setID(leaseId).setTTL(5).build();
         assertEquals(leaseId, client.leaseGrant(request).getID());
-        now.set(20_000);
+        // Keep the Lease below its deadline while asserting that unhealthy and rewound clock
+        // observations do not select an expiry mutation in the background.
+        now.set(12_000);
         assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
             .anyMatch(lease -> lease.getID() == leaseId));
         assertEquals(Status.Code.FAILED_PRECONDITION,
