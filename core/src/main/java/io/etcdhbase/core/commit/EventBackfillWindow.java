@@ -26,12 +26,29 @@ public final class EventBackfillWindow implements AutoCloseable {
   public static CompletableFuture<EventBackfillWindow> open(EventHistoryPinManager pins,
       CommitControlStore control, EventIndexBackfillCheckpoint checkpoint, ByteKey authorizationDigest,
       RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    return open(pins, control, checkpoint, authorizationDigest, scope, budget, false);
+  }
+
+  /** Registers the initial window before its checkpoint is selected by the owner. */
+  public static CompletableFuture<EventBackfillWindow> openCapture(EventHistoryPinManager pins,
+      CommitControlStore control, EventIndexBackfillCheckpoint checkpoint, ByteKey authorizationDigest,
+      RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    Objects.requireNonNull(checkpoint, "checkpoint");
+    if (checkpoint.nextSequence() != checkpoint.firstSequence()) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("capture must start at the first sequence"));
+    }
+    return open(pins, control, checkpoint, authorizationDigest, scope, budget, true);
+  }
+
+  private static CompletableFuture<EventBackfillWindow> open(EventHistoryPinManager pins,
+      CommitControlStore control, EventIndexBackfillCheckpoint checkpoint, ByteKey authorizationDigest,
+      RequestScope scope, ManifestCatalog.ProofReadBudget budget, boolean capture) {
     Objects.requireNonNull(pins, "pins");
     Objects.requireNonNull(control, "control");
     Objects.requireNonNull(checkpoint, "checkpoint");
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(budget, "budget");
-    if (checkpoint.complete() || !budget.belongsTo(scope)) {
+    if (!capture && checkpoint.complete() || !budget.belongsTo(scope)) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid event backfill protection request"));
     }
     long firstRevision = checkpoint.firstBaseRevision() == Long.MAX_VALUE
@@ -53,7 +70,9 @@ public final class EventBackfillWindow implements AutoCloseable {
         return;
       }
       try {
-        window.check(checkpoint, Optional.empty(), budget).whenComplete((ignored, checkFailure) -> {
+        Optional<Fence> fence = capture ? Optional.of(new Fence(checkpoint.ownerEpoch(), checkpoint.sequence()))
+            : Optional.empty();
+        window.check(checkpoint, fence, budget, capture).whenComplete((ignored, checkFailure) -> {
           if (checkFailure != null) {
             window.close();
             output.completeExceptionally(checkFailure);
@@ -76,11 +95,11 @@ public final class EventBackfillWindow implements AutoCloseable {
     if (ownerEpoch <= 0 || commitSequence <= 0) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid backfill publication fence"));
     }
-    return check(checkpoint, Optional.of(new Fence(ownerEpoch, commitSequence)), budget);
+    return check(checkpoint, Optional.of(new Fence(ownerEpoch, commitSequence)), budget, true);
   }
 
   private CompletableFuture<Void> check(EventIndexBackfillCheckpoint checkpoint,
-      Optional<Fence> fence, ManifestCatalog.ProofReadBudget budget) {
+      Optional<Fence> fence, ManifestCatalog.ProofReadBudget budget, boolean allowInitialSelection) {
     Objects.requireNonNull(checkpoint, "checkpoint");
     Objects.requireNonNull(budget, "budget");
     if (!budget.belongsTo(scope) || checkpoint.firstSequence() != captured.firstSequence()
@@ -95,8 +114,17 @@ public final class EventBackfillWindow implements AutoCloseable {
         () -> control.read(scope))).thenCompose(snapshot -> {
       CommitState state = snapshot.orElseThrow(
           () -> new IllegalStateException("authoritative commit control is missing")).state();
+      boolean initialSelection = allowInitialSelection && checkpoint.equals(captured)
+          && checkpoint.nextSequence() == checkpoint.firstSequence()
+          && state.finalizedSequence() == checkpoint.sequence() - 1
+          && state.publishedSequence() == state.finalizedSequence();
       if (!state.supportsEventRevisionIndex() || state.compactRevision() != captured.compactRevision()
-          || state.finalizedSequence() < checkpoint.sequence() || state.ownerEpoch() < checkpoint.ownerEpoch()) {
+          || state.finalizedSequence() < checkpoint.sequence() && !initialSelection
+          || state.finalizedSequence() < checkpoint.upperSequence()
+          || state.finalizedRevision() < checkpoint.upperRevision()
+          || initialSelection && (state.finalizedSequence() != checkpoint.upperSequence()
+              || state.finalizedRevision() != checkpoint.upperRevision())
+          || state.ownerEpoch() < checkpoint.ownerEpoch()) {
         throw new IllegalStateException("event backfill protection no longer covers the captured window");
       }
       if (fence.isPresent()) {

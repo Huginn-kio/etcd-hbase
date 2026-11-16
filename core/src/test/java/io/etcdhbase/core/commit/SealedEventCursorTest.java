@@ -385,6 +385,43 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void capturesHistoryProtectionBeforeInitialCheckpointSelection() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account account = fixture.account(scope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var control = fixture.control(fixture.finalizedState());
+      var window = EventBackfillWindow.openCapture(pins, control, checkpoint, fixture.digest, scope,
+          new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20)).join();
+      assertFalse(pins.readBoundary(setup).join().protections().isEmpty());
+      window.checkPublication(checkpoint, 1, 4,
+          new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20)).join();
+      window.close();
+      window.releaseCompletion().toCompletableFuture().join();
+    }
+  }
+
+  @Test
+  void initialCaptureRejectsAnOutdatedUpperBoundary() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 2, 2, 2, 10, 10, 10, 0);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account account = fixture.account(scope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      assertThrows(CompletionException.class, () -> EventBackfillWindow.openCapture(pins,
+          fixture.control(fixture.finalizedState()), checkpoint, fixture.digest, scope,
+          new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20)).join());
+    }
+  }
+
+  @Test
   void backfillRejectsMissingEventPageWithoutAdvancingCheckpoint() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
