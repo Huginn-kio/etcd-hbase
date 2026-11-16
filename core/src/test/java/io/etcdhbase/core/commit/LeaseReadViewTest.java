@@ -26,6 +26,40 @@ import org.junit.jupiter.api.Test;
 
 class LeaseReadViewTest {
   @Test
+  void pendingSelectedBackfillRetainsHistoryAfterTemporaryPinsDisappear() throws Exception {
+    var registry = ByteKey.copyOf(new byte[16]);
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0, registry);
+    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0, registry);
+    try (Fixture fixture = new Fixture(stable, selected); var budget = new EnumerationBudget(fixture.scope)) {
+      var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
+      var candidate = new SnapshotGcBoundary(10, 10, List.of());
+
+      var retained = reader.retainPendingHistory(candidate, registry, fixture.pinned,
+          fixture.scope, budget.metadata).join();
+
+      assertEquals(2, retained.safeRevision());
+      assertEquals(1, retained.safeSequence());
+      assertTrue(retained.protections().isEmpty());
+    }
+  }
+
+  @Test
+  void completedBackfillReleasesWindowAndMismatchedRegistryFailsClosed() throws Exception {
+    var registry = ByteKey.copyOf(new byte[16]);
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 2, 1, 2, 2, 0, registry);
+    var complete = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 3, 1, 2, 2, 0, registry);
+    try (Fixture fixture = new Fixture(stable, complete); var budget = new EnumerationBudget(fixture.scope)) {
+      var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
+      var candidate = new SnapshotGcBoundary(10, 10, List.of());
+      assertEquals(candidate, reader.retainPendingHistory(candidate, registry, fixture.pinned,
+          fixture.scope, budget.metadata).join());
+      var wrongRegistry = ByteKey.copyOf(new byte[] {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+      assertThrows(CompletionException.class, () -> reader.retainPendingHistory(candidate, wrongRegistry,
+          fixture.pinned, fixture.scope, budget.metadata).join());
+    }
+  }
+
+  @Test
   void backfillReadUsesSelectedCheckpointAtThePinnedBarrier() throws Exception {
     var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0, ByteKey.copyOf(new byte[16]));
     var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0, ByteKey.copyOf(new byte[16]));

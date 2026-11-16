@@ -48,6 +48,33 @@ public final class EventIndexBackfillReader {
     })).whenComplete((ignored, failure) -> lease.close()).copy();
   }
 
+  /**
+   * Applies a selected, incomplete backfill window to a candidate event GC boundary.
+   * The caller must acquire the current auxiliary view after collecting the pin boundary and
+   * fence older publication attempts before using the result for physical collection.
+   */
+  public CompletableFuture<SnapshotGcBoundary> retainPendingHistory(SnapshotGcBoundary candidate,
+      ByteKey registryIdentity, PinnedReadView pinned, RequestScope scope,
+      ManifestCatalog.ProofReadBudget budget) {
+    Objects.requireNonNull(candidate, "candidate");
+    Objects.requireNonNull(registryIdentity, "registryIdentity");
+    if (registryIdentity.length() != 16) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid event pin registry identity"));
+    }
+    return read(pinned, scope, budget).thenApply(checkpoint -> {
+      if (checkpoint.isEmpty()) return candidate;
+      EventIndexBackfillCheckpoint window = checkpoint.orElseThrow();
+      if (!window.registryIdentity().equals(registryIdentity)) {
+        throw new IllegalStateException("event backfill registry differs from the GC registry");
+      }
+      if (window.complete()) return candidate;
+      long firstRevision = window.firstBaseRevision() == Long.MAX_VALUE
+          ? Long.MAX_VALUE : window.firstBaseRevision() + 1;
+      return new SnapshotGcBoundary(Math.min(candidate.safeRevision(), firstRevision),
+          Math.min(candidate.safeSequence(), window.firstSequence()), candidate.protections());
+    });
+  }
+
   private CompletableFuture<Optional<EventIndexBackfillCheckpoint>> readStable(
       ReadView view, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
     if (view.finalizedSequence() == 0) return CompletableFuture.completedFuture(Optional.empty());
