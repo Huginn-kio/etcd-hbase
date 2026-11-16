@@ -154,16 +154,26 @@ class M4LeaseRpcIT {
           var configuration = new RuntimeConfiguration(initialization.schemaVersion(),
               List.of(new RuntimeConfiguration.Listener("j44", "127.0.0.1", 0, source.tableGroupId())),
               initialization.hbaseProfiles(), initialization.saltProfiles(), initialization.tableGroups(), RESOURCES);
+          long legacyRevision;
+          try (var legacy = RuntimeServer.startM3(configuration, activation("1", false))) {
+            legacyRevision = putThrough(legacy, "j44-legacy-key", 1).getHeader().getRevision();
+          }
+          M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, provider, identity);
           long revision;
-          try (var runtime = RuntimeServer.startM3(configuration, activation)) {
+          try (var runtime = RuntimeServer.startM3(configuration, activation("2"))) {
             assertTrue(runtime.dataReady());
-            var response = putThrough(runtime, "j44-index-key", 1);
+            assertEquals(1, rangeKey(runtime, "j44-legacy-key".getBytes(StandardCharsets.UTF_8)).getKvsCount());
+            var response = putThrough(runtime, "j44-index-key", 2);
             revision = response.getHeader().getRevision();
+            assertEquals(legacyRevision + 1, revision);
             try (var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
               var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
               assertTrue(control.supportsEventRevisionIndex());
               assertTrue(control.read(scope).join().orElseThrow().state().supportsEventRevisionIndex());
               var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
+              assertTrue(new HBaseEventRevisionIndexRepository(records)
+                  .read(legacyRevision, scope).join().isEmpty(),
+                  "old history requires backfill before historical Watch can be enabled");
               var index = new HBaseEventRevisionIndexRepository(records)
                   .read(revision, scope).join().orElseThrow();
               var decision = new HBaseCommitDecisionRepository(records)
@@ -174,9 +184,10 @@ class M4LeaseRpcIT {
             }
           }
           M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, provider, identity);
-          try (var restarted = RuntimeServer.startM3(configuration, activation("2"));
+          try (var restarted = RuntimeServer.startM3(configuration, activation("3"));
                var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
             assertTrue(restarted.dataReady());
+            assertEquals(1, rangeKey(restarted, "j44-legacy-key".getBytes(StandardCharsets.UTF_8)).getKvsCount());
             var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
             var index = new HBaseEventRevisionIndexRepository(records)
                 .read(revision, scope).join().orElseThrow();
