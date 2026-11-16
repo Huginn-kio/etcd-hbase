@@ -331,7 +331,8 @@ class LeaseRevocationPreparerTest {
       var points = new LeaseBindingReadView(metadata.store, manifests, LeaseBindingMessages::decode, 10, 1L << 20);
       var planner = new LeaseBindingMutationPlanner(leases, points,
           () -> new LeaseTimeObservation(1_000, 1_000, true), COSTS);
-      preparer = new LeaseRevocationPreparer(leases, bindings, planner, COSTS);
+      preparer = new LeaseRevocationPreparer(leases, bindings, planner, COSTS,
+          metadata.store);
     }
 
     private PinnedReadView openPinnedView(ManifestCatalog manifests) {

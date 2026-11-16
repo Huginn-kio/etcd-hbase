@@ -315,6 +315,30 @@ public final class LeaseBindingMutationPlanner {
       return List.copyOf(records);
     }
 
+    private long appendBindingRecords(List<PreparedAuxiliaryRecord> records,
+        InvocationBinding invocation, long sequence, Map<Long, LeaseState> updatedStates,
+        LeaseBindingChange change, long ordinal) {
+      LeaseState previous = change.previousLeaseId() == 0 ? null
+          : Objects.requireNonNull(updatedStates.get(change.previousLeaseId()),
+              "previous Lease update missing");
+      LeaseState current = change.currentLeaseId() == 0 ? null
+          : Objects.requireNonNull(updatedStates.get(change.currentLeaseId()),
+              "current Lease update missing");
+      if (change.previousLeaseId() != 0 && change.previousLeaseId() != change.currentLeaseId()) {
+        var unbound = new LeaseBindingVersion(previous.identity(), change.key(), false, sequence,
+            change.currentCreateRevision(), change.currentModRevision());
+        ordinal = add(records, invocation, ordinal, SystemRecordType.LEASE_BINDING,
+            unbound.recordIdentity().encode(), LeaseBindingMessages.encode(unbound));
+      }
+      if (current != null && change.changesBindingIdentity()) {
+        var bound = new LeaseBindingVersion(current.identity(), change.key(), true, sequence,
+            change.currentCreateRevision(), change.currentModRevision());
+        ordinal = add(records, invocation, ordinal, SystemRecordType.LEASE_BINDING,
+            bound.recordIdentity().encode(), LeaseBindingMessages.encode(bound));
+      }
+      return ordinal;
+    }
+
     static long appendLeaseStateRecords(List<PreparedAuxiliaryRecord> records,
         InvocationBinding invocation, LeaseState state, long ordinal) {
       Objects.requireNonNull(records, "records");
