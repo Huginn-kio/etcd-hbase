@@ -19,6 +19,7 @@ public final class EventIndexBackfillStep implements AutoCloseable {
   private final EventIndexBackfillCheckpoint before;
   private final SelectedSequenceReader.Selected selected;
   private final CommitControlStore control;
+  private final EventBackfillWindow window;
   private final RequestScope scope;
   private final long ownerEpoch;
   private final long commitSequence;
@@ -27,11 +28,12 @@ public final class EventIndexBackfillStep implements AutoCloseable {
   private boolean closed;
 
   private EventIndexBackfillStep(EventIndexBackfillCheckpoint before,
-      SelectedSequenceReader.Selected selected, CommitControlStore control,
+      SelectedSequenceReader.Selected selected, CommitControlStore control, EventBackfillWindow window,
       RequestScope scope, long ownerEpoch, long commitSequence) {
     this.before = before;
     this.selected = selected;
     this.control = control;
+    this.window = window;
     this.scope = scope;
     this.ownerEpoch = ownerEpoch;
     this.commitSequence = commitSequence;
@@ -39,10 +41,12 @@ public final class EventIndexBackfillStep implements AutoCloseable {
 
   /** The caller supplies a checkpoint read from a selected M2 auxiliary version. */
   public static CompletableFuture<EventIndexBackfillStep> open(SelectedSequenceReader source,
-      CommitControlStore control, EventIndexBackfillCheckpoint checkpoint, ByteKey authorizationDigest,
-      long ownerEpoch, long commitSequence, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+      CommitControlStore control, EventBackfillWindow window, EventIndexBackfillCheckpoint checkpoint,
+      ByteKey authorizationDigest, long ownerEpoch, long commitSequence, RequestScope scope,
+      ManifestCatalog.ProofReadBudget budget, ManifestCatalog.ProofReadBudget windowBudget) {
     Objects.requireNonNull(source, "source");
     Objects.requireNonNull(control, "control");
+    Objects.requireNonNull(window, "window");
     Objects.requireNonNull(checkpoint, "checkpoint");
     Objects.requireNonNull(scope, "scope");
     if (ownerEpoch < checkpoint.ownerEpoch() || commitSequence <= checkpoint.sequence()) {
@@ -50,7 +54,9 @@ public final class EventIndexBackfillStep implements AutoCloseable {
     }
     var output = new CompletableFuture<EventIndexBackfillStep>();
     output.whenComplete((ignored, failure) -> { if (output.isCancelled()) scope.cancel(); });
-    source.openLegacy(checkpoint, authorizationDigest, scope, budget).whenComplete((found, failure) -> {
+    window.checkPublication(checkpoint, ownerEpoch, commitSequence, windowBudget)
+        .thenCompose(ignored -> source.openLegacy(checkpoint, authorizationDigest, scope, budget))
+        .whenComplete((found, failure) -> {
       if (failure != null) {
         scope.close();
         output.completeExceptionally(failure);
@@ -61,7 +67,7 @@ public final class EventIndexBackfillStep implements AutoCloseable {
         output.completeExceptionally(new IllegalStateException("captured legacy sequence is missing"));
         return;
       }
-      var step = new EventIndexBackfillStep(checkpoint, found.orElseThrow(), control,
+      var step = new EventIndexBackfillStep(checkpoint, found.orElseThrow(), control, window,
           scope, ownerEpoch, commitSequence);
       if (!output.complete(step)) step.close();
     });
@@ -69,8 +75,10 @@ public final class EventIndexBackfillStep implements AutoCloseable {
   }
 
   /** Reads at most one event; the proposal appears only after all sealed events are verified. */
-  public synchronized CompletableFuture<Optional<Prepared>> next(ManifestCatalog.ProofReadBudget budget) {
+  public synchronized CompletableFuture<Optional<Prepared>> next(ManifestCatalog.ProofReadBudget budget,
+      ManifestCatalog.ProofReadBudget windowBudget) {
     Objects.requireNonNull(budget, "budget");
+    Objects.requireNonNull(windowBudget, "windowBudget");
     if (closed || finished || reading || !budget.belongsTo(scope)) {
       return CompletableFuture.failedFuture(new IllegalStateException("event backfill step is not readable"));
     }
@@ -78,7 +86,8 @@ public final class EventIndexBackfillStep implements AutoCloseable {
     CompletableFuture<Optional<Prepared>> operation;
     if (selected.events().isEmpty()) {
       try {
-        operation = CompletableFuture.completedFuture(Optional.of(proposal()));
+        operation = window.checkPublication(before, ownerEpoch, commitSequence, windowBudget)
+            .thenApply(ignored -> Optional.of(proposal()));
       } catch (RuntimeException failure) {
         reading = false;
         close();
@@ -98,8 +107,12 @@ public final class EventIndexBackfillStep implements AutoCloseable {
               || current.publishedSequence() + 1 != commitSequence) {
             throw new IllegalStateException("event backfill boundary or owner changed");
           }
-          events.close();
-          return events.releaseCompletion().thenApply(ignored -> Optional.of(proposal())).toCompletableFuture();
+          return window.checkPublication(before, ownerEpoch, commitSequence, windowBudget)
+              .thenCompose(ignored -> {
+                events.close();
+                return events.releaseCompletion().thenApply(released -> Optional.of(proposal()))
+                    .toCompletableFuture();
+              });
         });
       });
     }
