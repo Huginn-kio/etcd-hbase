@@ -57,18 +57,16 @@ final class M3RuntimeBudgets {
         Math.addExact(resources.maxScannersPerTable(), perGroupReserve.scanners()), groups.size());
     long memory = activation.memoryBytes() - ownerTransportMemoryBytes;
     if (activation.m4LeaseApiEnabled()) {
-      long minimumLeaseMemory = M3MemoryReservations.minimumLeaseMemory(
-          groups.size(), activation.maxEtcdRequestBytes());
+      long minimumLeaseMemory = Math.addExact(
+          M3MemoryReservations.minimumLeaseMemory(groups.size(), activation.maxEtcdRequestBytes()),
+          globalReserve.memoryBytes());
       if (memory < minimumLeaseMemory) {
         throw new IllegalArgumentException("M4 memory_bytes must leave at least " + minimumLeaseMemory
-            + " after owner transport reservation for recovery accounts and a Lease request/owner pair");
+            + " after owner transport reservation for recovery accounts, Lease request/owner pairs, "
+            + "and reserved expiry capacity");
       }
     }
     int cleanup = Math.addExact(operations, scanners);
-    if (globalReserve.memoryBytes() > memory) {
-      throw new IllegalArgumentException(
-          "M4 Lease and expiry reserved capacity exceeds the runtime memory budget");
-    }
     // This queue belongs to finite-page scans within already admitted requests. It does not
     // enable an external mutation request queue (which remains disabled for this runtime).
     long scanQueueBytes = Math.min(memory, Math.multiplyExact((long) requests,

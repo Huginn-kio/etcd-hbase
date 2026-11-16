@@ -33,6 +33,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.LeaseBindingIdentity;
 import io.etcdhbase.core.lease.LeaseBindingVersion;
 import io.etcdhbase.core.lease.LeaseCostAdmission;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
@@ -275,7 +276,8 @@ class LeaseRevocationPreparerTest {
   private static void assertTerminalRecords(LeaseRevocationPreparer.Prepared prepared, LeaseState previous) {
     var records = prepared.auxiliaryRecords();
     assertEquals(List.of(SystemRecordType.LEASE_STATE, SystemRecordType.LEASE_ENUMERATION,
-        SystemRecordType.LEASE_BINDING, SystemRecordType.LEASE_BINDING),
+        SystemRecordType.LEASE_BINDING, SystemRecordType.LEASE_BINDING,
+        SystemRecordType.LEASE_EXPIRY_CHECKPOINT),
         records.stream().map(record -> record.targetType()).toList());
     LeaseState revoked = LeaseStateMessages.decode(records.getFirst().payload());
     assertEquals(LeaseState.Status.REVOKED, revoked.status());
@@ -436,6 +438,10 @@ class LeaseRevocationPreparerTest {
         assertEquals(LeaseRecordIdentity.routePrefix(IDENTITY.leaseId()), route);
         return CompletableFuture.completedFuture(Optional.of(new SystemRecordEntry(
             LeaseRecordIdentity.stateVersion(IDENTITY.leaseId(), 10), LeaseStateMessages.encode(state))));
+      }
+      if (type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT) {
+        assertEquals(LeaseExpiryCheckpoint.routePrefix(), route);
+        return CompletableFuture.completedFuture(Optional.empty());
       }
       assertEquals(SystemRecordType.LEASE_BINDING, type);
       return CompletableFuture.completedFuture(bindings.stream().filter(binding ->

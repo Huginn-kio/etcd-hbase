@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.server.commit.LeaseBudgetProfile;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.M3MemoryReservations;
 import io.etcdhbase.server.config.RuntimeConfiguration;
@@ -22,7 +23,9 @@ class M3RuntimeBudgetsTest {
         new RuntimeConfiguration.Listener("first", "127.0.0.1", 0, "a"),
         new RuntimeConfiguration.Listener("second", "127.0.0.1", 0, "b")),
         List.of(), List.of(), List.of(), resources);
-    long minimum = M3MemoryReservations.minimumLeaseMemory(2, 1_572_864);
+    long regularMinimum = M3MemoryReservations.minimumLeaseMemory(2, 1_572_864);
+    long minimum = Math.addExact(regularMinimum,
+        LeaseBudgetProfile.capacityForGroups(2, 1_572_864).memoryBytes());
     var tooSmall = leaseActivation(minimum - 1);
     assertThrows(IllegalArgumentException.class, () -> M3RuntimeBudgets.create(configuration, tooSmall));
     var budgets = M3RuntimeBudgets.create(configuration, leaseActivation(minimum));
@@ -33,14 +36,15 @@ class M3RuntimeBudgetsTest {
          var read = budgets.admit("a", gateway,
              M3MemoryReservations.leaseBindingRead(M3MemoryReservations.LEASE, 1_572_864));
          var mutation = budgets.admit("a", owner, M3MemoryReservations.LEASE)) {
-      assertEquals(minimum, budgets.snapshot().reservedBytes());
+      assertEquals(regularMinimum, budgets.snapshot().reservedBytes());
     }
     assertEquals(0, budgets.snapshot().reservedBytes());
   }
 
   private static M3RuntimeConfiguration leaseActivation(long memory) {
     return new M3RuntimeConfiguration("1", 6_000, 1_000, 30_000, 30_000,
-        memory, 1_572_864, 2, 16, 60_000, false, true, 5, 1_000);
+        memory, 1_572_864, 2, 16, 60_000, false, true, 5, 1_000,
+        1_000, 1024, 4L << 20, 32L << 20);
   }
 
   @Test

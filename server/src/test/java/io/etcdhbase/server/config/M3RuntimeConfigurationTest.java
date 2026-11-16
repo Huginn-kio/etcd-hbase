@@ -95,7 +95,8 @@ class M3RuntimeConfigurationTest {
     assertEquals(368_082_944L, minimum);
     String enabled = valid().replace("\"pin_lease_ms\":60000",
         "\"pin_lease_ms\":60000,\"m4_lease_api_enabled\":true,"
-            + "\"lease_min_ttl_seconds\":5,\"lease_clock_uncertainty_ms\":1000,\"lease_maximum_bindings\":1024,"
+            + "\"lease_min_ttl_seconds\":5,\"lease_clock_uncertainty_ms\":1000,"
+            + "\"lease_clock_max_drift_ppm\":1000,\"lease_maximum_bindings\":1024,"
             + "\"lease_maximum_key_bytes\":4194304,\"lease_maximum_revoke_cost_bytes\":33554432");
     assertThrows(IllegalArgumentException.class, () -> load(enabled.replace("536870912", "268435456")));
     assertThrows(IllegalArgumentException.class, () -> load(enabled.replace("536870912", Long.toString(minimum - 1))));

@@ -235,7 +235,8 @@ class M4LeaseRpcIT {
   private static M3RuntimeConfiguration minimumActivation() {
     int maxRequest = 1_572_864;
     return new M3RuntimeConfiguration("1", 6_000, 1_000, 60_000, 30_000,
-        M3MemoryReservations.minimumLeaseMemory(1, maxRequest), maxRequest,
+        Math.addExact(M3MemoryReservations.minimumLeaseMemory(1, maxRequest),
+            LeaseBudgetProfile.capacityForGroups(1, maxRequest).memoryBytes()), maxRequest,
         2, 16, 60_000, false, true, 5, 1_000);
   }
 

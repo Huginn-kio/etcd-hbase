@@ -315,7 +315,12 @@ public final class LeaseRevocationPreparer {
           } catch (RuntimeException | Error failure) {
             return CompletableFuture.failedFuture(failure);
           }
-          return finish.thenApply(ignored -> new PreparedAuxiliaryPlan(auxiliary));
+          return finish.thenCompose(ignored -> {
+            if (scope.isClosed() || scope.isDeadlineExceeded()) {
+              return CompletableFuture.failedFuture(inactive(scope));
+            }
+            return CompletableFuture.completedFuture(new PreparedAuxiliaryPlan(auxiliary));
+          });
         });
   }
 
