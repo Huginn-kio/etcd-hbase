@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -398,6 +399,109 @@ class SealedEventCursorTest {
     }
   }
 
+  @Test
+  void sharedTailerReadsOnceAndIsolatesSlowSubscriptions() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope fastScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope slowScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope readScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account tailMemory = fixture.account(tailScope);
+         BudgetManager.Account fastMemory = fixture.account(fastScope);
+         BudgetManager.Account slowMemory = fixture.account(slowScope);
+         BudgetManager.Account readMemory = fixture.account(readScope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+      var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 3, 4, 8192)) {
+        var fast = tailer.subscribe(KeyRange.all(), fastMemory, 4, 8192);
+        var slow = tailer.subscribe(KeyRange.all(), slowMemory, 1, 8192);
+        assertEquals(SharedEventTailer.Step.OPENED, tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 10, 1024L << 20)).join());
+        for (int i = 0; i < 2; i++) {
+          assertEquals(SharedEventTailer.Step.BUFFERED, tailer.step(readScope,
+              new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join());
+          assertTrue(fast.poll().isEmpty());
+        }
+        assertEquals(SharedEventTailer.Step.PUBLISHED, tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 1, 512L << 20)).join());
+        assertEquals(2, fixture.eventReads.get());
+        assertEquals(3, tailer.completedSequence());
+        assertEquals(11, tailer.completedRevision());
+        assertEquals(Optional.of(SharedEventTailer.Termination.RESOURCE_LIMIT), slow.termination());
+        assertTrue(slow.poll().isEmpty());
+        try (var first = fast.poll().orElseThrow(); var second = fast.poll().orElseThrow()) {
+          assertEquals(0, first.event().ordinal());
+          assertEquals(1, second.event().ordinal());
+          assertEquals(11, first.revision());
+        }
+        assertTrue(fast.poll().isEmpty());
+      }
+    }
+  }
+
+  @Test
+  void sharedTailerDoesNotPublishAnIncompleteCorruptRevision() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope watchScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope readScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account tailMemory = fixture.account(tailScope);
+         BudgetManager.Account watchMemory = fixture.account(watchScope);
+         BudgetManager.Account readMemory = fixture.account(readScope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+      var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 2, 4, 8192)) {
+        var watch = tailer.subscribe(KeyRange.all(), watchMemory, 4, 8192);
+        tailer.step(readScope, new ManifestCatalog.ProofReadBudget(readScope, readMemory, 10, 1024L << 20)).join();
+        tailer.step(readScope, new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join();
+        fixture.missingPage = true;
+        assertThrows(CompletionException.class, () -> tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join());
+        assertTrue(watch.poll().isEmpty());
+        assertEquals(Optional.of(SharedEventTailer.Termination.TAILER_CLOSED), watch.termination());
+        assertEquals(2, tailer.completedSequence());
+      }
+    }
+  }
+
+  @Test
+  void closingSharedTailerDuringBackendReadDoesNotPublishLateEvent() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope watchScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope readScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account tailMemory = fixture.account(tailScope);
+         BudgetManager.Account watchMemory = fixture.account(watchScope);
+         BudgetManager.Account readMemory = fixture.account(readScope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+      var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 2, 4, 8192)) {
+        var watch = tailer.subscribe(KeyRange.all(), watchMemory, 4, 8192);
+        tailer.step(readScope, new ManifestCatalog.ProofReadBudget(readScope, readMemory, 10, 1024L << 20)).join();
+        fixture.pendingEvent = new CompletableFuture<>();
+        var reading = tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20));
+        tailer.close();
+        fixture.pendingEvent.complete(Optional.of(fixture.first));
+        assertThrows(CompletionException.class, reading::join);
+        assertTrue(watch.poll().isEmpty());
+        assertEquals(Optional.of(SharedEventTailer.Termination.TAILER_CLOSED), watch.termination());
+      }
+    }
+  }
+
   private static final class MemoryRecords implements SystemRecordStore {
     private final Map<ByteKey, ByteKey> rows = new HashMap<>();
     private CompletableFuture<Boolean> pauseNextCas;
@@ -447,6 +551,7 @@ class SealedEventCursorTest {
     private final CommitDecision decision = new CommitDecision(transaction, InvocationId.create(),
         3, 10, 11, root.systemIdentity(), root.digest(), true);
     private final AtomicInteger controlReads = new AtomicInteger();
+    private final AtomicInteger eventReads = new AtomicInteger();
     private CommitState stateAfterRoot;
     private ManifestRoot rootReadOverride;
     private boolean missingPage;
@@ -470,9 +575,12 @@ class SealedEventCursorTest {
             case "readEventDirectoryPage" -> CompletableFuture.completedFuture(Optional.of(directory));
             case "readEventPage" -> CompletableFuture.completedFuture(missingPage
                 ? Optional.empty() : Optional.of(page));
-            case "readEvent" -> pendingEvent != null ? pendingEvent
-                : CompletableFuture.completedFuture(Optional.of(wrongEvent ? second
-                    : arguments[0].equals(first.systemIdentity()) ? first : second));
+            case "readEvent" -> {
+              eventReads.incrementAndGet();
+              yield pendingEvent != null ? pendingEvent
+                  : CompletableFuture.completedFuture(Optional.of(wrongEvent ? second
+                      : arguments[0].equals(first.systemIdentity()) ? first : second));
+            }
             default -> throw new UnsupportedOperationException(method.getName());
           });
     }
