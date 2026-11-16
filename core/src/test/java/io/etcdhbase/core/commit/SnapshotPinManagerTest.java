@@ -31,6 +31,54 @@ class SnapshotPinManagerTest {
   private static final ByteKey AUTHORIZATION = digest(9);
 
   @Test
+  void eventHistoryUsesAnIndependentDurableBoundaryAndRetainsItsExactRoot() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    try (RequestScope scope = scope()) {
+      var snapshots = SnapshotPinManager.initializeFresh(records, configuration, scope).join();
+      var events = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), scope).join();
+      var root = new EventReference(ByteKey.copyOf(new byte[] {7}), digest(4), 0, 0, 1, 8, 1, 0);
+      var transaction = TransactionId.create();
+      var requirement = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.of(transaction), Optional.of(root));
+      var pin = events.register(requirement, scope).join();
+      var boundary = events.advanceRegistrationFloors(8, 6, scope).join();
+      assertEquals(5, boundary.safeRevision());
+      assertEquals(3, boundary.safeSequence());
+      assertEquals(root.identity(), boundary.protections().getFirst().rootIdentity().orElseThrow());
+      assertEquals(root.digest(), boundary.protections().getFirst().rootDigest().orElseThrow());
+      assertEquals(transaction, boundary.protections().getFirst().transactionId().orElseThrow());
+      assertTrue(snapshots.readBoundary(scope).join().protections().isEmpty());
+      var reopened = EventHistoryPinManager.open(records, configuration, Clock.systemUTC(), scope).join();
+      assertEquals(boundary, reopened.readBoundary(scope).join());
+      assertInstanceOf(IllegalStateException.class, failure(() -> reopened.register(requirement, scope).join()));
+      pin.renew(scope).join();
+      pin.complete(scope).join();
+      assertEquals(8, reopened.readBoundary(scope).join().safeRevision());
+      assertEquals(6, reopened.readBoundary(scope).join().safeSequence());
+    }
+  }
+
+  @Test
+  void eventPinRegistrationLosingTheGcFloorRaceFailsClosed() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    try (RequestScope scope = scope()) {
+      var events = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), scope).join();
+      var requirement = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.empty(), Optional.empty());
+      records.pauseNextCompareAndSet();
+      var entered = records.casEntered();
+      var registering = events.register(requirement, scope);
+      entered.join();
+      events.advanceRegistrationFloors(8, 6, scope).join();
+      records.releaseCompareAndSet();
+      assertInstanceOf(IllegalStateException.class, failure(registering::join));
+      assertTrue(events.readBoundary(scope).join().protections().isEmpty());
+    }
+  }
+
+  @Test
   void durableFloorsProtectExistingViewsAndRejectNewOlderViews() {
     var records = new MemoryRecords();
     var configuration = new SnapshotPinConfiguration(3, 2, Duration.ofSeconds(2));

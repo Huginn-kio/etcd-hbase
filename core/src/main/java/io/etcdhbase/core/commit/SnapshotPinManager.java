@@ -97,13 +97,33 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     Objects.requireNonNull(scope, "scope");
     if (!active(scope)) return failed(inactive(scope));
     final PinRequirement requirement;
-    final ByteKey pinId;
     try {
       requirement = PinRequirement.from(view, auxiliary);
-      pinId = ByteKey.copyOf(TransactionId.create().bytes());
     } catch (RuntimeException failure) {
       return failed(failure);
     }
+    return registerRequirement(requirement, scope);
+  }
+
+  CompletableFuture<Pin> registerEventHistory(long revision, long sequence, ByteKey digest,
+      Optional<TransactionId> transaction, Optional<ByteKey> eventRoot,
+      Optional<ByteKey> eventRootDigest, RequestScope scope) {
+    Objects.requireNonNull(scope, "scope");
+    if (!active(scope)) return failed(inactive(scope));
+    if (revision <= 0 || sequence <= 0 || digest == null || digest.length() != 32
+        || transaction == null || eventRoot == null || eventRootDigest == null
+        || transaction.isPresent() != eventRoot.isPresent()
+        || eventRoot.isPresent() != eventRootDigest.isPresent()
+        || eventRoot.filter(root -> root.length() == 0 || root.length() > 1024).isPresent()
+        || eventRootDigest.filter(value -> value.length() != 32).isPresent()) {
+      return failed(new IllegalArgumentException("invalid event history pin requirement"));
+    }
+    return registerRequirement(new PinRequirement(revision, sequence, digest, transaction,
+        eventRoot, eventRootDigest), scope);
+  }
+
+  private CompletableFuture<Pin> registerRequirement(PinRequirement requirement, RequestScope scope) {
+    ByteKey pinId = ByteKey.copyOf(TransactionId.create().bytes());
     int shard = shardFor(pinId);
     return registerAttempt(shard, pinId, requirement, scope, 0);
   }
