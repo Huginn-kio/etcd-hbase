@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.AuxiliaryDirectory;
 import io.etcdhbase.core.commit.AuxiliaryPage;
+import io.etcdhbase.core.commit.EventIndexBackfillCheckpoint;
 import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.InvocationRepository;
@@ -44,6 +45,43 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class LeaseGrantPreparationTest {
+  @Test
+  void sealsProtectedBackfillCheckpointAsOneMetadataOnlyTransaction() throws Exception {
+    try (Fixture fixture = new Fixture()) {
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 1, 1, 0, 1, 1, 1, 1, 0,
+          ByteKey.copyOf(new byte[16]));
+      var preparation = new EventBackfillPreparation(fixture.auxiliaryMutationPreparation);
+      var sealed = preparation.prepare(fixture.invocation, checkpoint,
+          () -> CompletableFuture.completedFuture(null), fixture.scope, fixture.account).join();
+      assertEquals(InvocationBinding.State.SEALED, sealed.invocation().state());
+      assertFalse(sealed.manifest().containsKeyChanges());
+      assertEquals(1, sealed.manifest().auxiliaryReference().orElseThrow().itemCount());
+      var record = fixture.records.values().iterator().next();
+      assertEquals(SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT, record.targetType());
+      assertEquals(checkpoint, EventIndexBackfillCheckpoint.decode(record.payload()));
+      assertEquals(checkpoint.encode(), ByteKey.copyOf(fixture.results.page.payload()));
+    }
+  }
+
+  @Test
+  void backfillDoesNotSealWhenTheWindowIsLostOrInvocationDiffers() throws Exception {
+    try (Fixture fixture = new Fixture()) {
+      var checkpoint = new EventIndexBackfillCheckpoint(1, 1, 1, 0, 1, 1, 1, 1, 0,
+          ByteKey.copyOf(new byte[16]));
+      var preparation = new EventBackfillPreparation(fixture.auxiliaryMutationPreparation);
+      var wrongEpoch = new EventIndexBackfillCheckpoint(2, 1, 1, 0, 1, 1, 1, 1, 0,
+          checkpoint.registryIdentity());
+      assertThrows(CompletionException.class, () -> preparation.prepare(fixture.invocation, wrongEpoch,
+          () -> CompletableFuture.completedFuture(null), fixture.scope, fixture.account).join());
+      assertTrue(fixture.records.isEmpty());
+      assertThrows(CompletionException.class, () -> preparation.prepare(fixture.invocation, checkpoint,
+          () -> CompletableFuture.failedFuture(new IllegalStateException("lost event window")),
+          fixture.scope, fixture.account).join());
+      assertEquals(0, fixture.seals);
+      assertEquals(InvocationBinding.State.PREPARING, fixture.current.get().state());
+    }
+  }
+
   @Test
   void sealsOriginalResultAndAllThreeStateRecordsAfterReadValidation() throws Exception {
     try (Fixture fixture = new Fixture()) {
