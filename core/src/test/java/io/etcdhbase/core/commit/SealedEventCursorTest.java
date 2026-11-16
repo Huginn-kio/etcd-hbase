@@ -351,6 +351,31 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void scopeCleanupWaitsForDurableEventPinRelease() throws Exception {
+    Fixture fixture = new Fixture();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      CompletableFuture<Void> durableRelease = new CompletableFuture<>();
+      AtomicInteger releases = new AtomicInteger();
+      ReadViewPinRegistry.Pin pin = new ReadViewPinRegistry.Pin() {
+        @Override public long generation() { return 1; }
+        @Override public void close() { releases.incrementAndGet(); }
+        @Override public java.util.concurrent.CompletionStage<Void> releaseCompletion() {
+          return durableRelease;
+        }
+      };
+      var cursor = new ProtectedEventCursor(fixture.cursor(scope), pin, scope);
+      scope.close();
+      assertTrue(scope.physicalProducersCompletion().toCompletableFuture().isDone());
+      assertEquals(1, releases.get());
+      assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+      assertFalse(cursor.releaseCompletion().toCompletableFuture().isDone());
+      durableRelease.complete(null);
+      scope.cleanupCompletion().toCompletableFuture().join();
+      cursor.releaseCompletion().toCompletableFuture().join();
+    }
+  }
+
+  @Test
   void cancellingEventFutureStopsCursorAndWaitsForPhysicalDrain() throws Exception {
     Fixture fixture = new Fixture();
     try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));

@@ -29,7 +29,8 @@ public final class ProtectedEventCursor implements AutoCloseable {
   ProtectedEventCursor(ReadViewPinRegistry.Pin pin, RequestScope scope) {
     this.pin = Objects.requireNonNull(pin, "pin");
     this.scope = Objects.requireNonNull(scope, "scope");
-    scope.registerCleanup(this);
+    // Scope cleanup must include the durable release, not only the backend producer drain.
+    scope.registerScopedCleanup(this, release);
   }
 
   synchronized void attach(SealedEventCursor cursor) {
