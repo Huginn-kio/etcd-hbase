@@ -25,11 +25,14 @@ public final class SelectedSequenceReader {
   }
 
   /** A KV-changing sequence owns an event cursor; metadata-only sequences have none. */
-  public record Selected(CommitDecision decision, Optional<ProtectedEventCursor> events) {
+  public record Selected(CommitDecision decision, Optional<ProtectedEventCursor> events,
+      Optional<EventRevisionIndex> index) {
     public Selected {
       Objects.requireNonNull(decision, "decision");
       Objects.requireNonNull(events, "events");
-      if (events.isPresent() != decision.containsKeyChanges()) {
+      Objects.requireNonNull(index, "index");
+      if (events.isPresent() != decision.containsKeyChanges()
+          || index.isPresent() != decision.containsKeyChanges()) {
         throw new IllegalArgumentException("event cursor differs from selected decision");
       }
     }
@@ -42,12 +45,29 @@ public final class SelectedSequenceReader {
    */
   public CompletableFuture<Optional<Selected>> open(long sequence, long baseRevision,
       ByteKey authorizationDigest, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    return open(sequence, baseRevision, authorizationDigest, scope, budget, Optional.empty());
+  }
+
+  /** Reads one captured legacy sequence; the caller must authenticate the persisted checkpoint. */
+  public CompletableFuture<Optional<Selected>> openLegacy(EventIndexBackfillCheckpoint checkpoint,
+      ByteKey authorizationDigest, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    Objects.requireNonNull(checkpoint, "checkpoint");
+    if (checkpoint.complete()) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("event backfill is already complete"));
+    }
+    return open(checkpoint.nextSequence(), checkpoint.currentRevision(), authorizationDigest,
+        scope, budget, Optional.of(checkpoint));
+  }
+
+  private CompletableFuture<Optional<Selected>> open(long sequence, long baseRevision,
+      ByteKey authorizationDigest, RequestScope scope, ManifestCatalog.ProofReadBudget budget,
+      Optional<EventIndexBackfillCheckpoint> legacy) {
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(budget, "budget");
     if (sequence <= 0 || baseRevision <= 0 || !budget.belongsTo(scope)) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid selected sequence request"));
     }
-    var requirement = new EventHistoryPinManager.Requirement(baseRevision, sequence,
+    var requirement = new EventHistoryPinManager.Requirement(nextRevision(baseRevision), sequence,
         authorizationDigest, Optional.empty(), Optional.empty());
     var output = new CompletableFuture<Optional<Selected>>();
     output.whenComplete((ignored, failure) -> { if (output.isCancelled()) scope.cancel(); });
@@ -62,7 +82,7 @@ public final class SelectedSequenceReader {
         return;
       }
       try {
-        read(sequence, baseRevision, protectedCursor, scope, budget)
+        read(sequence, baseRevision, protectedCursor, scope, budget, legacy)
             .whenComplete((selected, readFailure) -> {
               if (readFailure != null) {
                 protectedCursor.close();
@@ -81,9 +101,10 @@ public final class SelectedSequenceReader {
   }
 
   private CompletableFuture<Optional<Selected>> read(long sequence, long baseRevision,
-      ProtectedEventCursor pin, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+      ProtectedEventCursor pin, RequestScope scope, ManifestCatalog.ProofReadBudget budget,
+      Optional<EventIndexBackfillCheckpoint> legacy) {
     return pin.renew().thenCompose(ignored -> readControl(scope, budget)).thenCompose(state -> {
-      validateControl(state, baseRevision);
+      validateControl(state, baseRevision, legacy);
       if (sequence > state.publishedSequence()) return closeEmpty(pin);
       return decisions.read(sequence, scope, budget).thenCompose(found -> {
         CommitDecision decision = found.orElseThrow(
@@ -97,21 +118,22 @@ public final class SelectedSequenceReader {
               () -> new IllegalStateException("selected manifest root is missing"));
           validateRoot(decision, root);
           CompletableFuture<Void> index = decision.containsKeyChanges()
-              ? verifyIndex(decision, root, scope, budget) : CompletableFuture.completedFuture(null);
+              ? verifyIndex(decision, root, scope, budget, legacy.isPresent()) : CompletableFuture.completedFuture(null);
           return index.thenCompose(ignored -> pin.renew())
               .thenCompose(ignored -> readControl(scope, budget))
               .thenCompose(latest -> {
-                validateControl(latest, baseRevision);
+                validateControl(latest, baseRevision, legacy);
                 if (decision.sequence() > latest.publishedSequence()) {
                   throw new IllegalStateException("selected sequence moved behind the control barrier");
                 }
                 if (!decision.containsKeyChanges()) {
                   pin.close();
                   return pin.releaseCompletion().thenApply(released ->
-                      Optional.of(new Selected(decision, Optional.empty()))).toCompletableFuture();
+                      Optional.of(new Selected(decision, Optional.empty(), Optional.empty()))).toCompletableFuture();
                 }
                 pin.attach(new SealedEventCursor(manifests, decision, root, scope));
-                return CompletableFuture.completedFuture(Optional.of(new Selected(decision, Optional.of(pin))));
+                return CompletableFuture.completedFuture(Optional.of(new Selected(decision, Optional.of(pin),
+                    Optional.of(EventRevisionIndex.fromSelected(decision, root)))));
               });
         });
       });
@@ -119,12 +141,13 @@ public final class SelectedSequenceReader {
   }
 
   private CompletableFuture<Void> verifyIndex(CommitDecision decision, ManifestRoot root,
-      RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+      RequestScope scope, ManifestCatalog.ProofReadBudget budget, boolean legacy) {
     return readIndex(decision.revision(), scope, budget).thenCompose(index -> {
       if (index.isPresent()) {
         index.orElseThrow().verifySelected(decision, root);
         return CompletableFuture.completedFuture(null);
       }
+      if (legacy) return CompletableFuture.completedFuture(null);
       return readControl(scope, budget).thenCompose(state -> {
         if (state.finalizedSequence() < decision.sequence()) {
           if (state.publication().filter(decision::matches).isEmpty()) {
@@ -153,13 +176,23 @@ public final class SelectedSequenceReader {
             () -> new IllegalStateException("authoritative commit control is missing")).state());
   }
 
-  private static void validateControl(CommitState state, long baseRevision) {
+  private static void validateControl(CommitState state, long baseRevision,
+      Optional<EventIndexBackfillCheckpoint> legacy) {
     if (!state.supportsEventRevisionIndex() || baseRevision > state.publishedRevision()) {
       throw new IllegalStateException("sequence cursor is outside the control barrier");
     }
-    if (baseRevision < state.compactRevision()) {
+    if (nextRevision(baseRevision) < state.compactRevision()) {
       throw new IllegalStateException("event history has been compacted");
     }
+    if (legacy.isPresent() && (state.finalizedSequence() < legacy.orElseThrow().sequence()
+        || state.ownerEpoch() < legacy.orElseThrow().ownerEpoch()
+        || state.compactRevision() != legacy.orElseThrow().compactRevision())) {
+      throw new IllegalStateException("captured event backfill boundary changed");
+    }
+  }
+
+  private static long nextRevision(long baseRevision) {
+    return baseRevision == Long.MAX_VALUE ? Long.MAX_VALUE : baseRevision + 1;
   }
 
   private static void validateRoot(CommitDecision decision, ManifestRoot root) {

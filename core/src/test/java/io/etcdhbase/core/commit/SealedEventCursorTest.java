@@ -344,6 +344,63 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void legacyReaderAllowsMissingIndexOnlyInsideCapturedUnchangedWindow() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 0);
+    var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+        Optional.of("owner"), 1, 100, 1, 4, 11, 4, 11, Optional.empty(), 0);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        var selected = fixture.sequenceReader(pins, state, Optional.empty())
+            .openLegacy(checkpoint, fixture.digest, scope, budget).join().orElseThrow();
+        assertEquals(EventRevisionIndex.fromSelected(fixture.decision, fixture.root), selected.index().orElseThrow());
+        var cursor = selected.events().orElseThrow();
+        var eventBudget = new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20);
+        assertEquals(0, cursor.next(eventBudget).join().orElseThrow().ordinal());
+        cursor.close();
+        cursor.releaseCompletion().toCompletableFuture().join();
+      }
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var compacted = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+            Optional.of("owner"), 1, 100, 2, 4, 11, 4, 11, Optional.empty(), 11);
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        assertThrows(CompletionException.class, () -> fixture.sequenceReader(pins, compacted, Optional.empty())
+            .openLegacy(checkpoint, fixture.digest, scope, budget).join());
+      }
+    }
+  }
+
+  @Test
+  void sequenceReaderCanReadAnEventAtTheCompactBoundary() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+        Optional.of("owner"), 1, 100, 1, 3, 11, 3, 11, Optional.empty(), 11);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        var selected = fixture.sequenceReader(pins, state, Optional.of(index))
+            .open(3, 10, fixture.digest, scope, budget).join().orElseThrow();
+        var cursor = selected.events().orElseThrow();
+        var eventBudget = new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20);
+        assertEquals(0, cursor.next(eventBudget).join().orElseThrow().ordinal());
+        cursor.close();
+        cursor.releaseCompletion().toCompletableFuture().join();
+      }
+    }
+  }
+
+  @Test
   void sequenceReaderHandlesMetadataAndWaitsWhenNoSequenceIsSelected() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
