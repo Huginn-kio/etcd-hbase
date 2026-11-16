@@ -14,10 +14,13 @@ import io.etcdhbase.core.commit.EventRevisionIndex;
 import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
+import io.etcdhbase.core.commit.SystemRecordEntry;
+import io.etcdhbase.core.commit.SystemRecordPage;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.codec.EventRevisionIndexMessages;
 import java.util.Optional;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import org.junit.jupiter.api.Test;
@@ -54,6 +57,29 @@ class HBaseEventRevisionIndexRepositoryTest {
     try (RequestScope scope = RequestScope.withoutDeadline()) {
       assertEquals(Optional.empty(), repository.read(9, scope).join());
       assertEquals(SystemRecordStore.CreateResult.CONFLICT, repository.createIfAbsent(index(), scope).join());
+    }
+  }
+
+  @Test
+  void bucketSeekValidatesTheRowIdentityAndEncodedByteCount() {
+    SystemRecordStore records = mock(SystemRecordStore.class);
+    var index = index();
+    ByteKey identity = ByteKey.copyOf(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(9).array());
+    var entry = new SystemRecordEntry(identity, ByteKey.copyOf(EventRevisionIndexMessages.encode(index)));
+    when(records.scanEventRevisions(eq(2), eq(8L), eq(Optional.empty()), eq(1), eq(4096L), any()))
+        .thenReturn(CompletableFuture.completedFuture(new SystemRecordPage(
+            List.of(entry), Optional.of(identity), true, entry.encodedBytes())));
+    var repository = new HBaseEventRevisionIndexRepository(records);
+    try (RequestScope scope = RequestScope.withoutDeadline()) {
+      var page = repository.firstAtOrAfter(2, 8, 4096, scope).join();
+      assertEquals(Optional.of(index), page.index());
+      assertEquals(entry.encodedBytes(), page.encodedBytes());
+      var wrongIdentity = ByteKey.copyOf(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(10).array());
+      var wrongEntry = new SystemRecordEntry(wrongIdentity, entry.value());
+      when(records.scanEventRevisions(eq(2), eq(8L), eq(Optional.empty()), eq(1), eq(4096L), any()))
+          .thenReturn(CompletableFuture.completedFuture(new SystemRecordPage(
+              List.of(wrongEntry), Optional.of(wrongIdentity), true, wrongEntry.encodedBytes())));
+      assertThrows(CompletionException.class, () -> repository.firstAtOrAfter(2, 8, 4096, scope).join());
     }
   }
 

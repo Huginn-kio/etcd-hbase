@@ -10,4 +10,11 @@ public interface EventRevisionIndexRepository {
 
   CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
       EventRevisionIndex index, RequestScope scope);
+
+  /** Reads the first index at or after a revision in one salt bucket. */
+  default CompletableFuture<EventRevisionIndexPage> firstAtOrAfter(
+      int bucket, long revision, long maximumBytes, RequestScope scope) {
+    return CompletableFuture.failedFuture(new UnsupportedOperationException(
+        "event revision index scans are not available"));
+  }
 }

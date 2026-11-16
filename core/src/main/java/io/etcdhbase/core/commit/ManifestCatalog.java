@@ -93,6 +93,7 @@ public final class ManifestCatalog {
     public synchronized int pages() { return pages; }
     public synchronized long bytes() { return bytes; }
     public boolean belongsTo(RequestScope candidate) { return scope == candidate; }
+    boolean usesAccount(BudgetManager.Account candidate) { return account == candidate; }
     RequestScope scope() { return scope; }
 
     <T> CompletableFuture<T> read(long maximumBytes, Supplier<CompletableFuture<T>> work) {

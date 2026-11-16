@@ -2,6 +2,7 @@ package io.etcdhbase.hbase.storage;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.EventRevisionIndex;
+import io.etcdhbase.core.commit.EventRevisionIndexPage;
 import io.etcdhbase.core.commit.EventRevisionIndexRepository;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
@@ -39,6 +40,34 @@ public final class HBaseEventRevisionIndexRepository implements EventRevisionInd
     return records.createIfAbsent(SystemRecordType.EVENT_REVISION_INDEX,
         identity(index.decision().revision()), ByteKey.copyOf(EventRevisionIndexMessages.encode(index)),
         scope);
+  }
+
+  @Override
+  public CompletableFuture<EventRevisionIndexPage> firstAtOrAfter(
+      int bucket, long revision, long maximumBytes, RequestScope scope) {
+    if (revision <= 0 || maximumBytes <= 0) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid event index seek"));
+    }
+    return records.scanEventRevisions(bucket, revision, Optional.empty(), 1, maximumBytes, scope)
+        .thenApply(page -> {
+          long actualBytes = page.entries().stream().mapToLong(entry -> entry.encodedBytes()).sum();
+          if (page.entries().size() > 1 || page.encodedBytes() != actualBytes
+              || page.encodedBytes() > maximumBytes || page.physicalRows() > 2
+              || page.entries().isEmpty() && !page.exhausted()) {
+            throw new IllegalStateException("invalid event index seek page");
+          }
+          var index = page.entries().stream().findFirst().map(entry -> {
+            EventRevisionIndex decoded = EventRevisionIndexMessages.decode(entry.value().bytes());
+            if (entry.identity().length() != Long.BYTES
+                || ByteBuffer.wrap(entry.identity().bytes()).getLong() != decoded.decision().revision()
+                || decoded.decision().revision() < revision) {
+              throw new IllegalStateException("event index seek returned an inconsistent revision");
+            }
+            return decoded;
+          });
+          return new EventRevisionIndexPage(index, page.encodedBytes(),
+              page.physicalRows(), page.scanRpcCalls());
+        });
   }
 
   private static ByteKey identity(long revision) {
