@@ -422,6 +422,54 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void initialCaptureVerifiesRetainedDecisionBoundaries() throws Exception {
+    Fixture fixture = new Fixture();
+    CommitDecision previous = new CommitDecision(TransactionId.create(), InvocationId.create(),
+        2, 10, 10, fixture.key, fixture.digest, false);
+    var records = new MemoryRecords();
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 11);
+    var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+        Optional.of("owner"), 1, 100, 1, 3, 11, 3, 11, Optional.empty(), 11);
+    var decisions = fixture.decisionsBySequence(Map.of(2L, previous, 3L, fixture.decision));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account account = fixture.account(scope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var capture = new EventIndexBackfillCapture(pins, fixture.control(state), decisions);
+      var window = capture.open(checkpoint, fixture.digest, scope,
+          new ManifestCatalog.ProofReadBudget(scope, account, 16, 1024L << 20)).join();
+      assertFalse(pins.readBoundary(setup).join().protections().isEmpty());
+      window.close();
+      window.releaseCompletion().toCompletableFuture().join();
+    }
+  }
+
+  @Test
+  void initialCaptureRejectsSkippedOrMissingRetainedHistory() throws Exception {
+    Fixture fixture = new Fixture();
+    CommitDecision previous = new CommitDecision(TransactionId.create(), InvocationId.create(),
+        2, 10, 10, fixture.key, fixture.digest, false);
+    var records = new MemoryRecords();
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 4, 3, 3, 3, 10, 10, 11, 10);
+    var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+        Optional.of("owner"), 1, 100, 1, 3, 11, 3, 11, Optional.empty(), 10);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      for (var decisions : List.of(fixture.decisionsBySequence(Map.of(2L, previous, 3L, fixture.decision)),
+          fixture.decisionsBySequence(Map.of(2L, previous)))) {
+        try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+             BudgetManager.Account account = fixture.account(scope)) {
+          var capture = new EventIndexBackfillCapture(pins, fixture.control(state), decisions);
+          assertThrows(CompletionException.class, () -> capture.open(checkpoint, fixture.digest, scope,
+              new ManifestCatalog.ProofReadBudget(scope, account, 16, 1024L << 20)).join());
+        }
+      }
+    }
+  }
+
+  @Test
   void backfillRejectsMissingEventPageWithoutAdvancingCheckpoint() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
@@ -839,6 +887,17 @@ class SealedEventCursorTest {
           CommitDecisionRepository.class.getClassLoader(), new Class<?>[] {CommitDecisionRepository.class},
           (proxy, method, arguments) -> {
             if (method.getName().equals("read")) return CompletableFuture.completedFuture(Optional.of(archived));
+            throw new UnsupportedOperationException(method.getName());
+          });
+    }
+
+    private CommitDecisionRepository decisionsBySequence(Map<Long, CommitDecision> archived) {
+      return (CommitDecisionRepository) Proxy.newProxyInstance(
+          CommitDecisionRepository.class.getClassLoader(), new Class<?>[] {CommitDecisionRepository.class},
+          (proxy, method, arguments) -> {
+            if (method.getName().equals("read")) {
+              return CompletableFuture.completedFuture(Optional.ofNullable(archived.get(arguments[0])));
+            }
             throw new UnsupportedOperationException(method.getName());
           });
     }
