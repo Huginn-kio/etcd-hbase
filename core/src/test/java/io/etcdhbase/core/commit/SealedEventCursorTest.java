@@ -184,7 +184,7 @@ class SealedEventCursorTest {
            BudgetManager.Account account = fixture.account(scope)) {
         var reader = fixture.reader(pins, fixture.decision);
         var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
-        var openingBudget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        var openingBudget = new ManifestCatalog.ProofReadBudget(scope, account, 5, 1024L << 20);
         var cursor = reader.open(index, fixture.digest, scope, openingBudget).join();
         var eventBudget = new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20);
         assertEquals(0, cursor.next(eventBudget).join().orElseThrow().ordinal());
@@ -207,7 +207,7 @@ class SealedEventCursorTest {
         var different = new CommitDecision(fixture.decision.transactionId(), InvocationId.create(),
             fixture.decision.sequence(), fixture.decision.baseRevision(), fixture.decision.revision(),
             fixture.decision.manifestRoot(), fixture.decision.manifestDigest(), true);
-        var openingBudget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        var openingBudget = new ManifestCatalog.ProofReadBudget(scope, account, 5, 1024L << 20);
         assertThrows(CompletionException.class,
             () -> fixture.reader(pins, different).open(index, fixture.digest, scope, openingBudget).join());
         assertTrue(scope.isClosed());
@@ -229,7 +229,7 @@ class SealedEventCursorTest {
           original.totalBytes(), original.leafPageCount(), original.level());
       try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
            BudgetManager.Account account = fixture.account(scope)) {
-        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 5, 1024L << 20);
         assertThrows(CompletionException.class, () -> fixture.reader(pins, fixture.decision)
             .open(new EventRevisionIndex(fixture.decision, altered), fixture.digest, scope, budget).join());
       }
@@ -237,9 +237,29 @@ class SealedEventCursorTest {
            BudgetManager.Account account = fixture.account(scope)) {
         var state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
             Optional.of("owner"), 1, 100, 1, 4, 12, 4, 12, Optional.empty(), 12);
-        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 5, 1024L << 20);
         assertThrows(CompletionException.class, () -> fixture.reader(pins, fixture.decision, state)
             .open(index, fixture.digest, scope, budget).join());
+      }
+    }
+  }
+
+  @Test
+  void rechecksCompactBoundaryAfterReadingSelectedRoot() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        fixture.stateAfterRoot = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, fixture.digest,
+            Optional.of("owner"), 1, 100, 2, 4, 12, 4, 12, Optional.empty(), 12);
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 5, 1024L << 20);
+        var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+        assertThrows(CompletionException.class,
+            () -> fixture.reader(pins, fixture.decision).open(index, fixture.digest, scope, budget).join());
+        assertTrue(fixture.controlReads.get() >= 3);
       }
     }
   }
@@ -255,7 +275,7 @@ class SealedEventCursorTest {
            BudgetManager.Account account = fixture.account(scope)) {
         records.pauseNextCas = new CompletableFuture<>();
         var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
-        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 4, 1024L << 20);
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 5, 1024L << 20);
         var opening = fixture.reader(pins, fixture.decision).open(index, fixture.digest, scope, budget);
         assertFalse(opening.isDone());
         assertTrue(opening.cancel(false));
@@ -314,6 +334,8 @@ class SealedEventCursorTest {
         Optional.of(directory.reference()));
     private final CommitDecision decision = new CommitDecision(transaction, InvocationId.create(),
         3, 10, 11, root.systemIdentity(), root.digest(), true);
+    private final AtomicInteger controlReads = new AtomicInteger();
+    private CommitState stateAfterRoot;
     private boolean missingPage;
     private boolean wrongEvent;
     private CompletableFuture<Optional<PreparedEvent>> pendingEvent;
@@ -356,7 +378,9 @@ class SealedEventCursorTest {
           CommitControlStore.class.getClassLoader(), new Class<?>[] {CommitControlStore.class},
           (proxy, method, arguments) -> {
             if (method.getName().equals("read")) {
-              return CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(state, new byte[] {1})));
+              CommitState current = controlReads.incrementAndGet() >= 3 && stateAfterRoot != null
+                  ? stateAfterRoot : state;
+              return CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(current, new byte[] {1})));
             }
             throw new UnsupportedOperationException(method.getName());
           });

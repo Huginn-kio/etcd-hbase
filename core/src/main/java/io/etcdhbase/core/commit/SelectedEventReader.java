@@ -76,16 +76,7 @@ public final class SelectedEventReader {
         .thenCompose(ignored -> budget.read(ManifestCatalog.maximumProofReadPageBytes(),
             () -> control.read(scope)))
         .thenCompose(snapshot -> {
-          CommitState barrier = snapshot.orElseThrow(
-              () -> new IllegalStateException("authoritative commit control is missing")).state();
-          if (!barrier.supportsEventRevisionIndex()
-              || expected.sequence() > barrier.publishedSequence()
-              || expected.revision() > barrier.publishedRevision()) {
-            throw new IllegalStateException("event locator is outside the captured control barrier");
-          }
-          if (expected.revision() < barrier.compactRevision()) {
-            throw new IllegalStateException("event history has been compacted");
-          }
+          validateBarrier(snapshot, expected);
           return decisions.read(expected.sequence(), scope, budget);
         })
         .thenCompose(selected -> {
@@ -103,9 +94,25 @@ public final class SelectedEventReader {
                 return manifest;
               });
         })
-        .thenCompose(root -> protectedCursor.renew().thenApply(ignored -> {
-          protectedCursor.attach(new SealedEventCursor(manifests, expected, root, scope));
-          return protectedCursor;
-        }));
+        .thenCompose(root -> protectedCursor.renew()
+            .thenCompose(ignored -> budget.read(ManifestCatalog.maximumProofReadPageBytes(),
+                () -> control.read(scope)))
+            .thenApply(snapshot -> {
+              validateBarrier(snapshot, expected);
+              protectedCursor.attach(new SealedEventCursor(manifests, expected, root, scope));
+              return protectedCursor;
+            }));
+  }
+
+  private static void validateBarrier(Optional<ControlSnapshot> snapshot, CommitDecision expected) {
+    CommitState barrier = snapshot.orElseThrow(
+        () -> new IllegalStateException("authoritative commit control is missing")).state();
+    if (!barrier.supportsEventRevisionIndex() || expected.sequence() > barrier.publishedSequence()
+        || expected.revision() > barrier.publishedRevision()) {
+      throw new IllegalStateException("event locator is outside the captured control barrier");
+    }
+    if (expected.revision() < barrier.compactRevision()) {
+      throw new IllegalStateException("event history has been compacted");
+    }
   }
 }
