@@ -120,7 +120,8 @@ class M3OwnerLeaseTest {
         assertFalse(lease.drained().isDone(), "the transition still owns its completion path");
         pending.complete(new CommitOwnerService.OwnerToken(previous.instance(), previous.epoch() + 1));
         assertThrows(CompletionException.class, transition::join);
-        assertEquals(previous, lease.token(), "a late transition cannot publish after stop");
+        assertTrue(lease.currentToken().isEmpty(), "a stopped owner must not expose a stale token");
+        assertThrows(IllegalStateException.class, lease::token);
         lease.drained().get(5, TimeUnit.SECONDS);
       } finally {
         pending.complete(previous);
@@ -144,7 +145,8 @@ class M3OwnerLeaseTest {
         var transition = lease.transitionFence(owners, current -> CompletableFuture.completedFuture(
             new CommitOwnerService.OwnerToken("another-owner", current.epoch())), startup);
         assertThrows(CompletionException.class, transition::join);
-        assertEquals(previous, lease.token());
+        assertTrue(lease.currentToken().isEmpty(), "a rejected transition must fence the old token");
+        assertThrows(IllegalStateException.class, lease::token);
         assertEquals(1, lost.get());
         assertFalse(lease.isReady());
         lease.drained().get(5, TimeUnit.SECONDS);
