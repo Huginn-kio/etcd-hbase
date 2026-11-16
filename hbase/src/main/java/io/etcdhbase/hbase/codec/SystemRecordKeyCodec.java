@@ -1,6 +1,7 @@
 package io.etcdhbase.hbase.codec;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.commit.EventIndexBackfillCheckpoint;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.LeaseBindingIdentity;
@@ -173,16 +174,18 @@ public final class SystemRecordKeyCodec {
     return new ScanBounds(start, startInclusive, prefixEnd(prefix), false, false);
   }
 
-  /** Reverse-seeks one Lease state or expiry-checkpoint history at the requested sequence. */
+  /** Reverse-seeks a fixed-route versioned system record at the requested sequence. */
   public ScanBounds leaseVersionBounds(SystemRecordType type, ByteKey routePrefix, long sequence) {
     int routeBytes = switch (type) {
       case LEASE_STATE -> LeaseRecordIdentity.ROUTE_BYTES;
       case LEASE_EXPIRY_CHECKPOINT -> LeaseExpiryCheckpoint.ROUTE_BYTES;
+      case EVENT_INDEX_BACKFILL_CHECKPOINT -> EventIndexBackfillCheckpoint.ROUTE_BYTES;
       default -> -1;
     };
     int identityBytes = switch (type) {
       case LEASE_STATE -> LeaseRecordIdentity.IDENTITY_BYTES;
       case LEASE_EXPIRY_CHECKPOINT -> LeaseExpiryCheckpoint.IDENTITY_BYTES;
+      case EVENT_INDEX_BACKFILL_CHECKPOINT -> EventIndexBackfillCheckpoint.IDENTITY_BYTES;
       default -> -1;
     };
     if (routeBytes < 0 || routePrefix.length() != routeBytes || sequence <= 0) {
@@ -393,6 +396,10 @@ public final class SystemRecordKeyCodec {
       long sequence = LeaseExpiryCheckpoint.sequence(ByteKey.copyOf(identity));
       if (sequence <= 0) throw new IllegalArgumentException("invalid Lease expiry checkpoint sequence");
       return Arrays.copyOf(identity, LeaseExpiryCheckpoint.ROUTE_BYTES);
+    }
+    if (type == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT) {
+      EventIndexBackfillCheckpoint.sequence(ByteKey.copyOf(identity));
+      return Arrays.copyOf(identity, EventIndexBackfillCheckpoint.ROUTE_BYTES);
     }
     if (type != SystemRecordType.CANDIDATE) return identity;
     if (identity.length <= 16 + Integer.BYTES) {

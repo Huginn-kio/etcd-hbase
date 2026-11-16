@@ -34,7 +34,8 @@ public final class SystemTableBinding {
       "LEASE_RESULT", "LEASE_BINDING");
   private static final Set<String> LEASE_EXPIRY_RECORD_CATEGORIES =
       Set.of("LEASE_EXPIRY_CHECKPOINT");
-  private static final Set<String> EVENT_INDEX_RECORD_CATEGORIES = Set.of("EVENT_REVISION_INDEX");
+  private static final Set<String> EVENT_INDEX_RECORD_CATEGORIES =
+      Set.of("EVENT_REVISION_INDEX", "EVENT_INDEX_BACKFILL_CHECKPOINT");
   private final TableName table;
   private final byte[] family;
   private final String tableGroupId;

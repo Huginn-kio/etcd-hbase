@@ -1,10 +1,13 @@
 package io.etcdhbase.hbase.storage;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.commit.CommitState;
+import io.etcdhbase.core.commit.EventIndexBackfillCheckpoint;
+import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import java.time.Duration;
@@ -78,6 +81,20 @@ class J44EventIndexControlStoreIT {
           .state().supportsEventRevisionIndex());
       assertFalse(M1TestEnvironment.await(oldStore.compareAndSet(beforeUpgrade,
           beforeUpgrade.state().heartbeat("owner", beforeUpgrade.state().ownerEpoch(), 200), scope)));
+
+      var records = M1TestEnvironment.await(HBaseSystemRecordStore.open(
+          environment.factory(), environment.identity(), binding, scope));
+      var first = new EventIndexBackfillCheckpoint(1, 8, 2, 7, 2, 10, 10, 11, 4);
+      var second = new EventIndexBackfillCheckpoint(1, 9, 2, 7, 3, 10, 10, 11, 4);
+      var type = SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT;
+      records.createIfAbsent(type, EventIndexBackfillCheckpoint.versionIdentity(8), first.encode(), scope).join();
+      records.createIfAbsent(type, EventIndexBackfillCheckpoint.versionIdentity(9), second.encode(), scope).join();
+      var prefix = EventIndexBackfillCheckpoint.routePrefix();
+      assertTrue(records.latestAtOrBefore(type, prefix, 7, scope).join().isEmpty());
+      assertEquals(first, EventIndexBackfillCheckpoint.decode(
+          records.latestAtOrBefore(type, prefix, 8, scope).join().orElseThrow().value()));
+      assertEquals(second, EventIndexBackfillCheckpoint.decode(
+          records.latestAtOrBefore(type, prefix, 12, scope).join().orElseThrow().value()));
     }
   }
 }

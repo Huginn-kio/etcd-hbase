@@ -1,6 +1,7 @@
 package io.etcdhbase.hbase.storage;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.commit.EventIndexBackfillCheckpoint;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordEntry;
 import io.etcdhbase.core.commit.SystemRecordPage;
@@ -249,7 +250,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
     }
     if (sequence == 0) return CompletableFuture.completedFuture(Optional.empty());
     var bounds = switch (type) {
-      case LEASE_STATE, LEASE_EXPIRY_CHECKPOINT ->
+      case LEASE_STATE, LEASE_EXPIRY_CHECKPOINT, EVENT_INDEX_BACKFILL_CHECKPOINT ->
           binding.keyCodec().leaseVersionBounds(type, routePrefix, sequence);
       case LEASE_BINDING -> binding.keyCodec().leaseBindingVersionBounds(routePrefix, sequence);
       default -> throw new IllegalArgumentException("system record type has no versioned seek");
@@ -261,6 +262,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
         .setLimit(1)
         .setCaching(1)
         .setMaxResultSize(type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT
+            || type == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT
             ? MAX_EXPIRY_CHECKPOINT_SCAN_BYTES : MAX_RECORD_BYTES)
         .addFamily(binding.family());
     return scan(scan, scope, new LatestVersionCollector(type, routePrefix, sequence));
@@ -447,6 +449,7 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
         case LEASE_BINDING -> io.etcdhbase.core.lease.LeaseBindingIdentity.sequence(decoded.identity());
         case LEASE_EXPIRY_CHECKPOINT ->
             io.etcdhbase.core.lease.LeaseExpiryCheckpoint.sequence(decoded.identity());
+        case EVENT_INDEX_BACKFILL_CHECKPOINT -> EventIndexBackfillCheckpoint.sequence(decoded.identity());
         default -> throw new IllegalArgumentException("system record type has no versioned sequence");
       };
       if (actualSequence > sequence) {
@@ -455,6 +458,10 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
       if (type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT
           && validatedValueLength(row) > LeaseExpiryCheckpoint.MAX_ENCODED_BYTES) {
         throw new IllegalArgumentException("Lease expiry checkpoint exceeds its encoded size limit");
+      }
+      if (type == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT
+          && validatedValueLength(row) != EventIndexBackfillCheckpoint.ENCODED_BYTES) {
+        throw new IllegalArgumentException("event backfill checkpoint has an invalid encoded size");
       }
       latest = Optional.of(new SystemRecordEntry(decoded.identity(),
           decode(row, binding.family()).orElseThrow()));
@@ -563,7 +570,8 @@ public final class HBaseSystemRecordStore implements SystemRecordStore {
     if (type == SystemRecordType.LEASE_EXPIRY_CHECKPOINT && !leaseExpiryCheckpointsSupported) {
       throw new IllegalStateException("system table does not declare J43 Lease expiry capability");
     }
-    if (type == SystemRecordType.EVENT_REVISION_INDEX && !eventRevisionIndexSupported) {
+    if ((type == SystemRecordType.EVENT_REVISION_INDEX
+        || type == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT) && !eventRevisionIndexSupported) {
       throw new IllegalStateException("system table does not declare J44 event index capability");
     }
   }
