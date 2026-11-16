@@ -51,15 +51,10 @@ class M3RuntimeBudgetsTest {
     var configuration = new RuntimeConfiguration(1, List.of(
         new RuntimeConfiguration.Listener("first", "127.0.0.1", 0, "a")),
         List.of(), List.of(), List.of(), resources);
-<<<<<<< HEAD
     long minimum = Math.addExact(
         M3MemoryReservations.minimumLeaseMemory(1, maximumRequestBytes),
         Math.addExact(LeaseBudgetProfile.capacityForGroups(1, maximumRequestBytes).memoryBytes(),
             LeaseBudgetProfile.startupLeaseScanMemory().total()));
-=======
-    long minimum = LeaseBudgetProfile.perGroupCapacity(maximumRequestBytes).memoryBytes()
-        + LeaseBudgetProfile.RECOVERY_MEMORY.total() + LeaseBudgetProfile.startupLeaseScanMemory().total();
->>>>>>> 432c5e68 (fix(j44): 校验启动扫描所需内存)
 
     assertThrows(IllegalArgumentException.class,
         () -> M3RuntimeBudgets.create(configuration, leaseActivation(minimum - 1), 0));
