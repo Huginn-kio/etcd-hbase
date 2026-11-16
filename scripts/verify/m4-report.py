@@ -274,7 +274,7 @@ J40_CRITICAL_JAVA_TESTS = {
     },
     "io.etcdhbase.server.M4LeaseRpcIT": {
         "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts",
-        "minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection",
+        "minimumMemoryPreservesLeaseLifecycleAcrossClockFailures",
     },
     "io.etcdhbase.server.config.M3RuntimeConfigurationTest": {
         "m4MemoryMinimumIncludesGatewayOwnerAndRecoveryReservations",

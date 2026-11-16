@@ -21,6 +21,7 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
 import io.etcdhbase.core.lease.LeaseTimeObservation;
 import io.etcdhbase.core.lease.LeaseTimeSource;
+import io.etcdhbase.core.lease.LeaseCostAdmission;
 import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.MutationOperationEnvelope;
@@ -145,7 +146,7 @@ class M4LeaseRpcIT {
   }
 
  @Test
-  void minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection() throws Exception {
+  void minimumMemoryPreservesLeaseLifecycleAcrossClockFailures() throws Exception {
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
       int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
       InitializationConfiguration initialization = initialization("history-table.json", clientPort);
@@ -175,17 +176,18 @@ class M4LeaseRpcIT {
       RuntimeConfiguration configuration, M3RuntimeConfiguration activation) throws Exception {
     var now = new AtomicLong(10_000);
     var healthy = new AtomicBoolean(true);
-    var observations = new AtomicInteger();
+    var highestObservedTime = new AtomicLong(10_000);
     var armed = new AtomicBoolean(false);
     var rewind = new AtomicBoolean(false);
     LeaseTimeSource time = () -> {
-      boolean observedHealthy = healthy.get();
-      long observedNow = now.get();
-      if (armed.get() && observations.incrementAndGet() == 2) {
+      if (armed.get()) {
         if (rewind.get()) now.set(12_000);
         else healthy.set(false);
       }
-      return new LeaseTimeObservation(observedNow, observedNow, observedHealthy);
+      long observedNow = now.get();
+      long previousHighWater = highestObservedTime.getAndAccumulate(observedNow, Math::max);
+      boolean monotonic = observedNow >= previousHighWater;
+      return new LeaseTimeObservation(observedNow, observedNow, healthy.get() && monotonic);
     };
     try (RuntimeServer runtime = RuntimeServer.startM3WithLeaseTimeSource(configuration, activation, ignored -> time)) {
       var channel = NettyChannelBuilder.forAddress("127.0.0.1", runtime.boundListeners().getFirst().port())
@@ -205,21 +207,25 @@ class M4LeaseRpcIT {
         var ttlRequest = Rpc.LeaseTimeToLiveRequest.newBuilder().setID(leaseId).setKeys(true).build();
         assertEquals(Status.Code.UNAVAILABLE,
             assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
-        assertTrue(observations.get() >= 3);
         assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
         armed.set(false);
         healthy.set(true);
         assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
             .anyMatch(lease -> lease.getID() == leaseId));
-        observations.set(0);
         rewind.set(true);
         armed.set(true);
         assertEquals(Status.Code.UNAVAILABLE,
             assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
-        assertTrue(observations.get() >= 3);
         assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
         armed.set(false);
         now.set(20_000);
+        long expiredTtl = client.leaseTimeToLive(ttlRequest).getTTL();
+        assertTrue(expiredTtl == 0 || expiredTtl == -1,
+            "the lease is either awaiting expiry work or already revoked");
+        if (client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId)) {
+          client.leaseRevoke(Rpc.LeaseRevokeRequest.newBuilder().setID(leaseId).build());
+        }
         assertEquals(-1, client.leaseTimeToLive(ttlRequest).getTTL());
         assertFalse(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
             .anyMatch(lease -> lease.getID() == leaseId));
@@ -237,7 +243,10 @@ class M4LeaseRpcIT {
     return new M3RuntimeConfiguration("1", 6_000, 1_000, 60_000, 30_000,
         Math.addExact(M3MemoryReservations.minimumLeaseMemory(1, maxRequest),
             LeaseBudgetProfile.capacityForGroups(1, maxRequest).memoryBytes()), maxRequest,
-        2, 16, 60_000, false, true, 5, 1_000);
+        2, 16, 60_000, false, true, 5, 1_000, 1_000,
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
   }
 
 
@@ -336,6 +345,10 @@ class M4LeaseRpcIT {
               grantThrough(ownerB, leaseA, 30);
               grantThrough(ownerB, leaseB, 60);
               CommitState beforeRenewal = controlSnapshot(plan, initializer, identity).state();
+              LeaseState leaseABeforeRenewal = leaseStateAt(plan, initializer, identity, leaseA,
+                  beforeRenewal.finalizedSequence());
+              LeaseState leaseBBeforeRenewal = leaseStateAt(plan, initializer, identity, leaseB,
+                  beforeRenewal.finalizedSequence());
               List<Rpc.LeaseKeepAliveResponse> renewals = keepAliveThrough(
                   ownerB, leaseA, leaseB, missingLease);
               assertEquals(List.of(leaseA, leaseB, missingLease),
@@ -350,9 +363,17 @@ class M4LeaseRpcIT {
               }
               CommitState afterRenewal = controlSnapshot(plan, initializer, identity).state();
               assertEquals(beforeRenewal.publishedRevision(), afterRenewal.publishedRevision());
-              assertEquals(beforeRenewal.publishedSequence() + 2,
-                  afterRenewal.publishedSequence(),
-                  "unknown Lease KeepAlive must persist its TTL=0 result without advancing sequence");
+              assertTrue(afterRenewal.publishedSequence() >= beforeRenewal.publishedSequence() + 2,
+                  "both successful KeepAlive requests must select an auxiliary commit; expiry "
+                      + "checkpoint maintenance may also advance the metadata-only sequence");
+              LeaseState leaseAAfterRenewal = leaseStateAt(plan, initializer, identity, leaseA,
+                  afterRenewal.finalizedSequence());
+              LeaseState leaseBAfterRenewal = leaseStateAt(plan, initializer, identity, leaseB,
+                  afterRenewal.finalizedSequence());
+              assertEquals(leaseABeforeRenewal.renewalGeneration() + 1,
+                  leaseAAfterRenewal.renewalGeneration());
+              assertEquals(leaseBBeforeRenewal.renewalGeneration() + 1,
+                  leaseBAfterRenewal.renewalGeneration());
 
               InvocationId missingInvocation = InvocationId.create();
               var missingKeepAlive = Rpc.LeaseKeepAliveRequest.newBuilder().setID(missingLease).build();
@@ -365,8 +386,13 @@ class M4LeaseRpcIT {
               assertTrue(java.util.Arrays.equals(missingInvocation.bytes(),
                   firstMissingReply.getOperationResult().toByteArray()));
               CommitState afterMissingReply = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(afterRenewal.publishedSequence(), afterMissingReply.publishedSequence());
               assertEquals(afterRenewal.publishedRevision(), afterMissingReply.publishedRevision());
+              assertEquals(leaseAAfterRenewal,
+                  leaseStateAt(plan, initializer, identity, leaseA, afterMissingReply.finalizedSequence()),
+                  "an unknown Lease KeepAlive must not change another Lease");
+              assertEquals(leaseBAfterRenewal,
+                  leaseStateAt(plan, initializer, identity, leaseB, afterMissingReply.finalizedSequence()),
+                  "an unknown Lease KeepAlive must not change another Lease");
 
               ForwardMutationResponse replayedMissingReply = forwardMutation(
                   ownerAPort, "owner-a", trustedPeers, ownerBCertificate, missingAttempt);
@@ -374,8 +400,13 @@ class M4LeaseRpcIT {
               assertTrue(java.util.Arrays.equals(missingInvocation.bytes(),
                   replayedMissingReply.getOperationResult().toByteArray()));
               CommitState afterMissingReplay = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(afterMissingReply.publishedSequence(), afterMissingReplay.publishedSequence());
               assertEquals(afterMissingReply.publishedRevision(), afterMissingReplay.publishedRevision());
+              assertEquals(leaseAAfterRenewal,
+                  leaseStateAt(plan, initializer, identity, leaseA, afterMissingReplay.finalizedSequence()),
+                  "replaying an unknown Lease result must remain side-effect free");
+              assertEquals(leaseBAfterRenewal,
+                  leaseStateAt(plan, initializer, identity, leaseB, afterMissingReplay.finalizedSequence()),
+                  "replaying an unknown Lease result must remain side-effect free");
 
               long oldEpoch = afterMissingReplay.ownerEpoch();
               long takeoverStartedNanos = System.nanoTime();

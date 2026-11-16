@@ -157,7 +157,7 @@
         ]},
         {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseRpcIT", "tests": [
           "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts",
-          "minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection"
+          "minimumMemoryPreservesLeaseLifecycleAcrossClockFailures"
         ]}
       ],
       "evidence": {

@@ -69,7 +69,7 @@ class M4ReportTest(unittest.TestCase):
             "io.etcdhbase.server.M3RuntimeBudgetsTest":
                 "m4MinimumAccountsForEveryGroupAndConcurrentLeaseOwner",
             "io.etcdhbase.server.M4LeaseRpcIT":
-                "minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection",
+                "minimumMemoryPreservesLeaseLifecycleAcrossClockFailures",
             "io.etcdhbase.core.commit.LeaseReadViewTest":
                 "bindingReadMergesStableHistoryWithSelectedChangesAtOneBarrier",
             "io.etcdhbase.grpc.protocol.LeaseTimeToLiveResponseMapperTest":
