@@ -88,6 +88,21 @@ class EventBackfillExecutorTest {
     }
   }
 
+  @Test
+  void unselectedRegistryCannotProtectPublishedProgress() {
+    try (var fixture = new Fixture()) {
+      when(fixture.control.read(fixture.scope)).thenReturn(fixture.snapshot(fixture.state));
+      byte[] otherNamespace = new byte[16];
+      otherNamespace[0] = 1;
+      var checkpoint = new EventIndexBackfillCheckpoint(7, 1, 1, 0, 1, 1, 1, 1, 0,
+          ByteKey.copyOf(otherNamespace));
+      assertThrows(CompletionException.class, () -> fixture.executor.publish(fixture.invocation, fixture.owner,
+          checkpoint, fixture.window, fixture.scope, fixture.account, fixture.budget).join());
+      verify(fixture.preparation, never()).prepare(any(), any(), any(), any(), any());
+      verify(fixture.publisher, never()).publish(any(), any(), any(), any());
+    }
+  }
+
   private static final class Fixture implements AutoCloseable {
     private final ByteKey fingerprint = ByteKey.copyOf(new byte[32]);
     private final ByteKey namespace = ByteKey.copyOf(new byte[16]);
