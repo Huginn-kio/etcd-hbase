@@ -15,7 +15,8 @@ import java.util.concurrent.CompletionException;
 import org.junit.jupiter.api.Test;
 
 class EventIndexBackfillPlannerTest {
-  private static final ByteKey REGISTRY = ByteKey.copyOf(new byte[16]);
+  private static final ByteKey NAMESPACE = ByteKey.copyOf(new byte[16]);
+  private static final ByteKey REGISTRY = ByteKey.copyOf(new byte[] {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
   private static final ByteKey DIGEST = ByteKey.copyOf(new byte[32]);
   private static final CommitOwnerService.OwnerToken OWNER = new CommitOwnerService.OwnerToken("owner", 3);
 
@@ -27,6 +28,7 @@ class EventIndexBackfillPlannerTest {
       assertEquals(0, result.upperSequence());
       assertEquals(1, result.upperRevision());
       assertTrue(result.complete());
+      assertEquals(REGISTRY, result.registryIdentity());
     }
   }
 
@@ -50,7 +52,7 @@ class EventIndexBackfillPlannerTest {
     try (Fixture fixture = new Fixture(5, 4, 3, Map.of())) {
       assertThrows(CompletionException.class, () -> fixture.plan().join());
       assertThrows(CompletionException.class, () -> fixture.planner.plan(
-          new CommitOwnerService.OwnerToken("old-owner", 2), REGISTRY, fixture.scope, fixture.budget()).join());
+          new CommitOwnerService.OwnerToken("old-owner", 2), NAMESPACE, REGISTRY, fixture.scope, fixture.budget()).join());
     }
   }
 
@@ -71,7 +73,7 @@ class EventIndexBackfillPlannerTest {
           new BudgetManager.ReadLimits(1000, 8L << 30, 1000, 1000, 1000));
       CommitState state = CommitState.restore(CommitState.EVENT_REGISTRY_FORMAT_VERSION, DIGEST,
           Optional.of("owner"), 3, Long.MAX_VALUE, 1, sequence, revision, sequence, revision,
-          Optional.empty(), compact, Optional.of(REGISTRY), Optional.empty(), 1);
+          Optional.empty(), compact, Optional.of(NAMESPACE), Optional.empty(), 1);
       CommitControlStore control = new CommitControlStore() {
         @Override public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope ignored) {
           return CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(state, new byte[] {1})));
@@ -97,7 +99,7 @@ class EventIndexBackfillPlannerTest {
     }
 
     private CompletableFuture<EventIndexBackfillCheckpoint> plan() {
-      return planner.plan(OWNER, REGISTRY, scope, budget());
+      return planner.plan(OWNER, NAMESPACE, REGISTRY, scope, budget());
     }
 
     @Override public void close() { scope.close(); }

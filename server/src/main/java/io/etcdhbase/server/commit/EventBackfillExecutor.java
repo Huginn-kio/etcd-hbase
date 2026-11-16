@@ -45,16 +45,17 @@ final class EventBackfillExecutor {
         || invocation.preparedOwnerEpoch() != owner.epoch()) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("backfill execution scope or owner differs"));
     }
-    return verifyOwner(invocation, owner, checkpoint, scope)
+    return verifyOwner(invocation, owner, checkpoint, window, scope)
         .thenCompose(ignored -> preparation.prepare(invocation, checkpoint,
             () -> window.checkPublication(checkpoint, owner.epoch(), checkpoint.sequence(), budget), scope, account))
         .thenCompose(sealed -> window.checkPublication(checkpoint, owner.epoch(), checkpoint.sequence(), budget)
-            .thenCompose(ignored -> verifyOwner(invocation, owner, checkpoint, scope))
+            .thenCompose(ignored -> verifyOwner(invocation, owner, checkpoint, window, scope))
             .thenCompose(ignored -> publisher.publish(sealed.invocation(), owner, sealed.manifest(), scope)));
   }
 
   private CompletableFuture<Void> verifyOwner(InvocationBinding invocation,
-      CommitOwnerService.OwnerToken owner, EventIndexBackfillCheckpoint checkpoint, RequestScope scope) {
+      CommitOwnerService.OwnerToken owner, EventIndexBackfillCheckpoint checkpoint,
+      EventBackfillWindow window, RequestScope scope) {
     if (scope.isClosed() || scope.isDeadlineExceeded()) {
       return CompletableFuture.failedFuture(new BackendFailure(scope.isDeadlineExceeded()
           ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED));
@@ -62,7 +63,9 @@ final class EventBackfillExecutor {
     return control.read(scope).thenAccept(found -> {
           var state = found.orElseThrow(() -> new IllegalStateException("backfill control row is missing")).state();
           if (!state.supportsEventRevisionIndex()
-              || state.eventRegistryNamespace().filter(checkpoint.registryIdentity()::equals).isEmpty()
+              || window.registryNamespace().isEmpty()
+              || !state.eventRegistryNamespace().equals(window.registryNamespace())
+              || !checkpoint.registryIdentity().equals(window.registryIdentity())
               || state.ownerEpoch() != owner.epoch()
               || state.ownerInstance().filter(owner.instance()::equals).isEmpty()
               || state.ownerLeaseExpired(clock.millis()) || state.publication().isPresent()

@@ -100,6 +100,7 @@ class SealedEventCursorTest {
       assertEquals(3, selection.owner().epoch());
       var reopened = EventHistoryPinManager.openSelected(records, control, configuration, clock, scope).join();
       assertEquals(selection.registry().registryIdentity(), reopened.registryIdentity());
+      assertEquals(control.state.eventRegistryNamespace(), reopened.namespace());
 
       byte[] losingBytes = control.state.eventRegistryNamespace().orElseThrow().bytes();
       losingBytes[0] ^= 1;

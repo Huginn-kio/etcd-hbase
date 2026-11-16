@@ -18,12 +18,13 @@ public final class EventIndexBackfillPlanner {
 
   /** The caller must still capture protection and publish the checkpoint on the owner lane. */
   public CompletableFuture<EventIndexBackfillCheckpoint> plan(CommitOwnerService.OwnerToken owner,
-      ByteKey registry, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+      ByteKey namespace, ByteKey registry, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
     Objects.requireNonNull(owner, "owner");
+    Objects.requireNonNull(namespace, "namespace");
     Objects.requireNonNull(registry, "registry");
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(budget, "budget");
-    if (registry.length() != 16 || !budget.belongsTo(scope)) {
+    if (namespace.length() != 16 || registry.length() != 16 || !budget.belongsTo(scope)) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid backfill planner scope or registry"));
     }
     return budget.read(ManifestCatalog.maximumProofReadPageBytes(), () -> control.read(scope))
@@ -31,7 +32,7 @@ public final class EventIndexBackfillPlanner {
           CommitState state = found.orElseThrow(() -> new IllegalStateException("backfill control row is missing")).state();
           if (state.ownerEpoch() != owner.epoch()
               || state.ownerInstance().filter(owner.instance()::equals).isEmpty()
-              || !state.eventRegistryNamespace().equals(Optional.of(registry))
+              || !state.eventRegistryNamespace().equals(Optional.of(namespace))
               || state.publication().isPresent() || state.publishedSequence() != state.finalizedSequence()
               || state.publishedSequence() == Long.MAX_VALUE) {
             throw new IllegalStateException("backfill capture requires a finalized owner barrier");

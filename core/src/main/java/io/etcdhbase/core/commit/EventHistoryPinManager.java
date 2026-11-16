@@ -11,31 +11,38 @@ import java.util.concurrent.CompletableFuture;
 /** Separate durable protection domain for event, index and decision history. */
 public final class EventHistoryPinManager {
   private final SnapshotPinManager registry;
+  private final Optional<ByteKey> namespace;
 
-  private EventHistoryPinManager(SnapshotPinManager registry) { this.registry = registry; }
+  private EventHistoryPinManager(SnapshotPinManager registry, Optional<ByteKey> namespace) {
+    this.registry = registry;
+    this.namespace = namespace;
+  }
 
   /** Identifies the immutable registry generation whose protections must be recovered. */
   public ByteKey registryIdentity() { return registry.registryIdentity(); }
+
+  /** Storage namespace, distinct from the registry's generated identity; staging is not selected yet. */
+  public Optional<ByteKey> namespace() { return namespace; }
 
   /** Initializes only after exclusive verification that the event registry is new. */
   public static CompletableFuture<EventHistoryPinManager> initializeFresh(SystemRecordStore records,
       SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
     return SnapshotPinManager.initializeFresh(new EventPinRecords(records), configuration, clock, scope)
-        .thenApply(EventHistoryPinManager::new);
+        .thenApply(registry -> new EventHistoryPinManager(registry, Optional.empty()));
   }
 
   /** Opens an existing registry; missing initialization and damaged shards fail closed. */
   public static CompletableFuture<EventHistoryPinManager> open(SystemRecordStore records,
       SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
     return SnapshotPinManager.open(new EventPinRecords(records), configuration, clock, scope)
-        .thenApply(EventHistoryPinManager::new);
+        .thenApply(registry -> new EventHistoryPinManager(registry, Optional.empty()));
   }
 
   /** A staging namespace belongs to one attempt and cannot be shared with another initializer. */
   static CompletableFuture<EventHistoryPinManager> stage(SystemRecordStore records, ByteKey namespace,
       SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
     return SnapshotPinManager.initializeFresh(new EventPinRecords(records, namespace), configuration, clock, scope)
-        .thenApply(EventHistoryPinManager::new);
+        .thenApply(registry -> new EventHistoryPinManager(registry, Optional.of(namespace)));
   }
 
   /** Opens only the namespace selected by the authoritative control row; never recreates it. */
@@ -53,7 +60,7 @@ public final class EventHistoryPinManager {
             if (!current.eventRegistryNamespace().equals(Optional.of(namespace))) {
               throw new IllegalStateException("event registry namespace changed during open");
             }
-            return new EventHistoryPinManager(registry);
+            return new EventHistoryPinManager(registry, Optional.of(namespace));
           }));
     });
   }

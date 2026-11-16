@@ -89,15 +89,29 @@ class EventBackfillExecutorTest {
   }
 
   @Test
-  void unselectedRegistryCannotProtectPublishedProgress() {
+  void mismatchedRegistryIdentityCannotProtectPublishedProgress() {
+    try (var fixture = new Fixture()) {
+      when(fixture.control.read(fixture.scope)).thenReturn(fixture.snapshot(fixture.state));
+      byte[] otherRegistry = new byte[16];
+      otherRegistry[0] = 2;
+      var checkpoint = new EventIndexBackfillCheckpoint(7, 1, 1, 0, 1, 1, 1, 1, 0,
+          ByteKey.copyOf(otherRegistry));
+      assertThrows(CompletionException.class, () -> fixture.executor.publish(fixture.invocation, fixture.owner,
+          checkpoint, fixture.window, fixture.scope, fixture.account, fixture.budget).join());
+      verify(fixture.preparation, never()).prepare(any(), any(), any(), any(), any());
+      verify(fixture.publisher, never()).publish(any(), any(), any(), any());
+    }
+  }
+
+  @Test
+  void unselectedNamespaceCannotProtectPublishedProgress() {
     try (var fixture = new Fixture()) {
       when(fixture.control.read(fixture.scope)).thenReturn(fixture.snapshot(fixture.state));
       byte[] otherNamespace = new byte[16];
       otherNamespace[0] = 1;
-      var checkpoint = new EventIndexBackfillCheckpoint(7, 1, 1, 0, 1, 1, 1, 1, 0,
-          ByteKey.copyOf(otherNamespace));
+      when(fixture.window.registryNamespace()).thenReturn(Optional.of(ByteKey.copyOf(otherNamespace)));
       assertThrows(CompletionException.class, () -> fixture.executor.publish(fixture.invocation, fixture.owner,
-          checkpoint, fixture.window, fixture.scope, fixture.account, fixture.budget).join());
+          fixture.checkpoint, fixture.window, fixture.scope, fixture.account, fixture.budget).join());
       verify(fixture.preparation, never()).prepare(any(), any(), any(), any(), any());
       verify(fixture.publisher, never()).publish(any(), any(), any(), any());
     }
@@ -106,6 +120,7 @@ class EventBackfillExecutorTest {
   private static final class Fixture implements AutoCloseable {
     private final ByteKey fingerprint = ByteKey.copyOf(new byte[32]);
     private final ByteKey namespace = ByteKey.copyOf(new byte[16]);
+    private final ByteKey registry = ByteKey.copyOf(new byte[] {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
     private final ByteKey rootIdentity = ByteKey.copyOf(new byte[] {1});
     private final RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
     private final BudgetManager.Account account = mock(BudgetManager.Account.class);
@@ -122,7 +137,7 @@ class EventBackfillExecutorTest {
         fingerprint, TransactionId.create(), 7, 0, 1);
     private final InvocationBinding sealed = invocation.seal(rootIdentity);
     private final EventIndexBackfillCheckpoint checkpoint = new EventIndexBackfillCheckpoint(7, 1, 1, 0,
-        1, 1, 1, 1, 0, namespace);
+        1, 1, 1, 1, 0, registry);
     private final ManifestRoot root = mock(ManifestRoot.class);
     private final ManifestCatalog.ProofReadBudget budget;
     private final CommitOutcomeResolver.Resolution finalized;
@@ -130,6 +145,8 @@ class EventBackfillExecutorTest {
 
     private Fixture() {
       when(account.belongsTo(scope)).thenReturn(true);
+      when(window.registryNamespace()).thenReturn(Optional.of(namespace));
+      when(window.registryIdentity()).thenReturn(checkpoint.registryIdentity());
       budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1L << 30);
       when(root.systemIdentity()).thenReturn(rootIdentity);
       var plan = new LeaseAuxiliaryMutationPreparation.Sealed(sealed, root);

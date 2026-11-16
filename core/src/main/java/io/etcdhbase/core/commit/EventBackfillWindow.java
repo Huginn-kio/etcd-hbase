@@ -13,13 +13,15 @@ public final class EventBackfillWindow implements AutoCloseable {
   private final ProtectedEventCursor pin;
   private final CommitControlStore control;
   private final RequestScope scope;
+  private final Optional<ByteKey> registryNamespace;
 
   private EventBackfillWindow(EventIndexBackfillCheckpoint captured, ProtectedEventCursor pin,
-      CommitControlStore control, RequestScope scope) {
+      CommitControlStore control, RequestScope scope, Optional<ByteKey> registryNamespace) {
     this.captured = captured;
     this.pin = pin;
     this.control = control;
     this.scope = scope;
+    this.registryNamespace = registryNamespace;
   }
 
   /** The checkpoint must first be resolved from a selected M2 auxiliary version. */
@@ -65,7 +67,7 @@ public final class EventBackfillWindow implements AutoCloseable {
         return;
       }
       var pin = new ProtectedEventCursor(registered, scope);
-      var window = new EventBackfillWindow(checkpoint, pin, control, scope);
+      var window = new EventBackfillWindow(checkpoint, pin, control, scope, pins.namespace());
       if (output.isDone()) {
         window.close();
         return;
@@ -121,6 +123,7 @@ public final class EventBackfillWindow implements AutoCloseable {
           && state.finalizedSequence() == checkpoint.sequence() - 1
           && state.publishedSequence() == state.finalizedSequence();
       if (!state.supportsEventRevisionIndex() || state.compactRevision() != captured.compactRevision()
+          || registryNamespace.isPresent() && !registryNamespace.equals(state.eventRegistryNamespace())
           // A proposed checkpoint belongs to the next commit. The captured checkpoint, not the
           // proposal, is the durable baseline that must already have been finalized.
           || state.finalizedSequence() < captured.sequence() && !initialSelection
@@ -143,6 +146,8 @@ public final class EventBackfillWindow implements AutoCloseable {
   }
 
   public CompletionStage<Void> releaseCompletion() { return pin.releaseCompletion(); }
+  public Optional<ByteKey> registryNamespace() { return registryNamespace; }
+  public ByteKey registryIdentity() { return captured.registryIdentity(); }
   @Override public void close() { pin.close(); }
   private record Fence(long epoch, long sequence) {}
 }
