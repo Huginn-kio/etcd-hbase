@@ -7,6 +7,7 @@ import io.etcdhbase.server.config.M3RuntimeConfigurationLoader;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfigurationLoader;
 import io.etcdhbase.server.config.RuntimeConfigurationValidator;
+import io.etcdhbase.server.commit.M3TableGroupRuntime;
 import io.etcdhbase.server.observability.RequestMetrics;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -130,6 +131,11 @@ public final class RuntimeServer implements AutoCloseable {
 
   /** Current local activation state; a bound protocol skeleton alone is never data-ready. */
   public boolean dataReady() { return !closed.get() && groups != null && groups.isReady(); }
+
+  M3TableGroupRuntime tableGroupRuntime(String tableGroupId) {
+    if (groups == null) throw new IllegalStateException("M3 runtime is not active");
+    return groups.runtime(tableGroupId);
+  }
 
   public void awaitTermination() throws InterruptedException {
     listeners.getFirst().awaitTermination();

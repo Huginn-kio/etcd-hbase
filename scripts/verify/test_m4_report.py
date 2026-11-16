@@ -120,6 +120,57 @@ class M4ReportTest(unittest.TestCase):
         with self.assertRaisesRegex(m4_report.ReportError, "not registered"):
             m4_report.validate_all_tasks_registered(self.registry)
 
+    def test_j44_registry_requires_tailer_backfill_and_layout_regressions(self) -> None:
+        missing_suite = copy.deepcopy(self.registry)
+        task = next(item for item in missing_suite["tasks"] if item["id"] == "J44")
+        task["maven_tests"] = [
+            suite for suite in task["maven_tests"]
+            if suite["class"] != "io.etcdhbase.hbase.storage.J44EventPinIT"
+        ]
+        with self.assertRaisesRegex(m4_report.ReportError, "suites are incomplete"):
+            m4_report.validate_registry_document(missing_suite)
+
+        missing_fairness = copy.deepcopy(self.registry)
+        task = next(item for item in missing_fairness["tasks"] if item["id"] == "J44")
+        suite = next(item for item in task["maven_tests"]
+                     if item["class"] == "io.etcdhbase.server.commit.SerialMutationQueueTest")
+        suite["tests"].remove("backgroundWorkHasReservedCapacityAndRoundRobinsWithOtherLanes")
+        with self.assertRaisesRegex(m4_report.ReportError, "fairness"):
+            m4_report.validate_registry_document(missing_fairness)
+
+    def test_complete_j44_minicluster_artifact_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            task = next(item for item in self.registry["tasks"] if item["id"] == "J44")
+            run_id = artifact.name
+            source_commit = "a" * 40
+            base_commit = "b" * 40
+            command_names = sorted(m4_report.J44_REQUIRED_COMMANDS)
+            commands = []
+            for name in command_names:
+                output = f"{name}.log"
+                error = f"{name}.stderr"
+                (artifact / output).write_text("completed\n", encoding="utf-8")
+                (artifact / error).write_text("", encoding="utf-8")
+                commands.append({
+                    "name": name,
+                    "argv": ["verification", name],
+                    "exit_code": 0,
+                    "started_at": "2026-11-14T00:00:00Z",
+                    "finished_at": "2026-11-14T00:00:01Z",
+                    "stdout_log": output,
+                    "stderr_log": error,
+                })
+            self._write_run_manifest(artifact, "J44", run_id, source_commit, base_commit, commands)
+            self._write_maven_test_reports(artifact, task)
+
+            summary = m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+            self.assertEqual("J44", summary["task"])
+            self.assertEqual("real-HBase-MiniCluster-event-and-layout-tests", summary["evidence"])
+            self.assertEqual(0, summary["go_test_count"])
+            self.assertGreater(summary["java_test_count"], 0)
+
     def test_complete_j40_artifact_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)

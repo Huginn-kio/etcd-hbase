@@ -13,6 +13,7 @@ public final class SelectedSequenceReader {
   private final SelectedDecisionReader decisions;
   private final ManifestRepository manifests;
   private final EventRevisionIndexRepository indexes;
+  private volatile long observedPublishedSequence;
 
   public SelectedSequenceReader(EventHistoryPinManager pins, CommitControlStore control,
       CommitDecisionRepository decisions, ManifestRepository manifests,
@@ -46,6 +47,15 @@ public final class SelectedSequenceReader {
   public CompletableFuture<Optional<Selected>> open(long sequence, long baseRevision,
       ByteKey authorizationDigest, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
     return open(sequence, baseRevision, authorizationDigest, scope, budget, Optional.empty());
+  }
+
+  /** Latest selected sequence observed by this reader; it is a lag watermark, not a read barrier. */
+  public long observedPublishedSequence() { return observedPublishedSequence; }
+
+  /** Seeds the lag watermark from the pinned barrier used to create a tailer. */
+  public void observePublishedSequence(long sequence) {
+    if (sequence < 0) throw new IllegalArgumentException("published sequence must not be negative");
+    observedPublishedSequence = Math.max(observedPublishedSequence, sequence);
   }
 
   /** Reads one captured legacy sequence; the caller must authenticate the persisted checkpoint. */
@@ -175,8 +185,12 @@ public final class SelectedSequenceReader {
 
   private CompletableFuture<CommitState> readControl(RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
     return budget.read(ManifestCatalog.maximumProofReadPageBytes(), () -> control.read(scope))
-        .thenApply(snapshot -> snapshot.orElseThrow(
-            () -> new IllegalStateException("authoritative commit control is missing")).state());
+        .thenApply(snapshot -> {
+          CommitState state = snapshot.orElseThrow(
+              () -> new IllegalStateException("authoritative commit control is missing")).state();
+          observePublishedSequence(state.publishedSequence());
+          return state;
+        });
   }
 
   private static void validateControl(CommitState state, long baseRevision,

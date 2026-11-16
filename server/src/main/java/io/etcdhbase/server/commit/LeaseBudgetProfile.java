@@ -22,6 +22,13 @@ public final class LeaseBudgetProfile {
   // The protected window and the nested legacy reader each own a separate scope and account.
   static final BudgetManager.Reservation EVENT_BACKFILL_MEMORY = new BudgetManager.Reservation(
       8192, 8192, 2 * ManifestCatalog.maximumProofReadPageBytes(), 8192, 2L << 20);
+  static final long EVENT_TAILER_MAX_REVISION_BYTES = 16L << 20;
+  static final BudgetManager.Reservation EVENT_TAILER_MEMORY = new BudgetManager.Reservation(
+      8192, 8192, 1, EVENT_TAILER_MAX_REVISION_BYTES, 0);
+  static final BudgetManager.Reservation EVENT_TAILER_READ_MEMORY = new BudgetManager.Reservation(
+      8192, 8192, ManifestCatalog.maximumProofReadPageBytes(), 8192, 0);
+  static final BudgetManager.ReadLimits EVENT_TAILER_READ_LIMITS =
+      new BudgetManager.ReadLimits(1_000_000, 512L << 20, 4096, 512, 4096);
   public static final BudgetManager.ReadLimits EXPIRY_WORKER_READ_LIMITS =
       new BudgetManager.ReadLimits(16, 1L << 20, 4, 4, 16);
   static final BudgetManager.Work EXPIRY_CONTROL_READ_WORK =
@@ -38,6 +45,11 @@ public final class LeaseBudgetProfile {
   /** Reserved memory for the nested window and step accounts of one backfill cycle. */
   public static long eventBackfillMinimumMemory() {
     return Math.multiplyExact(2, EVENT_BACKFILL_MEMORY.total());
+  }
+
+  /** A live tailer retains one bounded event revision while a separate account performs its read. */
+  public static long eventTailerMinimumMemory() {
+    return Math.addExact(EVENT_TAILER_MEMORY.total(), EVENT_TAILER_READ_MEMORY.total());
   }
 
   /** One sequential startup scan verifies that existing Lease records fit the configured limits. */
@@ -60,8 +72,9 @@ public final class LeaseBudgetProfile {
     // HISTORY Revoke peaks at 3 operations / 2 scanners / 3 cleanup leases. A checkpoint scan
     // can overlap it and adds 1 / 1 / 1; the preceding control Get is sequential.
     long leaseMemory = Math.addExact(leaseRequest.total(), EXPIRY_WORKER_MEMORY.total());
+    long eventMemory = Math.max(eventBackfillMinimumMemory(), eventTailerMinimumMemory());
     return new BudgetManager.ReservedCapacity(4, 0, 4, 3, 4, 0,
-        Math.addExact(leaseMemory, eventBackfillMinimumMemory()));
+        Math.addExact(leaseMemory, eventMemory));
   }
 
   public static BudgetManager.ReservedCapacity capacityForGroups(

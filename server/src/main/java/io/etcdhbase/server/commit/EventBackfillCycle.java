@@ -40,6 +40,8 @@ final class EventBackfillCycle {
       new BudgetManager.ReadLimits(MAX_PROOF_PAGES, MAX_PROOF_BYTES, MAX_PROOF_PAGES,
           MAX_PROOF_PAGES, MAX_PROOF_PAGES);
 
+  record CycleResult(boolean progressed, boolean complete) {}
+
   private final String tableGroup;
   private final TableGroupStores stores;
   private final EventHistoryPinManager pins;
@@ -65,15 +67,15 @@ final class EventBackfillCycle {
     }
   }
 
-  /** True means the entire captured legacy window is durably finalized. */
-  CompletableFuture<Boolean> run(CommitOwnerService.OwnerToken owner, RequestScope scope) {
+  /** Reports whether this invocation advanced the durable checkpoint and whether the window is complete. */
+  CompletableFuture<CycleResult> run(CommitOwnerService.OwnerToken owner, RequestScope scope) {
     Objects.requireNonNull(owner, "owner");
     Objects.requireNonNull(scope, "scope");
     var drained = new CompletableFuture<Void>();
     if (!scope.startIfOpen(() -> scope.trackPhysicalProducer(drained))) {
       return CompletableFuture.failedFuture(inactive(scope));
     }
-    var result = new CompletableFuture<Boolean>();
+    var result = new CompletableFuture<CycleResult>();
     try {
       Thread.ofVirtual().name("event-backfill-cycle").start(() -> {
         try {
@@ -93,7 +95,7 @@ final class EventBackfillCycle {
     return result.copy();
   }
 
-  private boolean execute(CommitOwnerService.OwnerToken owner, RequestScope parent) throws Exception {
+  private CycleResult execute(CommitOwnerService.OwnerToken owner, RequestScope parent) throws Exception {
     Optional<EventIndexBackfillCheckpoint> current = readCheckpoint(parent);
     try (Child windowScope = new Child(parent)) {
       var account = budgets.admitReserved(tableGroup, windowScope.scope, RESERVATION, READ_LIMITS);
@@ -106,7 +108,7 @@ final class EventBackfillCycle {
             || !pins.namespace().equals(state.eventRegistryNamespace())) {
           throw new IllegalStateException("backfill checkpoint is not finalized in the selected registry");
         }
-        if (previous.complete()) return true;
+        if (previous.complete()) return new CycleResult(false, true);
       }
       EventIndexBackfillCheckpoint checkpoint;
       EventBackfillWindow window;
@@ -124,7 +126,7 @@ final class EventBackfillCycle {
         EventIndexBackfillCheckpoint proposal = current.isEmpty() ? checkpoint
             : verifyNext(owner, state, checkpoint, window, windowScope.scope, budget);
         publish(owner, state, proposal, window, windowScope.scope, account, budget);
-        return proposal.complete();
+        return new CycleResult(true, proposal.complete());
       } finally {
         window.releaseCompletion().toCompletableFuture().join();
       }

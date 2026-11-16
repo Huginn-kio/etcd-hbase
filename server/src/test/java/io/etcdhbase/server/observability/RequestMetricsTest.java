@@ -87,6 +87,41 @@ class RequestMetricsTest {
   }
 
   @Test
+  void recordsBoundedEventTailerCostAndLagWithoutKeyDimensions() {
+    var metrics = new RequestMetrics();
+    metrics.recordEventTailerCycle(true, 2, 113,
+        new RequestScope.StorageCostSnapshot(7, 251), 18, 9, 21, 3);
+    metrics.recordEventTailerCycle(false, 0, 0,
+        new RequestScope.StorageCostSnapshot(1, 32), 18, 9, 21, 2);
+    metrics.recordEventTailerFailure(io.etcdhbase.core.error.BackendFailure.Category.RESOURCE_LIMIT);
+
+    var snapshot = metrics.eventTailer();
+    assertEquals(2, snapshot.cycles());
+    assertEquals(1, snapshot.progressCycles());
+    assertEquals(1, snapshot.idleCycles());
+    assertEquals(1, snapshot.failures());
+    assertEquals(1, snapshot.resourceFailures());
+    assertEquals(1, snapshot.sequences());
+    assertEquals(2, snapshot.events());
+    assertEquals(113, snapshot.eventBytes());
+    assertEquals(8, snapshot.hbaseClientOperations());
+    assertEquals(283, snapshot.logicalRequestPayloadBytes());
+    assertEquals(18, snapshot.sequence());
+    assertEquals(9, snapshot.revision());
+    assertEquals(21, snapshot.observedPublishedSequence());
+    assertEquals(3, snapshot.sequenceLag());
+    assertEquals(2, snapshot.subscriptions());
+  }
+
+  @Test
+  void recordsBoundedEventHistoryFailures() {
+    var metrics = new RequestMetrics();
+    metrics.recordEventHistoryFailure(io.etcdhbase.core.error.BackendFailure.Category.RESOURCE_LIMIT);
+    metrics.recordEventHistoryFailure(io.etcdhbase.core.error.BackendFailure.Category.UNAVAILABLE);
+    assertEquals(new RequestMetrics.EventHistoryFailureSnapshot(2, 1), metrics.eventHistoryFailures());
+  }
+
+  @Test
   void countsOnlyBoundedMethodAndOutcomeDimensions() {
     RequestMetrics metrics = new RequestMetrics();
     RequestScope scope = RequestScope.withoutDeadline();

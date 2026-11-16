@@ -36,6 +36,8 @@ public final class SharedEventTailer implements AutoCloseable {
   private long sequence;
   private long revision;
   private long bufferedBytes;
+  private int lastPublishedEventCount;
+  private long lastPublishedEventBytes;
   private ProtectedEventCursor active;
   private RequestScope activeScope;
   private CommitDecision activeDecision;
@@ -64,6 +66,11 @@ public final class SharedEventTailer implements AutoCloseable {
 
   public synchronized long completedSequence() { return sequence; }
   public synchronized long completedRevision() { return revision; }
+  public synchronized boolean isClosed() { return closed; }
+  public synchronized int subscriptionCount() { return subscriptions.size(); }
+  public synchronized int lastPublishedEventCount() { return lastPublishedEventCount; }
+  public synchronized long lastPublishedEventBytes() { return lastPublishedEventBytes; }
+  public long observedPublishedSequence() { return source.observedPublishedSequence(); }
 
   /** The caller authorizes the range and arranges any history replay before live delivery. */
   public synchronized Subscription subscribe(KeyRange range, BudgetManager.Account account,
@@ -191,6 +198,8 @@ public final class SharedEventTailer implements AutoCloseable {
     }
     sequence = activeDecision.sequence();
     revision = activeDecision.revision();
+    lastPublishedEventCount = buffered.size();
+    lastPublishedEventBytes = bufferedBytes;
     releaseBuffered();
     active = null;
     activeScope = null;

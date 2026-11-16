@@ -32,6 +32,78 @@ J41_COMPARE_SUCCESS = "M4 Lease binding traces match the registered native compa
 J42_COMPARE_SUCCESS = "M4 KeepAlive traces match the registered native comparison policy"
 J43_COMPARE_SUCCESS = "M4 Revoke traces match the registered native comparison policy"
 REQUIRED_COMMANDS = {"go-module-lock", "go-tests", "maven-verify", "collect-maven-reports"}
+J44_REQUIRED_COMMANDS = {"registry-check", "report-tests", "maven-verify", "collect-maven-reports"}
+
+J44_JAVA_CLASS_MODULES = {
+    "io.etcdhbase.core.commit.EventRevisionIndexSeekerTest": "core",
+    "io.etcdhbase.core.commit.EventSubscriptionIndexTest": "core",
+    "io.etcdhbase.core.commit.SealedEventCursorTest": "core",
+    "io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepositoryTest": "hbase",
+    "io.etcdhbase.hbase.storage.J44EventIndexControlStoreIT": "hbase",
+    "io.etcdhbase.hbase.storage.J44EventPinIT": "hbase",
+    "io.etcdhbase.server.commit.EventBackfillCycleBudgetTest": "server",
+    "io.etcdhbase.server.commit.EventBackfillExecutorTest": "server",
+    "io.etcdhbase.server.commit.EventBackfillPublicationIT": "server",
+    "io.etcdhbase.server.commit.EventHistoryWorkerTest": "server",
+    "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest": "server",
+    "io.etcdhbase.server.commit.SerialMutationQueueTest": "server",
+    "io.etcdhbase.server.observability.RequestMetricsTest": "server",
+    "io.etcdhbase.server.M4LeaseRpcIT": "server",
+}
+J44_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.core.commit.EventRevisionIndexSeekerTest": {
+        "mergesBucketsAcrossBoundedStepsWithoutTreatingPartialResultsAsComplete",
+    },
+    "io.etcdhbase.core.commit.EventSubscriptionIndexTest": {
+        "matchesRawPointsAndHalfOpenRangesAndRemovesSubscriptions",
+    },
+    "io.etcdhbase.core.commit.SealedEventCursorTest": {
+        "readsEventsInOrderWithPauseAndBoundedPageReads",
+        "missingPageAndExhaustedBudgetFailWithoutAdvancingCursor",
+        "sharedTailerReadsOnceAndIsolatesSlowSubscriptions",
+        "sharedTailerDeliversOnlyMatchingPointAndRangeSubscriptions",
+    },
+    "io.etcdhbase.hbase.storage.J44EventIndexControlStoreIT": {
+        "requiresDescriptorAndReopenedStoreForFencedControlUpgrade",
+    },
+    "io.etcdhbase.hbase.storage.J44EventPinIT": {
+        "eventPinSurvivesReopenAndStopsPhysicalCollectionUntilReleased",
+    },
+    "io.etcdhbase.server.commit.EventBackfillCycleBudgetTest": {
+        "cycleFailsClosedWhenItsReservedAccountCannotBeAdmitted",
+    },
+    "io.etcdhbase.server.commit.EventBackfillExecutorTest": {
+        "rechecksOwnerAndProtectionBeforePublishingTheSealedCheckpoint",
+        "takeoverAfterSealingPreventsPublication",
+        "cancellationBeforePreparationPreventsPublication",
+    },
+    "io.etcdhbase.server.commit.EventBackfillPublicationIT": {
+        "resumesBackfillCycleAfterReopeningBothLayouts",
+        "publishesAndReopensLegacyBackfillOnBothLayouts",
+    },
+    "io.etcdhbase.server.commit.EventHistoryWorkerTest": {
+        "retriesResourceLimitAndOnlyCompletesAfterSuccessfulProgress",
+        "stopCancelsActiveCycleAndWaitsForLaneCleanup",
+        "rejectedSchedulingStopsAndReportsTheFailure",
+    },
+    "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest": {
+        "ownerLossBetweenWorkerInstallationsStopsExistingWorkerAndRejectsLateWorker",
+        "ownerLossBeforeInstallationRejectsBothWorkers",
+    },
+    "io.etcdhbase.server.observability.RequestMetricsTest": {
+        "recordsBoundedEventTailerCostAndLagWithoutKeyDimensions",
+        "recordsBoundedEventHistoryFailures",
+    },
+    "io.etcdhbase.server.commit.SerialMutationQueueTest": {
+        "backgroundWorkHasReservedCapacityAndRoundRobinsWithOtherLanes",
+        "backgroundAdmissionCancellationAndCloseReleaseOnlyItsOwnBudget",
+        "dispatchedCancellationDoesNotReleaseLaneUntilProducerDrains",
+    },
+    "io.etcdhbase.server.M4LeaseRpcIT": {
+        "runtimeFencesEventIndexFormatAndPersistsSelectedPutAcrossLayouts",
+        "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts",
+    },
+}
 
 J40_TRACE_CASES = (
     ("native-baseline", "etcdserverpb.Lease/LeaseLeases"),
@@ -560,10 +632,19 @@ def validate_registry_document(document: object) -> dict[str, object]:
     j43 = task_map.get("J43")
     if j43 is not None:
         _validate_j43_registration(j43)
+    j44 = task_map.get("J44")
+    if j44 is not None:
+        _validate_j44_registration(j44)
     return document
 
 
 def _validate_task_shape(task: dict[str, object]) -> None:
+    if task.get("id") == "J44":
+        if (task.get("kind") != "event-storage"
+                or not isinstance(task.get("maven_tests"), list)
+                or not task["maven_tests"]):
+            raise ReportError("J44 must register its event-storage integration suites")
+        return
     if not isinstance(task.get("api_ids"), list) or not task["api_ids"]:
         raise ReportError("registered M4 task must identify API coverage")
     if not isinstance(task.get("scenario"), str) or not task["scenario"]:
@@ -865,6 +946,37 @@ def _validate_j43_registration(task: dict[str, object]) -> None:
         raise ReportError("J43 comparison log registration changed")
 
 
+def _validate_j44_registration(task: dict[str, object]) -> None:
+    if task.get("kind") != "event-storage" or task.get("id") != "J44":
+        raise ReportError("J44 event-storage registration changed")
+    java_classes: set[str] = set()
+    java_methods: dict[str, set[str]] = {}
+    java_modules: dict[str, str] = {}
+    for suite in task["maven_tests"]:
+        if not isinstance(suite, dict):
+            raise ReportError("J44 Maven test registration is malformed")
+        module, kind, class_name, tests = (
+            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
+        )
+        if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
+            raise ReportError("J44 Maven suite has an invalid module, kind, or class")
+        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
+            raise ReportError("J44 Maven suite has no named required tests")
+        java_classes.add(class_name)
+        previous_module = java_modules.setdefault(class_name, module)
+        if previous_module != module:
+            raise ReportError("J44 Maven suite is registered in multiple modules")
+        java_methods.setdefault(class_name, set()).update(tests)
+    if java_classes != set(J44_JAVA_CLASS_MODULES):
+        raise ReportError("J44 cursor, pin, backfill, shared tailer, and MiniCluster suites are incomplete")
+    if any(java_modules.get(class_name) != module
+           for class_name, module in J44_JAVA_CLASS_MODULES.items()):
+        raise ReportError("J44 Java suites must be collected from their declared modules")
+    if any(not methods.issubset(java_methods.get(class_name, set()))
+           for class_name, methods in J44_CRITICAL_JAVA_TESTS.items()):
+        raise ReportError("J44 event cursor, backfill, fairness, or layout regression coverage is incomplete")
+
+
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, object]:
     return validate_registry_document(read_json(path))
 
@@ -915,7 +1027,7 @@ def validate_repository_binding(repository: Path, run: dict[str, object]) -> Non
         raise ReportError("clean M4 evidence no longer has a clean source tree")
 
 
-def _validate_commands(artifact: Path, run: dict[str, object]) -> None:
+def _validate_commands(artifact: Path, run: dict[str, object], task: dict[str, object]) -> None:
     commands = run.get("commands")
     if not isinstance(commands, list) or not commands:
         raise ReportError("M4 run has no command evidence")
@@ -946,8 +1058,9 @@ def _validate_commands(artifact: Path, run: dict[str, object]) -> None:
                 raise ReportError("M4 command log path escapes its artifact directory") from error
             if not log_path.is_file() or log_path.is_symlink():
                 raise ReportError(f"M4 command log for {name} is missing or unsafe")
-    if not REQUIRED_COMMANDS.issubset(names):
-        raise ReportError("M4 run is missing a required Go, Maven, or evidence collection command")
+    required = J44_REQUIRED_COMMANDS if task.get("id") == "J44" else REQUIRED_COMMANDS
+    if not required.issubset(names):
+        raise ReportError("M4 run is missing a required task verification command")
 
 
 def _validate_go_tests(artifact: Path, task: dict[str, object]) -> int:
@@ -1806,10 +1919,21 @@ def _validate_j29_4_expiry(value: object) -> None:
 
 def validate_artifact(repository: Path, artifact: Path, registry: dict[str, object]) -> dict[str, object]:
     run, task = _load_run_and_task(artifact, registry)
-    evidence_root = _task_artifact_root(artifact, task)
-    _validate_commands(artifact, run)
-    go_test_count = _validate_go_tests(artifact, task)
+    _validate_commands(artifact, run, task)
     java_test_count = _validate_java_tests(artifact, task)
+    if task.get("id") == "J44":
+        return {
+            "task": run["tasks"][0],
+            "run_id": run["run_id"],
+            "source_commit": run["source_commit"],
+            "base_commit": run["base_commit"],
+            "evidence_class": "official-clean" if run["worktree_clean"] else "development-dirty",
+            "go_test_count": 0,
+            "java_test_count": java_test_count,
+            "evidence": "real-HBase-MiniCluster-event-and-layout-tests",
+        }
+    evidence_root = _task_artifact_root(artifact, task)
+    go_test_count = _validate_go_tests(artifact, task)
     run_id = run["run_id"]
     source_commit = run["source_commit"]
     suite_hash, prefix_hash = _scenario_hashes(repository, task, run_id)

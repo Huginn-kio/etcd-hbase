@@ -471,5 +471,24 @@
         </plugins>
       </build>
     </profile>
+    <profile>
+      <id>m4-j44-public</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <failIfNoTests>true</failIfNoTests>
+              <includes combine.self="override">
+                <include>**/J44EventIndexControlStoreIT.java</include>
+                <include>**/J44EventPinIT.java</include>
+              </includes>
+              <forkedProcessTimeoutInSeconds>1200</forkedProcessTimeoutInSeconds>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
   </profiles>
 </project>

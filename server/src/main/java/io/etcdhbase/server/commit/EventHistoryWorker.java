@@ -16,18 +16,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
-/** Schedules one owner-fenced backfill step at a time on the mutation lane. */
-final class EventBackfillWorker {
+/** Schedules one bounded backfill or live-tail step at a time on the owner mutation lane. */
+final class EventHistoryWorker {
   enum State { WAITING, RUNNING, COMPLETE, RETRYING, STOPPED }
 
+  record CycleResult(boolean progressed, boolean finished) {}
+
   private static final long PROGRESS_DELAY_MILLIS = 20;
+  private static final long IDLE_DELAY_MILLIS = 250;
   private static final long RETRY_DELAY_MILLIS = 1000;
-  private static final Executor CLEANUP = task -> Thread.ofVirtual().name("event-backfill-cleanup").start(task);
+  private static final Executor CLEANUP = task -> Thread.ofVirtual().name("event-history-cleanup").start(task);
   private final Object lock = new Object();
   private final SerialMutationQueue lane;
   private final ScheduledExecutorService timer;
   private final Supplier<Optional<CommitOwnerService.OwnerToken>> owner;
-  private final BiFunction<CommitOwnerService.OwnerToken, RequestScope, CompletableFuture<Boolean>> cycle;
+  private final BiFunction<Optional<CommitOwnerService.OwnerToken>, RequestScope,
+      CompletableFuture<CycleResult>> cycle;
   private final RequestMetrics metrics;
   private final CompletableFuture<Void> drained = new CompletableFuture<>();
   private final CompletableFuture<Void> complete = new CompletableFuture<>();
@@ -40,9 +44,10 @@ final class EventBackfillWorker {
   private boolean running;
   private boolean outstanding;
 
-  EventBackfillWorker(SerialMutationQueue lane, ScheduledExecutorService timer,
+  EventHistoryWorker(SerialMutationQueue lane, ScheduledExecutorService timer,
       Supplier<Optional<CommitOwnerService.OwnerToken>> owner,
-      BiFunction<CommitOwnerService.OwnerToken, RequestScope, CompletableFuture<Boolean>> cycle,
+      BiFunction<Optional<CommitOwnerService.OwnerToken>, RequestScope,
+          CompletableFuture<CycleResult>> cycle,
       RequestMetrics metrics) {
     this.lane = Objects.requireNonNull(lane, "lane");
     this.timer = Objects.requireNonNull(timer, "timer");
@@ -53,7 +58,7 @@ final class EventBackfillWorker {
 
   void start() {
     synchronized (lock) {
-      if (started) throw new IllegalStateException("backfill worker already started");
+      if (started) throw new IllegalStateException("event history worker already started");
       started = true;
       running = true;
       schedule(0);
@@ -77,7 +82,7 @@ final class EventBackfillWorker {
       cancel = service == null ? waiter : service;
       idle = !outstanding;
     }
-    complete.completeExceptionally(new CancellationException("backfill worker stopped"));
+    complete.completeExceptionally(new CancellationException("event history worker stopped"));
     if (idle) drained.complete(null);
     if (cancel != null) cancel.cancelAsync(CLEANUP);
   }
@@ -90,7 +95,7 @@ final class EventBackfillWorker {
       running = false;
       state = State.STOPPED;
       lastFailure = Optional.of(BackendFailure.Category.UNAVAILABLE);
-      metrics.recordEventBackfillFailure(BackendFailure.Category.UNAVAILABLE);
+      metrics.recordEventHistoryFailure(BackendFailure.Category.UNAVAILABLE);
       complete.completeExceptionally(failure);
       drained.completeExceptionally(failure);
     }
@@ -107,27 +112,23 @@ final class EventBackfillWorker {
       waiter = request;
     }
     try {
-      CompletableFuture<Boolean> result = lane.submitReserved(1, request, this::runOnLane);
-      result.whenComplete((complete, failure) -> finish(request, complete, failure));
+      CompletableFuture<CycleResult> result = lane.submitBackground(request, this::runOnLane);
+      result.whenComplete((cycleResult, failure) -> finish(request, cycleResult, failure));
     } catch (RuntimeException | Error failure) {
       finish(request, null, failure);
       if (failure instanceof Error fatal) throw fatal;
     }
   }
 
-  private CompletableFuture<Boolean> runOnLane(RequestScope scope) {
+  private CompletableFuture<CycleResult> runOnLane(RequestScope scope) {
     synchronized (lock) {
       if (!running) return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.CANCELLED));
       service = scope;
     }
-    Optional<CommitOwnerService.OwnerToken> current = owner.get();
-    if (current.isEmpty()) {
-      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-    }
-    return Objects.requireNonNull(cycle.apply(current.orElseThrow(), scope), "backfill cycle future");
+    return Objects.requireNonNull(cycle.apply(owner.get(), scope), "event history cycle future");
   }
 
-  private void finish(RequestScope request, Boolean complete, Throwable failure) {
+  private void finish(RequestScope request, CycleResult result, Throwable failure) {
     request.close();
     boolean stopped = false;
     boolean finished = false;
@@ -141,22 +142,20 @@ final class EventBackfillWorker {
         Throwable cause = CompletionFailures.unwrapCompletion(failure);
         lastFailure = Optional.of(cause instanceof BackendFailure backend
             ? backend.category() : BackendFailure.Category.UNKNOWN);
-        metrics.recordEventBackfillFailure(lastFailure.orElseThrow());
+        metrics.recordEventHistoryFailure(lastFailure.orElseThrow());
         state = State.RETRYING;
         schedule(RETRY_DELAY_MILLIS);
-      } else if (Boolean.TRUE.equals(complete)) {
+      } else if (result.finished()) {
         lastFailure = Optional.empty();
-        metrics.recordEventBackfillStep(true);
         state = State.COMPLETE;
         finished = true;
       } else {
         lastFailure = Optional.empty();
-        metrics.recordEventBackfillStep(false);
         state = State.WAITING;
-        schedule(PROGRESS_DELAY_MILLIS);
+        schedule(result.progressed() ? PROGRESS_DELAY_MILLIS : IDLE_DELAY_MILLIS);
       }
     }
     if (stopped) drained.complete(null);
-    if (finished) this.complete.complete(null);
+    if (finished) complete.complete(null);
   }
 }

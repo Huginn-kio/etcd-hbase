@@ -258,6 +258,120 @@ class SerialMutationQueueTest {
   }
 
   @Test
+  void backgroundWorkHasReservedCapacityAndRoundRobinsWithOtherLanes() throws Exception {
+    var queue = new SerialMutationQueue(2, 100, 1, 100, Duration.ofSeconds(10));
+    var activeScope = RequestScope.withoutDeadline();
+    var regularScope = RequestScope.withoutDeadline();
+    var reservedScope = RequestScope.withoutDeadline();
+    var backgroundScope = RequestScope.withoutDeadline();
+    var activeWork = new CompletableFuture<String>();
+    var reservedWork = new CompletableFuture<String>();
+    var backgroundWork = new CompletableFuture<String>();
+    var order = java.util.Collections.synchronizedList(new ArrayList<String>());
+    var activeStarted = new CountDownLatch(1);
+    var reservedStarted = new CountDownLatch(1);
+    var backgroundStarted = new CountDownLatch(1);
+    var regularStarted = new CountDownLatch(1);
+    try {
+      var active = queue.submit(10, activeScope, ignored -> {
+        order.add("active");
+        activeStarted.countDown();
+        return activeWork;
+      });
+      assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
+      var regular = queue.submit(10, regularScope, ignored -> {
+        order.add("regular");
+        regularStarted.countDown();
+        return CompletableFuture.completedFuture("regular");
+      });
+      var reserved = queue.submitReserved(10, reservedScope, ignored -> {
+        order.add("reserved");
+        reservedStarted.countDown();
+        return reservedWork;
+      });
+      var background = queue.submitBackground(backgroundScope, ignored -> {
+        order.add("background");
+        backgroundStarted.countDown();
+        return backgroundWork;
+      });
+
+      assertEquals(3, queue.snapshot().waiting());
+      assertEquals(31, queue.snapshot().retainedBytes());
+      activeWork.complete("active");
+      assertEquals("active", active.get(5, TimeUnit.SECONDS));
+      assertTrue(reservedStarted.await(5, TimeUnit.SECONDS));
+      reservedWork.complete("reserved");
+      assertEquals("reserved", reserved.get(5, TimeUnit.SECONDS));
+      assertTrue(backgroundStarted.await(5, TimeUnit.SECONDS));
+      backgroundWork.complete("background");
+      assertEquals("background", background.get(5, TimeUnit.SECONDS));
+      assertTrue(regularStarted.await(5, TimeUnit.SECONDS));
+      assertEquals("regular", regular.get(5, TimeUnit.SECONDS));
+      assertEquals(List.of("active", "reserved", "background", "regular"), order);
+      assertEquals(0, queue.snapshot().retainedBytes());
+    } finally {
+      activeWork.complete("finish");
+      reservedWork.complete("finish");
+      backgroundWork.complete("finish");
+      activeScope.close();
+      regularScope.close();
+      reservedScope.close();
+      backgroundScope.close();
+      closeAndAssertDrained(queue);
+    }
+  }
+
+  @Test
+  void backgroundAdmissionCancellationAndCloseReleaseOnlyItsOwnBudget() throws Exception {
+    var queue = new SerialMutationQueue(0, 100, 1, 100, Duration.ofSeconds(10));
+    var activeScope = RequestScope.withoutDeadline();
+    var cancelledScope = RequestScope.withoutDeadline();
+    var rejectedScope = RequestScope.withoutDeadline();
+    var activeWork = new CompletableFuture<String>();
+    var activeStarted = new CountDownLatch(1);
+    var backgroundStarts = new AtomicInteger();
+    try {
+      var active = queue.submit(10, activeScope, ignored -> {
+        activeStarted.countDown();
+        return activeWork;
+      });
+      assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
+      var cancelled = queue.submitBackground(cancelledScope, ignored -> {
+        backgroundStarts.incrementAndGet();
+        return CompletableFuture.completedFuture("must not run");
+      });
+      assertEquals(11, queue.snapshot().retainedBytes());
+      assertCategory(BackendFailure.Category.RESOURCE_LIMIT,
+          queue.submitBackground(rejectedScope, ignored -> CompletableFuture.completedFuture("over-limit")));
+
+      cancelledScope.cancel();
+      assertCategory(BackendFailure.Category.CANCELLED, cancelled);
+      assertEquals(10, queue.snapshot().retainedBytes());
+      assertEquals(0, queue.snapshot().waiting());
+      assertEquals(0, backgroundStarts.get());
+
+      var rejectedOnClose = queue.submitBackground(rejectedScope,
+          ignored -> CompletableFuture.completedFuture("must be rejected on close"));
+      assertEquals(11, queue.snapshot().retainedBytes());
+      queue.close();
+      assertCategory(BackendFailure.Category.UNAVAILABLE, rejectedOnClose);
+      assertEquals(10, queue.snapshot().retainedBytes());
+      assertFalse(queue.drained().isDone());
+
+      activeWork.complete("active");
+      assertEquals("active", active.get(5, TimeUnit.SECONDS));
+      queue.drained().get(5, TimeUnit.SECONDS);
+      assertEquals(0, queue.snapshot().retainedBytes());
+    } finally {
+      activeWork.complete("finish");
+      activeScope.close();
+      cancelledScope.close();
+      rejectedScope.close();
+      closeAndAssertDrained(queue);
+    }
+  }
+
+  @Test
   void dispatchedCancellationDoesNotReleaseLaneUntilProducerDrains() throws Exception {
     var queue = new SerialMutationQueue(1, 100, Duration.ofSeconds(10));
     var firstScope = RequestScope.withoutDeadline();

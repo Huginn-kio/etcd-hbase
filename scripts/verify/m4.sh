@@ -29,7 +29,7 @@ while (($#)); do
       artifact_request="$2"; seen_artifact=true; shift 2 ;;
     --help)
       cat <<'USAGE'
-用法：scripts/verify/m4.sh --scope public --task J40|J41|J42|J43 --artifact-root .artifacts/m4/<fresh-run-id>
+用法：scripts/verify/m4.sh --scope public --task J40|J41|J42|J43|J44 --artifact-root .artifacts/m4/<fresh-run-id>
      或 scripts/verify/m4.sh --scope public --all --artifact-root .artifacts/m4/<fresh-run-id>
 USAGE
       exit 0 ;;
@@ -50,7 +50,7 @@ if [[ "$run_all" == true ]]; then
   echo 'M4 bulk execution is unavailable until every registered task has an execution profile.' >&2
   exit 2
 fi
-if [[ "$task" != J40 && "$task" != J41 && "$task" != J42 && "$task" != J43 ]]; then
+if [[ "$task" != J40 && "$task" != J41 && "$task" != J42 && "$task" != J43 && "$task" != J44 ]]; then
   echo "M4 task is not registered for public execution: $task" >&2
   exit 2
 fi
@@ -224,9 +224,11 @@ export M4_RUN_ID="$run_id"
 export M4_SOURCE_COMMIT="$source_commit"
 run_logged registry-check registry-check.log registry-check.stderr python3 scripts/verify/m4-report.py --validate-registry
 run_logged report-tests report-tests.log report-tests.stderr python3 scripts/verify/test_m4_report.py
-run_logged go-module-lock go-module-lock.log go-module-lock.stderr python3 scripts/verify/go-module-lock.py
-run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
-  ./internal/trace ./internal/scenario ./internal/compare ./cmd/m4driver
+if [[ "$task" != J44 ]]; then
+  run_logged go-module-lock go-module-lock.log go-module-lock.stderr python3 scripts/verify/go-module-lock.py
+  run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
+    ./internal/trace ./internal/scenario ./internal/compare ./cmd/m4driver
+fi
 maven_profile=m4-j40-public
 if [[ "$task" == J41 ]]; then
   maven_profile=m4-j41-public
@@ -234,6 +236,8 @@ elif [[ "$task" == J42 ]]; then
   maven_profile=m4-j42-public
 elif [[ "$task" == J43 ]]; then
   maven_profile=m4-j43-public
+elif [[ "$task" == J44 ]]; then
+  maven_profile=m4-j44-public
 fi
 run_logged maven-verify maven.log maven.stderr.log scripts/dev/mvn21.sh -B -ntp \
   -pl server -am clean verify -P"$maven_profile"

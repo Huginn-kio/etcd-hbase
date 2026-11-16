@@ -871,7 +871,69 @@
         ],
         "compare_logs": ["revoke-history.log", "revoke-native.log"]
       }
+    },
+    {
+      "id": "J44",
+      "kind": "event-storage",
+      "maven_tests": [
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.EventRevisionIndexSeekerTest", "tests": [
+          "mergesBucketsAcrossBoundedStepsWithoutTreatingPartialResultsAsComplete",
+          "rejectsEarlierResultsAndExhaustedBudgets"
+        ]},
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.EventSubscriptionIndexTest", "tests": [
+          "matchesRawPointsAndHalfOpenRangesAndRemovesSubscriptions"
+        ]},
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.SealedEventCursorTest", "tests": [
+          "readsEventsInOrderWithPauseAndBoundedPageReads",
+          "missingPageAndExhaustedBudgetFailWithoutAdvancingCursor",
+          "sharedTailerReadsOnceAndIsolatesSlowSubscriptions",
+          "sharedTailerDeliversOnlyMatchingPointAndRangeSubscriptions"
+        ]},
+        {"module": "hbase", "kind": "surefire", "class": "io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepositoryTest", "tests": [
+          "readsAndCreatesAnImmutableRevisionRecord"
+        ]},
+        {"module": "hbase", "kind": "failsafe", "class": "io.etcdhbase.hbase.storage.J44EventIndexControlStoreIT", "tests": [
+          "requiresDescriptorAndReopenedStoreForFencedControlUpgrade"
+        ]},
+        {"module": "hbase", "kind": "failsafe", "class": "io.etcdhbase.hbase.storage.J44EventPinIT", "tests": [
+          "eventPinSurvivesReopenAndStopsPhysicalCollectionUntilReleased"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.EventBackfillCycleBudgetTest", "tests": [
+          "cycleFailsClosedWhenItsReservedAccountCannotBeAdmitted"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.EventBackfillExecutorTest", "tests": [
+          "rechecksOwnerAndProtectionBeforePublishingTheSealedCheckpoint",
+          "takeoverAfterSealingPreventsPublication",
+          "cancellationBeforePreparationPreventsPublication"
+        ]},
+        {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.commit.EventBackfillPublicationIT", "tests": [
+          "resumesBackfillCycleAfterReopeningBothLayouts",
+          "publishesAndReopensLegacyBackfillOnBothLayouts"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.EventHistoryWorkerTest", "tests": [
+          "retriesResourceLimitAndOnlyCompletesAfterSuccessfulProgress",
+          "stopCancelsActiveCycleAndWaitsForLaneCleanup",
+          "rejectedSchedulingStopsAndReportsTheFailure"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest", "tests": [
+          "ownerLossBetweenWorkerInstallationsStopsExistingWorkerAndRejectsLateWorker",
+          "ownerLossBeforeInstallationRejectsBothWorkers"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.observability.RequestMetricsTest", "tests": [
+          "recordsBoundedEventTailerCostAndLagWithoutKeyDimensions",
+          "recordsBoundedEventHistoryFailures"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.SerialMutationQueueTest", "tests": [
+          "backgroundWorkHasReservedCapacityAndRoundRobinsWithOtherLanes",
+          "backgroundAdmissionCancellationAndCloseReleaseOnlyItsOwnBudget",
+          "dispatchedCancellationDoesNotReleaseLaneUntilProducerDrains"
+        ]},
+        {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseRpcIT", "tests": [
+          "runtimeFencesEventIndexFormatAndPersistsSelectedPutAcrossLayouts",
+          "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts"
+        ]}
+      ]
     }
   ],
-  "pending_tasks": ["J44","J45","J46","J47","J29.4"]
+  "pending_tasks": ["J45","J46","J47","J29.4"]
 }

@@ -25,6 +25,7 @@ import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.RecoveryManager;
 import io.etcdhbase.core.commit.ResultPreparation;
+import io.etcdhbase.core.commit.SharedEventTailer;
 import io.etcdhbase.core.commit.UnchangedRangeProof;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.LeaseIdAllocator;
@@ -251,7 +252,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       await(CompletableFuture.allOf(startup.cleanupCompletion().toCompletableFuture(),
           startup.physicalProducersCompletion().toCompletableFuture()), startup);
       if (!runtimeReady(owner.isReady(), leaseTime) || !pending.isReady()) {
-        throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+        throw new java.util.concurrent.CompletionException(
+            new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       }
       return new M3TableGroupRuntime(pending, services.kvService(), services.leaseService(),
           leaseTime, stores.clusterId(), activation.memberIdBits(), business.metrics());
@@ -771,8 +773,11 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           invocations));
       var backfill = new EventBackfillCycle(plan.source().tableGroupId(), stores, pending.eventPins,
           invocations, backfillPreparation, business.publisher(), budgets, authorization, Clock.systemUTC());
-      pending.startBackfillWorker(new EventBackfillWorker(
-          pending.queue, pending.leaseTimers, owner::currentToken, backfill::run, business.metrics()));
+      var tailer = new EventTailerCycle(plan.source().tableGroupId(), stores, pending.eventPins,
+          budgets, authorization, pending, business.metrics());
+      var history = new EventHistoryCycle(backfill, tailer, business.metrics());
+      pending.startEventHistoryWorker(new EventHistoryWorker(
+          pending.queue, pending.leaseTimers, owner::currentToken, history::run, business.metrics()));
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
         txnGateway::range), leaseService);
@@ -799,6 +804,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
 
   public KvService kvService() { return kvService; }
   public LeaseService leaseService() { return leaseService; }
+  public CompletableFuture<SharedEventTailer> eventTailerReady() { return resources.eventTailerReady(); }
+  public Optional<SharedEventTailer> eventTailer() { return resources.eventTailer(); }
   public long clusterId() { return clusterId; }
   public long memberId() { return memberId; }
   public RequestMetrics metrics() { return metrics; }
@@ -904,16 +911,24 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     private ThreadPoolExecutor worker;
     private RangeReadCache cache;
     private volatile EventHistoryPinManager eventPins;
+    private volatile BudgetManager.Account eventTailerMemory;
+    private volatile SharedEventTailer eventTailer;
+    private CompletableFuture<SharedEventTailer> eventTailerReady = new CompletableFuture<>();
     private ScheduledExecutorService leaseTimers;
     private ScheduledThreadPoolExecutor ownedLeaseTimers;
     private volatile LeaseExpiryWorker expiryWorker;
-    private volatile EventBackfillWorker backfillWorker;
+    private volatile EventHistoryWorker eventHistoryWorker;
     private volatile boolean leaseEnabled;
     private boolean ownerLost;
 
     Pending(RequestScope startup, ScheduledExecutorService leaseTimers) {
+      this(startup, leaseTimers, false);
+    }
+
+    Pending(RequestScope startup, ScheduledExecutorService leaseTimers, boolean leaseEnabled) {
       this.startup = startup;
       this.leaseTimers = leaseTimers;
+      this.leaseEnabled = leaseEnabled;
     }
 
     private void createCache(M3TableGroupPlan plan, TableGroupStores stores, BudgetManager budgets,
@@ -983,14 +998,56 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       worker.start();
     }
 
-    synchronized void startBackfillWorker(EventBackfillWorker worker) {
+    synchronized void startEventHistoryWorker(EventHistoryWorker worker) {
       Objects.requireNonNull(worker, "worker");
-      if (closing.get() || ownerLost || backfillWorker != null) {
-        throw new IllegalStateException("event backfill worker cannot be installed now");
+      if (closing.get() || ownerLost || eventHistoryWorker != null) {
+        throw new IllegalStateException("event history worker cannot be installed now");
       }
-      backfillWorker = worker;
+      eventHistoryWorker = worker;
       worker.start();
     }
+
+    synchronized BudgetManager.Account eventTailerMemory(BudgetManager budgets, String tableGroup)
+        throws BackendFailure {
+      if (closing.get() || ownerLost || !leaseEnabled) {
+        throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+      }
+      if (eventTailerMemory == null) {
+        eventTailerMemory = budgets.admitReserved(tableGroup, recoveryScope,
+            LeaseBudgetProfile.EVENT_TAILER_MEMORY, LeaseBudgetProfile.EVENT_TAILER_READ_LIMITS);
+      }
+      return eventTailerMemory;
+    }
+
+    synchronized SharedEventTailer installEventTailer(SharedEventTailer candidate) {
+      Objects.requireNonNull(candidate, "candidate");
+      if (closing.get() || ownerLost || !leaseEnabled) {
+        candidate.close();
+        throw new java.util.concurrent.CompletionException(
+            new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      }
+      if (eventTailer != null) {
+        candidate.close();
+        return eventTailer;
+      }
+      eventTailer = candidate;
+      eventTailerReady.complete(candidate);
+      return candidate;
+    }
+
+    synchronized Optional<SharedEventTailer> eventTailer() {
+      return Optional.ofNullable(eventTailer);
+    }
+
+    synchronized boolean detachClosedEventTailer(SharedEventTailer expected) {
+      Objects.requireNonNull(expected, "expected");
+      if (closing.get() || ownerLost || eventTailer != expected || !expected.isClosed()) return false;
+      eventTailer = null;
+      eventTailerReady = new CompletableFuture<>();
+      return true;
+    }
+
+    synchronized CompletableFuture<SharedEventTailer> eventTailerReady() { return eventTailerReady.copy(); }
 
     private CompletableFuture<Void> initialReadiness() {
       if (!leaseEnabled) return CompletableFuture.completedFuture(null);
@@ -1006,8 +1063,11 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       ownerLost = true;
       LeaseExpiryWorker current = expiryWorker;
       if (current != null) current.stop();
-      EventBackfillWorker backfill = backfillWorker;
-      if (backfill != null) backfill.stop();
+      EventHistoryWorker history = eventHistoryWorker;
+      if (history != null) history.stop();
+      SharedEventTailer tailer = eventTailer;
+      if (tailer != null) tailer.close();
+      else eventTailerReady.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       SerialMutationQueue currentQueue = queue;
       if (currentQueue != null) currentQueue.close();
     }
@@ -1028,9 +1088,12 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           shutdownFailure = failure;
         }
         try {
-          if (backfillWorker != null) backfillWorker.stop();
+          if (eventHistoryWorker != null) eventHistoryWorker.stop();
         } catch (RuntimeException | Error failure) {
           shutdownFailure = merge(shutdownFailure, failure);
+        }
+        if (eventTailer == null) {
+          eventTailerReady.completeExceptionally(new BackendFailure(BackendFailure.Category.CANCELLED));
         }
         try {
           if (queue != null) queue.close();
@@ -1053,7 +1116,11 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         if (expiryWorker != null) expiryWorker.drained().join();
       } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
       try {
-        if (backfillWorker != null) backfillWorker.drained().join();
+        if (eventHistoryWorker != null) eventHistoryWorker.drained().join();
+      } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
+      try {
+        SharedEventTailer tailer = eventTailer;
+        if (tailer != null) tailer.close();
       } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
       try {
         if (queue != null) queue.drained().join();

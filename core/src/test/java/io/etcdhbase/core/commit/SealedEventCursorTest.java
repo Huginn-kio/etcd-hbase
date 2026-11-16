@@ -928,6 +928,7 @@ class SealedEventCursorTest {
       try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 3, 4, 8192)) {
         var fast = tailer.subscribe(KeyRange.all(), fastMemory, 4, 8192);
         var slow = tailer.subscribe(KeyRange.all(), slowMemory, 1, 8192);
+        assertEquals(2, tailer.subscriptionCount());
         assertEquals(SharedEventTailer.Step.OPENED, tailer.step(readScope,
             new ManifestCatalog.ProofReadBudget(readScope, readMemory, 10, 1024L << 20)).join());
         assertEquals(SharedEventTailer.Step.BUFFERED, tailer.step(readScope,
@@ -943,6 +944,9 @@ class SealedEventCursorTest {
         assertEquals(2, fixture.eventReads.get());
         assertEquals(3, tailer.completedSequence());
         assertEquals(11, tailer.completedRevision());
+        assertEquals(2, tailer.lastPublishedEventCount());
+        assertTrue(tailer.lastPublishedEventBytes() > 0);
+        assertEquals(3, tailer.observedPublishedSequence());
         assertEquals(Optional.of(SharedEventTailer.Termination.RESOURCE_LIMIT), slow.termination());
         assertTrue(slow.poll().isEmpty());
         try (var first = fast.poll().orElseThrow(); var second = fast.poll().orElseThrow()) {
@@ -960,6 +964,7 @@ class SealedEventCursorTest {
         assertEquals(3, afterPublish.sequence());
         assertEquals(11, afterPublish.revision());
         assertTrue(afterPublish.subscription().poll().isEmpty());
+        assertEquals(3, tailer.subscriptionCount());
         assertTrue(fast.poll().isEmpty());
       }
     }

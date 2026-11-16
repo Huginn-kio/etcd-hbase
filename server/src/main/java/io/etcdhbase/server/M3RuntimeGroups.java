@@ -242,6 +242,12 @@ final class M3RuntimeGroups implements AutoCloseable {
     return managed.runtime().metrics();
   }
 
+  M3TableGroupRuntime runtime(String group) {
+    ManagedGroup managed = groups.get(group);
+    if (managed == null || closing.get()) throw new IllegalArgumentException("table group is not active");
+    return managed.runtime();
+  }
+
   boolean isReady() {
     return !closing.get() && !groups.isEmpty() && groups.values().stream().allMatch(value -> value.runtime().isReady());
   }

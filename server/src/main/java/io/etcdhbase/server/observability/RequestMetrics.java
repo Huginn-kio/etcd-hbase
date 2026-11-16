@@ -54,6 +54,23 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   private final LongAdder eventBackfillCompletions = new LongAdder();
   private final LongAdder eventBackfillResourceFailures = new LongAdder();
   private final LongAdder eventBackfillOtherFailures = new LongAdder();
+  private final LongAdder eventHistoryFailures = new LongAdder();
+  private final LongAdder eventHistoryResourceFailures = new LongAdder();
+  private final LongAdder eventTailerCycles = new LongAdder();
+  private final LongAdder eventTailerProgressCycles = new LongAdder();
+  private final LongAdder eventTailerIdleCycles = new LongAdder();
+  private final LongAdder eventTailerFailures = new LongAdder();
+  private final LongAdder eventTailerResourceFailures = new LongAdder();
+  private final LongAdder eventTailerSequences = new LongAdder();
+  private final LongAdder eventTailerEvents = new LongAdder();
+  private final LongAdder eventTailerEventBytes = new LongAdder();
+  private final LongAdder eventTailerHBaseOperations = new LongAdder();
+  private final LongAdder eventTailerLogicalRequestBytes = new LongAdder();
+  private final AtomicLong eventTailerSequence = new AtomicLong();
+  private final AtomicLong eventTailerRevision = new AtomicLong();
+  private final AtomicLong eventTailerObservedSequence = new AtomicLong();
+  private final AtomicLong eventTailerSequenceLag = new AtomicLong();
+  private final AtomicLong eventTailerSubscriptions = new AtomicLong();
   private final AtomicLong leaseExpiryOwnerEpoch = new AtomicLong();
   private final AtomicLong leaseExpiryCheckpointSequence = new AtomicLong();
   private final AtomicLong leaseExpiryWindowStopExclusive = new AtomicLong();
@@ -231,6 +248,67 @@ public final class RequestMetrics implements RequestCompletionRecorder {
 
   public record EventBackfillSnapshot(long steps, long completions,
       long resourceFailures, long otherFailures) {}
+
+  public void recordEventHistoryFailure(BackendFailure.Category category) {
+    eventHistoryFailures.increment();
+    if (Objects.requireNonNull(category, "category") == BackendFailure.Category.RESOURCE_LIMIT) {
+      eventHistoryResourceFailures.increment();
+    }
+  }
+
+  public EventHistoryFailureSnapshot eventHistoryFailures() {
+    return new EventHistoryFailureSnapshot(eventHistoryFailures.sum(), eventHistoryResourceFailures.sum());
+  }
+
+  public record EventHistoryFailureSnapshot(long failures, long resourceFailures) {}
+
+  /** Bounded per-runtime event read cost and lag; no keys, IDs, or authorization labels are retained. */
+  public void recordEventTailerCycle(boolean progressed, long publishedEvents, long eventBytes,
+      RequestScope.StorageCostSnapshot storageCost, long sequence, long revision,
+      long observedPublishedSequence, int subscriptions) {
+    Objects.requireNonNull(storageCost, "storageCost");
+    if (publishedEvents < 0 || eventBytes < 0 || sequence < 0 || revision < 0
+        || observedPublishedSequence < 0 || subscriptions < 0) {
+      throw new IllegalArgumentException("event tailer metrics must not be negative");
+    }
+    eventTailerCycles.increment();
+    if (progressed) {
+      eventTailerProgressCycles.increment();
+      eventTailerSequences.add(1);
+    } else {
+      eventTailerIdleCycles.increment();
+    }
+    eventTailerEvents.add(publishedEvents);
+    eventTailerEventBytes.add(eventBytes);
+    eventTailerHBaseOperations.add(storageCost.logicalOperations());
+    eventTailerLogicalRequestBytes.add(storageCost.logicalRequestPayloadBytes());
+    eventTailerSequence.set(sequence);
+    eventTailerRevision.set(revision);
+    eventTailerObservedSequence.set(observedPublishedSequence);
+    eventTailerSequenceLag.set(Math.max(0, observedPublishedSequence - sequence));
+    eventTailerSubscriptions.set(subscriptions);
+  }
+
+  public void recordEventTailerFailure(BackendFailure.Category category) {
+    eventTailerFailures.increment();
+    if (Objects.requireNonNull(category, "category") == BackendFailure.Category.RESOURCE_LIMIT) {
+      eventTailerResourceFailures.increment();
+    }
+  }
+
+  public EventTailerSnapshot eventTailer() {
+    return new EventTailerSnapshot(eventTailerCycles.sum(), eventTailerProgressCycles.sum(),
+        eventTailerIdleCycles.sum(), eventTailerFailures.sum(), eventTailerResourceFailures.sum(),
+        eventTailerSequences.sum(), eventTailerEvents.sum(), eventTailerEventBytes.sum(),
+        eventTailerHBaseOperations.sum(), eventTailerLogicalRequestBytes.sum(),
+        eventTailerSequence.get(), eventTailerRevision.get(), eventTailerObservedSequence.get(),
+        eventTailerSequenceLag.get(), eventTailerSubscriptions.get());
+  }
+
+  public record EventTailerSnapshot(long cycles, long progressCycles, long idleCycles,
+      long failures, long resourceFailures, long sequences, long events, long eventBytes,
+      long hbaseClientOperations, long logicalRequestPayloadBytes, long sequence,
+      long revision, long observedPublishedSequence, long sequenceLag, long subscriptions) {}
 
   public void recordLeaseExpiryStaleCandidate() { leaseExpiryStaleCandidates.increment(); }
 

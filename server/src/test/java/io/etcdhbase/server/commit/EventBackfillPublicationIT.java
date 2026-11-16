@@ -78,11 +78,16 @@ class EventBackfillPublicationIT {
         owner = selected.owner();
 
         var limits = new BudgetManager.Limits(4, 4, 4, 4, 4, 1_000_000, 1024L << 20);
-        var budgets = new BudgetManager(limits, Map.of(fixture.system().tableGroupId(), limits), limits);
+        var tableGroup = fixture.system().tableGroupId();
+        var reserved = LeaseBudgetProfile.perGroupCapacity(1_572_864);
+        var budgets = new BudgetManager(limits, Map.of(tableGroup, limits), limits, reserved,
+            Map.of(tableGroup, reserved));
         var handoff = new BoundedPublicationHandoff(1, 1, TIMEOUT);
         try {
           var cycle = backfillCycle(fixture, stores, selected.registry(), budgets, handoff);
-          assertFalse(cycle.run(owner, scope).join());
+          var first = cycle.run(owner, scope).join();
+          assertTrue(first.progressed());
+          assertFalse(first.complete());
           var state = stores.control().read(scope).join().orElseThrow().state();
           assertEquals(2, state.finalizedSequence());
           assertEquals(2, state.finalizedRevision());
@@ -93,11 +98,15 @@ class EventBackfillPublicationIT {
           var pins = io.etcdhbase.core.commit.EventHistoryPinManager.openSelected(
               reopened.records(), reopened.control(), PINS, Clock.systemUTC(), scope).join();
           cycle = backfillCycle(fixture, reopened, pins, budgets, handoff);
-          assertTrue(cycle.run(owner, scope).join());
+          var resumed = cycle.run(owner, scope).join();
+          assertTrue(resumed.progressed());
+          assertTrue(resumed.complete());
           state = reopened.control().read(scope).join().orElseThrow().state();
           assertEquals(3, state.finalizedSequence());
           assertEquals(2, state.finalizedRevision());
-          assertTrue(cycle.run(owner, scope).join());
+          var alreadyComplete = cycle.run(owner, scope).join();
+          assertFalse(alreadyComplete.progressed());
+          assertTrue(alreadyComplete.complete());
           assertEquals(3, reopened.control().read(scope).join().orElseThrow().state().finalizedSequence());
           var index = new HBaseEventRevisionIndexRepository(reopened.records()).read(2, scope).join().orElseThrow();
           var decision = reopened.decisions().read(1, scope).join().orElseThrow();
