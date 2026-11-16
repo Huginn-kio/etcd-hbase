@@ -52,6 +52,14 @@ public final class EventIndexBackfillMaterializer {
           || state.compactRevision() != checkpoint.compactRevision()) {
         throw new IllegalStateException("backfill publication fence or compact boundary changed");
       }
+      // The first checkpoint freezes the complete finalized history at the upgrade boundary.
+      // A later commit could otherwise persist a stale upper bound and incorrectly claim coverage.
+      if (!materialize && previousRevision.isEmpty()
+          && (checkpoint.nextSequence() != checkpoint.firstSequence()
+              || state.finalizedSequence() != checkpoint.upperSequence()
+              || state.finalizedRevision() != checkpoint.upperRevision())) {
+        throw new IllegalStateException("initial backfill window differs from the finalized barrier");
+      }
       return processLegacy(checkpoint, previousRevision, scope, materialize);
     });
   }

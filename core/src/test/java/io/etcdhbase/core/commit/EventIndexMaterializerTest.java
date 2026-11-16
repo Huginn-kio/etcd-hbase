@@ -19,6 +19,20 @@ class EventIndexMaterializerTest {
   private static final ByteKey KEY = ByteKey.copyOf(new byte[] {1});
 
   @Test
+  void initialCheckpointMustCaptureTheCurrentFinalizedBarrier() {
+    Fixture fixture = new Fixture();
+    var sequence = new java.util.concurrent.atomic.AtomicLong(4);
+    var materializer = backfill(fixture, new MemoryIndexes(), sequence, true);
+    var stale = new EventIndexBackfillCheckpoint(1, 5, 3, 3, 3, 10, 10, 11, 0);
+    var current = new EventIndexBackfillCheckpoint(1, 5, 5, 4, 5, 11, 11, 11, 0);
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      assertThrows(CompletionException.class,
+          () -> materializer.preflight(stale, OptionalLong.empty(), scope).join());
+      materializer.preflight(current, OptionalLong.empty(), scope).join();
+    }
+  }
+
+  @Test
   void backfillVerifiesLegacyDecisionBeforeSelectionAndRecoversIndexAfterSelection() {
     Fixture fixture = new Fixture();
     MemoryIndexes indexes = new MemoryIndexes();
