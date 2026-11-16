@@ -7,6 +7,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -28,6 +29,17 @@ class M4ReportTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.registry = m4_report.load_registry()
+
+    def test_registered_java_cases_have_a_matching_source_method(self) -> None:
+        # This catches renamed registrations early; executed XML is still required by the report.
+        for task in self.registry["tasks"]:
+            for suite in task["maven_tests"]:
+                source = (m4_report.REPO / suite["module"] / "src/test/java"
+                          / Path(*suite["class"].split(".")).with_suffix(".java"))
+                text = source.read_text(encoding="utf-8")
+                for method in suite["tests"]:
+                    with self.subTest(task=task["id"], suite=suite["class"], method=method):
+                        self.assertRegex(text, rf"\bvoid\s+{re.escape(method)}\s*\(")
 
     def test_registry_requires_j40_rpc_layout_and_regression_coverage(self) -> None:
         self.assertIsNotNone(m4_report.validate_registry_document(self.registry))

@@ -114,7 +114,7 @@
           "catalogRejectsMissingOrMismatchedPagesAndRestoreRejectsBadDigest"
         ]},
         {"module": "grpc", "kind": "surefire", "class": "io.etcdhbase.grpc.service.LeaseServiceTest", "tests": [
-          "routesOnlyInstalledUnaryOperationsAndLeavesRevokeUnimplemented",
+          "routesInstalledUnaryOperations",
           "defaultUnaryHandlersRemainUnimplemented"
         ]},
         {"module": "grpc", "kind": "surefire", "class": "io.etcdhbase.grpc.protocol.LeaseGrantResponseMapperTest", "tests": [
@@ -135,19 +135,19 @@
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest", "tests": [
           "returnsConservativeBoundsWhileWallAndMonotonicClocksAdvanceTogether",
-          "failsClosedAndStaysUnhealthyAfterForwardWallClockJump",
-          "failsClosedAfterBackwardWallClockJump",
+          "wallClockStepPausesTrustedTimeAndReportsOnceUntilTheClockReturns",
+          "backwardWallClockStepAlsoPausesUntilTheClockCatchesUp",
           "detectsCumulativeDriftAcrossManySmallWallClockChanges",
-          "failsClosedWhenClockReadThrowsAndDoesNotRecoverWithoutRevalidation",
-          "failsClosedWhenUpperBoundOverflows",
+          "clockReadFailureRecoversOnlyAfterASuccessfulTimeObservation",
+          "rejectsMonotonicRegressionAndWallTimeOverflow",
           "includesClockReadWindowInUpperBoundAtConfiguredLimit",
           "allowsOnlyDriftExplainedByMonotonicSamplingWindows",
           "rejectsClockReadWindowBeyondConfiguredLimit",
-          "runtimeReadinessBecomesFalseAfterLeaseClockDiscontinuity"
+          "runtimeReadinessBecomesFalseOnDiscontinuityAndTrueAfterRecovery"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.config.M3RuntimeConfigurationTest", "tests": [
           "m4ExampleUsesExplicitLeaseTimingInputs",
-          "m4ActivationRequiresExplicitMinimumTtlAndClockBound",
+          "m4ActivationRequiresExplicitMinimumTtlAndClockBounds",
           "m4MemoryMinimumIncludesGatewayOwnerAndRecoveryReservations"
         ]},
         {"module": "hbase", "kind": "failsafe", "class": "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT", "tests": [
@@ -745,7 +745,7 @@
         ]},
         {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseKeepAliveRpcIT", "tests": [
           "realGoKeepAliveMatchesNativeAcrossLayouts",
-          "expiredActiveLeaseCannotRenewBeforeDurableRevocation",
+          "expiredLeaseIsDurablyRevokedBeforeKeepAliveRetry",
           "dualRuntimeForwardsKeepAliveOverMtlsAndFencesTheOldOwner",
           "dualProcessKeepAliveSurvivesOwnerFailureAndFencesStaleEpoch",
           "persistedKeepAliveSurvivesLostOwnerReplyAndRestart",
@@ -823,7 +823,7 @@
           "seeksLatestExpiryCheckpointAtTheReadBarrier"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest", "tests": [
-          "wallClockStepPausesTrustedTimeUntilTheClockReturnsToItsMonotonicTrajectory",
+          "wallClockStepPausesTrustedTimeAndReportsOnceUntilTheClockReturns",
           "backwardWallClockStepAlsoPausesUntilTheClockCatchesUp",
           "rejectsMonotonicRegressionAndWallTimeOverflow"
         ]},
@@ -850,7 +850,7 @@
           "failedExpiryRevocationCannotTurnIntoASuccessfulKeepAliveResponse"
         ]},
         {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseKeepAliveRpcIT", "tests": [
-          "expiredActiveLeaseIsRejectedUntilDurableRevocation"
+          "expiredLeaseIsDurablyRevokedBeforeKeepAliveRetry"
         ]},
         {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4LeaseRevokeRpcIT", "tests": [
           "realGoLeaseRevokeMatchesNativeAcrossLayouts",

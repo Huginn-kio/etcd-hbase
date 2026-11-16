@@ -166,7 +166,7 @@ J43_CRITICAL_JAVA_TESTS = {
         "seeksLatestExpiryCheckpointAtTheReadBarrier",
     },
     "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest": {
-        "wallClockStepPausesTrustedTimeUntilTheClockReturnsToItsMonotonicTrajectory",
+        "wallClockStepPausesTrustedTimeAndReportsOnceUntilTheClockReturns",
         "backwardWallClockStepAlsoPausesUntilTheClockCatchesUp",
         "rejectsMonotonicRegressionAndWallTimeOverflow",
     },
@@ -281,15 +281,15 @@ J40_CRITICAL_JAVA_TESTS = {
     },
     "io.etcdhbase.server.commit.BoundedSystemLeaseTimeSourceTest": {
         "returnsConservativeBoundsWhileWallAndMonotonicClocksAdvanceTogether",
-        "failsClosedAndStaysUnhealthyAfterForwardWallClockJump",
-        "failsClosedAfterBackwardWallClockJump",
+        "wallClockStepPausesTrustedTimeAndReportsOnceUntilTheClockReturns",
+        "backwardWallClockStepAlsoPausesUntilTheClockCatchesUp",
         "detectsCumulativeDriftAcrossManySmallWallClockChanges",
-        "failsClosedWhenClockReadThrowsAndDoesNotRecoverWithoutRevalidation",
-        "failsClosedWhenUpperBoundOverflows",
+        "clockReadFailureRecoversOnlyAfterASuccessfulTimeObservation",
+        "rejectsMonotonicRegressionAndWallTimeOverflow",
         "includesClockReadWindowInUpperBoundAtConfiguredLimit",
         "allowsOnlyDriftExplainedByMonotonicSamplingWindows",
         "rejectsClockReadWindowBeyondConfiguredLimit",
-        "runtimeReadinessBecomesFalseAfterLeaseClockDiscontinuity",
+        "runtimeReadinessBecomesFalseOnDiscontinuityAndTrueAfterRecovery",
     },
 }
 J41_GO_TESTS = {
@@ -489,7 +489,7 @@ J42_CRITICAL_JAVA_TESTS = {
     },
     "io.etcdhbase.server.M4LeaseKeepAliveRpcIT": {
         "realGoKeepAliveMatchesNativeAcrossLayouts",
-        "expiredActiveLeaseCannotRenewBeforeDurableRevocation",
+        "expiredLeaseIsDurablyRevokedBeforeKeepAliveRetry",
         "dualRuntimeForwardsKeepAliveOverMtlsAndFencesTheOldOwner",
         "dualProcessKeepAliveSurvivesOwnerFailureAndFencesStaleEpoch",
         "persistedKeepAliveSurvivesLostOwnerReplyAndRestart",
