@@ -96,7 +96,7 @@ final class EventBackfillCycle {
   private boolean execute(CommitOwnerService.OwnerToken owner, RequestScope parent) throws Exception {
     Optional<EventIndexBackfillCheckpoint> current = readCheckpoint(parent);
     try (Child windowScope = new Child(parent)) {
-      var account = budgets.admit(tableGroup, windowScope.scope, RESERVATION, READ_LIMITS);
+      var account = budgets.admitReserved(tableGroup, windowScope.scope, RESERVATION, READ_LIMITS);
       var budget = proof(windowScope.scope, account);
       CommitState state = requireOwner(owner, windowScope.scope);
       if (current.isPresent()) {
@@ -133,7 +133,7 @@ final class EventBackfillCycle {
 
   private Optional<EventIndexBackfillCheckpoint> readCheckpoint(RequestScope parent) throws Exception {
     try (Child readScope = new Child(parent)) {
-      var account = budgets.admit(tableGroup, readScope.scope, RESERVATION, READ_LIMITS);
+      var account = budgets.admitReserved(tableGroup, readScope.scope, RESERVATION, READ_LIMITS);
       var budget = proof(readScope.scope, account);
       var pinned = stores.views().openAuxiliary(authorization, readScope.scope).join();
       return new EventIndexBackfillReader(stores.records(), stores.manifests())
@@ -145,7 +145,7 @@ final class EventBackfillCycle {
       EventIndexBackfillCheckpoint checkpoint, EventBackfillWindow window, RequestScope parent,
       ManifestCatalog.ProofReadBudget windowBudget) throws Exception {
     try (Child stepScope = new Child(parent)) {
-      var account = budgets.admit(tableGroup, stepScope.scope, RESERVATION, READ_LIMITS);
+      var account = budgets.admitReserved(tableGroup, stepScope.scope, RESERVATION, READ_LIMITS);
       var budget = proof(stepScope.scope, account);
       var source = new SelectedSequenceReader(pins, stores.control(), stores.decisions(),
           stores.manifestRepository(), new HBaseEventRevisionIndexRepository(stores.records()));

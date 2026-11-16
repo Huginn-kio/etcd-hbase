@@ -35,7 +35,7 @@ public final class LeaseBudgetProfile {
 
   private LeaseBudgetProfile() {}
 
-  /** Minimum regular memory for one backfill cycle, excluding recovery and Lease reserves. */
+  /** Reserved memory for the nested window and step accounts of one backfill cycle. */
   public static long eventBackfillMinimumMemory() {
     return Math.multiplyExact(2, EVENT_BACKFILL_MEMORY.total());
   }
@@ -53,8 +53,9 @@ public final class LeaseBudgetProfile {
     BudgetManager.Reservation leaseRequest = ownerMutationReservation(maximumEtcdRequestBytes);
     // HISTORY Revoke peaks at 3 operations / 2 scanners / 3 cleanup leases. A checkpoint scan
     // can overlap it and adds 1 / 1 / 1; the preceding control Get is sequential.
-    return new BudgetManager.ReservedCapacity(2, 0, 4, 3, 4, 0,
-        Math.addExact(leaseRequest.total(), EXPIRY_WORKER_MEMORY.total()));
+    long leaseMemory = Math.addExact(leaseRequest.total(), EXPIRY_WORKER_MEMORY.total());
+    return new BudgetManager.ReservedCapacity(4, 0, 4, 3, 4, 0,
+        Math.addExact(leaseMemory, eventBackfillMinimumMemory()));
   }
 
   public static BudgetManager.ReservedCapacity capacityForGroups(

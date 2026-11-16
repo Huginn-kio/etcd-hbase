@@ -24,9 +24,9 @@ import org.junit.jupiter.api.Test;
 
 class EventBackfillCycleBudgetTest {
   @Test
-  void minimumMemoryFailsClosedWhenLeaseReserveLeavesNoBackfillCapacity() {
+  void cycleFailsClosedWhenItsReservedAccountCannotBeAdmitted() {
     var limits = new BudgetManager.Limits(16, 16, 32, 16, 32, 1L << 20, 256L << 20);
-    var reserve = LeaseBudgetProfile.perGroupCapacity(1_572_864);
+    var reserve = new BudgetManager.ReservedCapacity(1, 0, 1, 0, 1, 0, 2);
     var budgets = new BudgetManager(limits, Map.of("group", limits), limits,
         reserve, Map.of("group", reserve));
     var stores = mock(TableGroupStores.class);

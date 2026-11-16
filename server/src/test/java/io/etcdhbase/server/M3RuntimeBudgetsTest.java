@@ -70,6 +70,38 @@ class M3RuntimeBudgetsTest {
   }
 
   @Test
+  void leaseActivationAllowsEveryGroupToAdmitItsNestedBackfillAccounts() throws Exception {
+    int maximumRequestBytes = 1_572_864;
+    var resources = new RuntimeConfiguration.ResourceBudgets(65_536, 2, 30_000,
+        4 << 20, 4 << 20, 2, 0);
+    var configuration = new RuntimeConfiguration(1, List.of(
+        new RuntimeConfiguration.Listener("first", "127.0.0.1", 0, "a"),
+        new RuntimeConfiguration.Listener("second", "127.0.0.1", 0, "b")),
+        List.of(), List.of(), List.of(), resources);
+    long minimum = LeaseBudgetProfile.capacityForGroups(2, maximumRequestBytes).memoryBytes()
+        + 2 * LeaseBudgetProfile.RECOVERY_MEMORY.total();
+    assertThrows(IllegalArgumentException.class,
+        () -> M3RuntimeBudgets.create(configuration, leaseActivation(minimum - 1), 0));
+    var budgets = M3RuntimeBudgets.create(configuration, leaseActivation(minimum), 0);
+    long accountBytes = LeaseBudgetProfile.eventBackfillMinimumMemory() / 2;
+    var backfillAccount = new BudgetManager.Reservation(0, 1, 1, 0, accountBytes - 2);
+    try (var scope = RequestScope.withoutDeadline();
+         var recoveryA = budgets.admit("a", scope, LeaseBudgetProfile.RECOVERY_MEMORY);
+         var recoveryB = budgets.admit("b", scope, LeaseBudgetProfile.RECOVERY_MEMORY)) {
+      assertThrows(BackendFailure.class, () -> budgets.admit("a", scope,
+          new BudgetManager.Reservation(0, 1, 1, 0, 0)));
+      try (var windowA = budgets.admitReserved("a", scope, backfillAccount);
+           var windowB = budgets.admitReserved("b", scope, backfillAccount);
+           var stepA = budgets.admitReserved("a", scope, backfillAccount);
+           var stepB = budgets.admitReserved("b", scope, backfillAccount)) {
+        assertEquals(2 * LeaseBudgetProfile.RECOVERY_MEMORY.total()
+            + 2 * LeaseBudgetProfile.eventBackfillMinimumMemory(), budgets.snapshot().reservedBytes());
+      }
+    }
+    assertEquals(0, budgets.snapshot().reservedBytes());
+  }
+
+  @Test
   void tableGroupsShareTheSameGlobalMemoryLimit() throws Exception {
     var resources = new RuntimeConfiguration.ResourceBudgets(65_536, 2, 30_000,
         4 << 20, 4 << 20, 2, 0);
