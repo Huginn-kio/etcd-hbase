@@ -56,6 +56,79 @@ class EventBackfillPublicationIT {
   private static final SnapshotPinConfiguration PINS = new SnapshotPinConfiguration(2, 16, Duration.ofMinutes(1));
 
   @Test
+  void resumesBackfillCycleAfterReopeningBothLayouts() throws Exception {
+    for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
+      try (var fixture = M3TestEnvironment.start(layout);
+           var scope = RequestScope.withTimeout(TIMEOUT)) {
+        var original = TableGroupStores.open(fixture.factory(), fixture.identity(), fixture.system(),
+            fixture.primary(), fixture.current(), PINS, scope).join();
+        long now = System.currentTimeMillis();
+        var owner = new CommitOwnerService(original.control())
+            .claim("backfill-cycle-test-owner", now, now + TIMEOUT.toMillis(), scope).join().orElseThrow();
+        writeLegacyPut(fixture, original, owner);
+        enableCapabilities(fixture, scope);
+        var stores = TableGroupStores.open(fixture.factory(), fixture.identity(), fixture.system(),
+            fixture.primary(), fixture.current(), PINS, scope).join();
+        owner = new AuxiliaryFormatUpgrade(stores.control()).upgrade(owner, now, scope).join();
+        owner = new LeaseBindingFormatUpgrade(stores.control()).upgrade(owner, now, scope).join();
+        owner = new LeaseExpiryFormatUpgrade(stores.control()).upgrade(owner, now, scope).join();
+        owner = new EventIndexFormatUpgrade(stores.control()).upgrade(owner, now, scope).join();
+        var selected = new EventHistoryRegistryUpgrade(stores.records(), stores.control(), PINS, Clock.systemUTC())
+            .upgrade(owner, scope).join();
+        owner = selected.owner();
+
+        var limits = new BudgetManager.Limits(4, 4, 4, 4, 4, 1_000_000, 1024L << 20);
+        var budgets = new BudgetManager(limits, Map.of(fixture.system().tableGroupId(), limits), limits);
+        var handoff = new BoundedPublicationHandoff(1, 1, TIMEOUT);
+        try {
+          var cycle = backfillCycle(fixture, stores, selected.registry(), budgets, handoff);
+          assertFalse(cycle.run(owner, scope).join());
+          var state = stores.control().read(scope).join().orElseThrow().state();
+          assertEquals(2, state.finalizedSequence());
+          assertEquals(2, state.finalizedRevision());
+          assertTrue(new HBaseEventRevisionIndexRepository(stores.records()).read(2, scope).join().isEmpty());
+
+          var reopened = TableGroupStores.open(fixture.factory(), fixture.identity(), fixture.system(),
+              fixture.primary(), fixture.current(), PINS, scope).join();
+          var pins = io.etcdhbase.core.commit.EventHistoryPinManager.openSelected(
+              reopened.records(), reopened.control(), PINS, Clock.systemUTC(), scope).join();
+          cycle = backfillCycle(fixture, reopened, pins, budgets, handoff);
+          assertTrue(cycle.run(owner, scope).join());
+          state = reopened.control().read(scope).join().orElseThrow().state();
+          assertEquals(3, state.finalizedSequence());
+          assertEquals(2, state.finalizedRevision());
+          assertTrue(cycle.run(owner, scope).join());
+          assertEquals(3, reopened.control().read(scope).join().orElseThrow().state().finalizedSequence());
+          var index = new HBaseEventRevisionIndexRepository(reopened.records()).read(2, scope).join().orElseThrow();
+          var decision = reopened.decisions().read(1, scope).join().orElseThrow();
+          var root = reopened.manifests().readRoot(decision.manifestRoot(), scope).join().orElseThrow();
+          assertEquals(EventRevisionIndex.fromSelected(decision, root), index);
+        } finally {
+          handoff.close();
+          handoff.drained().join();
+        }
+      }
+    }
+  }
+
+  private static EventBackfillCycle backfillCycle(M3TestEnvironment fixture, TableGroupStores stores,
+      io.etcdhbase.core.commit.EventHistoryPinManager pins, BudgetManager budgets,
+      BoundedPublicationHandoff handoff) {
+    var invocations = new InvocationService(stores.invocations());
+    var preparation = new EventBackfillPreparation(new LeaseAuxiliaryMutationPreparation(
+        new ResultPreparation(stores.resultRepository()), stores.results(),
+        new ManifestPreparation(stores.manifestRepository(), new ManifestPreparation.Limits(0, 0, 0, 0)),
+        invocations));
+    var publisher = new CommitPublisher(stores.control(), stores.outcomes(),
+        new CommitPlanVerifier(stores.manifests(), stores.materialization(), stores.results(),
+            stores.auxiliaryMaterialization(), new AuxiliaryLeasePlanVerifier(
+                LeaseStateMessages::decode, LeaseBindingMessages::decode)),
+        stores.invocations(), handoff, stores.finalizer());
+    return new EventBackfillCycle(fixture.system().tableGroupId(), stores, pins, invocations,
+        preparation, publisher, budgets, AUTHORIZATION, Clock.systemUTC());
+  }
+
+  @Test
   void publishesAndReopensLegacyBackfillOnBothLayouts() throws Exception {
     for (var layout : List.of(StorageTableBinding.Layout.HISTORY, StorageTableBinding.Layout.NATIVE)) {
       try (var fixture = M3TestEnvironment.start(layout);
