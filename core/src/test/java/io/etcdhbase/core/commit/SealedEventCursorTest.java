@@ -569,6 +569,8 @@ class SealedEventCursorTest {
               new ManifestCatalog.ProofReadBudget(windowScope, windowAccount, 3, 512L << 20)).join().orElseThrow();
           assertTrue(proposal.checkpoint().complete());
           assertEquals(EventRevisionIndex.fromSelected(fixture.decision, fixture.root), proposal.index().orElseThrow());
+          window.checkPublication(proposal.checkpoint(), 1, 5,
+              new ManifestCatalog.ProofReadBudget(windowScope, windowAccount, 3, 512L << 20)).join();
           assertFalse(pins.readBoundary(setup).join().protections().isEmpty());
           assertThrows(CompletionException.class, () -> step.next(
               new ManifestCatalog.ProofReadBudget(scope, account, 1, 512L << 20),

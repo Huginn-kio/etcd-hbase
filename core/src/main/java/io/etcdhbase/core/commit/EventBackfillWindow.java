@@ -121,7 +121,9 @@ public final class EventBackfillWindow implements AutoCloseable {
           && state.finalizedSequence() == checkpoint.sequence() - 1
           && state.publishedSequence() == state.finalizedSequence();
       if (!state.supportsEventRevisionIndex() || state.compactRevision() != captured.compactRevision()
-          || state.finalizedSequence() < checkpoint.sequence() && !initialSelection
+          // A proposed checkpoint belongs to the next commit. The captured checkpoint, not the
+          // proposal, is the durable baseline that must already have been finalized.
+          || state.finalizedSequence() < captured.sequence() && !initialSelection
           || state.finalizedSequence() < checkpoint.upperSequence()
           || state.finalizedRevision() < checkpoint.upperRevision()
           || initialSelection && (state.finalizedSequence() != checkpoint.upperSequence()
