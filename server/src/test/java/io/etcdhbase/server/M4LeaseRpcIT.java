@@ -39,7 +39,10 @@ import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.hbase.codec.LeaseStateMessages;
 import io.etcdhbase.hbase.probe.TemporaryHBaseClusterProcess;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
+import io.etcdhbase.hbase.storage.HBaseCommitDecisionRepository;
+import io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepository;
 import io.etcdhbase.hbase.storage.HBaseInvocationRepository;
+import io.etcdhbase.hbase.storage.HBaseManifestRepository;
 import io.etcdhbase.hbase.storage.HBaseSystemRecordStore;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.M3RuntimeConfigurationLoader;
@@ -128,6 +131,65 @@ class M4LeaseRpcIT {
       new RuntimeConfiguration.ResourceBudgets(65_536, 8, 30_000,
           4 << 20, 4 << 20, 16, 0);
   @TempDir Path testDirectory;
+
+  @Test
+  void runtimeFencesEventIndexFormatAndPersistsSelectedPutAcrossLayouts() throws Exception {
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (String layoutFile : LAYOUT_FILES) {
+        InitializationConfiguration initialization = initialization(layoutFile, clientPort);
+        var source = TableGroupPlanFactory.create(initialization, "local", null);
+        M3TableGroupPlan plan = M3TableGroupPlan.from(source);
+        var authScope = new io.etcdhbase.spi.identity.AuthenticationScope(
+            source.tableGroupId(), source.hbaseProfile().id());
+        try (var provider = new HBaseBackendIdentityProvider(source.identityProviderId(), authScope,
+                cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+                (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+                1, 1, Duration.ofSeconds(30));
+             var credentials = new io.etcdhbase.spi.identity.BackendCredentials("j44-test", new char[0])) {
+          var identity = authenticate(provider, credentials, authScope);
+          var activation = activation("1");
+          M3TableGroupInitializer.initializeFresh(plan, "sha256:" + source.fingerprint(),
+              identity, provider, activation.pinConfiguration());
+          var configuration = new RuntimeConfiguration(initialization.schemaVersion(),
+              List.of(new RuntimeConfiguration.Listener("j44", "127.0.0.1", 0, source.tableGroupId())),
+              initialization.hbaseProfiles(), initialization.saltProfiles(), initialization.tableGroups(), RESOURCES);
+          long revision;
+          try (var runtime = RuntimeServer.startM3(configuration, activation)) {
+            assertTrue(runtime.dataReady());
+            var response = putThrough(runtime, "j44-index-key", 1);
+            revision = response.getHeader().getRevision();
+            try (var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+              var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
+              assertTrue(control.supportsEventRevisionIndex());
+              assertTrue(control.read(scope).join().orElseThrow().state().supportsEventRevisionIndex());
+              var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
+              var index = new HBaseEventRevisionIndexRepository(records)
+                  .read(revision, scope).join().orElseThrow();
+              var decision = new HBaseCommitDecisionRepository(records)
+                  .read(index.decision().sequence(), scope).join().orElseThrow();
+              var root = new HBaseManifestRepository(records)
+                  .readRoot(decision.manifestRoot(), scope).join().orElseThrow();
+              index.verifySelected(decision, root);
+            }
+          }
+          M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, provider, identity);
+          try (var restarted = RuntimeServer.startM3(configuration, activation("2"));
+               var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+            assertTrue(restarted.dataReady());
+            var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
+            var index = new HBaseEventRevisionIndexRepository(records)
+                .read(revision, scope).join().orElseThrow();
+            var decision = new HBaseCommitDecisionRepository(records)
+                .read(index.decision().sequence(), scope).join().orElseThrow();
+            var root = new HBaseManifestRepository(records)
+                .readRoot(decision.manifestRoot(), scope).join().orElseThrow();
+            index.verifySelected(decision, root);
+          }
+        }
+      }
+    }
+  }
 
   @Test
   void realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts() throws Exception {

@@ -9,6 +9,7 @@ import io.etcdhbase.core.commit.CommitPublisher;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.AuxiliaryFormatUpgrade;
 import io.etcdhbase.core.commit.AuxiliaryLeasePlanVerifier;
+import io.etcdhbase.core.commit.EventIndexFormatUpgrade;
 import io.etcdhbase.core.commit.LeaseBindingFormatUpgrade;
 import io.etcdhbase.core.commit.LeaseExpiryFormatUpgrade;
 import io.etcdhbase.core.commit.InvocationService;
@@ -217,9 +218,11 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         if (owner.isOwner()) {
           ensureM4LeaseBindingFormat(plan, connections, identity, stores, owner, startup);
           ensureM4LeaseExpiryFormat(plan, connections, identity, owner, startup);
+          ensureM4EventIndexFormat(plan, connections, identity, owner, startup);
           stores = await(TableGroupStores.openConfigured(connections, identity, plan,
               activation.pinConfiguration(), startup), startup);
           verifyLeaseExpiryFormat(stores, startup);
+          verifyEventIndexFormat(stores, startup);
           invocations = new InvocationService(stores.invocations());
           owners = new CommitOwnerService(stores.control());
           recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
@@ -227,6 +230,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           await(owner.refreshServices(owners, recovery, startup), startup);
         } else {
           verifyLeaseExpiryFormat(stores, startup);
+          verifyEventIndexFormat(stores, startup);
         }
       }
       ByteKey authorization = authorizationDigest(identity);
@@ -444,6 +448,70 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         || !stores.records().supportsAuxiliary() || !stores.records().supportsLeaseBindings()
         || !stores.records().supportsLeaseExpiryCheckpoints()) {
       throw new IllegalStateException("J43 Lease expiry checkpoint format is not fenced and available");
+    }
+  }
+
+  /** The owner fences old writers before finalizers require an index for each new KV revision. */
+  private static void ensureM4EventIndexFormat(M3TableGroupPlan plan,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity,
+      M3OwnerLease ownerLease, RequestScope startup) throws Exception {
+    if (!ownerLease.isReady()) throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    await(ensureEventIndexDescriptor(plan, connections, identity, startup), startup);
+    HBaseCommitControlStore control = await(
+        HBaseCommitControlStore.open(connections, identity, plan.system(), startup), startup);
+    if (!control.supportsEventRevisionIndex()) {
+      throw new IllegalStateException("J44 event index descriptor capability is not available");
+    }
+    var owners = new CommitOwnerService(control);
+    CommitState state = await(control.read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    if (state.formatVersion() == CommitState.LEASE_EXPIRY_FORMAT_VERSION) {
+      await(ownerLease.transitionFence(owners,
+          owner -> new EventIndexFormatUpgrade(control)
+              .upgrade(owner, Clock.systemUTC().millis(), startup), startup), startup);
+    } else if (state.supportsEventRevisionIndex()) {
+      await(ownerLease.transitionFence(owners, CompletableFuture::completedFuture, startup), startup);
+    } else {
+      throw new IllegalStateException("table-group control format cannot be activated for J44");
+    }
+    CommitState verified = await(control.read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    CommitOwnerService.OwnerToken owner = ownerLease.token();
+    if (!verified.supportsEventRevisionIndex()
+        || verified.ownerInstance().filter(owner.instance()::equals).isEmpty()
+        || verified.ownerEpoch() != owner.epoch()
+        || verified.ownerLeaseExpired(Clock.systemUTC().millis()) || !ownerLease.isReady()) {
+      throw new IllegalStateException("J44 event index format upgrade lost its owner fence");
+    }
+  }
+
+  private static CompletableFuture<Void> ensureEventIndexDescriptor(M3TableGroupPlan plan,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity, RequestScope scope) {
+    var request = new HBaseRequestContext(scope);
+    return request.borrowConnection(connections, identity).thenCompose(connection -> {
+      var admin = connection.getAdmin();
+      return request.execute(() -> admin.getDescriptor(plan.system().table())).thenCompose(descriptor -> {
+        if (plan.system().supportsEventRevisionIndex(descriptor)) return CompletableFuture.completedFuture(null);
+        var replacement = plan.system().withEventRevisionIndexCapability(descriptor);
+        return request.execute(() -> admin.modifyTable(replacement))
+            .thenCompose(ignored -> request.execute(() -> admin.getDescriptor(plan.system().table())))
+            .thenAccept(verified -> {
+              if (!plan.system().supportsEventRevisionIndex(verified)) {
+                throw new IllegalStateException("J44 event index descriptor was not persisted");
+              }
+            });
+      });
+    }).exceptionallyCompose(failure -> CompletableFuture.failedFuture(HBaseFailures.classify(failure)));
+  }
+
+  private static void verifyEventIndexFormat(TableGroupStores stores, RequestScope scope) throws Exception {
+    CommitState state = await(stores.control().read(scope), scope)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized")).state();
+    if (!state.supportsEventRevisionIndex() || !stores.control().supportsEventRevisionIndex()
+        || !stores.records().supportsEventRevisionIndex()) {
+      throw new IllegalStateException("J44 event index format is not fenced and available");
     }
   }
 
