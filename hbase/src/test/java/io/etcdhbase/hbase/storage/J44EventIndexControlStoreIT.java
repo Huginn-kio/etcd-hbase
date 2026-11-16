@@ -6,12 +6,19 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.commit.CommitOwnerService;
 import io.etcdhbase.core.commit.CommitState;
+import io.etcdhbase.core.commit.EventHistoryPinManager;
+import io.etcdhbase.core.commit.EventHistoryRegistryUpgrade;
 import io.etcdhbase.core.commit.EventIndexBackfillCheckpoint;
+import io.etcdhbase.core.commit.SnapshotPinConfiguration;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import java.time.Duration;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.hadoop.hbase.HConstants;
@@ -85,6 +92,18 @@ class J44EventIndexControlStoreIT {
 
       var records = M1TestEnvironment.await(HBaseSystemRecordStore.open(
           environment.factory(), environment.identity(), binding, scope));
+      var pinConfiguration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+      var clock = Clock.fixed(Instant.ofEpochMilli(20), ZoneOffset.UTC);
+      var selected = M1TestEnvironment.await(new EventHistoryRegistryUpgrade(
+          records, newStore, pinConfiguration, clock)
+          .upgrade(new CommitOwnerService.OwnerToken("owner", eventIndex.ownerEpoch()), scope));
+      var selectedState = M1TestEnvironment.await(newStore.read(scope)).orElseThrow().state();
+      assertEquals(CommitState.EVENT_REGISTRY_FORMAT_VERSION, selectedState.formatVersion());
+      assertEquals(selected.owner().epoch(), selectedState.ownerEpoch());
+      var reopened = M1TestEnvironment.await(EventHistoryPinManager.openSelected(
+          records, newStore, pinConfiguration, clock, scope));
+      assertEquals(selected.registry().registryIdentity(), reopened.registryIdentity());
+
       var first = new EventIndexBackfillCheckpoint(1, 8, 2, 7, 2, 10, 10, 11, 4, ByteKey.copyOf(new byte[16]));
       var second = new EventIndexBackfillCheckpoint(1, 9, 2, 7, 3, 10, 10, 11, 4, ByteKey.copyOf(new byte[16]));
       var type = SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT;

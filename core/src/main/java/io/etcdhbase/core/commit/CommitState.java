@@ -11,6 +11,8 @@ public final class CommitState {
   public static final int LEASE_BINDING_FORMAT_VERSION = 3;
   public static final int LEASE_EXPIRY_FORMAT_VERSION = 4;
   public static final int EVENT_INDEX_FORMAT_VERSION = 5;
+  public static final int EVENT_REGISTRY_FORMAT_VERSION = 6;
+  public static final int MAX_EVENT_REGISTRY_ATTEMPTS = 32;
   public static final int MAX_OWNER_INSTANCE_BYTES = 128;
 
   private final ByteKey profileFingerprint;
@@ -25,6 +27,9 @@ public final class CommitState {
   private final long finalizedRevision;
   private final Optional<PublicationSlot> publication;
   private final long compactRevision;
+  private final Optional<ByteKey> eventRegistryNamespace;
+  private final Optional<ByteKey> pendingEventRegistryNamespace;
+  private final int eventRegistryAttempts;
 
   private CommitState(
       int formatVersion,
@@ -39,15 +44,41 @@ public final class CommitState {
       long finalizedRevision,
       Optional<PublicationSlot> publication,
       long compactRevision) {
+    this(formatVersion, profileFingerprint, ownerInstance, ownerEpoch, ownerLeaseDeadlineEpochMillis,
+        stateVersion, publishedSequence, publishedRevision, finalizedSequence, finalizedRevision,
+        publication, compactRevision, Optional.empty(), Optional.empty(), 0);
+  }
+
+  private CommitState(int formatVersion, ByteKey profileFingerprint, Optional<String> ownerInstance,
+      long ownerEpoch, long ownerLeaseDeadlineEpochMillis, long stateVersion, long publishedSequence,
+      long publishedRevision, long finalizedSequence, long finalizedRevision,
+      Optional<PublicationSlot> publication, long compactRevision, Optional<ByteKey> eventRegistryNamespace,
+      Optional<ByteKey> pendingEventRegistryNamespace, int eventRegistryAttempts) {
     this.profileFingerprint = Objects.requireNonNull(profileFingerprint, "profileFingerprint");
     this.ownerInstance = Objects.requireNonNull(ownerInstance, "ownerInstance");
     this.publication = Objects.requireNonNull(publication, "publication");
+    this.eventRegistryNamespace = Objects.requireNonNull(eventRegistryNamespace, "eventRegistryNamespace");
+    this.pendingEventRegistryNamespace = Objects.requireNonNull(pendingEventRegistryNamespace,
+        "pendingEventRegistryNamespace");
     if (formatVersion != FORMAT_VERSION && formatVersion != AUXILIARY_FORMAT_VERSION
         && formatVersion != LEASE_BINDING_FORMAT_VERSION
         && formatVersion != LEASE_EXPIRY_FORMAT_VERSION
-        && formatVersion != EVENT_INDEX_FORMAT_VERSION) {
+        && formatVersion != EVENT_INDEX_FORMAT_VERSION && formatVersion != EVENT_REGISTRY_FORMAT_VERSION) {
       throw new IllegalArgumentException("unknown commit control format");
     }
+    if ((formatVersion == EVENT_REGISTRY_FORMAT_VERSION) != eventRegistryNamespace.isPresent()
+        || eventRegistryNamespace.filter(value -> value.length() != 16).isPresent()
+        || pendingEventRegistryNamespace.filter(value -> value.length() != 16).isPresent()
+        || eventRegistryAttempts < 0 || eventRegistryAttempts > MAX_EVENT_REGISTRY_ATTEMPTS
+        || formatVersion < EVENT_INDEX_FORMAT_VERSION
+            && (eventRegistryAttempts != 0 || pendingEventRegistryNamespace.isPresent())
+        || formatVersion == EVENT_INDEX_FORMAT_VERSION
+            && (eventRegistryAttempts > 0) != pendingEventRegistryNamespace.isPresent()
+        || formatVersion == EVENT_REGISTRY_FORMAT_VERSION
+            && (eventRegistryAttempts == 0 || pendingEventRegistryNamespace.isPresent())) {
+      throw new IllegalArgumentException("invalid event registry namespace");
+    }
+    this.eventRegistryAttempts = eventRegistryAttempts;
     this.formatVersion = formatVersion;
     validateProfileFingerprint(profileFingerprint);
     validateCountersAndWatermarks(ownerEpoch, stateVersion, publishedSequence, publishedRevision,
@@ -98,6 +129,18 @@ public final class CommitState {
         finalizedSequence, finalizedRevision, publication, compactRevision);
   }
 
+  public static CommitState restore(int formatVersion, ByteKey profileFingerprint,
+      Optional<String> ownerInstance, long ownerEpoch, long ownerLeaseDeadlineEpochMillis,
+      long stateVersion, long publishedSequence, long publishedRevision, long finalizedSequence,
+      long finalizedRevision, Optional<PublicationSlot> publication, long compactRevision,
+      Optional<ByteKey> eventRegistryNamespace, Optional<ByteKey> pendingEventRegistryNamespace,
+      int eventRegistryAttempts) {
+    return new CommitState(formatVersion, profileFingerprint, ownerInstance, ownerEpoch,
+        ownerLeaseDeadlineEpochMillis, stateVersion, publishedSequence, publishedRevision,
+        finalizedSequence, finalizedRevision, publication, compactRevision, eventRegistryNamespace,
+        pendingEventRegistryNamespace, eventRegistryAttempts);
+  }
+
   public int formatVersion() { return formatVersion; }
   public boolean supportsAuxiliaryRecords() { return formatVersion >= AUXILIARY_FORMAT_VERSION; }
   public boolean supportsLeaseBindings() { return formatVersion >= LEASE_BINDING_FORMAT_VERSION; }
@@ -114,6 +157,9 @@ public final class CommitState {
   public long finalizedRevision() { return finalizedRevision; }
   public Optional<PublicationSlot> publication() { return publication; }
   public long compactRevision() { return compactRevision; }
+  public Optional<ByteKey> eventRegistryNamespace() { return eventRegistryNamespace; }
+  public Optional<ByteKey> pendingEventRegistryNamespace() { return pendingEventRegistryNamespace; }
+  public int eventRegistryAttempts() { return eventRegistryAttempts; }
 
   /** Fences the old owner in the same CAS that enables the auxiliary control format. */
   public CommitState upgradeAuxiliaryFormat(String expectedOwner, long expectedEpoch, long nowMillis) {
@@ -166,6 +212,36 @@ public final class CommitState {
         Math.addExact(ownerEpoch, 1), ownerLeaseDeadlineEpochMillis, nextStateVersion(),
         publishedSequence, publishedRevision, finalizedSequence, finalizedRevision,
         publication, compactRevision);
+  }
+
+  /** Reserves one bounded staging attempt and fences earlier attempts before any staging writes. */
+  public CommitState reserveEventRegistry(String expectedOwner, long expectedEpoch, long nowMillis,
+      ByteKey namespace) {
+    requireOwner(expectedOwner, expectedEpoch);
+    Objects.requireNonNull(namespace, "namespace");
+    if (formatVersion != EVENT_INDEX_FORMAT_VERSION || publication.isPresent() || ownerLeaseExpired(nowMillis)
+        || namespace.length() != 16 || eventRegistryAttempts == MAX_EVENT_REGISTRY_ATTEMPTS) {
+      throw new IllegalStateException("control state cannot reserve an event registry attempt");
+    }
+    return new CommitState(formatVersion, profileFingerprint, ownerInstance,
+        Math.addExact(ownerEpoch, 1), ownerLeaseDeadlineEpochMillis, nextStateVersion(),
+        publishedSequence, publishedRevision, finalizedSequence, finalizedRevision, publication,
+        compactRevision, Optional.empty(), Optional.of(namespace), eventRegistryAttempts + 1);
+  }
+
+  /** Selects one fully prepared registry namespace and fences the previous owner in the same CAS. */
+  public CommitState upgradeEventRegistryFormat(String expectedOwner, long expectedEpoch, long nowMillis,
+      ByteKey namespace) {
+    requireOwner(expectedOwner, expectedEpoch);
+    Objects.requireNonNull(namespace, "namespace");
+    if (formatVersion != EVENT_INDEX_FORMAT_VERSION || publication.isPresent() || ownerLeaseExpired(nowMillis)
+        || !pendingEventRegistryNamespace.equals(Optional.of(namespace))) {
+      throw new IllegalStateException("control state cannot select an event registry");
+    }
+    return new CommitState(EVENT_REGISTRY_FORMAT_VERSION, profileFingerprint, ownerInstance,
+        Math.addExact(ownerEpoch, 1), ownerLeaseDeadlineEpochMillis, nextStateVersion(),
+        publishedSequence, publishedRevision, finalizedSequence, finalizedRevision,
+        publication, compactRevision, Optional.of(namespace), Optional.empty(), eventRegistryAttempts);
   }
 
   public boolean ownerLeaseExpired(long nowEpochMillis) {
@@ -246,7 +322,8 @@ public final class CommitState {
       Optional<PublicationSlot> nextPublication, long nextCompactRevision) {
     return new CommitState(formatVersion, profileFingerprint, nextOwner, nextEpoch, nextLeaseDeadline, nextVersion,
         nextPublishedSequence, nextPublishedRevision, nextFinalizedSequence,
-        nextFinalizedRevision, nextPublication, nextCompactRevision);
+        nextFinalizedRevision, nextPublication, nextCompactRevision, eventRegistryNamespace,
+        pendingEventRegistryNamespace, eventRegistryAttempts);
   }
 
   private long nextStateVersion() {

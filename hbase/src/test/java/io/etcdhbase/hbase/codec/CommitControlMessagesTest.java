@@ -29,6 +29,9 @@ class CommitControlMessagesTest {
     var bindingEnabled = upgraded.upgradeLeaseBindingFormat("owner-a", 2, 12);
     var expiryEnabled = bindingEnabled.upgradeLeaseExpiryFormat("owner-a", 3, 13);
     var eventIndexEnabled = expiryEnabled.upgradeEventIndexFormat("owner-a", 4, 14);
+    var namespace = ByteKey.copyOf(new byte[16]);
+    var registryReserved = eventIndexEnabled.reserveEventRegistry("owner-a", 5, 15, namespace);
+    var registryEnabled = registryReserved.upgradeEventRegistryFormat("owner-a", 6, 16, namespace);
     var oldWire = CommitProtos.CommitControlState.parseFrom(CommitControlMessages.encode(legacy));
     var newWire = CommitProtos.CommitControlState.parseFrom(CommitControlMessages.encode(upgraded));
     var bindingWire = CommitProtos.CommitControlState.parseFrom(CommitControlMessages.encode(bindingEnabled));
@@ -43,6 +46,15 @@ class CommitControlMessagesTest {
     assertEquals(4, expiryWire.getFormatVersion());
     assertStateEquals(expiryEnabled, roundTrip(expiryEnabled));
     assertStateEquals(eventIndexEnabled, roundTrip(eventIndexEnabled));
+    assertStateEquals(registryReserved, roundTrip(registryReserved));
+    assertStateEquals(registryEnabled, roundTrip(registryEnabled));
+    var registryWire = CommitProtos.CommitControlState.parseFrom(CommitControlMessages.encode(registryEnabled));
+    assertThrows(IllegalArgumentException.class, () -> CommitControlMessages.decode(
+        registryWire.toBuilder().clearEventRegistryNamespace().build().toByteArray()));
+    assertThrows(IllegalArgumentException.class, () -> CommitControlMessages.decode(
+        registryWire.toBuilder().setEventRegistryNamespace(ByteString.copyFrom(new byte[15])).build().toByteArray()));
+    assertThrows(IllegalArgumentException.class, () -> CommitControlMessages.decode(
+        registryWire.toBuilder().setFormatVersion(5).build().toByteArray()));
   }
 
   @Test
@@ -130,6 +142,9 @@ class CommitControlMessagesTest {
     assertEquals(expected.finalizedRevision(), actual.finalizedRevision());
     assertEquals(expected.publication(), actual.publication());
     assertEquals(expected.compactRevision(), actual.compactRevision());
+    assertEquals(expected.eventRegistryNamespace(), actual.eventRegistryNamespace());
+    assertEquals(expected.pendingEventRegistryNamespace(), actual.pendingEventRegistryNamespace());
+    assertEquals(expected.eventRegistryAttempts(), actual.eventRegistryAttempts());
   }
 
   private static PublicationSlot slot(long baseSequence, long baseRevision,

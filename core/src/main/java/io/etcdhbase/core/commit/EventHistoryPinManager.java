@@ -31,6 +31,33 @@ public final class EventHistoryPinManager {
         .thenApply(EventHistoryPinManager::new);
   }
 
+  /** A staging namespace belongs to one attempt and cannot be shared with another initializer. */
+  static CompletableFuture<EventHistoryPinManager> stage(SystemRecordStore records, ByteKey namespace,
+      SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
+    return SnapshotPinManager.initializeFresh(new EventPinRecords(records, namespace), configuration, clock, scope)
+        .thenApply(EventHistoryPinManager::new);
+  }
+
+  /** Opens only the namespace selected by the authoritative control row; never recreates it. */
+  public static CompletableFuture<EventHistoryPinManager> openSelected(SystemRecordStore records,
+      CommitControlStore control, SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
+    Objects.requireNonNull(control, "control");
+    return control.read(scope).thenCompose(found -> {
+      CommitState state = found.orElseThrow(() -> new IllegalStateException("event control row is missing")).state();
+      ByteKey namespace = state.eventRegistryNamespace().orElseThrow(
+          () -> new IllegalStateException("event registry namespace is not selected"));
+      return SnapshotPinManager.openSealed(new EventPinRecords(records, namespace), configuration, clock, scope)
+          .thenCompose(registry -> control.read(scope).thenApply(latest -> {
+            CommitState current = latest.orElseThrow(
+                () -> new IllegalStateException("event control row is missing")).state();
+            if (!current.eventRegistryNamespace().equals(Optional.of(namespace))) {
+              throw new IllegalStateException("event registry namespace changed during open");
+            }
+            return new EventHistoryPinManager(registry);
+          }));
+    });
+  }
+
   /**
    * Registers before event or index reads. The caller must re-read the logical compact/control
    * boundary after registration and stop if the requested history is no longer available.
@@ -89,10 +116,21 @@ public final class EventHistoryPinManager {
   /** Keeps event pins in a distinct durable namespace while reusing the CAS lease registry. */
   private static final class EventPinRecords implements SystemRecordStore {
     private static final byte[] PREFIX = {0x45, 0x56, 0x50, 0x49, 0x4e, 0x01, 0x00};
+    private static final byte[] STAGING_PREFIX = {0x45, 0x56, 0x50, 0x49, 0x4e, 0x01, 0x01};
     private final SystemRecordStore delegate;
+    private final byte[] prefix;
 
     private EventPinRecords(SystemRecordStore delegate) {
       this.delegate = Objects.requireNonNull(delegate, "records");
+      this.prefix = PREFIX;
+    }
+
+    private EventPinRecords(SystemRecordStore delegate, ByteKey namespace) {
+      this.delegate = Objects.requireNonNull(delegate, "records");
+      Objects.requireNonNull(namespace, "namespace");
+      if (namespace.length() != 16) throw new IllegalArgumentException("invalid event registry namespace");
+      this.prefix = ByteBuffer.allocate(STAGING_PREFIX.length + 16)
+          .put(STAGING_PREFIX).put(namespace.bytes()).array();
     }
 
     @Override public int bucket(SystemRecordType type, ByteKey identity) {
@@ -114,13 +152,13 @@ public final class EventHistoryPinManager {
       return delegate.compareAndSet(type, namespaced(type, identity), expected, replacement, scope);
     }
 
-    private static ByteKey namespaced(SystemRecordType type, ByteKey identity) {
+    private ByteKey namespaced(SystemRecordType type, ByteKey identity) {
       if (type != SystemRecordType.SNAPSHOT_PIN) {
         throw new IllegalArgumentException("event pin registry can only access pin records");
       }
       byte[] value = Objects.requireNonNull(identity, "identity").bytes();
-      return ByteKey.copyOf(ByteBuffer.allocate(Math.addExact(PREFIX.length, value.length))
-          .put(PREFIX).put(value).array());
+      return ByteKey.copyOf(ByteBuffer.allocate(Math.addExact(prefix.length, value.length))
+          .put(prefix).put(value).array());
     }
   }
 }

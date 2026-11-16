@@ -14,6 +14,8 @@ import io.etcdhbase.core.storage.StoredRecord;
 import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +27,95 @@ import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 
 class SealedEventCursorTest {
+  @Test
+  void cancelledRegistryAttemptDoesNotSelectAfterItsPhysicalWritesDrain() {
+    var records = new MemoryRecords();
+    var control = new MutableControl(new Fixture().finalizedState());
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    var clock = Clock.fixed(Instant.ofEpochMilli(20), ZoneOffset.UTC);
+    var physical = new CompletableFuture<Void>();
+    records.pendingProducer = physical;
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var selecting = new EventHistoryRegistryUpgrade(records, control, configuration, clock)
+          .upgrade(new CommitOwnerService.OwnerToken("owner", 1), scope);
+      scope.cancel();
+      physical.complete(null);
+      assertThrows(CompletionException.class, selecting::join);
+      assertEquals(CommitState.EVENT_INDEX_FORMAT_VERSION, control.state.formatVersion());
+      assertTrue(control.state.eventRegistryNamespace().isEmpty());
+    } finally {
+      physical.complete(null);
+    }
+  }
+
+  @Test
+  void replacedOwnerCannotSelectItsLateStagingNamespace() {
+    var records = new MemoryRecords();
+    var control = new MutableControl(new Fixture().finalizedState());
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    var physical = new CompletableFuture<Void>();
+    records.pendingProducer = physical;
+    try (RequestScope first = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope second = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var oldUpgrade = new EventHistoryRegistryUpgrade(records, control, configuration,
+          Clock.fixed(Instant.ofEpochMilli(20), ZoneOffset.UTC));
+      var oldSelection = oldUpgrade.upgrade(new CommitOwnerService.OwnerToken("owner", 1), first);
+      ByteKey oldNamespace = control.state.pendingEventRegistryNamespace().orElseThrow();
+
+      control.state = control.state.claimOwner("replacement", 100, 200);
+      var newUpgrade = new EventHistoryRegistryUpgrade(records, control, configuration,
+          Clock.fixed(Instant.ofEpochMilli(101), ZoneOffset.UTC));
+      var selected = newUpgrade.upgrade(new CommitOwnerService.OwnerToken("replacement", 3), second).join();
+      ByteKey newNamespace = control.state.eventRegistryNamespace().orElseThrow();
+      assertFalse(oldNamespace.equals(newNamespace));
+      assertEquals(5, selected.owner().epoch());
+
+      physical.complete(null);
+      assertThrows(CompletionException.class, oldSelection::join);
+      assertEquals(Optional.of(newNamespace), control.state.eventRegistryNamespace());
+    } finally {
+      physical.complete(null);
+    }
+  }
+
+  @Test
+  void eventRegistrySelectionWaitsForStagingProducersAndIgnoresLateLosingNamespaces() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var control = new MutableControl(fixture.finalizedState());
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    var clock = Clock.fixed(Instant.ofEpochMilli(20), ZoneOffset.UTC);
+    var physical = new CompletableFuture<Void>();
+    records.pendingProducer = physical;
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var upgrade = new EventHistoryRegistryUpgrade(records, control, configuration, clock);
+      var selecting = upgrade.upgrade(new CommitOwnerService.OwnerToken("owner", 1), scope);
+      assertFalse(selecting.isDone());
+      assertEquals(CommitState.EVENT_INDEX_FORMAT_VERSION, control.state.formatVersion());
+      assertTrue(control.state.pendingEventRegistryNamespace().isPresent());
+
+      physical.complete(null);
+      var selection = selecting.join();
+      assertEquals(CommitState.EVENT_REGISTRY_FORMAT_VERSION, control.state.formatVersion());
+      assertEquals(3, selection.owner().epoch());
+      var reopened = EventHistoryPinManager.openSelected(records, control, configuration, clock, scope).join();
+      assertEquals(selection.registry().registryIdentity(), reopened.registryIdentity());
+
+      byte[] losingBytes = control.state.eventRegistryNamespace().orElseThrow().bytes();
+      losingBytes[0] ^= 1;
+      var losingNamespace = ByteKey.copyOf(losingBytes);
+      EventHistoryPinManager.stage(records, losingNamespace, configuration, clock, scope).join();
+      assertEquals(reopened.registryIdentity(),
+          EventHistoryPinManager.openSelected(records, control, configuration, clock, scope).join().registryIdentity());
+
+      records.deleteEventNamespace(control.state.eventRegistryNamespace().orElseThrow());
+      assertThrows(CompletionException.class,
+          () -> EventHistoryPinManager.openSelected(records, control, configuration, clock, scope).join());
+    } finally {
+      physical.complete(null);
+    }
+  }
+
   @Test
   void eventCollectionWaitsForBackfillAndRetainsSelectedWindowAcrossReopen() throws Exception {
     Fixture fixture = new Fixture();
@@ -871,6 +962,8 @@ class SealedEventCursorTest {
     private CompletableFuture<Boolean> pauseNextCas;
     private CompletableFuture<Boolean> pausedCas;
     private CompletableFuture<Optional<SystemRecordEntry>> pendingCheckpointRead;
+    private CompletableFuture<Void> pendingProducer;
+    private boolean producerTracked;
     @Override public int bucket(SystemRecordType type, ByteKey identity) { return 0; }
     @Override public synchronized CompletableFuture<Optional<ByteKey>> read(
         SystemRecordType type, ByteKey identity, RequestScope scope) {
@@ -892,9 +985,20 @@ class SealedEventCursorTest {
     }
     @Override public synchronized CompletableFuture<CreateResult> createIfAbsent(
         SystemRecordType type, ByteKey identity, ByteKey value, RequestScope scope) {
+      if (pendingProducer != null && !producerTracked && type == SystemRecordType.SNAPSHOT_PIN
+          && identity.bytes()[0] == 0x45) {
+        producerTracked = true;
+        scope.trackPhysicalProducer(pendingProducer);
+      }
       ByteKey old = rows.putIfAbsent(identity, value);
       return CompletableFuture.completedFuture(old == null ? CreateResult.CREATED
           : old.equals(value) ? CreateResult.ALREADY_PRESENT : CreateResult.CONFLICT);
+    }
+    private synchronized void deleteEventNamespace(ByteKey namespace) {
+      byte[] prefix = java.nio.ByteBuffer.allocate(23)
+          .put(new byte[] {0x45, 0x56, 0x50, 0x49, 0x4e, 0x01, 0x01}).put(namespace.bytes()).array();
+      rows.keySet().removeIf(key -> key.length() >= prefix.length
+          && java.util.Arrays.equals(prefix, java.util.Arrays.copyOf(key.bytes(), prefix.length)));
     }
     @Override public synchronized CompletableFuture<Boolean> compareAndSet(SystemRecordType type,
         ByteKey identity, Optional<ByteKey> expected, ByteKey replacement, RequestScope scope) {
@@ -910,6 +1014,23 @@ class SealedEventCursorTest {
       return CompletableFuture.completedFuture(true);
     }
     private void resumeCas() { pausedCas.complete(true); }
+  }
+
+  private static final class MutableControl implements CommitControlStore {
+    private CommitState state;
+    private MutableControl(CommitState state) { this.state = state; }
+    @Override public synchronized CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(state, new byte[] {1})));
+    }
+    @Override public CompletableFuture<Boolean> initializeIfAbsent(CommitState initial, RequestScope scope) {
+      throw new UnsupportedOperationException();
+    }
+    @Override public synchronized CompletableFuture<Boolean> compareAndSet(
+        ControlSnapshot observed, CommitState replacement, RequestScope scope) {
+      if (observed.state() != state) return CompletableFuture.completedFuture(false);
+      state = replacement;
+      return CompletableFuture.completedFuture(true);
+    }
   }
 
   private static final class Fixture {

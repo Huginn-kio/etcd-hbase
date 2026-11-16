@@ -139,7 +139,15 @@ public final class HBaseCommitControlStore implements CommitControlStore {
             && eventRevisionIndexSupported && state.ownerInstance().isPresent()
             && Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
                 state.upgradeEventIndexFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0)));
-        if (!auxiliaryUpgrade && !leaseBindingUpgrade && !leaseExpiryUpgrade && !eventIndexUpgrade) {
+        boolean eventRegistryUpgrade = state.formatVersion() == CommitState.EVENT_INDEX_FORMAT_VERSION
+            && replacement.formatVersion() == CommitState.EVENT_REGISTRY_FORMAT_VERSION
+            && eventRevisionIndexSupported && state.ownerInstance().isPresent()
+            && state.pendingEventRegistryNamespace().isPresent()
+            && Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
+                state.upgradeEventRegistryFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0,
+                    state.pendingEventRegistryNamespace().orElseThrow())));
+        if (!auxiliaryUpgrade && !leaseBindingUpgrade && !leaseExpiryUpgrade && !eventIndexUpgrade
+            && !eventRegistryUpgrade) {
           return CompletableFuture.failedFuture(new IllegalArgumentException("invalid control format upgrade"));
         }
       } catch (IllegalArgumentException | IllegalStateException | ArithmeticException failure) {

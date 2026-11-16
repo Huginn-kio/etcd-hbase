@@ -56,6 +56,28 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     return start(records, configuration, clock, scope, false);
   }
 
+  /** Opens a selected namespace without resuming or recreating initialization metadata. */
+  static CompletableFuture<SnapshotPinManager> openSealed(SystemRecordStore records,
+      SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
+    Objects.requireNonNull(records, "records");
+    Objects.requireNonNull(configuration, "configuration");
+    Objects.requireNonNull(clock, "clock");
+    Objects.requireNonNull(scope, "scope");
+    var manager = new SnapshotPinManager(records, configuration, clock,
+        ByteKey.copyOf(TransactionId.create().bytes()));
+    return manager.readConfiguration(scope).thenCompose(configurationRecord ->
+        manager.readInitialization(scope).thenCompose(initialization -> {
+          StoredConfiguration stored = configurationRecord.orElseThrow(
+              () -> new IllegalStateException("selected snapshot pin configuration is missing"));
+          ByteKey selected = stored.value().registryId();
+          if (initialization.isEmpty()
+              || initialization.orElseThrow().value().sealedRegistryId().filter(selected::equals).isEmpty()) {
+            return failed(new IllegalStateException("selected snapshot pin witness is missing or unsealed"));
+          }
+          return manager.finishOpen(stored, scope);
+        }));
+  }
+
   /**
    * Bootstraps a verified new table group. The caller must confirm that the table is fresh, exclude
    * existing services and other bootstrap attempts, and wait for earlier bootstrap writes to stop.

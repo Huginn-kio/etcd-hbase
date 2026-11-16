@@ -17,6 +17,9 @@ message CommitControlState {
   optional int64 finalized_revision = 10;
   optional int64 compact_revision = 11;
   optional PublicationSlot publication = 12;
+  optional bytes event_registry_namespace = 13;
+  optional bytes pending_event_registry_namespace = 14;
+  optional uint32 event_registry_attempts = 15;
 }
 
 message PublicationSlot {

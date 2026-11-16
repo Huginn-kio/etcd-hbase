@@ -102,6 +102,52 @@ class CommitStateTest {
   }
 
   @Test
+  void eventRegistrySelectionFencesOldOwnerAndSurvivesControlUpdates() {
+    var index = CommitState.initial(FINGERPRINT, 7).claimOwner("owner-a", 10, 100)
+        .upgradeAuxiliaryFormat("owner-a", 1, 11)
+        .upgradeLeaseBindingFormat("owner-a", 2, 12)
+        .upgradeLeaseExpiryFormat("owner-a", 3, 13)
+        .upgradeEventIndexFormat("owner-a", 4, 14);
+    var namespace = ByteKey.copyOf(new byte[16]);
+    var reserved = index.reserveEventRegistry("owner-a", 5, 15, namespace);
+    assertEquals(1, reserved.eventRegistryAttempts());
+    assertEquals(Optional.of(namespace), reserved.pendingEventRegistryNamespace());
+    var selected = reserved.upgradeEventRegistryFormat("owner-a", 6, 16, namespace);
+    assertEquals(CommitState.EVENT_REGISTRY_FORMAT_VERSION, selected.formatVersion());
+    assertEquals(Optional.of(namespace), selected.eventRegistryNamespace());
+    assertEquals(7, selected.ownerEpoch());
+    assertEquals(index.publishedSequence(), selected.publishedSequence());
+    assertEquals(index.publishedRevision(), selected.publishedRevision());
+    assertEquals(Optional.of(namespace), selected.heartbeat("owner-a", 7, 200).eventRegistryNamespace());
+    assertThrows(IllegalStateException.class, () -> selected.heartbeat("owner-a", 5, 200));
+    assertThrows(IllegalStateException.class, () -> index.reserveEventRegistry("owner-a", 5, 100, namespace));
+    assertThrows(IllegalStateException.class, () -> index.reserveEventRegistry("owner-a", 5, 15,
+        ByteKey.copyOf(new byte[15])));
+    assertThrows(IllegalStateException.class, () -> reserved.upgradeEventRegistryFormat("owner-a", 6, 16,
+        ByteKey.copyOf(new byte[] {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})));
+    assertThrows(IllegalStateException.class, () -> index.publish(slot(0, 7, false, 5))
+        .reserveEventRegistry("owner-a", 5, 15, namespace));
+  }
+
+  @Test
+  void eventRegistryAttemptsAreDurablyBounded() {
+    var state = CommitState.initial(FINGERPRINT, 7).claimOwner("owner-a", 10, 100)
+        .upgradeAuxiliaryFormat("owner-a", 1, 11)
+        .upgradeLeaseBindingFormat("owner-a", 2, 12)
+        .upgradeLeaseExpiryFormat("owner-a", 3, 13)
+        .upgradeEventIndexFormat("owner-a", 4, 14);
+    for (int attempt = 0; attempt < CommitState.MAX_EVENT_REGISTRY_ATTEMPTS; attempt++) {
+      byte[] namespace = new byte[16];
+      namespace[0] = (byte) attempt;
+      state = state.reserveEventRegistry("owner-a", state.ownerEpoch(), 15, ByteKey.copyOf(namespace));
+    }
+    var exhausted = state;
+    assertEquals(CommitState.MAX_EVENT_REGISTRY_ATTEMPTS, exhausted.eventRegistryAttempts());
+    assertThrows(IllegalStateException.class, () -> exhausted.reserveEventRegistry("owner-a",
+        exhausted.ownerEpoch(), 15, ByteKey.copyOf(new byte[16])));
+  }
+
+  @Test
   void metadataOnlyPublicationDoesNotAdvanceRevisionAndKeyChangesAdvanceItOnce() {
     CommitState owned = CommitState.initial(FINGERPRINT, 7).claimOwner("owner-a", 1, 100);
 

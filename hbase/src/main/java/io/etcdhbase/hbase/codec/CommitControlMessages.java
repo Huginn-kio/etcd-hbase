@@ -32,6 +32,10 @@ public final class CommitControlMessages {
         .setCompactRevision(state.compactRevision());
     state.ownerInstance().ifPresent(builder::setOwnerInstance);
     state.publication().ifPresent(slot -> builder.setPublication(encode(slot)));
+    state.eventRegistryNamespace().ifPresent(value -> builder.setEventRegistryNamespace(ByteString.copyFrom(value.bytes())));
+    state.pendingEventRegistryNamespace().ifPresent(value ->
+        builder.setPendingEventRegistryNamespace(ByteString.copyFrom(value.bytes())));
+    if (state.eventRegistryAttempts() > 0) builder.setEventRegistryAttempts(state.eventRegistryAttempts());
     byte[] encoded = builder.build().toByteArray();
     requireLength(encoded.length);
     return encoded;
@@ -48,6 +52,7 @@ public final class CommitControlMessages {
               && message.getFormatVersion() != CommitState.LEASE_BINDING_FORMAT_VERSION
               && message.getFormatVersion() != CommitState.LEASE_EXPIRY_FORMAT_VERSION
               && message.getFormatVersion() != CommitState.EVENT_INDEX_FORMAT_VERSION
+              && message.getFormatVersion() != CommitState.EVENT_REGISTRY_FORMAT_VERSION
           || !message.hasProfileFingerprint() || !message.hasOwnerEpoch()
           || !message.hasOwnerLeaseDeadlineEpochMillis() || !message.hasStateVersion()
           || !message.hasPublishedSequence() || !message.hasPublishedRevision()
@@ -63,11 +68,16 @@ public final class CommitControlMessages {
           ? Optional.of(message.getOwnerInstance()) : Optional.empty();
       Optional<PublicationSlot> publication = message.hasPublication()
           ? Optional.of(decode(message.getPublication())) : Optional.empty();
+      Optional<ByteKey> registryNamespace = message.hasEventRegistryNamespace()
+          ? Optional.of(ByteKey.copyOf(message.getEventRegistryNamespace().toByteArray())) : Optional.empty();
+      Optional<ByteKey> pendingNamespace = message.hasPendingEventRegistryNamespace()
+          ? Optional.of(ByteKey.copyOf(message.getPendingEventRegistryNamespace().toByteArray())) : Optional.empty();
+      if (message.hasEventRegistryAttempts() && message.getEventRegistryAttempts() == 0) throw invalid();
       return CommitState.restore(message.getFormatVersion(), ByteKey.copyOf(fingerprint), owner, ownerEpoch,
           message.getOwnerLeaseDeadlineEpochMillis(), message.getStateVersion(),
           message.getPublishedSequence(), message.getPublishedRevision(),
           message.getFinalizedSequence(), message.getFinalizedRevision(), publication,
-          message.getCompactRevision());
+          message.getCompactRevision(), registryNamespace, pendingNamespace, message.getEventRegistryAttempts());
     } catch (InvalidProtocolBufferException | IllegalArgumentException failure) {
       throw new IllegalArgumentException("invalid persisted commit control state", failure);
     }
