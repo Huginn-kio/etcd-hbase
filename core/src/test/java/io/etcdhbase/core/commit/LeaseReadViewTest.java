@@ -26,6 +26,60 @@ import org.junit.jupiter.api.Test;
 
 class LeaseReadViewTest {
   @Test
+  void backfillReadUsesSelectedCheckpointAtThePinnedBarrier() throws Exception {
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0);
+    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0);
+    try (Fixture fixture = new Fixture(stable, selected); var budget = new EnumerationBudget(fixture.scope)) {
+      var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
+      assertEquals(selected, reader.read(fixture.pinned, fixture.scope, budget.metadata).join().orElseThrow());
+      assertEquals(3, fixture.records.lastSequence);
+    }
+  }
+
+  @Test
+  void backfillReadRejectsCorruptOrDiscontinuousCheckpoints() throws Exception {
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0);
+    var skipped = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 3, 1, 2, 2, 0);
+    try (Fixture fixture = new Fixture(stable, skipped); var budget = new EnumerationBudget(fixture.scope)) {
+      var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
+      assertThrows(CompletionException.class, () -> reader.read(fixture.pinned, fixture.scope, budget.metadata).join());
+    }
+    try (Fixture fixture = new Fixture(stable, skipped); var budget = new EnumerationBudget(fixture.scope)) {
+      fixture.records.checkpointRows.put(EventIndexBackfillCheckpoint.versionIdentity(3),
+          ByteKey.copyOf(new byte[] {1}));
+      var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
+      assertThrows(CompletionException.class, () -> reader.read(fixture.pinned, fixture.scope, budget.metadata).join());
+    }
+  }
+
+  @Test
+  void cancelledBackfillReadHoldsItsPinUntilPhysicalReadFinishes() throws Exception {
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0);
+    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0);
+    try (Fixture fixture = new Fixture(stable, selected); var budget = new EnumerationBudget(fixture.scope)) {
+      fixture.records.blocked = new CompletableFuture<>();
+      var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
+      var result = reader.read(fixture.pinned, fixture.scope, budget.metadata);
+      fixture.pinned.close();
+      assertEquals(0, fixture.pin.closes);
+      fixture.records.blocked.complete(Optional.empty());
+      assertThrows(CompletionException.class, result::join);
+      assertEquals(1, fixture.pin.closes);
+    }
+  }
+
+  @Test
+  void backfillReadDoesNotReturnAfterProtectionExpires() throws Exception {
+    var stable = new EventIndexBackfillCheckpoint(1, 3, 1, 2, 1, 1, 1, 2, 0);
+    var selected = new EventIndexBackfillCheckpoint(1, 4, 1, 2, 2, 1, 2, 2, 0);
+    try (Fixture fixture = new Fixture(stable, selected); var budget = new EnumerationBudget(fixture.scope)) {
+      fixture.pin.failRenewAt = 2;
+      var reader = new EventIndexBackfillReader(fixture.records, new ManifestCatalog(fixture.manifests));
+      assertThrows(CompletionException.class, () -> reader.read(fixture.pinned, fixture.scope, budget.metadata).join());
+    }
+  }
+
+  @Test
   void enumeratesStableAndSelectedLeasesWithoutIncludingFutureOnlyPointers() throws Exception {
     try (Fixture fixture = new Fixture(true); var budget = new EnumerationBudget(fixture.scope)) {
       fixture.records.pointer(9, 2);
@@ -358,6 +412,26 @@ class LeaseReadViewTest {
       pinned = new PinnedReadView(view, pin, scope, true);
     }
 
+    private Fixture(EventIndexBackfillCheckpoint stable, EventIndexBackfillCheckpoint selectedCheckpoint) {
+      records.checkpointRows.put(EventIndexBackfillCheckpoint.versionIdentity(stable.sequence()), stable.encode());
+      TransactionId transaction = TransactionId.create();
+      var record = PreparedAuxiliaryRecord.create(transaction, 1, 3, 0,
+          SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,
+          EventIndexBackfillCheckpoint.versionIdentity(selectedCheckpoint.sequence()), selectedCheckpoint.encode());
+      var reference = new AuxiliaryRecordReference(record.ordinal(), record.systemIdentity(),
+          record.digest(), record.encodedBytes());
+      var page = AuxiliaryPage.create(transaction, 0, List.of(reference));
+      var directory = AuxiliaryDirectory.create(transaction, List.of(page.reference()));
+      var root = ManifestRoot.createWithAuxiliary(transaction, 1, 3, 2,
+          Optional.of(directory.reference()));
+      var decision = new CommitDecision(transaction, InvocationId.create(), 4, 2, 2,
+          root.systemIdentity(), root.digest(), false);
+      var view = new ReadView(ByteKey.copyOf(new byte[32]), ByteKey.copyOf(new byte[32]),
+          4, 3, 2, 2, 0, Optional.of(decision), Optional.of(root), 1);
+      manifests = new Manifests(List.of(record), page, directory);
+      pinned = new PinnedReadView(view, pin, scope, true);
+    }
+
     private LeaseReadView reader(long count, long bytes) {
       return new LeaseReadView(records, new ManifestCatalog(manifests), decoded::get, count, bytes);
     }
@@ -406,7 +480,13 @@ class LeaseReadViewTest {
 
   private static final class Pin implements ReadViewPinRegistry.Pin {
     private int closes;
+    private int renewals;
+    private int failRenewAt;
     @Override public long generation() { return 1; }
+    @Override public CompletableFuture<Void> renew(RequestScope scope) {
+      if (++renewals == failRenewAt) return CompletableFuture.failedFuture(new IllegalStateException("expired pin"));
+      return CompletableFuture.completedFuture(null);
+    }
     @Override public void close() { closes++; }
   }
 
@@ -414,6 +494,7 @@ class LeaseReadViewTest {
     private final Map<ByteKey, ByteKey> rows = new HashMap<>();
     private final Map<ByteKey, ByteKey> pointers = new HashMap<>();
     private final Map<ByteKey, ByteKey> bindingRows = new HashMap<>();
+    private final Map<ByteKey, ByteKey> checkpointRows = new HashMap<>();
     private long lastSequence;
     private CompletableFuture<Optional<SystemRecordEntry>> blocked;
 
@@ -438,6 +519,12 @@ class LeaseReadViewTest {
         SystemRecordType type, ByteKey route, long sequence, RequestScope scope) {
       lastSequence = sequence;
       if (blocked != null) return blocked;
+      if (type == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT) {
+        return CompletableFuture.completedFuture(checkpointRows.entrySet().stream()
+            .filter(row -> EventIndexBackfillCheckpoint.sequence(row.getKey()) <= sequence)
+            .max(Map.Entry.comparingByKey())
+            .map(row -> new SystemRecordEntry(row.getKey(), row.getValue())));
+      }
       return CompletableFuture.completedFuture(rows.entrySet().stream()
           .filter(row -> LeaseRecordIdentity.routePrefix(LeaseRecordIdentity.leaseId(row.getKey())).equals(route))
           .filter(row -> LeaseRecordIdentity.sequence(row.getKey()) <= sequence)
