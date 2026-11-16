@@ -382,13 +382,6 @@ public final class LeaseBindingMutationPlanner {
     }
   }
 
-  private static final class Delta {
-    private long bindingCount;
-    private long keyBytes;
-    private long revokeCostBytes;
-    private long bindingHistoryBytes;
-  }
-
   private static BackendFailure resourceLimit() {
     return new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
   }
