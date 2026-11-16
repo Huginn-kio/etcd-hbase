@@ -2,6 +2,7 @@
 """Warm external reactor dependencies, plugins and checksum-locked dynamic tools."""
 import importlib.util
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -27,9 +28,45 @@ def request_coordinate(artifact):
     return coordinate + ":" + artifact.classifier if artifact.classifier else coordinate
 
 
+def maven_command(*arguments):
+    return [str(ROOT / "scripts/dev/mvn21.sh"), "-B", "-ntp",
+            "-Dmaven.artifact.threads=1", *arguments]
+
+
 def run_maven(*arguments):
-    subprocess.run([str(ROOT / "scripts/dev/mvn21.sh"), "-B", "-ntp",
-                    "-Dmaven.artifact.threads=1", *arguments], cwd=ROOT, check=True)
+    subprocess.run(maven_command(*arguments), cwd=ROOT, check=True)
+
+
+def missing_transfer_coordinates(output):
+    # Resolver's offline diagnostic names concrete absent artifacts, including optional classifier.
+    # This is not a dependency-lock parser. Only dependency:get receives the validated coordinates.
+    pattern = r"(?<![\w.:-])([\w.-]+):([\w.-]+):([\w.-]+):(?:([\w.-]+):)?([\w.-]+) \(absent\)"
+    coordinates = set()
+    for group, artifact, extension, classifier, version in re.findall(pattern, output, re.ASCII):
+        if group == "io.etcdhbase":
+            raise ValueError("cache preparation must not fetch reactor SNAPSHOTs")
+        coordinate = f"{group}:{artifact}:{version}:{extension}"
+        coordinates.add(coordinate + ":" + classifier if classifier else coordinate)
+    if len(coordinates) > 64:
+        raise ValueError("offline cache repair exceeded the bounded missing artifact set")
+    return sorted(coordinates)
+
+
+def ensure_offline_cache():
+    command = maven_command("-o", GOAL + "go-offline", "-DexcludeReactor=true")
+    # go-offline may leave normal transitive artifacts absent. Repair only those named by the
+    # offline Resolver, at most three rounds; no test or build lifecycle is retried here.
+    for attempt in range(4):
+        result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, check=False)
+        print(result.stdout, end="", flush=True)
+        if result.returncode == 0:
+            return
+        missing = missing_transfer_coordinates(result.stdout)
+        if attempt == 3 or not missing:
+            raise subprocess.CalledProcessError(result.returncode, command)
+        for coordinate in missing:
+            run_maven("-N", GOAL + "get", "-Dartifact=" + coordinate)
 
 
 def main():
@@ -62,7 +99,7 @@ def main():
     run_maven("-pl", "hbase", "-am", "test-compile")
     # Successful online resolution and the explicit checksum lock are insufficient proof that
     # the whole transitive cache can be consumed. Fail before saving an incomplete cache.
-    run_maven("-o", GOAL + "go-offline", "-DexcludeReactor=true")
+    ensure_offline_cache()
     checked, missing = LOCK.verify_artifacts(artifacts, repository, require_all=True)
     print(f"Maven dependency cache prepared: {checked} locked artifacts verified, {missing} missing")
 

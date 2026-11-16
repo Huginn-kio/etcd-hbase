@@ -14,12 +14,18 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("public_build_policy", ROOT / "scripts/verify/public-build-policy.py")
 POLICY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(POLICY)
+PREP_SPEC = importlib.util.spec_from_file_location(
+    "maven_preparation", ROOT / "scripts/dev/prepare-maven-dependencies.py")
+PREPARATION = importlib.util.module_from_spec(PREP_SPEC)
+PREP_SPEC.loader.exec_module(PREPARATION)
+
 PARENT = b"""<project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion><groupId>resilience.fixture</groupId>
   <artifactId>parent</artifactId><version>1</version><packaging>pom</packaging>
@@ -51,6 +57,39 @@ class MavenCachePolicyTest(unittest.TestCase):
         for action in ("actions/setup-java@main", "./../unexpected.yml", "./.github/workflows/other.yml"):
             with self.subTest(action=action), self.assertRaises(ValueError):
                 POLICY.workflow_actions("    uses: " + action, ROOT, pins)
+
+
+class MavenOfflineCacheRepairTest(unittest.TestCase):
+    def test_missing_coordinates_preserve_classifier_and_deduplicate(self):
+        diagnostic = ("net.bytebuddy:byte-buddy:jar:1.18.3 (absent), "
+                      "com.google.protobuf:protoc:exe:linux-x86_64:4.35.0 (absent), "
+                      "net.bytebuddy:byte-buddy:jar:1.18.3 (absent)")
+        self.assertEqual([
+            "com.google.protobuf:protoc:4.35.0:exe:linux-x86_64",
+            "net.bytebuddy:byte-buddy:1.18.3:jar",
+        ], PREPARATION.missing_transfer_coordinates(diagnostic))
+        with self.assertRaisesRegex(ValueError, "reactor SNAPSHOTs"):
+            PREPARATION.missing_transfer_coordinates("io.etcdhbase:core:jar:0.1.0-SNAPSHOT (absent)")
+
+    def test_non_transfer_failure_is_not_retried_or_ignored(self):
+        result = subprocess.CompletedProcess([], 1, "unrelated offline resolution failure")
+        with patch.object(PREPARATION.subprocess, "run", return_value=result) as probe:
+            with patch.object(PREPARATION, "run_maven") as fetch:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    PREPARATION.ensure_offline_cache()
+                self.assertEqual(1, probe.call_count)
+                fetch.assert_not_called()
+
+    def test_persistently_missing_transfer_repair_has_a_fixed_bound(self):
+        result = subprocess.CompletedProcess([], 1, "net.bytebuddy:byte-buddy:jar:1.18.3 (absent)")
+        with patch.object(PREPARATION.subprocess, "run", return_value=result) as probe:
+            with patch.object(PREPARATION, "run_maven") as fetch:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    PREPARATION.ensure_offline_cache()
+                self.assertEqual(4, probe.call_count)
+                self.assertEqual(3, fetch.call_count)
+                fetch.assert_called_with("-N", PREPARATION.GOAL + "get",
+                                         "-Dartifact=net.bytebuddy:byte-buddy:1.18.3:jar")
 
 
 class MavenHttpResilienceTest(unittest.TestCase):
