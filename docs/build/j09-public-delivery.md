@@ -28,7 +28,7 @@ Maven SNAPSHOT 依赖安装到本工作树专用的 `.artifacts/m0/j09/maven-rep
 
 缓存键同时覆盖所有 POM、依赖锁、Maven Wrapper、公共仓库设置、下载参数和准备脚本。只有准备任务先完成整个 reactor 的外部依赖、插件及动态制品下载后，才保存这一版本的缓存；测试任务使用相同键恢复，并设置 `cache-read-only: true`，防止缓存服务故障时由只执行部分构建的消费者写入不完整缓存。新键避免继续复用旧的、不完整且无法追加保存的精确命中缓存。准备过程不安装本工程的 SNAPSHOT 制品。
 
-`scripts/dev/prepare-maven-dependencies.py` 除了执行锁定插件的 `go-offline`，还从已有依赖锁补齐动态下载的 protoc、gRPC 代码生成器、配置解析库和隔离 HBase 进程依赖，并核验全部显式制品 SHA-256。JUnit provider 和 Platform launcher 分别跟随已锁定的 Surefire/Failsafe 及 JUnit 6 版本补齐。普通依赖和插件预解析本身不能证明这些执行期依赖已经缓存。
+`scripts/dev/prepare-maven-dependencies.py` 除了执行锁定插件的 `go-offline`，还从已有依赖锁补齐动态下载的 protoc、gRPC 代码生成器、配置解析库和隔离 HBase 进程依赖，并核验全部显式制品 SHA-256。JUnit provider 和 Platform launcher 分别跟随已锁定的 Surefire/Failsafe 及 JUnit 6 版本补齐。普通依赖和插件预解析本身不能证明这些执行期依赖已经缓存。准备阶段还通过 HBase reactor 的 `test-compile` 解析实际测试类路径（不执行测试），并在保存前离线重跑整个 reactor 的依赖解析；缺少普通传递制品时同样拒绝保存，完整测试继续由原有质量任务执行。
 
 `.mvn/maven.config` 将普通制品下载并发降为 2；缓存准备进一步降为 1。Resolver 对 429/503 等传输失败最多重试 4 次，无服务端等待提示时从 15 秒开始递增等待，间隔上限 60 秒，并保留其 `Retry-After` 处理。不会重新执行失败的测试来制造通过。跨工作流的冷缓存准备仍可能并发，GitHub 托管 runner 的出口及 Central 的服务端策略也不受本项目控制，因此这些措施不承诺永久消除 429。
 

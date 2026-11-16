@@ -57,6 +57,12 @@ def main():
     for coordinate in ("org.junit.platform:junit-platform-launcher", "org.junit.vintage:junit-vintage-engine"):
         # HBase test dependencies also put JUnit 4 on the classpath, enabling Vintage discovery.
         run_maven("-N", GOAL + "get", "-Dartifact=" + coordinate + ":" + junit_version)
+    # Exercise the normal HBase test classpath as well as the dependency plugin's graph.
+    # test-compile downloads/generates inputs, but does not execute or skip any quality test.
+    run_maven("-pl", "hbase", "-am", "test-compile")
+    # Successful online resolution and the explicit checksum lock are insufficient proof that
+    # the whole transitive cache can be consumed. Fail before saving an incomplete cache.
+    run_maven("-o", GOAL + "go-offline", "-DexcludeReactor=true")
     checked, missing = LOCK.verify_artifacts(artifacts, repository, require_all=True)
     print(f"Maven dependency cache prepared: {checked} locked artifacts verified, {missing} missing")
 
