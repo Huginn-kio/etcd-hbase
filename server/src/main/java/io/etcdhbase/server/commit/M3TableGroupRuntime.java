@@ -531,7 +531,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     var bindings = new LeaseBindingReader(stores.records(), stores.manifests(),
         LeaseBindingMessages::decode, LeaseGateway.BINDING_PAGE_ENTRIES,
         LeaseGateway.bindingPageBytes(activation.maxEtcdRequestBytes()), 100_000, 64L << 20,
-        100_000, activation.maxEtcdRequestBytes(), maximumMutationRecords, 64L << 20);
+        100_000, activation.leaseCostLimits().maximumKeyBytes(), maximumMutationRecords,
+        64L << 20);
     LeaseTimeSource time = Objects.requireNonNull(
         leaseTimeSourceFactory.apply(activation.leaseClockUncertaintyMs(),
             activation.leaseClockMaxDriftPpm()), "Lease time source");

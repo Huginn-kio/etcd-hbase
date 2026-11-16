@@ -31,7 +31,7 @@ public final class LeaseBindingReader {
   private final int maximumExamined;
   private final long maximumScannedBytes;
   private final int maximumBindings;
-  private final long maximumOutputBytes;
+  private final long maximumKeyBytes;
   private final int maximumOverlayRecords;
   private final long maximumOverlayBytes;
 
@@ -40,12 +40,12 @@ public final class LeaseBindingReader {
   public LeaseBindingReader(SystemRecordStore records, ManifestCatalog manifests,
       Function<ByteKey, LeaseBindingVersion> decode, int pageEntries, long pageBytes,
       int maximumExamined, long maximumScannedBytes, int maximumBindings,
-      long maximumOutputBytes, int maximumOverlayRecords, long maximumOverlayBytes) {
+      long maximumKeyBytes, int maximumOverlayRecords, long maximumOverlayBytes) {
     this.records = Objects.requireNonNull(records, "records");
     this.manifests = Objects.requireNonNull(manifests, "manifests");
     this.decode = Objects.requireNonNull(decode, "decode");
     if (pageEntries < 1 || pageBytes < 1 || maximumExamined < 1 || maximumScannedBytes < 1
-        || maximumBindings < 1 || maximumOutputBytes < 1 || maximumOverlayRecords < 1
+        || maximumBindings < 1 || maximumKeyBytes < 1 || maximumOverlayRecords < 1
         || maximumOverlayBytes < 1) {
       throw new IllegalArgumentException("invalid Lease binding read limits");
     }
@@ -54,7 +54,7 @@ public final class LeaseBindingReader {
     this.maximumExamined = maximumExamined;
     this.maximumScannedBytes = maximumScannedBytes;
     this.maximumBindings = maximumBindings;
-    this.maximumOutputBytes = maximumOutputBytes;
+    this.maximumKeyBytes = maximumKeyBytes;
     this.maximumOverlayRecords = maximumOverlayRecords;
     this.maximumOverlayBytes = maximumOverlayBytes;
   }
@@ -95,7 +95,7 @@ public final class LeaseBindingReader {
     ScopedBudgetLeases reservations = null;
     CompletableFuture<List<LeaseBindingVersion>> operation;
     try {
-      if (state.boundKeyCount() > maximumBindings || state.boundKeyBytes() > maximumOutputBytes) {
+      if (state.boundKeyCount() > maximumBindings || state.boundKeyBytes() > maximumKeyBytes) {
         throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
       }
       reservations = ScopedBudgetLeases.register(scope, account);
@@ -323,7 +323,7 @@ public final class LeaseBindingReader {
           keyBytes = Math.addExact(keyBytes, entry.getValue().key().length());
         }
       }
-      if (bindingCount > maximumBindings || keyBytes > maximumOutputBytes) {
+      if (bindingCount > maximumBindings || keyBytes > maximumKeyBytes) {
         throw new CompletionException(resourceLimit());
       }
       if (bindingCount != lease.boundKeyCount() || keyBytes != lease.boundKeyBytes()) {

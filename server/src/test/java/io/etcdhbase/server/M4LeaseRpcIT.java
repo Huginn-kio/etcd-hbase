@@ -1344,6 +1344,44 @@ class M4LeaseRpcIT {
               LeaseState revoked = leaseStateAt(plan, initializer, identity, leaseId,
                   after.finalizedSequence());
               assertEquals(LeaseState.Status.REVOKED, revoked.status());
+
+              long largeKeyLeaseId = leaseIdForPrefix(run.prefix(), "large-key-bytes-" + layout);
+              grantThrough(server, largeKeyLeaseId, 30);
+              List<byte[]> largeKeys = new ArrayList<>(64);
+              for (int indexInLease = 0; indexInLease < 64; indexInLease++) {
+                byte[] prefix = (run.prefix() + layout.toLowerCase(java.util.Locale.ROOT)
+                    + "/large/key-bytes/" + indexInLease + "/").getBytes(StandardCharsets.UTF_8);
+                byte[] key = new byte[30 * 1024];
+                System.arraycopy(prefix, 0, key, 0, prefix.length);
+                java.util.Arrays.fill(key, prefix.length, key.length, (byte) 'x');
+                largeKeys.add(key);
+              }
+              for (int offset = 0; offset < largeKeys.size(); offset += registrationBatchSize) {
+                int end = Math.min(largeKeys.size(), offset + registrationBatchSize);
+                Rpc.TxnResponse registered = putLeaseBoundKeysInOneTransaction(
+                    server, largeKeyLeaseId, largeKeys.subList(offset, end));
+                assertTrue(registered.getSucceeded(),
+                    "each bounded batch of large keys must bind successfully");
+              }
+              assertTrue(largeKeys.stream().mapToInt(key -> key.length).sum()
+                      > activation("1").maxEtcdRequestBytes(),
+                  "the total binding key bytes must exceed the per-request size limit");
+              StatusRuntimeException ttlFailure = assertThrows(StatusRuntimeException.class,
+                  () -> timeToLive(server, largeKeyLeaseId, true));
+              assertEquals(Status.Code.RESOURCE_EXHAUSTED, ttlFailure.getStatus().getCode(),
+                  "the oversized TimeToLive response must respect the RPC output limit");
+
+              CommitState beforeLargeRevoke = controlSnapshot(plan, initializer, identity).state();
+              revokeThrough(server, largeKeyLeaseId);
+              CommitState afterLargeRevoke = awaitLeaseRevoked(plan, initializer, identity,
+                  largeKeyLeaseId, beforeLargeRevoke.finalizedSequence(), Duration.ofSeconds(30));
+              assertEquals(beforeLargeRevoke.publishedRevision() + 1,
+                  afterLargeRevoke.publishedRevision(),
+                  "an admitted Lease must be revocable even when its total key bytes exceed one request");
+              awaitKeysAbsent(server, largeKeys.toArray(byte[][]::new));
+              assertEquals(LeaseState.Status.REVOKED,
+                  leaseStateAt(plan, initializer, identity, largeKeyLeaseId,
+                      afterLargeRevoke.finalizedSequence()).status());
             });
       }
     }
