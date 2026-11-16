@@ -325,39 +325,47 @@ def _validate_j40_api_and_trace(task: dict[str, object]) -> None:
         raise ReportError("J40 trace case has no API mapping")
 
 
-def _validate_j40_go_tests(registrations: list[dict[str, object]]) -> None:
+def _registered_go_tests(registrations: list[dict[str, object]], label: str) -> dict[str, set[str]]:
     go_tests: dict[str, set[str]] = {}
     for package in registrations:
         if not isinstance(package, dict) or not isinstance(package.get("package"), str):
-            raise ReportError("M4 Go test registration is malformed")
+            raise ReportError(f"{label} Go test registration is malformed")
         names = package.get("tests")
         if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
-            raise ReportError("M4 Go package has no named required tests")
+            raise ReportError(f"{label} Go package has no named required tests")
         package_name = package["package"]
         if package_name in go_tests:
-            raise ReportError("M4 Go package is registered more than once")
+            raise ReportError(f"{label} Go package is registered more than once")
         go_tests[package_name] = set(names)
+    return go_tests
+
+
+def _validate_j40_go_tests(registrations: list[dict[str, object]]) -> None:
+    go_tests = _registered_go_tests(registrations, "M4")
     if any(not expected.issubset(go_tests.get(package, set()))
            for package, expected in J40_GO_TESTS.items()):
         raise ReportError("J40 Go regression coverage is incomplete")
 
 
-def _validate_j40_java_tests(registrations: list[dict[str, object]]) -> None:
-    java_classes: set[str] = set()
+def _registered_java_tests(registrations: list[dict[str, object]], label: str) -> dict[str, set[str]]:
     java_methods: dict[str, set[str]] = {}
     for suite in registrations:
         if not isinstance(suite, dict):
-            raise ReportError("M4 Maven test registration is malformed")
+            raise ReportError(f"{label} Maven test registration is malformed")
         module, kind, class_name, tests = (
             suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
         )
         if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
-            raise ReportError("M4 Maven test registration has an invalid module, kind, or class")
+            raise ReportError(f"{label} Maven test registration has an invalid module, kind, or class")
         if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
-            raise ReportError("M4 Maven suite has no named required tests")
-        java_classes.add(class_name)
+            raise ReportError(f"{label} Maven suite has no named required tests")
         java_methods.setdefault(class_name, set()).update(tests)
-    if not J40_JAVA_CLASSES.issubset(java_classes):
+    return java_methods
+
+
+def _validate_j40_java_tests(registrations: list[dict[str, object]]) -> None:
+    java_methods = _registered_java_tests(registrations, "M4")
+    if not J40_JAVA_CLASSES.issubset(java_methods):
         raise ReportError("J40 Maven unit or MiniCluster suites are not all registered")
     if any(not methods.issubset(java_methods.get(class_name, set()))
            for class_name, methods in J40_CRITICAL_JAVA_TESTS.items()):
@@ -384,6 +392,13 @@ def _validate_j40_evidence(evidence: dict[str, object]) -> None:
 
 
 def _validate_j41_registration(task: dict[str, object]) -> None:
+    _validate_j41_api_and_trace(task)
+    _validate_j41_go_tests(task["go_tests"])
+    _validate_j41_java_tests(task["maven_tests"])
+    _validate_j41_evidence(task["evidence"])
+
+
+def _validate_j41_api_and_trace(task: dict[str, object]) -> None:
     if (task.get("api_ids") != ["L01", "L04", "L05", "P01", "T01", "D01", "R01"]
             or task.get("scenario") != "m4-lease-bindings-v1"
             or task.get("manifest") != "m4-lease-bindings.yaml"
@@ -397,41 +412,24 @@ def _validate_j41_registration(task: dict[str, object]) -> None:
     if any(not isinstance(item.get("api_id"), str) or not item["api_id"] for item in traces):
         raise ReportError("J41 trace case has no API mapping")
 
-    go_tests: dict[str, set[str]] = {}
-    for package in task["go_tests"]:
-        if not isinstance(package, dict) or not isinstance(package.get("package"), str):
-            raise ReportError("J41 Go test registration is malformed")
-        names = package.get("tests")
-        if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
-            raise ReportError("J41 Go package has no named required tests")
-        if package["package"] in go_tests:
-            raise ReportError("J41 Go package is registered more than once")
-        go_tests[package["package"]] = set(names)
+
+def _validate_j41_go_tests(registrations: list[dict[str, object]]) -> None:
+    go_tests = _registered_go_tests(registrations, "J41")
     if any(not expected.issubset(go_tests.get(package, set()))
            for package, expected in J41_GO_TESTS.items()):
         raise ReportError("J41 Go binding regression coverage is incomplete")
 
-    java_classes: set[str] = set()
-    java_methods: dict[str, set[str]] = {}
-    for suite in task["maven_tests"]:
-        if not isinstance(suite, dict):
-            raise ReportError("J41 Maven test registration is malformed")
-        module, kind, class_name, tests = (
-            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
-        )
-        if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
-            raise ReportError("J41 Maven test registration has an invalid module, kind, or class")
-        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
-            raise ReportError("J41 Maven suite has no named required tests")
-        java_classes.add(class_name)
-        java_methods.setdefault(class_name, set()).update(tests)
-    if not J41_JAVA_CLASSES.issubset(java_classes):
+
+def _validate_j41_java_tests(registrations: list[dict[str, object]]) -> None:
+    java_methods = _registered_java_tests(registrations, "J41")
+    if not J41_JAVA_CLASSES.issubset(java_methods):
         raise ReportError("J41 Maven unit or MiniCluster suites are not all registered")
     if any(not methods.issubset(java_methods.get(class_name, set()))
            for class_name, methods in J41_CRITICAL_JAVA_TESTS.items()):
         raise ReportError("J41 binding budget, restart, or atomic registration regression is not registered")
 
-    evidence = task["evidence"]
+
+def _validate_j41_evidence(evidence: dict[str, object]) -> None:
     native = evidence["native"]
     target_layouts = {
         (target.get("scope"), target.get("layout"), target.get("embedded_native"))

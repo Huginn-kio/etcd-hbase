@@ -102,6 +102,58 @@ class M3OwnerLeaseTest {
   }
 
   @Test
+  void closingDuringFenceTransitionWaitsAndDoesNotPublishTheLateToken() throws Exception {
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    var pending = new CompletableFuture<CommitOwnerService.OwnerToken>();
+    try (var startup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var lease = M3OwnerLease.acquire(recovery(store, owners), owners, "owner-a",
+          Duration.ofSeconds(30), Duration.ofSeconds(10), Duration.ofSeconds(1),
+          startup, () -> {}).join();
+      var previous = lease.token();
+      try {
+        var transition = lease.transitionFence(owners, current -> pending, startup);
+        assertFalse(lease.isReady());
+        lease.close();
+        assertFalse(lease.drained().isDone(), "the transition still owns its completion path");
+        pending.complete(new CommitOwnerService.OwnerToken(previous.instance(), previous.epoch() + 1));
+        assertThrows(CompletionException.class, transition::join);
+        assertEquals(previous, lease.token(), "a late transition cannot publish after stop");
+        lease.drained().get(5, TimeUnit.SECONDS);
+      } finally {
+        pending.complete(previous);
+        lease.close();
+        lease.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  @Test
+  void rejectedFenceTransitionStopsTheOwnerWithoutPublishingItsToken() throws Exception {
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    var lost = new AtomicInteger();
+    try (var startup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var lease = M3OwnerLease.acquire(recovery(store, owners), owners, "owner-a",
+          Duration.ofSeconds(30), Duration.ofSeconds(10), Duration.ofSeconds(1),
+          startup, lost::incrementAndGet).join();
+      var previous = lease.token();
+      try {
+        var transition = lease.transitionFence(owners, current -> CompletableFuture.completedFuture(
+            new CommitOwnerService.OwnerToken("another-owner", current.epoch())), startup);
+        assertThrows(CompletionException.class, transition::join);
+        assertEquals(previous, lease.token());
+        assertEquals(1, lost.get());
+        assertFalse(lease.isReady());
+        lease.drained().get(5, TimeUnit.SECONDS);
+      } finally {
+        lease.close();
+        lease.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  @Test
   void closingWaitsForTheActualInFlightHeartbeatProducer() throws Exception {
     var store = new MemoryControl();
     store.blockHeartbeat = true;

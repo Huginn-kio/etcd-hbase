@@ -12,7 +12,6 @@ import io.etcdhbase.core.commit.TxnReadSession;
 import io.etcdhbase.core.concurrent.ContinuationExecutor;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.LeaseBindingChange;
-import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.lease.LeaseStateLookup;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;

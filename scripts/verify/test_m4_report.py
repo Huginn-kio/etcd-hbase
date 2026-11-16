@@ -72,6 +72,38 @@ class M4ReportTest(unittest.TestCase):
                 with self.assertRaisesRegex(m4_report.ReportError, "binding, TTL projection"):
                     m4_report.validate_registry_document(missing_case)
 
+    def test_both_registries_reject_malformed_or_duplicate_go_packages(self) -> None:
+        for task_id in ("J40", "J41"):
+            for invalid in (None, {"package": 1}, {"package": "extra", "tests": []},
+                            {"package": "extra", "tests": [1]}):
+                self._assert_invalid_registration(task_id, "go_tests", invalid)
+            changed = copy.deepcopy(self.registry)
+            task = next(item for item in changed["tasks"] if item["id"] == task_id)
+            task["go_tests"].append(copy.deepcopy(task["go_tests"][0]))
+            with self.assertRaisesRegex(m4_report.ReportError, "more than once"):
+                m4_report.validate_registry_document(changed)
+
+    def test_both_registries_reject_malformed_maven_suites(self) -> None:
+        invalid_suites = (
+            None,
+            {"module": "outside", "kind": "unit", "class": "Extra", "tests": ["test"]},
+            {"module": "core", "kind": "unknown", "class": "Extra", "tests": ["test"]},
+            {"module": "core", "kind": "unit", "class": 1, "tests": ["test"]},
+            {"module": "core", "kind": "unit", "class": "Extra", "tests": []},
+            {"module": "core", "kind": "unit", "class": "Extra", "tests": [1]},
+        )
+        for task_id in ("J40", "J41"):
+            for invalid in invalid_suites:
+                self._assert_invalid_registration(task_id, "maven_tests", invalid)
+
+    def _assert_invalid_registration(self, task_id: str, field: str, invalid: object) -> None:
+        with self.subTest(task_id=task_id, field=field, invalid=invalid):
+            changed = copy.deepcopy(self.registry)
+            task = next(item for item in changed["tasks"] if item["id"] == task_id)
+            task[field].append(invalid)
+            with self.assertRaises(m4_report.ReportError):
+                m4_report.validate_registry_document(changed)
+
     def test_all_tasks_is_rejected_while_j41_to_j47_are_pending(self) -> None:
         with self.assertRaisesRegex(m4_report.ReportError, "not registered"):
             m4_report.validate_all_tasks_registered(self.registry)

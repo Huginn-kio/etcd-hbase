@@ -1,6 +1,5 @@
 package io.etcdhbase.server.commit;
 
-import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.LeaseBindingReader;
 import io.etcdhbase.core.commit.LeaseReadView;
@@ -20,7 +19,6 @@ import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.DirectRecordReader;
-import io.etcdhbase.core.scan.PointResult;
 import io.etcdhbase.core.storage.ReadProjection;
 import io.etcdhbase.core.storage.RecordStore;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -30,7 +28,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
 
 /** Builds one immutable KV and binding removal plan for a future Revoke or expiry selector. */
@@ -147,42 +144,66 @@ public final class LeaseRevocationPreparer {
       RecordStore currentRecords, RequestScope scope, BudgetManager.Account account,
       Supplier<CompletableFuture<Void>> finishPinnedRead,
       List<LeaseBindingVersion> effectiveBindings) {
-    long reservedUnbindHistory = 0;
+    long reservedUnbindHistory;
     try {
-      if (effectiveBindings.size() != state.boundKeyCount()) {
-        throw new IllegalStateException("Lease bindings differ from authoritative count");
-      }
-      for (LeaseBindingVersion binding : effectiveBindings) {
-        if (!binding.bound() || !binding.identity().equals(identity)) {
-          throw new IllegalStateException("Lease binding differs from the expected incarnation");
-        }
-        reservedUnbindHistory = Math.addExact(reservedUnbindHistory,
-            costs.bindingHistoryRecordBytes(binding.key()));
-      }
+      reservedUnbindHistory = validateBindingHistory(identity, state, effectiveBindings);
     } catch (RuntimeException invalidBinding) {
       return CompletableFuture.failedFuture(invalidBinding);
     }
-
-    long retainedBytes;
-    try {
-      retainedBytes = Math.addExact(state.revokeCostBytes(), reservedUnbindHistory);
-    } catch (ArithmeticException overflow) {
-      return CompletableFuture.failedFuture(resourceLimit());
-    }
     BudgetManager.Lease retainedMemory;
     try {
-      retainedMemory = account.tryRetain(BudgetManager.Memory.CANDIDATE, retainedBytes)
-          .orElseThrow(LeaseRevocationPreparer::resourceLimit);
+      retainedMemory = retainPlanMemory(state, reservedUnbindHistory, account);
     } catch (BackendFailure | RuntimeException unavailable) {
       return CompletableFuture.failedFuture(unavailable);
     }
 
     PlanBuilder plan = new PlanBuilder();
+    CompletableFuture<PreparedAuxiliaryPlan> operation =
+        readBindingRows(identity, invocation, currentRecords, account, effectiveBindings, plan)
+            .thenCompose(ignored -> prepareAuxiliary(identity, state, invocation, requireExpired,
+                pinned, scope, account, finishPinnedRead, plan));
+    return operation.thenApply(auxiliary -> new Prepared(identity, plan.candidates, plan.events,
+        plan.changes, auxiliary.auxiliaryRecords(), retainedMemory))
+        .whenComplete((prepared, failure) -> {
+          if (failure != null) retainedMemory.close();
+        });
+  }
+
+  private long validateBindingHistory(LeaseIdentity identity, LeaseState state,
+      List<LeaseBindingVersion> effectiveBindings) {
+    long reservedUnbindHistory = 0;
+    if (effectiveBindings.size() != state.boundKeyCount()) {
+      throw new IllegalStateException("Lease bindings differ from authoritative count");
+    }
+    for (LeaseBindingVersion binding : effectiveBindings) {
+      if (!binding.bound() || !binding.identity().equals(identity)) {
+        throw new IllegalStateException("Lease binding differs from the expected incarnation");
+      }
+      reservedUnbindHistory = Math.addExact(reservedUnbindHistory,
+          costs.bindingHistoryRecordBytes(binding.key()));
+    }
+    return reservedUnbindHistory;
+  }
+
+  private BudgetManager.Lease retainPlanMemory(LeaseState state, long reservedUnbindHistory,
+      BudgetManager.Account account) throws BackendFailure {
+    long retainedBytes;
+    try {
+      retainedBytes = Math.addExact(state.revokeCostBytes(), reservedUnbindHistory);
+    } catch (ArithmeticException overflow) {
+      throw resourceLimit();
+    }
+    return account.tryRetain(BudgetManager.Memory.CANDIDATE, retainedBytes)
+        .orElseThrow(LeaseRevocationPreparer::resourceLimit);
+  }
+
+  private CompletableFuture<Void> readBindingRows(LeaseIdentity identity, InvocationBinding invocation,
+      RecordStore currentRecords, BudgetManager.Account account,
+      List<LeaseBindingVersion> effectiveBindings, PlanBuilder plan) {
     DirectRecordReader reader;
     try {
       reader = new DirectRecordReader(currentRecords, account, MAX_POINT_BYTES);
     } catch (RuntimeException invalidReader) {
-      retainedMemory.close();
       return CompletableFuture.failedFuture(invalidReader);
     }
     CompletableFuture<Void> bindingReads = CompletableFuture.completedFuture(null);
@@ -190,14 +211,7 @@ public final class LeaseRevocationPreparer {
       bindingReads = bindingReads.thenCompose(ignored -> readBinding(binding, identity, invocation,
           reader, plan));
     }
-    CompletableFuture<PreparedAuxiliaryPlan> operation = bindingReads.thenCompose(ignored ->
-        prepareAuxiliary(identity, state, invocation, requireExpired, pinned, scope, account,
-            finishPinnedRead, plan));
-    return operation.thenApply(auxiliary -> new Prepared(identity, plan.candidates, plan.events,
-        plan.changes, auxiliary.auxiliaryRecords(), retainedMemory))
-        .whenComplete((prepared, failure) -> {
-          if (failure != null) retainedMemory.close();
-        });
+    return bindingReads;
   }
 
   private CompletableFuture<Void> readBinding(LeaseBindingVersion binding, LeaseIdentity identity,

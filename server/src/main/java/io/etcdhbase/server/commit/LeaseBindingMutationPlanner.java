@@ -12,7 +12,6 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.ExpiryCandidateRecord;
 import io.etcdhbase.core.lease.LeaseBindingChange;
-import io.etcdhbase.core.lease.LeaseBindingIdentity;
 import io.etcdhbase.core.lease.LeaseBindingVersion;
 import io.etcdhbase.core.lease.LeaseCostAdmission;
 import io.etcdhbase.core.lease.LeaseFailure;
@@ -119,12 +118,7 @@ public final class LeaseBindingMutationPlanner {
       Objects.requireNonNull(invocation, "invocation");
       Objects.requireNonNull(changes, "changes");
       Objects.requireNonNull(revokingLeases, "revokingLeases");
-      if (invocation.state() != InvocationBinding.State.PREPARING
-          || invocation.baseSequence() == Long.MAX_VALUE
-          || !pinned.belongsTo(scope) || !pinned.isOpen() || scope.isClosed() || scope.isDeadlineExceeded()
-          || pinned.view().barrierSequence() != invocation.baseSequence()
-          || pinned.view().targetRevision() != invocation.baseRevision()
-          || pinned.view().selectedDecision().isPresent()) {
+      if (!isUsableFor(invocation)) {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       }
       if (changes.isEmpty() && revokingLeases.isEmpty()) {
@@ -142,6 +136,35 @@ public final class LeaseBindingMutationPlanner {
 
       List<LeaseBindingChange> ordered = changes.stream()
           .sorted(Comparator.comparing(LeaseBindingChange::key)).toList();
+      LeaseIds ids;
+      try {
+        ids = collectLeaseIds(ordered, revokingLeases);
+      } catch (BackendFailure | IllegalArgumentException invalidRequest) {
+        return CompletableFuture.failedFuture(invalidRequest);
+      }
+      return resolveStates(ids, revokingLeases.keySet()).thenCompose(resolved -> {
+        LeaseTimeObservation observation = time.observe();
+        try {
+          validateLeaseStates(ids.attaching(), resolved, revokingLeases, requireExpired, observation);
+        } catch (BackendFailure | RuntimeException invalidState) {
+          return CompletableFuture.failedFuture(invalidState);
+        }
+        return validatePreviousBindings(ordered, resolved).thenApply(validated ->
+            createRecords(invocation, ordered, resolved, revokingLeases.keySet()));
+      });
+    }
+
+    private boolean isUsableFor(InvocationBinding invocation) {
+      return invocation.state() == InvocationBinding.State.PREPARING
+          && invocation.baseSequence() != Long.MAX_VALUE
+          && pinned.belongsTo(scope) && pinned.isOpen() && !scope.isClosed() && !scope.isDeadlineExceeded()
+          && pinned.view().barrierSequence() == invocation.baseSequence()
+          && pinned.view().targetRevision() == invocation.baseRevision()
+          && pinned.view().selectedDecision().isEmpty();
+    }
+
+    private LeaseIds collectLeaseIds(List<LeaseBindingChange> ordered,
+        Map<Long, LeaseIdentity> revokingLeases) throws BackendFailure {
       TreeSet<Long> leaseIds = new TreeSet<>();
       TreeSet<Long> attachingLeaseIds = new TreeSet<>();
       for (LeaseBindingChange change : ordered) {
@@ -154,50 +177,55 @@ public final class LeaseBindingMutationPlanner {
       for (Map.Entry<Long, LeaseIdentity> revocation : revokingLeases.entrySet()) {
         if (revocation.getKey() == 0 || revocation.getValue().leaseId() != revocation.getKey()
             || attachingLeaseIds.contains(revocation.getKey())) {
-          return CompletableFuture.failedFuture(
-              new IllegalArgumentException("invalid or simultaneously attached Lease revocation"));
+          throw new IllegalArgumentException("invalid or simultaneously attached Lease revocation");
         }
         leaseIds.add(revocation.getKey());
       }
       if (leaseIds.size() > MAX_LEASES_PER_MUTATION) {
-        return CompletableFuture.failedFuture(resourceLimit());
+        throw resourceLimit();
       }
 
+      return new LeaseIds(leaseIds, attachingLeaseIds);
+    }
+
+    private CompletableFuture<Map<Long, LeaseState>> resolveStates(
+        LeaseIds ids, Set<Long> revokingLeaseIds) {
       Map<Long, LeaseState> resolved = new HashMap<>();
       CompletableFuture<Void> loading = CompletableFuture.completedFuture(null);
-      for (long leaseId : leaseIds) {
+      for (long leaseId : ids.all()) {
         loading = loading.thenCompose(ignored -> load(leaseId).thenAccept(found -> {
-          resolved.put(leaseId, found.orElseThrow(() -> attachingLeaseIds.contains(leaseId)
-              || revokingLeases.containsKey(leaseId)
+          resolved.put(leaseId, found.orElseThrow(() -> ids.attaching().contains(leaseId)
+              || revokingLeaseIds.contains(leaseId)
                   ? new LeaseFailure(LeaseFailure.Reason.NOT_FOUND)
                   : new IllegalStateException("live KV record refers to an unknown Lease")));
         }));
       }
-      return loading.thenCompose(ignored -> {
-        LeaseTimeObservation observation = time.observe();
-        try {
-          for (long leaseId : attachingLeaseIds) {
-            requireAttachable(Objects.requireNonNull(resolved.get(leaseId)), observation);
-          }
-          for (Map.Entry<Long, LeaseIdentity> revocation : revokingLeases.entrySet()) {
-            LeaseState state = Objects.requireNonNull(resolved.get(revocation.getKey()));
-            if (!state.identity().equals(revocation.getValue())
-                || state.status() != LeaseState.Status.ACTIVE) {
-              throw new LeaseFailure(LeaseFailure.Reason.NOT_FOUND);
-            }
-            if (requireExpired && !observation.healthy()) {
-              throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
-            }
-            if (requireExpired && !LeaseTimeRules.isExpired(state, observation)) {
-              throw new LeaseFailure(LeaseFailure.Reason.NOT_FOUND);
-            }
-          }
-        } catch (BackendFailure | RuntimeException invalidState) {
-          return CompletableFuture.failedFuture(invalidState);
-        }
-        return validatePreviousBindings(ordered, resolved).thenApply(validated ->
-            createRecords(invocation, ordered, resolved, revokingLeases.keySet()));
-      });
+      return loading.thenApply(ignored -> resolved);
+    }
+
+    private void validateLeaseStates(Set<Long> attachingLeaseIds, Map<Long, LeaseState> resolved,
+        Map<Long, LeaseIdentity> revokingLeases, boolean requireExpired,
+        LeaseTimeObservation observation) throws BackendFailure {
+      for (long leaseId : attachingLeaseIds) {
+        requireAttachable(Objects.requireNonNull(resolved.get(leaseId)), observation);
+      }
+      for (Map.Entry<Long, LeaseIdentity> revocation : revokingLeases.entrySet()) {
+        LeaseState state = Objects.requireNonNull(resolved.get(revocation.getKey()));
+        requireRevocable(state, revocation.getValue(), requireExpired, observation);
+      }
+    }
+
+    private void requireRevocable(LeaseState state, LeaseIdentity identity, boolean requireExpired,
+        LeaseTimeObservation observation) throws BackendFailure {
+      if (!state.identity().equals(identity) || state.status() != LeaseState.Status.ACTIVE) {
+        throw new LeaseFailure(LeaseFailure.Reason.NOT_FOUND);
+      }
+      if (requireExpired && !observation.healthy()) {
+        throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+      }
+      if (requireExpired && !LeaseTimeRules.isExpired(state, observation)) {
+        throw new LeaseFailure(LeaseFailure.Reason.NOT_FOUND);
+      }
     }
 
     private CompletableFuture<Optional<LeaseState>> load(long leaseId) {
@@ -237,74 +265,93 @@ public final class LeaseBindingMutationPlanner {
     private List<PreparedAuxiliaryRecord> createRecords(InvocationBinding invocation,
         List<LeaseBindingChange> changes, Map<Long, LeaseState> resolved, Set<Long> revokingLeaseIds) {
       long sequence = Math.addExact(invocation.baseSequence(), 1);
-      Map<Long, Delta> deltas = new HashMap<>();
-      for (LeaseBindingChange change : changes) {
-        long previous = change.previousLeaseId();
-        long current = change.currentLeaseId();
-        if (previous != 0) {
-          Delta delta = deltas.computeIfAbsent(previous, ignored -> new Delta());
-          if (previous != current) delta.bindingCount = Math.subtractExact(delta.bindingCount, 1);
-          delta.keyBytes = Math.subtractExact(delta.keyBytes, change.key().length());
-          delta.revokeCostBytes = Math.subtractExact(delta.revokeCostBytes,
-              costs.revokeCostBytes(change.key(), change.previousValueBytes()));
-        }
-        if (current != 0) {
-          Delta delta = deltas.computeIfAbsent(current, ignored -> new Delta());
-          if (previous != current) delta.bindingCount = Math.addExact(delta.bindingCount, 1);
-          delta.keyBytes = Math.addExact(delta.keyBytes, change.key().length());
-          delta.revokeCostBytes = Math.addExact(delta.revokeCostBytes,
-              costs.revokeCostBytes(change.key(), change.currentValueBytes()));
-        }
-        int newVersions = change.newBindingVersionCount();
-        if (newVersions > 0) {
-          long historyCost = Math.multiplyExact(costs.bindingHistoryRecordBytes(change.key()), newVersions);
-          if (previous != 0) {
-            Delta delta = deltas.computeIfAbsent(previous, ignored -> new Delta());
-            if (current == previous) {
-              delta.bindingHistoryBytes = Math.addExact(delta.bindingHistoryBytes, historyCost);
-            } else {
-              delta.bindingHistoryBytes = Math.addExact(delta.bindingHistoryBytes,
-                  costs.bindingHistoryRecordBytes(change.key()));
-            }
-          }
-          if (current != 0 && current != previous) {
-            Delta delta = deltas.computeIfAbsent(current, ignored -> new Delta());
-            delta.bindingHistoryBytes = Math.addExact(delta.bindingHistoryBytes,
-                costs.bindingHistoryRecordBytes(change.key()));
-          } else if (previous == 0 && current != 0) {
-            Delta delta = deltas.computeIfAbsent(current, ignored -> new Delta());
-            delta.bindingHistoryBytes = Math.addExact(delta.bindingHistoryBytes, historyCost);
-          }
-        }
-      }
-      for (long leaseId : revokingLeaseIds) deltas.computeIfAbsent(leaseId, ignored -> new Delta());
-
+      Map<Long, Delta> deltas = collectDeltas(changes, revokingLeaseIds);
       Map<Long, LeaseState> updatedStates = new java.util.TreeMap<>();
       for (Map.Entry<Long, Delta> entry : deltas.entrySet()) {
-        LeaseState old = Objects.requireNonNull(resolved.get(entry.getKey()), "Lease state is missing");
-        Delta delta = entry.getValue();
-        long count = Math.addExact(old.boundKeyCount(), delta.bindingCount);
-        long keyBytes = Math.addExact(old.boundKeyBytes(), delta.keyBytes);
-        long revokeCostBytes = Math.addExact(old.revokeCostBytes(), delta.revokeCostBytes);
-        long bindingHistoryBytes = Math.addExact(old.bindingHistoryBytes(), delta.bindingHistoryBytes);
-        try {
-          costs.requireWithin(count, keyBytes, revokeCostBytes, bindingHistoryBytes);
-        } catch (BackendFailure failure) {
-          throw new CompletionException(failure);
-        }
-        if (revokingLeaseIds.contains(entry.getKey())) {
-          if (count != 0 || keyBytes != 0 || revokeCostBytes != 0) {
-            throw new IllegalStateException("Lease revocation plan leaves live bindings or reserved cost");
+        updatedStates.put(entry.getKey(), updateLeaseState(entry.getKey(), entry.getValue(),
+            resolved, revokingLeaseIds, sequence));
+      }
+      return encodeRecords(invocation, sequence, changes, updatedStates);
+    }
+
+    private Map<Long, Delta> collectDeltas(List<LeaseBindingChange> changes, Set<Long> revokingLeaseIds) {
+      Map<Long, Delta> deltas = new HashMap<>();
+      for (LeaseBindingChange change : changes) {
+        accumulateBindingDelta(change, deltas);
+        accumulateHistoryDelta(change, deltas);
+      }
+      for (long leaseId : revokingLeaseIds) deltas.computeIfAbsent(leaseId, ignored -> new Delta());
+      return deltas;
+    }
+
+    private void accumulateBindingDelta(LeaseBindingChange change, Map<Long, Delta> deltas) {
+      long previous = change.previousLeaseId();
+      long current = change.currentLeaseId();
+      if (previous != 0) {
+        Delta delta = deltas.computeIfAbsent(previous, ignored -> new Delta());
+        if (previous != current) delta.bindingCount = Math.subtractExact(delta.bindingCount, 1);
+        delta.keyBytes = Math.subtractExact(delta.keyBytes, change.key().length());
+        delta.revokeCostBytes = Math.subtractExact(delta.revokeCostBytes,
+            costs.revokeCostBytes(change.key(), change.previousValueBytes()));
+      }
+      if (current != 0) {
+        Delta delta = deltas.computeIfAbsent(current, ignored -> new Delta());
+        if (previous != current) delta.bindingCount = Math.addExact(delta.bindingCount, 1);
+        delta.keyBytes = Math.addExact(delta.keyBytes, change.key().length());
+        delta.revokeCostBytes = Math.addExact(delta.revokeCostBytes,
+            costs.revokeCostBytes(change.key(), change.currentValueBytes()));
+      }
+    }
+
+    private void accumulateHistoryDelta(LeaseBindingChange change, Map<Long, Delta> deltas) {
+      long previous = change.previousLeaseId();
+      long current = change.currentLeaseId();
+      int newVersions = change.newBindingVersionCount();
+      if (newVersions > 0) {
+        long historyCost = Math.multiplyExact(costs.bindingHistoryRecordBytes(change.key()), newVersions);
+        if (previous != 0) {
+          Delta delta = deltas.computeIfAbsent(previous, ignored -> new Delta());
+          if (current == previous) {
+            delta.bindingHistoryBytes = Math.addExact(delta.bindingHistoryBytes, historyCost);
+          } else {
+            delta.bindingHistoryBytes = Math.addExact(delta.bindingHistoryBytes,
+                costs.bindingHistoryRecordBytes(change.key()));
           }
-          updatedStates.put(entry.getKey(), new LeaseState(old.identity(), old.grantedTtlSeconds(),
-              old.deadlineEpochMillis(), old.renewalGeneration(), LeaseState.Status.REVOKED,
-              sequence, old.expiryCandidateSequence(), 0, 0, 0, bindingHistoryBytes));
-        } else {
-          updatedStates.put(entry.getKey(),
-              old.withBindingAccounting(sequence, count, keyBytes, revokeCostBytes, bindingHistoryBytes));
+        }
+        if (current != 0 && current != previous) {
+          Delta delta = deltas.computeIfAbsent(current, ignored -> new Delta());
+          delta.bindingHistoryBytes = Math.addExact(delta.bindingHistoryBytes,
+              costs.bindingHistoryRecordBytes(change.key()));
         }
       }
+    }
 
+    private LeaseState updateLeaseState(long leaseId, Delta delta, Map<Long, LeaseState> resolved,
+        Set<Long> revokingLeaseIds, long sequence) {
+      LeaseState old = Objects.requireNonNull(resolved.get(leaseId), "Lease state is missing");
+      long count = Math.addExact(old.boundKeyCount(), delta.bindingCount);
+      long keyBytes = Math.addExact(old.boundKeyBytes(), delta.keyBytes);
+      long revokeCostBytes = Math.addExact(old.revokeCostBytes(), delta.revokeCostBytes);
+      long bindingHistoryBytes = Math.addExact(old.bindingHistoryBytes(), delta.bindingHistoryBytes);
+      try {
+        costs.requireWithin(count, keyBytes, revokeCostBytes, bindingHistoryBytes);
+      } catch (BackendFailure failure) {
+        throw new CompletionException(failure);
+      }
+      if (revokingLeaseIds.contains(leaseId)) {
+        if (count != 0 || keyBytes != 0 || revokeCostBytes != 0) {
+          throw new IllegalStateException("Lease revocation plan leaves live bindings or reserved cost");
+        }
+        return new LeaseState(old.identity(), old.grantedTtlSeconds(),
+            old.deadlineEpochMillis(), old.renewalGeneration(), LeaseState.Status.REVOKED,
+            sequence, old.expiryCandidateSequence(), 0, 0, 0, bindingHistoryBytes);
+      } else {
+        return old.withBindingAccounting(sequence, count, keyBytes, revokeCostBytes, bindingHistoryBytes);
+      }
+    }
+
+    private List<PreparedAuxiliaryRecord> encodeRecords(InvocationBinding invocation, long sequence,
+        List<LeaseBindingChange> changes, Map<Long, LeaseState> updatedStates) {
       var records = new ArrayList<PreparedAuxiliaryRecord>(
           Math.addExact(Math.multiplyExact(updatedStates.size(), 3),
               changes.stream().mapToInt(LeaseBindingChange::newBindingVersionCount).sum()));
@@ -314,24 +361,31 @@ public final class LeaseBindingMutationPlanner {
       }
 
       for (LeaseBindingChange change : changes) {
-        LeaseState previous = change.previousLeaseId() == 0 ? null
-            : Objects.requireNonNull(updatedStates.get(change.previousLeaseId()), "previous Lease update missing");
-        LeaseState current = change.currentLeaseId() == 0 ? null
-            : Objects.requireNonNull(updatedStates.get(change.currentLeaseId()), "current Lease update missing");
-        if (change.previousLeaseId() != 0 && change.previousLeaseId() != change.currentLeaseId()) {
-          var unbound = new LeaseBindingVersion(previous.identity(), change.key(), false, sequence,
-              change.currentCreateRevision(), change.currentModRevision());
-          ordinal = add(records, invocation, ordinal, SystemRecordType.LEASE_BINDING,
-              unbound.recordIdentity().encode(), LeaseBindingMessages.encode(unbound));
-        }
-        if (current != null && change.changesBindingIdentity()) {
-          var bound = new LeaseBindingVersion(current.identity(), change.key(), true, sequence,
-              change.currentCreateRevision(), change.currentModRevision());
-          ordinal = add(records, invocation, ordinal, SystemRecordType.LEASE_BINDING,
-              bound.recordIdentity().encode(), LeaseBindingMessages.encode(bound));
-        }
+        ordinal = appendBindingRecords(records, invocation, sequence, updatedStates, change, ordinal);
       }
       return List.copyOf(records);
+    }
+
+    private long appendBindingRecords(List<PreparedAuxiliaryRecord> records,
+        InvocationBinding invocation, long sequence, Map<Long, LeaseState> updatedStates,
+        LeaseBindingChange change, long ordinal) {
+      LeaseState previous = change.previousLeaseId() == 0 ? null
+          : Objects.requireNonNull(updatedStates.get(change.previousLeaseId()), "previous Lease update missing");
+      LeaseState current = change.currentLeaseId() == 0 ? null
+          : Objects.requireNonNull(updatedStates.get(change.currentLeaseId()), "current Lease update missing");
+      if (change.previousLeaseId() != 0 && change.previousLeaseId() != change.currentLeaseId()) {
+        var unbound = new LeaseBindingVersion(previous.identity(), change.key(), false, sequence,
+            change.currentCreateRevision(), change.currentModRevision());
+        ordinal = add(records, invocation, ordinal, SystemRecordType.LEASE_BINDING,
+            unbound.recordIdentity().encode(), LeaseBindingMessages.encode(unbound));
+      }
+      if (current != null && change.changesBindingIdentity()) {
+        var bound = new LeaseBindingVersion(current.identity(), change.key(), true, sequence,
+            change.currentCreateRevision(), change.currentModRevision());
+        ordinal = add(records, invocation, ordinal, SystemRecordType.LEASE_BINDING,
+            bound.recordIdentity().encode(), LeaseBindingMessages.encode(bound));
+      }
+      return ordinal;
     }
 
     static long appendLeaseStateRecords(List<PreparedAuxiliaryRecord> records,
@@ -376,6 +430,8 @@ public final class LeaseBindingMutationPlanner {
       return state;
     }
   }
+
+  private record LeaseIds(Set<Long> all, Set<Long> attaching) {}
 
   private static final class Delta {
     private long bindingCount;
