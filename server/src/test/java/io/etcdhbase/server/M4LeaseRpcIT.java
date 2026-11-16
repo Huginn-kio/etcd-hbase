@@ -160,6 +160,7 @@ class M4LeaseRpcIT {
           }
           M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, provider, identity);
           long revision;
+          io.etcdhbase.core.bytes.ByteKey registryNamespace;
           try (var runtime = RuntimeServer.startM3(configuration, activation("2"))) {
             assertTrue(runtime.dataReady());
             assertEquals(1, rangeKey(runtime, "j44-legacy-key".getBytes(StandardCharsets.UTF_8)).getKvsCount());
@@ -169,7 +170,9 @@ class M4LeaseRpcIT {
             try (var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
               var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
               assertTrue(control.supportsEventRevisionIndex());
-              assertTrue(control.read(scope).join().orElseThrow().state().supportsEventRevisionIndex());
+              var state = control.read(scope).join().orElseThrow().state();
+              assertTrue(state.supportsEventRevisionIndex());
+              registryNamespace = state.eventRegistryNamespace().orElseThrow();
               var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
               assertTrue(new HBaseEventRevisionIndexRepository(records)
                   .read(legacyRevision, scope).join().isEmpty(),
@@ -189,6 +192,9 @@ class M4LeaseRpcIT {
             assertTrue(restarted.dataReady());
             assertEquals(1, rangeKey(restarted, "j44-legacy-key".getBytes(StandardCharsets.UTF_8)).getKvsCount());
             var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
+            var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
+            assertEquals(registryNamespace,
+                control.read(scope).join().orElseThrow().state().eventRegistryNamespace().orElseThrow());
             var index = new HBaseEventRevisionIndexRepository(records)
                 .read(revision, scope).join().orElseThrow();
             var decision = new HBaseCommitDecisionRepository(records)

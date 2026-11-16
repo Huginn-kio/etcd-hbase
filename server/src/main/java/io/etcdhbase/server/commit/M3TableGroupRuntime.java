@@ -10,6 +10,8 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.AuxiliaryFormatUpgrade;
 import io.etcdhbase.core.commit.AuxiliaryLeasePlanVerifier;
 import io.etcdhbase.core.commit.EventIndexFormatUpgrade;
+import io.etcdhbase.core.commit.EventHistoryPinManager;
+import io.etcdhbase.core.commit.EventHistoryRegistryUpgrade;
 import io.etcdhbase.core.commit.LeaseBindingFormatUpgrade;
 import io.etcdhbase.core.commit.LeaseExpiryFormatUpgrade;
 import io.etcdhbase.core.commit.InvocationService;
@@ -232,6 +234,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           verifyLeaseExpiryFormat(stores, startup);
           verifyEventIndexFormat(stores, startup);
         }
+        pending.eventPins = openEventRegistry(stores, activation, owner, startup);
       }
       ByteKey authorization = authorizationDigest(identity);
       var business = assembleBusiness(plan, activation, connections, budgets, scans, pending, stores,
@@ -513,6 +516,24 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         || !stores.records().supportsEventRevisionIndex()) {
       throw new IllegalStateException("J44 event index format is not fenced and available");
     }
+  }
+
+  /** Selects a fully staged protection registry before the runtime can consume event history. */
+  private static EventHistoryPinManager openEventRegistry(TableGroupStores stores,
+      M3RuntimeConfiguration activation, M3OwnerLease owner, RequestScope scope) throws Exception {
+    CommitState state = await(stores.control().read(scope), scope)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized")).state();
+    if (state.eventRegistryNamespace().isEmpty()) {
+      if (!owner.isOwner()) throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+      var owners = new CommitOwnerService(stores.control());
+      var upgrade = new EventHistoryRegistryUpgrade(stores.records(), stores.control(),
+          activation.pinConfiguration(), Clock.systemUTC());
+      await(owner.transitionFence(owners,
+          token -> upgrade.upgrade(token, scope).thenApply(EventHistoryRegistryUpgrade.Selection::owner),
+          scope), scope);
+    }
+    return await(EventHistoryPinManager.openSelected(stores.records(), stores.control(),
+        activation.pinConfiguration(), Clock.systemUTC(), scope), scope);
   }
 
   private record BusinessComponents(PutOwnerProcessor putProcessor, TxnOwnerProcessor txnProcessor,
@@ -876,6 +897,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     private BoundedPublicationHandoff handoff;
     private ThreadPoolExecutor worker;
     private RangeReadCache cache;
+    private volatile EventHistoryPinManager eventPins;
     private ScheduledExecutorService leaseTimers;
     private ScheduledThreadPoolExecutor ownedLeaseTimers;
     private volatile LeaseExpiryWorker expiryWorker;
@@ -974,7 +996,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       M3OwnerLease current = owner;
       if (closing.get() || current == null || !current.isReady()) return false;
       LeaseExpiryWorker expiry = expiryWorker;
-      return !leaseEnabled || expiry != null && expiry.isReady();
+      return !leaseEnabled || eventPins != null && expiry != null && expiry.isReady();
     }
 
     private void close() {
