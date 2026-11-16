@@ -889,10 +889,12 @@ class SealedEventCursorTest {
          RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope fastScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope slowScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope lateScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope readScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          BudgetManager.Account tailMemory = fixture.account(tailScope);
          BudgetManager.Account fastMemory = fixture.account(fastScope);
          BudgetManager.Account slowMemory = fixture.account(slowScope);
+         BudgetManager.Account lateMemory = fixture.account(lateScope);
          BudgetManager.Account readMemory = fixture.account(readScope)) {
       var pins = EventHistoryPinManager.initializeFresh(records,
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
@@ -903,11 +905,14 @@ class SealedEventCursorTest {
         var slow = tailer.subscribe(KeyRange.all(), slowMemory, 1, 8192);
         assertEquals(SharedEventTailer.Step.OPENED, tailer.step(readScope,
             new ManifestCatalog.ProofReadBudget(readScope, readMemory, 10, 1024L << 20)).join());
-        for (int i = 0; i < 2; i++) {
-          assertEquals(SharedEventTailer.Step.BUFFERED, tailer.step(readScope,
-              new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join());
-          assertTrue(fast.poll().isEmpty());
-        }
+        assertEquals(SharedEventTailer.Step.BUFFERED, tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join());
+        var lateStart = tailer.subscribeWithCheckpoint(KeyRange.all(), lateMemory, 4, 8192);
+        assertEquals(2, lateStart.sequence());
+        assertEquals(10, lateStart.revision());
+        assertEquals(SharedEventTailer.Step.BUFFERED, tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join());
+        assertTrue(fast.poll().isEmpty());
         assertEquals(SharedEventTailer.Step.PUBLISHED, tailer.step(readScope,
             new ManifestCatalog.ProofReadBudget(readScope, readMemory, 1, 512L << 20)).join());
         assertEquals(2, fixture.eventReads.get());
@@ -920,6 +925,16 @@ class SealedEventCursorTest {
           assertEquals(1, second.event().ordinal());
           assertEquals(11, first.revision());
         }
+        try (var first = lateStart.subscription().poll().orElseThrow();
+             var second = lateStart.subscription().poll().orElseThrow()) {
+          assertEquals(0, first.event().ordinal());
+          assertEquals(1, second.event().ordinal());
+          assertEquals(3, first.sequence());
+        }
+        var afterPublish = tailer.subscribeWithCheckpoint(KeyRange.all(), slowMemory, 4, 8192);
+        assertEquals(3, afterPublish.sequence());
+        assertEquals(11, afterPublish.revision());
+        assertTrue(afterPublish.subscription().poll().isEmpty());
         assertTrue(fast.poll().isEmpty());
       }
     }

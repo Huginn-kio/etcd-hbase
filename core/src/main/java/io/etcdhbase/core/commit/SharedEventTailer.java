@@ -19,6 +19,11 @@ public final class SharedEventTailer implements AutoCloseable {
   public enum Step { WAITING, METADATA, OPENED, BUFFERED, PUBLISHED }
   public enum Termination { CANCELLED, RESOURCE_LIMIT, TAILER_CLOSED }
 
+  /** Last complete cursor position immediately before the subscription was installed. */
+  public record SubscriptionStart(Subscription subscription, long sequence, long revision) {
+    public SubscriptionStart { Objects.requireNonNull(subscription, "subscription"); }
+  }
+
   private final SelectedSequenceReader source;
   private final ByteKey authorizationDigest;
   private final BudgetManager.Account memory;
@@ -62,6 +67,12 @@ public final class SharedEventTailer implements AutoCloseable {
   /** The caller authorizes the range and arranges any history replay before live delivery. */
   public synchronized Subscription subscribe(KeyRange range, BudgetManager.Account account,
       int maximumEvents, long maximumBytes) {
+    return subscribeWithCheckpoint(range, account, maximumEvents, maximumBytes).subscription();
+  }
+
+  /** Installs the subscription and captures the live cursor under the same lock as publication. */
+  public synchronized SubscriptionStart subscribeWithCheckpoint(KeyRange range, BudgetManager.Account account,
+      int maximumEvents, long maximumBytes) {
     Objects.requireNonNull(range, "range");
     Objects.requireNonNull(account, "account");
     if (closed || subscriptions.size() >= maximumSubscriptions || maximumEvents < 1 || maximumBytes < 1) {
@@ -69,7 +80,7 @@ public final class SharedEventTailer implements AutoCloseable {
     }
     var subscription = new Subscription(range, account, maximumEvents, maximumBytes);
     subscriptions.add(subscription);
-    return subscription;
+    return new SubscriptionStart(subscription, sequence, revision);
   }
 
   /** Performs at most one sequence open or one event read; callers schedule the next bounded step. */
