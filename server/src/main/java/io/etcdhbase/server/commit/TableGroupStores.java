@@ -4,6 +4,7 @@ import io.etcdhbase.admin.M3TableGroupPlan;
 import io.etcdhbase.core.commit.CommitFinalizationService;
 import io.etcdhbase.core.commit.CommitOutcomeResolver;
 import io.etcdhbase.core.commit.AuxiliaryMaterializationStore;
+import io.etcdhbase.core.commit.EventIndexBackfillMaterializer;
 import io.etcdhbase.core.commit.InvocationResultResolver;
 import io.etcdhbase.core.commit.ManifestCatalog;
 import io.etcdhbase.core.commit.ReadViewService;
@@ -208,10 +209,12 @@ public final class TableGroupStores {
     var results = new ResultCatalog(resultRepository);
     var decisions = new HBaseCommitDecisionRepository(records);
     var outcomes = new CommitOutcomeResolver(control, decisions);
+    var eventIndexes = new HBaseEventRevisionIndexRepository(records);
+    var backfill = new EventIndexBackfillMaterializer(control, decisions, manifests, eventIndexes);
     var auxiliaryMaterialization = new SystemRecordAuxiliaryMaterializationStore(records,
-        LeaseStateMessages::decode, LeaseBindingMessages::decode);
+        LeaseStateMessages::decode, LeaseBindingMessages::decode, backfill);
     var finalizer = new CommitFinalizationService(control, outcomes, decisions, manifests,
-        materialization, results, auxiliaryMaterialization, new HBaseEventRevisionIndexRepository(records));
+        materialization, results, auxiliaryMaterialization, eventIndexes);
     var views = new ReadViewService(control, manifests, pins, system.profileFingerprint());
     var invocationResults = new InvocationResultResolver(invocations, outcomes, manifests, results);
     return new TableGroupStores(records, control, invocations, manifestRepository, manifests,

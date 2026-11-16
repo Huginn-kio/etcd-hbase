@@ -14,6 +14,7 @@ import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
@@ -25,6 +26,7 @@ public final class SystemRecordAuxiliaryMaterializationStore
   private final SystemRecordStore records;
   private final Function<ByteKey, LeaseState> decodeLeaseState;
   private final Function<ByteKey, LeaseBindingVersion> decodeLeaseBinding;
+  private final EventIndexBackfillMaterializer eventBackfill;
 
   public SystemRecordAuxiliaryMaterializationStore(SystemRecordStore records,
       Function<ByteKey, LeaseState> decodeLeaseState) {
@@ -34,9 +36,17 @@ public final class SystemRecordAuxiliaryMaterializationStore
   public SystemRecordAuxiliaryMaterializationStore(SystemRecordStore records,
       Function<ByteKey, LeaseState> decodeLeaseState,
       Function<ByteKey, LeaseBindingVersion> decodeLeaseBinding) {
+    this(records, decodeLeaseState, decodeLeaseBinding, null);
+  }
+
+  public SystemRecordAuxiliaryMaterializationStore(SystemRecordStore records,
+      Function<ByteKey, LeaseState> decodeLeaseState,
+      Function<ByteKey, LeaseBindingVersion> decodeLeaseBinding,
+      EventIndexBackfillMaterializer eventBackfill) {
     this.records = Objects.requireNonNull(records, "records");
     this.decodeLeaseState = Objects.requireNonNull(decodeLeaseState, "decodeLeaseState");
     this.decodeLeaseBinding = decodeLeaseBinding;
+    this.eventBackfill = eventBackfill;
   }
 
   @Override
@@ -80,6 +90,15 @@ public final class SystemRecordAuxiliaryMaterializationStore
     if (record.targetType() == SystemRecordType.LEASE_ENUMERATION) {
       return updatePointer(record, 0, scope);
     }
+    if (record.targetType() == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT) {
+      if (eventBackfill == null) return failed(conflict("event backfill recovery is not configured"));
+      return eventBackfill.apply(EventIndexBackfillCheckpoint.decode(record.payload()), scope)
+          .thenCompose(ignored -> createImmutable(record, scope));
+    }
+    return createImmutable(record, scope);
+  }
+
+  private CompletableFuture<ApplyResult> createImmutable(PreparedAuxiliaryRecord record, RequestScope scope) {
     return records.createIfAbsent(record.targetType(), record.targetIdentity(), record.payload(), scope)
         .thenApply(result -> switch (result) {
           case CREATED -> ApplyResult.APPLIED;
@@ -234,17 +253,18 @@ public final class SystemRecordAuxiliaryMaterializationStore
 
   private CompletableFuture<Void> validateEventCheckpointBeforeSelection(PreparedAuxiliaryRecord record,
       Optional<ByteKey> existing, RequestScope scope) {
+    if (eventBackfill == null) return failed(conflict("event backfill verification is not configured"));
     EventIndexBackfillCheckpoint replacement = EventIndexBackfillCheckpoint.decode(record.payload());
     if (existing.isPresent() && !existing.orElseThrow().equals(record.payload())) {
       return CompletableFuture.failedFuture(conflict("same-sequence event backfill checkpoints differ"));
     }
     return records.latestAtOrBefore(SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,
-        EventIndexBackfillCheckpoint.routePrefix(), record.baseSequence(), scope).thenAccept(previous -> {
+        EventIndexBackfillCheckpoint.routePrefix(), record.baseSequence(), scope).thenApply(previous -> {
       if (previous.isEmpty()) {
         if (replacement.nextSequence() != replacement.firstSequence()) {
           throw conflict("initial event backfill checkpoint must start at the captured boundary");
         }
-        return;
+        return OptionalLong.empty();
       }
       SystemRecordEntry entry = previous.orElseThrow();
       EventIndexBackfillCheckpoint current = EventIndexBackfillCheckpoint.decode(entry.value());
@@ -257,7 +277,8 @@ public final class SystemRecordAuxiliaryMaterializationStore
       } catch (IllegalArgumentException stale) {
         throw conflict("event backfill checkpoint does not advance protected durable progress");
       }
-    });
+      return OptionalLong.of(current.currentRevision());
+    }).thenCompose(previousRevision -> eventBackfill.preflight(replacement, previousRevision, scope));
   }
 
   private CompletableFuture<Void> validateCheckpointBeforeSelection(PreparedAuxiliaryRecord record,
