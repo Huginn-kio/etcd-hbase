@@ -2,7 +2,9 @@ package io.etcdhbase.core.commit;
 
 import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Verifies every sealed candidate and event reference before the publication CAS. */
 public final class CommitPlanVerifier {
@@ -44,6 +46,14 @@ public final class CommitPlanVerifier {
   }
 
   public CompletableFuture<ManifestRoot> verify(
+      InvocationBinding invocation, ManifestRoot proposed, RequestScope scope) {
+    return verifyForPublication(invocation, proposed, scope).thenApply(VerifiedPlan::root);
+  }
+
+  /** Carries the checked compact boundary to the exact control-row CAS. */
+  record VerifiedPlan(ManifestRoot root, OptionalLong backfillCompactRevision) {}
+
+  CompletableFuture<VerifiedPlan> verifyForPublication(
       InvocationBinding invocation, ManifestRoot proposed, RequestScope scope) {
     Objects.requireNonNull(invocation, "invocation");
     Objects.requireNonNull(proposed, "proposed");
@@ -88,6 +98,7 @@ public final class CommitPlanVerifier {
       }
       AuxiliaryLeasePlanVerifier.Transaction leasePlan = root.auxiliaryReference().isPresent()
           ? auxiliaryLeasePlanVerifier.begin(root.baseSequence()) : null;
+      var backfill = new AtomicReference<EventIndexBackfillCheckpoint>();
       return verified.thenCompose(ignored -> catalog.forEachCandidate(root, scope,
               candidate -> materialization.preflight(candidate, scope)))
           .thenCompose(ignored -> catalog.forEachEvent(root, scope,
@@ -97,11 +108,17 @@ public final class CommitPlanVerifier {
               : catalog.forEachAuxiliary(root, scope,
                   record -> {
                     leasePlan.accept(record);
+                    if (record.targetType() == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT
+                        && !backfill.compareAndSet(null, EventIndexBackfillCheckpoint.decode(record.payload()))) {
+                      throw new IllegalStateException("multiple event backfill checkpoints in one publication");
+                    }
                     return auxiliaryMaterialization.preflight(record, scope);
                   }))
           .thenApply(ignored -> {
             if (leasePlan != null) leasePlan.finish();
-            return root;
+            EventIndexBackfillCheckpoint checkpoint = backfill.get();
+            return new VerifiedPlan(root, checkpoint == null ? OptionalLong.empty()
+                : OptionalLong.of(checkpoint.compactRevision()));
           });
     });
   }

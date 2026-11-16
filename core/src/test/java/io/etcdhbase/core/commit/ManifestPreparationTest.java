@@ -31,6 +31,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 
@@ -860,6 +861,112 @@ class ManifestPreparationTest {
 
   private static LeaseState throwInvalidLeaseStatePayload() {
     throw new IllegalArgumentException("unexpected test Lease state payload");
+  }
+
+  @Test
+  void eventBackfillPublicationRejectsCompactChangesBeforeOrDuringCas() {
+    var repository = new MemoryRepository();
+    var resultRepository = new SingleResultRepository();
+    var results = new ResultCatalog(resultRepository);
+    var digest = ByteKey.copyOf(new byte[32]);
+    var preparing = InvocationBinding.begin(InvocationId.create(), digest, digest,
+        TransactionId.create(), 1, 0, 1);
+    var identity = ResultIdentity.from(preparing);
+    var resultPage = new ResultPage(identity, 0, new byte[] {1});
+    var resultDirectory = ResultDirectory.create(identity, List.of(ResultPageReference.from(resultPage)));
+    resultRepository.page = resultPage;
+    resultRepository.directory = resultDirectory;
+    var checkpoint = new EventIndexBackfillCheckpoint(1, 1, 1, 0, 1, 1, 1, 1, 0);
+    var record = PreparedAuxiliaryRecord.create(preparing.transactionId(), 1, 0, 0,
+        SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT,
+        EventIndexBackfillCheckpoint.versionIdentity(1), checkpoint.encode());
+    try (RequestScope scope = scope()) {
+      var root = new ManifestPreparation(repository, new ManifestPreparation.Limits(0, 0, 0, 0))
+          .prepareWithResultAndAuxiliary(preparing, List.<PreparedCandidate>of().iterator(),
+              List.<PreparedEvent>of().iterator(), resultDirectory.reference(), results,
+              List.of(record).iterator(), () -> CompletableFuture.completedFuture(null), scope).join();
+      var sealed = preparing.seal(root.systemIdentity());
+      var initial = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION, digest,
+          Optional.of("owner"), 1, 10_000, 1, 0, 1, 0, 1, Optional.empty(), 0);
+      var state = new AtomicReference<>(initial);
+      var casCalls = new AtomicInteger();
+      var changeDuringCas = new java.util.concurrent.atomic.AtomicBoolean();
+      CommitControlStore control = new CommitControlStore() {
+        @Override public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope ignored) {
+          return CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(state.get(), new byte[] {1})));
+        }
+        @Override public CompletableFuture<Boolean> initializeIfAbsent(CommitState value, RequestScope ignored) {
+          throw new UnsupportedOperationException();
+        }
+        @Override public CompletableFuture<Boolean> compareAndSet(ControlSnapshot observed,
+            CommitState replacement, RequestScope ignored) {
+          casCalls.incrementAndGet();
+          if (changeDuringCas.getAndSet(false)) {
+            state.set(state.get().advanceCompactRevision(1));
+            return CompletableFuture.completedFuture(false);
+          }
+          state.set(replacement);
+          return CompletableFuture.completedFuture(true);
+        }
+      };
+      var changeBeforeCas = new java.util.concurrent.atomic.AtomicBoolean();
+      PublicationHandoff handoff = new PublicationHandoff() {
+        @Override public <T> CompletableFuture<T> transfer(InvocationBinding binding, RequestScope request,
+            java.util.function.Function<RequestScope, CompletableFuture<T>> work) {
+          if (changeBeforeCas.getAndSet(false)) state.set(state.get().advanceCompactRevision(1));
+          return work.apply(request);
+        }
+      };
+      InvocationRepository invocations = new InvocationRepository() {
+        @Override public CompletableFuture<Optional<InvocationBinding>> read(InvocationId id, RequestScope ignored) {
+          return CompletableFuture.completedFuture(Optional.of(sealed));
+        }
+        @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+            InvocationBinding binding, RequestScope ignored) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<Boolean> compareAndSet(InvocationBinding previous,
+            InvocationBinding replacement, RequestScope ignored) { throw new UnsupportedOperationException(); }
+      };
+      MaterializationStore materialization = new MaterializationStore() {
+        @Override public CompletableFuture<ApplyResult> applySelected(
+            CommitDecision decision, PreparedCandidate candidate, RequestScope ignored) {
+          throw new AssertionError("backfill has no KV candidates");
+        }
+        @Override public CompletableFuture<Void> preflight(PreparedCandidate candidate, RequestScope ignored) {
+          throw new AssertionError("backfill has no KV candidates");
+        }
+      };
+      AuxiliaryMaterializationStore auxiliary = new AuxiliaryMaterializationStore() {
+        @Override public CompletableFuture<Void> preflight(PreparedAuxiliaryRecord value, RequestScope ignored) {
+          return CompletableFuture.completedFuture(null);
+        }
+        @Override public CompletableFuture<ApplyResult> applySelected(
+            CommitDecision decision, PreparedAuxiliaryRecord value, RequestScope ignored) {
+          throw new UnsupportedOperationException();
+        }
+      };
+      var verifier = new CommitPlanVerifier(new ManifestCatalog(repository), materialization, results,
+          auxiliary, new AuxiliaryLeasePlanVerifier(value -> null, value -> null));
+      CommitDecisionRepository decisions = new CommitDecisionRepository() {
+        @Override public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope ignored) {
+          return CompletableFuture.completedFuture(Optional.empty());
+        }
+        @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+            CommitDecision decision, RequestScope ignored) { throw new UnsupportedOperationException(); }
+      };
+      var publisher = new CommitPublisher(control, new CommitOutcomeResolver(control, decisions), verifier,
+          invocations, handoff, (binding, publication, ignored) -> CompletableFuture.completedFuture(publication));
+      var owner = new CommitOwnerService.OwnerToken("owner", 1);
+      changeBeforeCas.set(true);
+      assertThrows(CompletionException.class, () -> publisher.publish(sealed, owner, root, scope).join());
+      assertEquals(0, casCalls.get());
+      state.set(initial);
+      changeDuringCas.set(true);
+      assertThrows(CompletionException.class, () -> publisher.publish(sealed, owner, root, scope).join());
+      assertEquals(1, casCalls.get());
+      state.set(initial);
+      assertEquals(CommitOutcomeResolver.State.SELECTED_PENDING,
+          publisher.publish(sealed, owner, root, scope).join().state());
+    }
   }
 
   private static io.etcdhbase.core.lease.LeaseBindingVersion throwInvalidLeaseBindingPayload() {

@@ -60,7 +60,7 @@ public final class CommitPublisher {
       return CompletableFuture.failedFuture(
           new IllegalArgumentException("owner token does not match the sealed invocation"));
     }
-    return planVerifier.verify(invocation, manifest, requestScope).thenCompose(verified ->
+    return planVerifier.verifyForPublication(invocation, manifest, requestScope).thenCompose(verified ->
         invocations.read(invocation.invocationId(), requestScope).thenCompose(found -> {
           InvocationBinding durable = found.orElseThrow(() ->
               new IllegalStateException("sealed invocation was not persisted"));
@@ -80,7 +80,7 @@ public final class CommitPublisher {
   private CompletableFuture<CommitOutcomeResolver.Resolution> attempt(
       InvocationBinding invocation,
       CommitOwnerService.OwnerToken owner,
-      ManifestRoot manifest,
+      CommitPlanVerifier.VerifiedPlan verified,
       RequestScope scope,
       Runnable beforeSelection,
       int attempt) {
@@ -94,6 +94,12 @@ public final class CommitPublisher {
       }
       ControlSnapshot observed = snapshot.orElseThrow();
       CommitState state = observed.state();
+      ManifestRoot manifest = verified.root();
+      if (verified.backfillCompactRevision().isPresent()
+          && verified.backfillCompactRevision().getAsLong() != state.compactRevision()) {
+        return CompletableFuture.failedFuture(new IllegalStateException(
+            "event backfill compact boundary changed before publication"));
+      }
       if (manifest.auxiliaryReference().isPresent() && !state.supportsAuxiliaryRecords()) {
         return CompletableFuture.failedFuture(new IllegalStateException(
             "auxiliary publication requires the fenced control format"));
@@ -114,14 +120,18 @@ public final class CommitPublisher {
       beforeSelection.run();
       return control.compareAndSet(observed, selected, scope)
           .handle((updated, failure) -> new CasResult(updated, failure))
+<<<<<<< HEAD
           .thenCompose(result -> resolveAttempt(invocation, owner, manifest, scope, beforeSelection, attempt, result));
+=======
+          .thenCompose(result -> resolveAttempt(invocation, owner, verified, scope, attempt, result));
+>>>>>>> 5cb128ec (fix(j44): 将回填压缩边界绑定到发布 CAS)
     });
   }
 
   private CompletableFuture<CommitOutcomeResolver.Resolution> resolveAttempt(
       InvocationBinding invocation,
       CommitOwnerService.OwnerToken owner,
-      ManifestRoot manifest,
+      CommitPlanVerifier.VerifiedPlan verified,
       RequestScope scope,
       Runnable beforeSelection,
       int attempt,
@@ -145,7 +155,11 @@ public final class CommitPublisher {
           && state.publishedSequence() == invocation.baseSequence()
           && state.publishedRevision() == invocation.baseRevision()
           && state.publication().isEmpty()) {
+<<<<<<< HEAD
         return attempt(invocation, owner, manifest, scope, beforeSelection, attempt + 1);
+=======
+        return attempt(invocation, owner, verified, scope, attempt + 1);
+>>>>>>> 5cb128ec (fix(j44): 将回填压缩边界绑定到发布 CAS)
       }
       return outcomes.resolve(invocation, scope);
     });
