@@ -1,6 +1,7 @@
 package io.etcdhbase.core.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -16,6 +17,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class SealedEventCursorTest {
@@ -69,6 +71,58 @@ class SealedEventCursorTest {
       cursor.close();
       fixture.pendingEvent.complete(Optional.of(fixture.first));
       assertThrows(CompletionException.class, result::join);
+    }
+  }
+
+  @Test
+  void protectedCursorStopsDeliveryWhenPinExpiresAfterTheRead() throws Exception {
+    Fixture fixture = new Fixture();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account account = fixture.account(scope)) {
+      AtomicInteger renewals = new AtomicInteger();
+      AtomicInteger releases = new AtomicInteger();
+      ReadViewPinRegistry.Pin pin = new ReadViewPinRegistry.Pin() {
+        @Override public long generation() { return 1; }
+        @Override public CompletableFuture<Void> renew(RequestScope ignored) {
+          return renewals.incrementAndGet() == 2
+              ? CompletableFuture.failedFuture(new IllegalStateException("pin expired"))
+              : CompletableFuture.completedFuture(null);
+        }
+        @Override public void close() { releases.incrementAndGet(); }
+      };
+      var cursor = new ProtectedEventCursor(fixture.cursor(scope), pin, scope);
+      var budget = new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20);
+      assertThrows(CompletionException.class, () -> cursor.next(budget).join());
+      cursor.releaseCompletion().toCompletableFuture().join();
+      assertEquals(1, releases.get());
+      assertThrows(CompletionException.class, () -> cursor.next(budget).join());
+    }
+  }
+
+  @Test
+  void protectedCursorWaitsForPhysicalProducerBeforeReleasingPin() throws Exception {
+    Fixture fixture = new Fixture();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account account = fixture.account(scope)) {
+      AtomicInteger releases = new AtomicInteger();
+      ReadViewPinRegistry.Pin pin = new ReadViewPinRegistry.Pin() {
+        @Override public long generation() { return 1; }
+        @Override public void close() { releases.incrementAndGet(); }
+      };
+      fixture.pendingEvent = new CompletableFuture<>();
+      CompletableFuture<Void> physical = new CompletableFuture<>();
+      scope.trackPhysicalProducer(physical);
+      var cursor = new ProtectedEventCursor(fixture.cursor(scope), pin, scope);
+      var budget = new ManifestCatalog.ProofReadBudget(scope, account, 3, 512L << 20);
+      var result = cursor.next(budget);
+      cursor.close();
+      fixture.pendingEvent.complete(Optional.of(fixture.first));
+      assertThrows(CompletionException.class, result::join);
+      assertEquals(0, releases.get());
+      assertFalse(cursor.releaseCompletion().toCompletableFuture().isDone());
+      physical.complete(null);
+      cursor.releaseCompletion().toCompletableFuture().join();
+      assertEquals(1, releases.get());
     }
   }
 
