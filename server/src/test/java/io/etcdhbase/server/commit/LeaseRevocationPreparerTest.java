@@ -288,6 +288,9 @@ class LeaseRevocationPreparerTest {
     assertEquals(0, revoked.revokeCostBytes());
     assertEquals(previous.bindingHistoryBytes() + 2 * COSTS.bindingHistoryRecordBytes(KEY_A),
         revoked.bindingHistoryBytes());
+    var checkpointRecord = records.getLast();
+    assertEquals(LeaseExpiryCheckpoint.versionIdentity(11), checkpointRecord.targetIdentity());
+    assertEquals(11, LeaseExpiryCheckpoint.decode(checkpointRecord.payload()).sequence());
     for (int i = 0; i < 2; i++) {
       var binding = LeaseBindingMessages.decode(records.get(i + 2).payload());
       assertFalse(binding.bound());
