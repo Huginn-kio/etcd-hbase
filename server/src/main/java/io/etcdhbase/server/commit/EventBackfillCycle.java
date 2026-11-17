@@ -130,8 +130,10 @@ final class EventBackfillCycle {
       try (window) {
         EventIndexBackfillCheckpoint proposal = current.isEmpty() ? checkpoint
             : verifyNext(owner, state, checkpoint, window, windowScope.scope, budget);
+        EventIndexBackfillCheckpoint protectedCheckpoint = current.orElse(checkpoint);
         account.close();
-        publishOnOwnerLane(owner, state, proposal, windowScope.scope, current.isEmpty());
+        publishOnOwnerLane(owner, state, proposal, protectedCheckpoint, windowScope.scope,
+            current.isEmpty());
         return new CycleResult(true, proposal.complete());
       } finally {
         window.releaseCompletion().toCompletableFuture().join();
@@ -170,8 +172,8 @@ final class EventBackfillCycle {
   }
 
   private void publishOnOwnerLane(CommitOwnerService.OwnerToken owner, CommitState state,
-      EventIndexBackfillCheckpoint checkpoint, RequestScope scope, boolean initialCapture)
-      throws BackendFailure {
+      EventIndexBackfillCheckpoint checkpoint, EventIndexBackfillCheckpoint protectedCheckpoint,
+      RequestScope scope, boolean initialCapture) throws BackendFailure {
     var proposed = InvocationBinding.begin(InvocationId.create(), digest(checkpoint), authorization,
         TransactionId.create(), owner.epoch(), state.publishedSequence(), state.publishedRevision());
     var publicationDrained = new CompletableFuture<Void>();
@@ -186,7 +188,8 @@ final class EventBackfillCycle {
           return CompletableFuture.failedFuture(inactive(scope));
         }
         return invocations.bindOrJoin(proposed, laneScope)
-            .thenCompose(invocation -> publishOnLane(invocation, owner, checkpoint, laneScope, initialCapture));
+            .thenCompose(invocation -> publishOnLane(invocation, owner, checkpoint,
+                protectedCheckpoint, laneScope, initialCapture));
       });
     } catch (RuntimeException | Error failure) {
       publicationScope.close();
@@ -205,7 +208,8 @@ final class EventBackfillCycle {
 
   private CompletableFuture<CommitOutcomeResolver.Resolution> publishOnLane(
       InvocationBinding invocation, CommitOwnerService.OwnerToken owner,
-      EventIndexBackfillCheckpoint checkpoint, RequestScope scope, boolean initialCapture) {
+      EventIndexBackfillCheckpoint checkpoint, EventIndexBackfillCheckpoint protectedCheckpoint,
+      RequestScope scope, boolean initialCapture) {
     BudgetManager.Account account;
     try {
       account = budgets.admitReserved(tableGroup, scope, RESERVATION, READ_LIMITS);
@@ -216,7 +220,8 @@ final class EventBackfillCycle {
     CompletableFuture<EventBackfillWindow> window = initialCapture
         ? new EventIndexBackfillCapture(pins, stores.control(), stores.decisions())
             .open(checkpoint, authorization, scope, budget)
-        : EventBackfillWindow.open(pins, stores.control(), checkpoint, authorization, scope, budget);
+        : EventBackfillWindow.open(pins, stores.control(), protectedCheckpoint, authorization,
+            scope, budget);
     return window.thenCompose(protectedWindow -> {
       CompletableFuture<CommitOutcomeResolver.Resolution> publication;
       try {
