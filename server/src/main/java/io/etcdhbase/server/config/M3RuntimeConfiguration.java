@@ -86,18 +86,6 @@ public record M3RuntimeConfiguration(
     }
   }
 
-  /** Preserve callers using the full J41 activation shape before owner transport was added. */
-  public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
-      int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
-      int pinShards, int pinSlotsPerShard, int pinLeaseMs, boolean readCacheEnabled,
-      boolean m4LeaseApiEnabled, long leaseMinTtlSeconds, long leaseClockUncertaintyMs,
-      int leaseMaximumBindings, long leaseMaximumKeyBytes, long leaseMaximumRevokeCostBytes) {
-    this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
-        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
-        m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs, 0,
-        leaseMaximumBindings, leaseMaximumKeyBytes, leaseMaximumRevokeCostBytes, null, null);
-  }
-
   /** Explicit clock-rate bound required for Lease activation. */
   public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
       int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,

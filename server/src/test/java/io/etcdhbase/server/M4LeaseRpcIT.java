@@ -2591,37 +2591,6 @@ class M4LeaseRpcIT {
     }
   }
 
-  private static Status.Code keepAliveFailureCode(RuntimeServer server, long leaseId)
-      throws Exception {
-    var channel = NettyChannelBuilder.forAddress(
-            "127.0.0.1", server.boundListeners().getFirst().port())
-        .usePlaintext().build();
-    var responses = new CopyOnWriteArrayList<Rpc.LeaseKeepAliveResponse>();
-    var failure = new AtomicReference<Throwable>();
-    var terminated = new CountDownLatch(1);
-    try {
-      StreamObserver<Rpc.LeaseKeepAliveRequest> sender = LeaseGrpc.newStub(channel)
-          .withDeadlineAfter(30, TimeUnit.SECONDS).leaseKeepAlive(new StreamObserver<>() {
-            @Override public void onNext(Rpc.LeaseKeepAliveResponse response) { responses.add(response); }
-            @Override public void onError(Throwable cause) {
-              failure.set(cause);
-              terminated.countDown();
-            }
-            @Override public void onCompleted() { terminated.countDown(); }
-          });
-      sender.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(leaseId).build());
-      sender.onCompleted();
-      assertTrue(terminated.await(30, TimeUnit.SECONDS), "KeepAlive failure stream did not terminate");
-      assertTrue(responses.isEmpty(), "an expired ACTIVE Lease must not return a successful response");
-      Throwable observed = failure.get();
-      assertTrue(observed != null, "an expired ACTIVE Lease must terminate with a failure");
-      return Status.fromThrowable(observed).getCode();
-    } finally {
-      channel.shutdownNow();
-      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
-    }
-  }
-
   private static boolean isOwnerForPeer(CommitState state, String peerId) throws Exception {
     byte[] digest = MessageDigest.getInstance("SHA-256")
         .digest(peerId.getBytes(StandardCharsets.UTF_8));
