@@ -84,6 +84,23 @@ class M4ReportTest(unittest.TestCase):
                 with self.assertRaisesRegex(m4_report.ReportError, "binding, TTL projection"):
                     m4_report.validate_registry_document(missing_case)
 
+    def test_j44_registry_requires_empty_replacement_index_regression(self) -> None:
+        class_name = "io.etcdhbase.core.commit.EventSubscriptionIndexTest"
+        method_name = "replacingRegistrationWithEmptyRangeRemovesPreviousPointOrInterval"
+
+        for missing_suite in (True, False):
+            changed = copy.deepcopy(self.registry)
+            task = next(item for item in changed["tasks"] if item["id"] == "J44")
+            if missing_suite:
+                task["maven_tests"] = [suite for suite in task["maven_tests"]
+                                        if suite["class"] != class_name]
+            else:
+                suite = next(item for item in task["maven_tests"] if item["class"] == class_name)
+                suite["tests"].remove(method_name)
+            with self.subTest(missing_suite=missing_suite):
+                with self.assertRaises(m4_report.ReportError):
+                    m4_report.validate_registry_document(changed)
+
     def test_both_registries_reject_malformed_or_duplicate_go_packages(self) -> None:
         for task_id in ("J40", "J41"):
             for invalid in (None, {"package": 1}, {"package": "extra", "tests": []},
@@ -129,6 +146,24 @@ class M4ReportTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(m4_report.ReportError, "suites are incomplete"):
             m4_report.validate_registry_document(missing_suite)
+
+        missing_scan_suite = copy.deepcopy(self.registry)
+        task = next(item for item in missing_scan_suite["tasks"] if item["id"] == "J44")
+        task["maven_tests"] = [
+            suite for suite in task["maven_tests"]
+            if suite["class"] != "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT"
+        ]
+        with self.assertRaisesRegex(m4_report.ReportError, "suites are incomplete"):
+            m4_report.validate_registry_document(missing_scan_suite)
+
+        missing_scan_case = copy.deepcopy(self.registry)
+        task = next(item for item in missing_scan_case["tasks"] if item["id"] == "J44")
+        suite = next(item for item in task["maven_tests"]
+                     if item["class"] == "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT")
+        suite["tests"].append("seeksLatestExpiryCheckpointAtTheReadBarrier")
+        suite["tests"].remove("seeksEventRevisionsWithinOneBucketAndResumesExclusively")
+        with self.assertRaisesRegex(m4_report.ReportError, "cursor, backfill, fairness, or layout"):
+            m4_report.validate_registry_document(missing_scan_case)
 
         missing_fairness = copy.deepcopy(self.registry)
         task = next(item for item in missing_fairness["tasks"] if item["id"] == "J44")

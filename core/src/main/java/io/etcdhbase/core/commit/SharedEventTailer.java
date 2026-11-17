@@ -7,21 +7,60 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** One bounded, shared live-event reader for a single table-group authorization domain. */
 public final class SharedEventTailer implements AutoCloseable {
   public enum Step { WAITING, METADATA, OPENED, BUFFERED, PUBLISHED }
   public enum Termination { CANCELLED, RESOURCE_LIMIT, TAILER_CLOSED }
 
+  // Covers each subscription, queue, index registration and collection/tree nodes.
+  static final long SUBSCRIPTION_INDEX_ENTRY_OVERHEAD_BYTES = 512;
+
   /** Last complete cursor position immediately before the subscription was installed. */
   public record SubscriptionStart(Subscription subscription, long sequence, long revision) {
     public SubscriptionStart { Objects.requireNonNull(subscription, "subscription"); }
+  }
+
+  /** A bounded read result whose shared-state changes have not yet been applied. */
+  public static final class StepProposal {
+    private final SharedEventTailer owner;
+    private final long expectedSequence;
+    private final long expectedRevision;
+    private final Step step;
+    private final RequestScope scope;
+    private final Optional<SelectedSequenceReader.Selected> selected;
+    private final ProtectedEventCursor expectedCursor;
+    private final CommitDecision expectedDecision;
+    private final ProtectedEventCursor cursor;
+    private final CommitDecision decision;
+    private final PreparedEvent event;
+    private final AtomicBoolean consumed = new AtomicBoolean();
+
+    private StepProposal(SharedEventTailer owner, long expectedSequence, long expectedRevision,
+        Step step, RequestScope scope, Optional<SelectedSequenceReader.Selected> selected,
+        ProtectedEventCursor expectedCursor, CommitDecision expectedDecision,
+        ProtectedEventCursor cursor, CommitDecision decision, PreparedEvent event) {
+      this.owner = owner;
+      this.expectedSequence = expectedSequence;
+      this.expectedRevision = expectedRevision;
+      this.step = step;
+      this.scope = scope;
+      this.selected = selected;
+      this.expectedCursor = expectedCursor;
+      this.expectedDecision = expectedDecision;
+      this.cursor = cursor;
+      this.decision = decision;
+      this.event = event;
+    }
   }
 
   private final SelectedSequenceReader source;
@@ -74,124 +113,265 @@ public final class SharedEventTailer implements AutoCloseable {
 
   /** The caller authorizes the range and arranges any history replay before live delivery. */
   public synchronized Subscription subscribe(KeyRange range, BudgetManager.Account account,
-      int maximumEvents, long maximumBytes) {
+      int maximumEvents, long maximumBytes) throws BackendFailure {
     return subscribeWithCheckpoint(range, account, maximumEvents, maximumBytes).subscription();
   }
 
   /** Installs the subscription and captures the live cursor under the same lock as publication. */
   public synchronized SubscriptionStart subscribeWithCheckpoint(KeyRange range, BudgetManager.Account account,
-      int maximumEvents, long maximumBytes) {
+      int maximumEvents, long maximumBytes) throws BackendFailure {
     Objects.requireNonNull(range, "range");
     Objects.requireNonNull(account, "account");
     if (closed || subscriptions.size() >= maximumSubscriptions || maximumEvents < 1 || maximumBytes < 1) {
       throw new IllegalStateException("shared tailer cannot admit another subscription");
     }
-    var subscription = new Subscription(range, account, maximumEvents, maximumBytes);
-    subscriptions.add(subscription);
-    subscriptionIndex.add(subscription, range);
-    return new SubscriptionStart(subscription, sequence, revision);
+    long indexBytes = subscriptionIndexMemoryBytes(range);
+    BudgetManager.Lease indexMemory = account.tryRetain(BudgetManager.Memory.OUTPUT, indexBytes)
+        .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+    var subscription = new Subscription(range, account, maximumEvents, maximumBytes, indexMemory);
+    try {
+      subscriptions.add(subscription);
+      subscriptionIndex.add(subscription, range);
+      return new SubscriptionStart(subscription, sequence, revision);
+    } catch (RuntimeException | Error failure) {
+      subscription.stop(Termination.CANCELLED);
+      throw failure;
+    }
   }
 
-  /** Performs at most one sequence open or one event read; callers schedule the next bounded step. */
-  public synchronized CompletableFuture<Step> step(RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+  private static long subscriptionIndexMemoryBytes(KeyRange range) {
+    long bytes = SUBSCRIPTION_INDEX_ENTRY_OVERHEAD_BYTES;
+    if (range.lowerInclusive().isPresent()) {
+      bytes = Math.addExact(bytes, range.lowerInclusive().orElseThrow().length());
+    }
+    if (range.kind() == KeyRange.Kind.RANGE && range.upperExclusive().isPresent()) {
+      bytes = Math.addExact(bytes, range.upperExclusive().orElseThrow().length());
+    }
+    return bytes;
+  }
+
+  /** Reads at most one selected sequence or event without advancing shared tailer state. */
+  public CompletableFuture<StepProposal> prepareStep(RequestScope scope,
+      ManifestCatalog.ProofReadBudget budget) {
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(budget, "budget");
-    if (closed || busy || !budget.belongsTo(scope) || active != null && activeScope != scope) {
-      return CompletableFuture.failedFuture(new IllegalStateException("shared tailer is closed, busy, or has another scope"));
+    ProtectedEventCursor cursor;
+    long expectedSequence;
+    long expectedRevision;
+    CommitDecision decision;
+    synchronized (this) {
+      if (closed || busy || !budget.belongsTo(scope) || active != null && activeScope != scope) {
+        return CompletableFuture.failedFuture(
+            new IllegalStateException("shared tailer is closed, busy, or has another scope"));
+      }
+      busy = true;
+      inFlightScope = scope;
+      cursor = active;
+      decision = activeDecision;
+      expectedSequence = sequence;
+      expectedRevision = revision;
     }
-    busy = true;
-    inFlightScope = scope;
-    CompletableFuture<Step> work;
+    CompletableFuture<StepProposal> work;
     try {
-      work = active == null ? open(scope, budget) : readEvent(budget);
+      work = cursor == null
+          ? open(expectedSequence, expectedRevision, scope, budget)
+          : readEvent(expectedSequence, expectedRevision, scope, cursor, decision, budget);
     } catch (RuntimeException | Error failure) {
-      busy = false;
-      inFlightScope = null;
-      scope.cancel();
-      close();
+      failPreparation(scope);
       if (failure instanceof Error fatal) throw fatal;
       return CompletableFuture.failedFuture(failure);
     }
-    var response = new CompletableFuture<Step>();
+    var response = new CompletableFuture<StepProposal>();
     response.whenComplete((ignored, failure) -> {
       if (response.isCancelled()) {
         scope.cancel();
         close();
       }
     });
-    work.whenComplete((result, failure) -> {
-      synchronized (SharedEventTailer.this) {
-        busy = false;
-        inFlightScope = null;
-      }
+    work.whenComplete((proposal, failure) -> {
       if (failure != null) {
-        close();
+        failPreparation(scope);
         response.completeExceptionally(failure);
-      } else if (!response.complete(result)) {
-        close();
+      } else if (!response.complete(proposal)) {
+        discardStep(proposal);
       }
     });
     return response;
   }
 
-  private CompletableFuture<Step> open(RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
-    long expectedSequence = Math.addExact(sequence, 1);
-    return source.open(expectedSequence, revision, authorizationDigest, scope, budget).thenApply(found -> {
+  /** Applies a proposal after its caller has revalidated the owner and cursor on the owner lane. */
+  public CompletableFuture<Step> applyStep(StepProposal proposal) {
+    Objects.requireNonNull(proposal, "proposal");
+    if (proposal.owner != this || !proposal.consumed.compareAndSet(false, true)) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("step proposal is foreign or consumed"));
+    }
+    ProtectedEventCursor completedCursor = null;
+    Step result;
+    try {
       synchronized (this) {
-        if (closed) {
-          found.flatMap(SelectedSequenceReader.Selected::events).ifPresent(ProtectedEventCursor::close);
-          throw new IllegalStateException("shared tailer is closed");
-        }
-        if (found.isEmpty()) return Step.WAITING;
-        var selected = found.orElseThrow();
-        if (selected.events().isEmpty()) {
-          sequence = selected.decision().sequence();
-          return Step.METADATA;
-        }
-        active = selected.events().orElseThrow();
-        activeScope = scope;
-        activeDecision = selected.decision();
-        return Step.OPENED;
+        requireCurrent(proposal);
+        result = apply(proposal);
+        if (proposal.step == Step.PUBLISHED) completedCursor = proposal.cursor;
+        busy = false;
+        inFlightScope = null;
       }
+    } catch (BackendFailure failure) {
+      return failApply(proposal, failure);
+    } catch (RuntimeException | Error failure) {
+      return failApply(proposal, failure);
+    }
+    if (completedCursor == null) return CompletableFuture.completedFuture(result);
+    completedCursor.close();
+    return completedCursor.releaseCompletion().thenApply(ignored -> result).toCompletableFuture();
+  }
+
+  private CompletableFuture<Step> failApply(StepProposal proposal, Throwable failure) {
+    return releaseProposal(proposal).handle((ignored, releaseFailure) -> {
+      if (releaseFailure != null && failure != releaseFailure) failure.addSuppressed(
+          io.etcdhbase.core.error.CompletionFailures.unwrapCompletion(releaseFailure));
+      throw new java.util.concurrent.CompletionException(failure);
     });
   }
 
-  private CompletableFuture<Step> readEvent(ManifestCatalog.ProofReadBudget budget) {
-    ProtectedEventCursor cursor = active;
+  /** Discards a stale proposal and closes the cursor so the last complete revision can be reread. */
+  public CompletableFuture<Void> discardStep(StepProposal proposal) {
+    Objects.requireNonNull(proposal, "proposal");
+    if (proposal.owner != this || !proposal.consumed.compareAndSet(false, true)) {
+      return CompletableFuture.completedFuture(null);
+    }
+    return releaseProposal(proposal);
+  }
+
+  private CompletableFuture<Void> releaseProposal(StepProposal proposal) {
+    Set<ProtectedEventCursor> cursors = Collections.newSetFromMap(new IdentityHashMap<>());
+    proposal.selected.flatMap(SelectedSequenceReader.Selected::events).ifPresent(cursors::add);
+    if (proposal.cursor != null) cursors.add(proposal.cursor);
+    synchronized (this) {
+      if (inFlightScope == proposal.scope) {
+        busy = false;
+        inFlightScope = null;
+      }
+    }
+    for (ProtectedEventCursor cursor : cursors) cursor.close();
+    close();
+    if (cursors.isEmpty()) return CompletableFuture.completedFuture(null);
+    CompletableFuture<?>[] releases = cursors.stream()
+        .map(cursor -> cursor.releaseCompletion().toCompletableFuture())
+        .toArray(CompletableFuture[]::new);
+    return CompletableFuture.allOf(releases);
+  }
+
+  /** Compatibility helper for callers that do not need to separate reads from owner-lane state changes. */
+  public CompletableFuture<Step> step(RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    return prepareStep(scope, budget).thenCompose(this::applyStep);
+  }
+
+  private CompletableFuture<StepProposal> open(long expectedSequence, long expectedRevision,
+      RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    long nextSequence = Math.addExact(expectedSequence, 1);
+    return source.open(nextSequence, expectedRevision, authorizationDigest, scope, budget)
+        .thenApply(found -> found.isEmpty()
+            ? proposal(expectedSequence, expectedRevision, Step.WAITING, scope, Optional.empty(),
+                null, null, null, null, null)
+            : selectedProposal(expectedSequence, expectedRevision, scope, found.orElseThrow()));
+  }
+
+  private StepProposal selectedProposal(long expectedSequence, long expectedRevision, RequestScope scope,
+      SelectedSequenceReader.Selected selected) {
+    Step step = selected.events().isEmpty() ? Step.METADATA : Step.OPENED;
+    return proposal(expectedSequence, expectedRevision, step, scope, Optional.of(selected),
+        null, null, null, selected.decision(), null);
+  }
+
+  private CompletableFuture<StepProposal> readEvent(long expectedSequence, long expectedRevision,
+      RequestScope scope, ProtectedEventCursor cursor, CommitDecision decision,
+      ManifestCatalog.ProofReadBudget budget) {
     return cursor.next(budget).thenCompose(found -> {
       if (found.isPresent()) {
-        synchronized (this) {
-          requireOpen();
-          PreparedEvent event = found.orElseThrow();
-          if (buffered.size() >= maximumRevisionEvents
-              || event.retainedBytes() > maximumRevisionBytes - bufferedBytes) {
-            return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-          }
-          BudgetManager.Lease lease;
-          try {
-            lease = memory.tryRetain(BudgetManager.Memory.OUTPUT, event.retainedBytes())
-                .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-          } catch (BackendFailure failure) {
-            return CompletableFuture.failedFuture(failure);
-          }
-          buffered.add(new Buffered(event, lease));
-          bufferedBytes += event.retainedBytes();
-          return CompletableFuture.completedFuture(Step.BUFFERED);
-        }
+        return CompletableFuture.completedFuture(proposal(expectedSequence, expectedRevision,
+            Step.BUFFERED, scope, Optional.empty(), cursor, decision,
+            cursor, decision, found.orElseThrow()));
       }
-      cursor.close();
-      return cursor.releaseCompletion().thenApply(ignored -> finishRevision()).toCompletableFuture();
+      return CompletableFuture.completedFuture(proposal(expectedSequence, expectedRevision,
+          Step.PUBLISHED, scope, Optional.empty(), cursor, decision,
+          cursor, decision, null));
     });
   }
 
-  private synchronized Step finishRevision() {
-    requireOpen();
-    try {
-      Set<Subscription> matches = new HashSet<>();
-      for (Buffered event : buffered) {
-        subscriptionIndex.forEachMatch(event.event().current().key(), matches::add);
+  private StepProposal proposal(long expectedSequence, long expectedRevision, Step step,
+      RequestScope scope, Optional<SelectedSequenceReader.Selected> selected,
+      ProtectedEventCursor expectedCursor, CommitDecision expectedDecision,
+      ProtectedEventCursor cursor, CommitDecision decision, PreparedEvent event) {
+    return new StepProposal(this, expectedSequence, expectedRevision, step, scope,
+        selected, expectedCursor, expectedDecision, cursor, decision, event);
+  }
+
+  private void requireCurrent(StepProposal proposal) {
+    if (closed || !busy || inFlightScope != proposal.scope || sequence != proposal.expectedSequence
+        || revision != proposal.expectedRevision || active != proposal.expectedCursor
+        || activeDecision != proposal.expectedDecision) {
+      throw new java.util.concurrent.CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
+  }
+
+  private Step apply(StepProposal proposal) throws BackendFailure {
+    return switch (proposal.step) {
+      case WAITING -> Step.WAITING;
+      case METADATA -> {
+        CommitDecision decision = proposal.decision;
+        requireContiguous(decision, proposal.expectedSequence, proposal.expectedRevision);
+        sequence = decision.sequence();
+        yield Step.METADATA;
       }
-      for (Subscription subscription : matches) subscription.offer(buffered, activeDecision);
+      case OPENED -> {
+        CommitDecision decision = proposal.decision;
+        requireContiguous(decision, proposal.expectedSequence, proposal.expectedRevision);
+        active = proposal.selected.orElseThrow().events().orElseThrow();
+        activeScope = proposal.scope;
+        activeDecision = decision;
+        yield Step.OPENED;
+      }
+      case BUFFERED -> {
+        requireOpen();
+        PreparedEvent event = proposal.event;
+        if (buffered.size() >= maximumRevisionEvents
+            || event.retainedBytes() > maximumRevisionBytes - bufferedBytes) {
+          throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+        }
+        BudgetManager.Lease lease = memory.tryRetain(BudgetManager.Memory.OUTPUT, event.retainedBytes())
+            .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+        try {
+          buffered.add(new Buffered(event, lease));
+        } catch (RuntimeException | Error failure) {
+          lease.close();
+          throw failure;
+        }
+        bufferedBytes += event.retainedBytes();
+        yield Step.BUFFERED;
+      }
+      case PUBLISHED -> finishRevision(proposal);
+    };
+  }
+
+  private static void requireContiguous(CommitDecision decision, long sequence, long revision) {
+    if (decision == null || decision.sequence() != Math.addExact(sequence, 1)
+        || decision.baseRevision() != revision) {
+      throw new java.util.concurrent.CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
+  }
+
+  private Step finishRevision(StepProposal proposal) {
+    requireOpen();
+    if (proposal.cursor != active || proposal.decision != activeDecision) {
+      throw new java.util.concurrent.CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
+    try {
+      List<Subscription> matches = new ArrayList<>();
+      for (Buffered event : buffered) {
+        matches.clear();
+        subscriptionIndex.forEachMatch(event.event().current().key(), matches::add);
+        for (Subscription subscription : matches) subscription.offer(event, activeDecision);
+      }
     } catch (RuntimeException | Error failure) {
       close();
       throw failure;
@@ -205,6 +385,17 @@ public final class SharedEventTailer implements AutoCloseable {
     activeScope = null;
     activeDecision = null;
     return Step.PUBLISHED;
+  }
+
+  private void failPreparation(RequestScope scope) {
+    synchronized (this) {
+      if (inFlightScope == scope) {
+        busy = false;
+        inFlightScope = null;
+      }
+    }
+    scope.cancel();
+    close();
   }
 
   private void requireOpen() {
@@ -233,42 +424,42 @@ public final class SharedEventTailer implements AutoCloseable {
     private final BudgetManager.Account account;
     private final int maximumEvents;
     private final long maximumBytes;
+    private final BudgetManager.Lease indexMemory;
     private final ArrayDeque<Delivery> pending = new ArrayDeque<>();
     private long pendingBytes;
     private Termination termination;
 
-    private Subscription(KeyRange range, BudgetManager.Account account, int maximumEvents, long maximumBytes) {
+    private Subscription(KeyRange range, BudgetManager.Account account, int maximumEvents, long maximumBytes,
+        BudgetManager.Lease indexMemory) {
       this.range = range;
       this.account = account;
       this.maximumEvents = maximumEvents;
       this.maximumBytes = maximumBytes;
+      this.indexMemory = indexMemory;
     }
 
-    private void offer(List<Buffered> events, CommitDecision decision) {
-      List<Delivery> additions = new ArrayList<>();
-      long bytes = 0;
-      try {
-        for (Buffered item : events) {
-          PreparedEvent event = item.event();
-          if (!range.contains(event.current().key())) continue;
-          bytes = Math.addExact(bytes, event.retainedBytes());
-          if (additions.size() >= maximumEvents - pending.size() || bytes > maximumBytes - pendingBytes) {
-            throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
-          }
-          var retained = account.tryRetain(BudgetManager.Memory.OUTPUT, event.retainedBytes())
-              .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-          additions.add(new Delivery(decision.sequence(), decision.revision(), event, retained));
-        }
-      } catch (BackendFailure failure) {
-        additions.forEach(Delivery::close);
+    private void offer(Buffered item, CommitDecision decision) {
+      PreparedEvent event = item.event();
+      long eventBytes = event.retainedBytes();
+      if (pending.size() >= maximumEvents || eventBytes > maximumBytes - pendingBytes) {
         stop(Termination.RESOURCE_LIMIT);
         return;
+      }
+      BudgetManager.Lease retained;
+      try {
+        retained = account.tryRetain(BudgetManager.Memory.OUTPUT, eventBytes)
+            .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+      } catch (BackendFailure failure) {
+        stop(Termination.RESOURCE_LIMIT);
+        return;
+      }
+      try {
+        pending.addLast(new Delivery(decision.sequence(), decision.revision(), event, retained));
       } catch (RuntimeException | Error failure) {
-        additions.forEach(Delivery::close);
+        retained.close();
         throw failure;
       }
-      pending.addAll(additions);
-      pendingBytes += bytes;
+      pendingBytes += eventBytes;
     }
 
     /** The receiver owns the returned delivery and must close it after its last use. */
@@ -296,6 +487,7 @@ public final class SharedEventTailer implements AutoCloseable {
       subscriptionIndex.remove(this, range);
       while (!pending.isEmpty()) pending.removeFirst().close();
       pendingBytes = 0;
+      indexMemory.close();
     }
   }
 

@@ -481,6 +481,7 @@
             <configuration>
               <failIfNoTests>true</failIfNoTests>
               <includes combine.self="override">
+                <include>**/HBaseSystemRecordStoreScanIT.java</include>
                 <include>**/J44EventIndexControlStoreIT.java</include>
                 <include>**/J44EventPinIT.java</include>
               </includes>

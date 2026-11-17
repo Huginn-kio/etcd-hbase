@@ -60,6 +60,118 @@ class SnapshotPinManagerTest {
   }
 
   @Test
+  void eventHistoryRootPromotionSurvivesAnUnknownCasReplyAndIsIdempotent() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    var root = new EventReference(ByteKey.copyOf(new byte[] {7}), digest(4), 0, 0, 1, 8, 1, 0);
+    var transaction = TransactionId.create();
+    try (RequestScope scope = scope()) {
+      var events = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), scope).join();
+      var previous = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.empty(), Optional.empty());
+      var promotedRequirement = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.of(transaction), Optional.of(root));
+      var pin = events.register(previous, scope).join();
+      var before = events.readBoundary(scope).join().protections().getFirst();
+      assertTrue(before.rootIdentity().isEmpty());
+      var wrongAuthorization = new EventHistoryPinManager.Requirement(5, 3, digest(10),
+          Optional.of(transaction), Optional.of(root));
+      assertInstanceOf(IllegalArgumentException.class,
+          failure(() -> pin.promoteRoot(previous, wrongAuthorization, scope).join()));
+      assertTrue(events.readBoundary(scope).join().protections().getFirst().rootIdentity().isEmpty());
+      records.loseNextCasReplyAfterWrite();
+
+      pin.promoteRoot(previous, promotedRequirement, scope).join();
+
+      var promoted = events.readBoundary(scope).join();
+      var protection = promoted.protections().getFirst();
+      assertEquals(before.requiredRevision(), protection.requiredRevision());
+      assertEquals(before.requiredSequence(), protection.requiredSequence());
+      assertEquals(Optional.of(transaction), protection.transactionId());
+      assertEquals(Optional.of(root.identity()), protection.rootIdentity());
+      assertEquals(Optional.of(root.digest()), protection.rootDigest());
+      assertEquals(promotedRequirement.digest(), records.rootPin(root).viewDigest());
+      var reopened = EventHistoryPinManager.open(records, configuration, Clock.systemUTC(), scope).join();
+      assertEquals(promoted, reopened.readBoundary(scope).join(),
+          "the promoted event root must be in the durable pin shard");
+
+      pin.promoteRoot(previous, promotedRequirement, scope).join();
+      pin.renew(scope).join();
+      assertEquals(promotedRequirement.digest(), records.rootPin(root).viewDigest(),
+          "renewal must preserve the promoted root digest");
+      var differentRoot = new EventReference(ByteKey.copyOf(new byte[] {8}), digest(5), 0, 0, 1, 8, 1, 0);
+      var differentRequirement = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.of(transaction), Optional.of(differentRoot));
+      assertInstanceOf(IllegalStateException.class, failure(
+          () -> pin.promoteRoot(previous, differentRequirement, scope).join()));
+      pin.close();
+      pin.releaseCompletion().toCompletableFuture().join();
+      assertTrue(reopened.readBoundary(scope).join().protections().isEmpty());
+    }
+  }
+
+  @Test
+  void eventHistoryRootPromotionRetriesWhenRenewWinsTheShardCas() throws Exception {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    var root = new EventReference(ByteKey.copyOf(new byte[] {7}), digest(4), 0, 0, 1, 8, 1, 0);
+    var transaction = TransactionId.create();
+    try (RequestScope scope = scope()) {
+      var events = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), scope).join();
+      var previous = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.empty(), Optional.empty());
+      var promotedRequirement = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.of(transaction), Optional.of(root));
+      var pin = events.register(previous, scope).join();
+      records.pauseNextCompareAndSet();
+      CompletableFuture<Void> entered = records.casEntered();
+      CompletableFuture<Void> promotion = pin.promoteRoot(previous, promotedRequirement, scope);
+      entered.get(5, TimeUnit.SECONDS);
+
+      pin.renew(scope).join();
+      records.releaseCompareAndSet();
+      promotion.get(5, TimeUnit.SECONDS);
+
+      var protection = events.readBoundary(scope).join().protections().getFirst();
+      assertEquals(5, protection.requiredRevision());
+      assertEquals(3, protection.requiredSequence());
+      assertEquals(Optional.of(transaction), protection.transactionId());
+      assertEquals(Optional.of(root.identity()), protection.rootIdentity());
+      pin.close();
+      pin.releaseCompletion().toCompletableFuture().join();
+    }
+  }
+
+  @Test
+  void closingAnEventHistoryPinDuringRootPromotionDoesNotResurrectItsProtection() throws Exception {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    var root = new EventReference(ByteKey.copyOf(new byte[] {7}), digest(4), 0, 0, 1, 8, 1, 0);
+    var transaction = TransactionId.create();
+    try (RequestScope scope = scope()) {
+      var events = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), scope).join();
+      var previous = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.empty(), Optional.empty());
+      var promotedRequirement = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.of(transaction), Optional.of(root));
+      var pin = events.register(previous, scope).join();
+      records.pauseNextCompareAndSet();
+      CompletableFuture<Void> entered = records.casEntered();
+      CompletableFuture<Void> promotion = pin.promoteRoot(previous, promotedRequirement, scope);
+      entered.get(5, TimeUnit.SECONDS);
+
+      pin.close();
+      pin.releaseCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+      records.releaseCompareAndSet();
+
+      Throwable failure = failure(promotion::join);
+      assertEquals(BackendFailure.Category.CANCELLED,
+          assertInstanceOf(BackendFailure.class, failure).category());
+      assertTrue(events.readBoundary(scope).join().protections().isEmpty());
+    }
+  }
+
+  @Test
   void eventPinRegistrationLosingTheGcFloorRaceFailsClosed() {
     var records = new MemoryRecords();
     var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
@@ -845,6 +957,28 @@ class SnapshotPinManagerTest {
 
     private synchronized ByteKey value(SystemRecordType type, ByteKey identity) {
       return java.util.Objects.requireNonNull(rows.get(new RecordKey(type, identity)));
+    }
+
+    private synchronized SnapshotPinShard.Slot rootPin(EventReference root) {
+      for (var entry : rows.entrySet()) {
+        byte[] identity = entry.getKey().identity().bytes();
+        byte[] eventPinPrefix = {0x45, 0x56, 0x50, 0x49, 0x4e, 0x01, 0x00};
+        if (entry.getKey().type() != SystemRecordType.SNAPSHOT_PIN
+            || identity.length != eventPinPrefix.length + Integer.BYTES * 2 + 16
+            || !java.util.Arrays.equals(eventPinPrefix,
+                java.util.Arrays.copyOf(identity, eventPinPrefix.length))
+            || java.nio.ByteBuffer.wrap(identity, eventPinPrefix.length, Integer.BYTES).getInt() != 2) {
+          continue;
+        }
+        SnapshotPinShard shard = SnapshotPinRecordCodec.decodeShard(entry.getValue());
+        for (SnapshotPinShard.Slot slot : shard.slots()) {
+          if (slot.rootIdentity().filter(root.identity()::equals).isPresent()
+              && slot.rootDigest().filter(root.digest()::equals).isPresent()) {
+            return slot;
+          }
+        }
+      }
+      throw new AssertionError("event root pin was not persisted");
     }
 
     private static boolean matchesShard(RecordKey key, Integer shard) {

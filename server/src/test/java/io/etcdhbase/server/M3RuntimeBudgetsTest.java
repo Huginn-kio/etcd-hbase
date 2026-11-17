@@ -24,12 +24,14 @@ class M3RuntimeBudgetsTest {
         new RuntimeConfiguration.Listener("first", "127.0.0.1", 0, "a"),
         new RuntimeConfiguration.Listener("second", "127.0.0.1", 0, "b")),
         List.of(), List.of(), List.of(), resources);
-    long regularMinimum = M3MemoryReservations.minimumLeaseMemory(2, 1_572_864);
-    long minimum = Math.addExact(regularMinimum,
-        Math.addExact(LeaseBudgetProfile.capacityForGroups(2, 1_572_864).memoryBytes(),
-            LeaseBudgetProfile.startupLeaseScanMemory().total()));
-    var tooSmall = leaseActivation(minimum - 1);
-    assertThrows(IllegalArgumentException.class, () -> M3RuntimeBudgets.create(configuration, tooSmall));
+    long admittedMinimum = M3MemoryReservations.minimumLeaseMemory(2, maximumRequestBytes);
+    long reservedMemory = LeaseBudgetProfile.capacityForGroups(2, maximumRequestBytes).memoryBytes();
+    long startupMemory = Math.addExact(Math.multiplyExact(2L, LeaseBudgetProfile.RECOVERY_MEMORY.total()),
+        LeaseBudgetProfile.startupLeaseScanMemory().total());
+    long regularMinimum = Math.max(admittedMinimum, startupMemory);
+    long minimum = Math.addExact(reservedMemory, regularMinimum);
+    assertThrows(IllegalArgumentException.class,
+        () -> M3RuntimeBudgets.create(configuration, leaseActivation(minimum - 1)));
     var budgets = M3RuntimeBudgets.create(configuration, leaseActivation(minimum));
     try (var recoveryA = RequestScope.withoutDeadline(); var recoveryB = RequestScope.withoutDeadline();
          var gateway = RequestScope.withoutDeadline(); var owner = RequestScope.withoutDeadline();
@@ -38,7 +40,7 @@ class M3RuntimeBudgetsTest {
          var read = budgets.admit("a", gateway,
              M3MemoryReservations.leaseBindingRead(M3MemoryReservations.LEASE, maximumRequestBytes));
          var mutation = budgets.admit("a", owner, M3MemoryReservations.LEASE)) {
-      assertEquals(regularMinimum, budgets.snapshot().reservedBytes());
+      assertEquals(admittedMinimum, budgets.snapshot().reservedBytes());
     }
     assertEquals(0, budgets.snapshot().reservedBytes());
   }
@@ -51,10 +53,12 @@ class M3RuntimeBudgetsTest {
     var configuration = new RuntimeConfiguration(1, List.of(
         new RuntimeConfiguration.Listener("first", "127.0.0.1", 0, "a")),
         List.of(), List.of(), List.of(), resources);
+    long startupMemory = Math.addExact(LeaseBudgetProfile.RECOVERY_MEMORY.total(),
+        LeaseBudgetProfile.startupLeaseScanMemory().total());
+    long regularMemory = Math.max(
+        M3MemoryReservations.minimumLeaseMemory(1, maximumRequestBytes), startupMemory);
     long minimum = Math.addExact(
-        M3MemoryReservations.minimumLeaseMemory(1, maximumRequestBytes),
-        Math.addExact(LeaseBudgetProfile.capacityForGroups(1, maximumRequestBytes).memoryBytes(),
-            LeaseBudgetProfile.startupLeaseScanMemory().total()));
+        LeaseBudgetProfile.capacityForGroups(1, maximumRequestBytes).memoryBytes(), regularMemory);
 
     assertThrows(IllegalArgumentException.class,
         () -> M3RuntimeBudgets.create(configuration, leaseActivation(minimum - 1), 0));
@@ -78,8 +82,11 @@ class M3RuntimeBudgetsTest {
         new RuntimeConfiguration.Listener("first", "127.0.0.1", 0, "a"),
         new RuntimeConfiguration.Listener("second", "127.0.0.1", 0, "b")),
         List.of(), List.of(), List.of(), resources);
-    long minimum = LeaseBudgetProfile.capacityForGroups(2, maximumRequestBytes).memoryBytes()
-        + 2 * LeaseBudgetProfile.RECOVERY_MEMORY.total() + LeaseBudgetProfile.startupLeaseScanMemory().total();
+    long startupMemory = Math.addExact(Math.multiplyExact(2L, LeaseBudgetProfile.RECOVERY_MEMORY.total()),
+        LeaseBudgetProfile.startupLeaseScanMemory().total());
+    long regularMemory = Math.max(M3MemoryReservations.minimumLeaseMemory(2, maximumRequestBytes), startupMemory);
+    long minimum = Math.addExact(
+        LeaseBudgetProfile.capacityForGroups(2, maximumRequestBytes).memoryBytes(), regularMemory);
     assertThrows(IllegalArgumentException.class,
         () -> M3RuntimeBudgets.create(configuration, leaseActivation(minimum - 1), 0));
     var budgets = M3RuntimeBudgets.create(configuration, leaseActivation(minimum), 0);
@@ -89,8 +96,9 @@ class M3RuntimeBudgetsTest {
          var recoveryA = budgets.admit("a", scope, LeaseBudgetProfile.RECOVERY_MEMORY);
          var recoveryB = budgets.admit("b", scope, LeaseBudgetProfile.RECOVERY_MEMORY);
          var startupScan = budgets.admit("b", scope, LeaseBudgetProfile.startupLeaseScanMemory())) {
+      long remainingRegularMemory = regularMemory - startupMemory;
       assertThrows(BackendFailure.class, () -> budgets.admit("a", scope,
-          new BudgetManager.Reservation(0, 1, 1, 0, 0)));
+          new BudgetManager.Reservation(0, 1, 1, 0, Math.addExact(remainingRegularMemory, 1))));
       try (var windowA = budgets.admitReserved("a", scope, backfillAccount);
            var windowB = budgets.admitReserved("b", scope, backfillAccount);
            var stepA = budgets.admitReserved("a", scope, backfillAccount);

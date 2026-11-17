@@ -10,6 +10,11 @@ import java.util.concurrent.CompletableFuture;
 
 /** Separate durable protection domain for event, index and decision history. */
 public final class EventHistoryPinManager {
+  /** Durable event-history protection with a monotonic selected-root promotion operation. */
+  public interface Pin extends ReadViewPinRegistry.Pin {
+    CompletableFuture<Void> promoteRoot(Requirement previous, Requirement promoted, RequestScope scope);
+  }
+
   private final SnapshotPinManager registry;
   private final Optional<ByteKey> namespace;
 
@@ -69,7 +74,7 @@ public final class EventHistoryPinManager {
    * Registers before event or index reads. The caller must re-read the logical compact/control
    * boundary after registration and stop if the requested history is no longer available.
    */
-  public CompletableFuture<ReadViewPinRegistry.Pin> register(Requirement requirement, RequestScope scope) {
+  public CompletableFuture<Pin> register(Requirement requirement, RequestScope scope) {
     Objects.requireNonNull(requirement, "requirement");
     return registry.registerEventHistory(requirement.revision(), requirement.sequence(),
         requirement.digest(), requirement.transaction(), requirement.eventRoot().map(EventReference::identity),
@@ -104,7 +109,7 @@ public final class EventHistoryPinManager {
       }
     }
 
-    private ByteKey digest() {
+    ByteKey digest() {
       return ManifestDigest.sha256(output -> {
         output.writeInt(1);
         output.writeLong(revision);
@@ -117,6 +122,16 @@ public final class EventHistoryPinManager {
           ManifestDigest.writeBytes(output, eventRoot.orElseThrow().digest().bytes());
         }
       });
+    }
+
+    void requirePromotionFrom(Requirement previous) {
+      Objects.requireNonNull(previous, "previous");
+      if (previous.revision != revision || previous.sequence != sequence
+          || !previous.authorizationDigest.equals(authorizationDigest)
+          || previous.transaction.isPresent() || previous.eventRoot.isPresent()
+          || transaction.isEmpty() || eventRoot.isEmpty()) {
+        throw new IllegalArgumentException("event root promotion changes its pinned boundary or identity");
+      }
     }
   }
 

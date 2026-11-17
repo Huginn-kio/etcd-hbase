@@ -95,7 +95,7 @@ public final class SelectedSequenceReader {
         return;
       }
       try {
-        read(sequence, baseRevision, protectedCursor, scope, budget, legacy)
+        read(sequence, baseRevision, protectedCursor, pin, requirement, scope, budget, legacy)
             .whenComplete((selected, readFailure) -> {
               if (readFailure != null) {
                 protectedCursor.close();
@@ -114,11 +114,12 @@ public final class SelectedSequenceReader {
   }
 
   private CompletableFuture<Optional<Selected>> read(long sequence, long baseRevision,
-      ProtectedEventCursor pin, RequestScope scope, ManifestCatalog.ProofReadBudget budget,
-      Optional<EventIndexBackfillCheckpoint> legacy) {
-    return pin.renew().thenCompose(ignored -> readControl(scope, budget)).thenCompose(state -> {
+      ProtectedEventCursor protectedCursor, EventHistoryPinManager.Pin pin,
+      EventHistoryPinManager.Requirement pinRequirement, RequestScope scope,
+      ManifestCatalog.ProofReadBudget budget, Optional<EventIndexBackfillCheckpoint> legacy) {
+    return protectedCursor.renew().thenCompose(ignored -> readControl(scope, budget)).thenCompose(state -> {
       validateControl(state, baseRevision, legacy);
-      if (sequence > state.publishedSequence()) return closeEmpty(pin);
+      if (sequence > state.publishedSequence()) return closeEmpty(protectedCursor);
       return decisions.read(sequence, scope, budget).thenCompose(found -> {
         CommitDecision decision = found.orElseThrow(
             () -> new IllegalStateException("selected decision disappeared from the control barrier"));
@@ -130,9 +131,11 @@ public final class SelectedSequenceReader {
           ManifestRoot root = foundRoot.orElseThrow(
               () -> new IllegalStateException("selected manifest root is missing"));
           validateRoot(decision, root);
-          CompletableFuture<Void> index = decision.containsKeyChanges()
-              ? verifyIndex(decision, root, scope, budget, legacy.isPresent()) : CompletableFuture.completedFuture(null);
-          return index.thenCompose(ignored -> pin.renew())
+          CompletableFuture<Void> rootProtection = decision.containsKeyChanges()
+              ? promoteEventRoot(decision, root, pin, pinRequirement, protectedCursor, scope)
+              : CompletableFuture.completedFuture(null);
+          return rootProtection.thenCompose(ignored -> readSelectedIndex(decision, root, scope, budget,
+              legacy)).thenCompose(ignored -> protectedCursor.renew())
               .thenCompose(ignored -> readControl(scope, budget))
               .thenCompose(latest -> {
                 validateControl(latest, baseRevision, legacy);
@@ -140,17 +143,34 @@ public final class SelectedSequenceReader {
                   throw new IllegalStateException("selected sequence moved behind the control barrier");
                 }
                 if (!decision.containsKeyChanges()) {
-                  pin.close();
-                  return pin.releaseCompletion().thenApply(released ->
+                  protectedCursor.close();
+                  return protectedCursor.releaseCompletion().thenApply(released ->
                       Optional.of(new Selected(decision, Optional.empty(), Optional.empty()))).toCompletableFuture();
                 }
-                pin.attach(new SealedEventCursor(manifests, decision, root, scope));
-                return CompletableFuture.completedFuture(Optional.of(new Selected(decision, Optional.of(pin),
-                    Optional.of(EventRevisionIndex.fromSelected(decision, root)))));
+                protectedCursor.attach(new SealedEventCursor(manifests, decision, root, scope));
+                return CompletableFuture.completedFuture(Optional.of(new Selected(decision,
+                    Optional.of(protectedCursor), Optional.of(EventRevisionIndex.fromSelected(decision, root)))));
               });
         });
       });
     });
+  }
+
+  private CompletableFuture<Void> promoteEventRoot(CommitDecision decision, ManifestRoot root,
+      EventHistoryPinManager.Pin pin, EventHistoryPinManager.Requirement previous,
+      ProtectedEventCursor protectedCursor, RequestScope scope) {
+    EventReference eventRoot = EventRevisionIndex.fromSelected(decision, root).events();
+    var promoted = new EventHistoryPinManager.Requirement(previous.revision(), previous.sequence(),
+        previous.authorizationDigest(), Optional.of(decision.transactionId()), Optional.of(eventRoot));
+    return protectedCursor.renew().thenCompose(ignored ->
+        pin.promoteRoot(previous, promoted, scope));
+  }
+
+  private CompletableFuture<Void> readSelectedIndex(CommitDecision decision, ManifestRoot root,
+      RequestScope scope, ManifestCatalog.ProofReadBudget budget,
+      Optional<EventIndexBackfillCheckpoint> legacy) {
+    if (!decision.containsKeyChanges()) return CompletableFuture.completedFuture(null);
+    return verifyIndex(decision, root, scope, budget, legacy.isPresent());
   }
 
   private CompletableFuture<Void> verifyIndex(CommitDecision decision, ManifestRoot root,

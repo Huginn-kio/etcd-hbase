@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
@@ -23,6 +24,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 
@@ -907,6 +909,38 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void sequenceReaderPersistsSelectedEventRootBeforeReadingItsIndex() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    AtomicInteger indexReads = new AtomicInteger();
+    var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      fixture.indexReadObserver = scope -> {
+        SnapshotGcBoundary boundary = pins.readBoundary(scope).join();
+        SnapshotGcBoundary.Protection protection = boundary.protections().getFirst();
+        assertEquals(11, protection.requiredRevision());
+        assertEquals(3, protection.requiredSequence());
+        assertEquals(Optional.of(fixture.decision.transactionId()), protection.transactionId());
+        assertEquals(Optional.of(index.events().identity()), protection.rootIdentity());
+        assertEquals(Optional.of(index.events().digest()), protection.rootDigest());
+        indexReads.incrementAndGet();
+      };
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var budget = new ManifestCatalog.ProofReadBudget(scope, account, 10, 1024L << 20);
+        var selected = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index))
+            .open(3, 10, fixture.digest, scope, budget).join().orElseThrow();
+        assertEquals(1, indexReads.get());
+        var cursor = selected.events().orElseThrow();
+        cursor.close();
+        cursor.releaseCompletion().toCompletableFuture().join();
+      }
+    }
+  }
+
+  @Test
   void sharedTailerReadsOnceAndIsolatesSlowSubscriptions() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
@@ -925,10 +959,12 @@ class SealedEventCursorTest {
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
       var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
       var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
-      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 3, 4, 8192)) {
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 4, 4, 8192)) {
         var fast = tailer.subscribe(KeyRange.all(), fastMemory, 4, 8192);
         var slow = tailer.subscribe(KeyRange.all(), slowMemory, 1, 8192);
-        assertEquals(2, tailer.subscriptionCount());
+        long byteLimit = fixture.first.retainedBytes() + fixture.second.retainedBytes() - 1;
+        var byteLimited = tailer.subscribe(KeyRange.all(), lateMemory, 4, byteLimit);
+        assertEquals(3, tailer.subscriptionCount());
         assertEquals(SharedEventTailer.Step.OPENED, tailer.step(readScope,
             new ManifestCatalog.ProofReadBudget(readScope, readMemory, 10, 1024L << 20)).join());
         assertEquals(SharedEventTailer.Step.BUFFERED, tailer.step(readScope,
@@ -949,6 +985,8 @@ class SealedEventCursorTest {
         assertEquals(3, tailer.observedPublishedSequence());
         assertEquals(Optional.of(SharedEventTailer.Termination.RESOURCE_LIMIT), slow.termination());
         assertTrue(slow.poll().isEmpty());
+        assertEquals(Optional.of(SharedEventTailer.Termination.RESOURCE_LIMIT), byteLimited.termination());
+        assertTrue(byteLimited.poll().isEmpty(), "a byte-limit failure clears the partial revision");
         try (var first = fast.poll().orElseThrow(); var second = fast.poll().orElseThrow()) {
           assertEquals(0, first.event().ordinal());
           assertEquals(1, second.event().ordinal());
@@ -971,7 +1009,45 @@ class SealedEventCursorTest {
   }
 
   @Test
-  void sharedTailerDeliversOnlyMatchingPointAndRangeSubscriptions() throws Exception {
+  void watchRangeIndexMemoryIsAccountedAndReleasedOnCancellation() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    var watchLimits = new BudgetManager.Limits(4, 4, 4, 4, 4, 1L << 20, 1L << 20);
+    var watchBudgets = new BudgetManager(watchLimits, Map.of("watch", watchLimits), watchLimits);
+    var watchReservation = new BudgetManager.Reservation(0, 1, 1, 800, 0);
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account tailMemory = fixture.account(tailScope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+      var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
+      try (RequestScope watchScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account watchMemory = watchBudgets.admit("watch", watchScope, watchReservation);
+           var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 4, 4, 8192)) {
+        long baselineBytes = watchBudgets.snapshot().allocatedBytes();
+        var subscription = tailer.subscribe(
+            KeyRange.between(ByteKey.copyOf(new byte[80]), ByteKey.copyOf(new byte[120])),
+            watchMemory, 4, 8192);
+        long expectedIndexBytes = SharedEventTailer.SUBSCRIPTION_INDEX_ENTRY_OVERHEAD_BYTES + 200;
+        assertEquals(expectedIndexBytes,
+            watchBudgets.snapshot().allocatedBytes() - baselineBytes);
+
+        BackendFailure exhausted = assertThrows(BackendFailure.class,
+            () -> tailer.subscribe(KeyRange.point(ByteKey.copyOf(new byte[100])), watchMemory, 4, 8192));
+        assertEquals(BackendFailure.Category.RESOURCE_LIMIT, exhausted.category());
+        assertEquals(1, tailer.subscriptionCount(), "a failed reservation must not install an index entry");
+
+        subscription.close();
+        assertEquals(baselineBytes, watchBudgets.snapshot().allocatedBytes(),
+            "cancelling a watch releases its range and index reservation");
+        assertEquals(0, tailer.subscriptionCount());
+      }
+    }
+  }
+
+  @Test
+  void sharedTailerDeliversOnlySparsePointAndRangeMatches() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
     try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
@@ -985,11 +1061,12 @@ class SealedEventCursorTest {
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
       var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
       var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
-      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 5, 4, 8192)) {
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 6, 4, 8192)) {
         ByteKey firstKey = fixture.first.current().key();
         ByteKey secondKey = fixture.second.current().key();
         var first = tailer.subscribe(KeyRange.point(firstKey), watchMemory, 4, 8192);
         var second = tailer.subscribe(KeyRange.between(firstKey, secondKey), watchMemory, 4, 8192);
+        var last = tailer.subscribe(KeyRange.point(secondKey), watchMemory, 4, 8192);
         var missing = tailer.subscribe(KeyRange.point(ByteKey.copyOf(new byte[] {'c'})), watchMemory, 4, 8192);
         var cancelled = tailer.subscribe(KeyRange.all(), watchMemory, 4, 8192);
         cancelled.close();
@@ -999,10 +1076,17 @@ class SealedEventCursorTest {
         tailer.step(readScope, new ManifestCatalog.ProofReadBudget(readScope, readMemory, 1, 512L << 20)).join();
         try (var pointEvent = first.poll().orElseThrow(); var rangeEvent = second.poll().orElseThrow()) {
           assertEquals(firstKey, pointEvent.event().current().key());
+          assertEquals(0, pointEvent.event().ordinal());
           assertEquals(firstKey, rangeEvent.event().current().key());
+          assertEquals(0, rangeEvent.event().ordinal());
+        }
+        try (var pointEvent = last.poll().orElseThrow()) {
+          assertEquals(secondKey, pointEvent.event().current().key());
+          assertEquals(1, pointEvent.event().ordinal());
         }
         assertTrue(first.poll().isEmpty());
         assertTrue(second.poll().isEmpty());
+        assertTrue(last.poll().isEmpty());
         assertTrue(missing.poll().isEmpty());
         assertTrue(cancelled.poll().isEmpty());
         assertEquals(2, fixture.eventReads.get());
@@ -1069,6 +1153,36 @@ class SealedEventCursorTest {
     }
   }
 
+  @Test
+  void synchronousSequenceOpenFailureClosesTailerAndSubscriptions() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope watchScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope readScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account tailMemory = fixture.account(tailScope);
+         BudgetManager.Account watchMemory = fixture.account(watchScope);
+         BudgetManager.Account readMemory = fixture.account(readScope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      records.failPointReadsSynchronously = true;
+      var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+      var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 2, 4, 8192)) {
+        var watch = tailer.subscribe(KeyRange.all(), watchMemory, 4, 8192);
+
+        assertThrows(CompletionException.class, () -> tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 10, 1024L << 20)).join());
+
+        assertTrue(tailer.isClosed(), "a synchronous open failure must not leave a stuck tailer");
+        assertEquals(0, tailer.subscriptionCount());
+        assertEquals(Optional.of(SharedEventTailer.Termination.TAILER_CLOSED), watch.termination());
+        assertTrue(watch.poll().isEmpty());
+      }
+    }
+  }
+
   private static final class MemoryRecords implements SystemRecordStore {
     private final Map<ByteKey, ByteKey> rows = new HashMap<>();
     private CompletableFuture<Boolean> pauseNextCas;
@@ -1076,9 +1190,11 @@ class SealedEventCursorTest {
     private CompletableFuture<Optional<SystemRecordEntry>> pendingCheckpointRead;
     private CompletableFuture<Void> pendingProducer;
     private boolean producerTracked;
+    private boolean failPointReadsSynchronously;
     @Override public int bucket(SystemRecordType type, ByteKey identity) { return 0; }
     @Override public synchronized CompletableFuture<Optional<ByteKey>> read(
         SystemRecordType type, ByteKey identity, RequestScope scope) {
+      if (failPointReadsSynchronously) throw new IllegalStateException("synchronous record read failure");
       return CompletableFuture.completedFuture(Optional.ofNullable(rows.get(identity)));
     }
     @Override public synchronized CompletableFuture<Optional<SystemRecordEntry>> latestAtOrBefore(
@@ -1169,6 +1285,7 @@ class SealedEventCursorTest {
     private boolean missingPage;
     private boolean wrongEvent;
     private CompletableFuture<Optional<PreparedEvent>> pendingEvent;
+    private Consumer<RequestScope> indexReadObserver = ignored -> {};
 
     private PreparedEvent event(long ordinal, byte key) {
       byte[] value = {1};
@@ -1224,7 +1341,10 @@ class SealedEventCursorTest {
       EventRevisionIndexRepository indexes = (EventRevisionIndexRepository) Proxy.newProxyInstance(
           EventRevisionIndexRepository.class.getClassLoader(), new Class<?>[] {EventRevisionIndexRepository.class},
           (proxy, method, arguments) -> {
-            if (method.getName().equals("read")) return CompletableFuture.completedFuture(index.get());
+            if (method.getName().equals("read")) {
+              indexReadObserver.accept((RequestScope) arguments[1]);
+              return CompletableFuture.completedFuture(index.get());
+            }
             throw new UnsupportedOperationException(method.getName());
           });
       return new SelectedSequenceReader(pins, control(state), decisions(archived), repository(), indexes);

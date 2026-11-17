@@ -39,6 +39,7 @@ J44_JAVA_CLASS_MODULES = {
     "io.etcdhbase.core.commit.EventSubscriptionIndexTest": "core",
     "io.etcdhbase.core.commit.SealedEventCursorTest": "core",
     "io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepositoryTest": "hbase",
+    "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT": "hbase",
     "io.etcdhbase.hbase.storage.J44EventIndexControlStoreIT": "hbase",
     "io.etcdhbase.hbase.storage.J44EventPinIT": "hbase",
     "io.etcdhbase.server.commit.EventBackfillCycleBudgetTest": "server",
@@ -56,18 +57,25 @@ J44_CRITICAL_JAVA_TESTS = {
     },
     "io.etcdhbase.core.commit.EventSubscriptionIndexTest": {
         "matchesRawPointsAndHalfOpenRangesAndRemovesSubscriptions",
+        "replacingRegistrationWithEmptyRangeRemovesPreviousPointOrInterval",
+        "prunesDisjointIntervalsWithoutScanningEveryLowerBound",
+        "returnsAllOverlappingIntervalsAcrossRotationsAndRemovals",
     },
     "io.etcdhbase.core.commit.SealedEventCursorTest": {
         "readsEventsInOrderWithPauseAndBoundedPageReads",
         "missingPageAndExhaustedBudgetFailWithoutAdvancingCursor",
         "sharedTailerReadsOnceAndIsolatesSlowSubscriptions",
-        "sharedTailerDeliversOnlyMatchingPointAndRangeSubscriptions",
+        "watchRangeIndexMemoryIsAccountedAndReleasedOnCancellation",
+        "sharedTailerDeliversOnlySparsePointAndRangeMatches",
     },
     "io.etcdhbase.hbase.storage.J44EventIndexControlStoreIT": {
         "requiresDescriptorAndReopenedStoreForFencedControlUpgrade",
     },
     "io.etcdhbase.hbase.storage.J44EventPinIT": {
         "eventPinSurvivesReopenAndStopsPhysicalCollectionUntilReleased",
+    },
+    "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT": {
+        "seeksEventRevisionsWithinOneBucketAndResumesExclusively",
     },
     "io.etcdhbase.server.commit.EventBackfillCycleBudgetTest": {
         "cycleFailsClosedWhenItsReservedAccountCannotBeAdmitted",

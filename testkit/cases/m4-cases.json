@@ -881,16 +881,23 @@
           "rejectsEarlierResultsAndExhaustedBudgets"
         ]},
         {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.EventSubscriptionIndexTest", "tests": [
-          "matchesRawPointsAndHalfOpenRangesAndRemovesSubscriptions"
+          "matchesRawPointsAndHalfOpenRangesAndRemovesSubscriptions",
+          "replacingRegistrationWithEmptyRangeRemovesPreviousPointOrInterval",
+          "prunesDisjointIntervalsWithoutScanningEveryLowerBound",
+          "returnsAllOverlappingIntervalsAcrossRotationsAndRemovals"
         ]},
         {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.SealedEventCursorTest", "tests": [
           "readsEventsInOrderWithPauseAndBoundedPageReads",
           "missingPageAndExhaustedBudgetFailWithoutAdvancingCursor",
           "sharedTailerReadsOnceAndIsolatesSlowSubscriptions",
-          "sharedTailerDeliversOnlyMatchingPointAndRangeSubscriptions"
+          "watchRangeIndexMemoryIsAccountedAndReleasedOnCancellation",
+          "sharedTailerDeliversOnlySparsePointAndRangeMatches"
         ]},
         {"module": "hbase", "kind": "surefire", "class": "io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepositoryTest", "tests": [
           "readsAndCreatesAnImmutableRevisionRecord"
+        ]},
+        {"module": "hbase", "kind": "failsafe", "class": "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT", "tests": [
+          "seeksEventRevisionsWithinOneBucketAndResumesExclusively"
         ]},
         {"module": "hbase", "kind": "failsafe", "class": "io.etcdhbase.hbase.storage.J44EventIndexControlStoreIT", "tests": [
           "requiresDescriptorAndReopenedStoreForFencedControlUpgrade"

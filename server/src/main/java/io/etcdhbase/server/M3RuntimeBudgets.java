@@ -56,19 +56,26 @@ final class M3RuntimeBudgets {
     int scanners = Math.multiplyExact(
         Math.addExact(resources.maxScannersPerTable(), perGroupReserve.scanners()), groups.size());
     long memory = activation.memoryBytes() - ownerTransportMemoryBytes;
+    int cleanup = Math.addExact(operations, scanners);
+    if (globalReserve.memoryBytes() > memory) {
+      throw new IllegalArgumentException(
+          "M4 Lease and expiry reserved capacity exceeds the runtime memory budget");
+    }
     if (activation.m4LeaseApiEnabled()) {
-      long minimumLeaseMemory = Math.addExact(
-          M3MemoryReservations.minimumLeaseMemory(groups.size(), activation.maxEtcdRequestBytes()),
-          globalReserve.memoryBytes());
-      long minimum = Math.addExact(minimumLeaseMemory,
-          LeaseBudgetProfile.startupLeaseScanMemory().total());
-      if (memory < minimum) {
-        throw new IllegalArgumentException("M4 memory_bytes must leave at least " + minimum
-            + " after owner transport reservation for recovery accounts, Lease request/owner pairs, "
-            + "expiry and event backfill capacity, and a startup Lease validation scan");
+      long leaseAdmissionMemory = M3MemoryReservations.minimumLeaseMemory(
+          groups.size(), activation.maxEtcdRequestBytes());
+      long recoveryMemory = Math.multiplyExact(groups.size(), LeaseBudgetProfile.RECOVERY_MEMORY.total());
+      long startupMemory = Math.addExact(recoveryMemory, LeaseBudgetProfile.startupLeaseScanMemory().total());
+      // Regular accounts cannot consume the global reserve. Startup scanning precedes readiness,
+      // so its footprint and the Lease request footprint are not concurrent.
+      long regularMemory = Math.max(leaseAdmissionMemory, startupMemory);
+      long minimum = Math.addExact(globalReserve.memoryBytes(), regularMemory);
+      if (minimum > memory) {
+        throw new IllegalArgumentException(
+            "M4 reserved capacity and Lease lifecycles require at least " + minimum
+                + " bytes after owner transport");
       }
     }
-    int cleanup = Math.addExact(operations, scanners);
     // This queue belongs to finite-page scans within already admitted requests. It does not
     // enable an external mutation request queue (which remains disabled for this runtime).
     long scanQueueBytes = Math.min(memory, Math.multiplyExact((long) requests,
