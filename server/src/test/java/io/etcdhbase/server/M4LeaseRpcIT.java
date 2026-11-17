@@ -766,9 +766,11 @@ class M4LeaseRpcIT {
 
         long leaseId = leaseIdForPrefix(run.prefix(), "client-cancel");
         CommitState renewed;
+        LeaseState renewedLease;
+        long checkpointBeforeRestart;
         try (RuntimeServer server = RuntimeServer.startM3(configuration, firstActivation)) {
           assertTrue(server.dataReady());
-          Rpc.LeaseGrantResponse granted = grantThrough(server, leaseId, 30);
+          Rpc.LeaseGrantResponse granted = grantThrough(server, leaseId, 180);
           assertEquals(initialized.clusterId(), granted.getHeader().getClusterId());
           CommitState before = controlSnapshot(plan, initializer, identity).state();
           LeaseState leaseBeforeRenewal = leaseStateAt(plan, initializer, identity, leaseId,
@@ -779,9 +781,12 @@ class M4LeaseRpcIT {
           var closed = new CountDownLatch(1);
           var closeStatus = new AtomicReference<Status>();
           try {
+            // Force unrelated durable progress after the baseline, before the renewal is sent.
+            awaitExpiryCheckpoint(plan, initializer, identity,
+                before.finalizedSequence() + 1);
             ClientCall<Rpc.LeaseKeepAliveRequest, Rpc.LeaseKeepAliveResponse> call = channel.newCall(
                 LeaseGrpc.getLeaseKeepAliveMethod(),
-                CallOptions.DEFAULT.withDeadlineAfter(30, TimeUnit.SECONDS));
+                CallOptions.DEFAULT.withDeadlineAfter(90, TimeUnit.SECONDS));
             call.start(new ClientCall.Listener<>() {
               @Override public void onMessage(Rpc.LeaseKeepAliveResponse response) {
                 responseReceived.set(true);
@@ -793,19 +798,21 @@ class M4LeaseRpcIT {
             }, new Metadata());
             call.sendMessage(Rpc.LeaseKeepAliveRequest.newBuilder().setID(leaseId).build());
 
-            renewed = awaitFinalizedSequence(plan, initializer, identity,
-                before.publishedSequence() + 1, Duration.ofSeconds(30));
+            RenewalObservation observation = awaitRenewedLease(plan, initializer, identity,
+                leaseId, leaseBeforeRenewal, Duration.ofSeconds(30));
+            renewed = observation.control();
+            renewedLease = observation.lease();
             assertEquals(before.publishedRevision(), renewed.publishedRevision(),
                 "KeepAlive must not change the KV revision");
-            LeaseState leaseAfterRenewal = leaseStateAt(plan, initializer, identity, leaseId,
-                renewed.publishedSequence());
             assertEquals(leaseBeforeRenewal.renewalGeneration() + 1,
-                leaseAfterRenewal.renewalGeneration(),
+                renewedLease.renewalGeneration(),
                 "the durable renewal must advance the persisted generation before response delivery");
-            assertTrue(leaseAfterRenewal.deadlineEpochMillis()
+            assertTrue(renewedLease.deadlineEpochMillis()
                 > leaseBeforeRenewal.deadlineEpochMillis(),
                 "the durable renewal must persist a later deadline before response delivery");
-            assertEquals(renewed.publishedSequence(), leaseAfterRenewal.sequence());
+            assertTrue(renewedLease.sequence() <= renewed.finalizedSequence());
+            LeaseExpiryCheckpoint beforeCancellationCheckpoint = awaitExpiryCheckpoint(
+                plan, initializer, identity, renewed.finalizedSequence() + 1);
 
             // Manual ClientCall flow control is intentionally left at zero demand. The server may
             // persist and queue its response, but the client cancels before consuming that response.
@@ -813,10 +820,14 @@ class M4LeaseRpcIT {
             assertTrue(closed.await(10, TimeUnit.SECONDS), "client cancellation did not close the RPC");
             assertEquals(Status.Code.CANCELLED, closeStatus.get().getCode());
             assertFalse(responseReceived.get(), "the cancelled client must not consume a success response");
+            LeaseExpiryCheckpoint afterCancellationCheckpoint = awaitExpiryCheckpoint(
+                plan, initializer, identity, beforeCancellationCheckpoint.sequence() + 1);
             CommitState afterCancel = controlSnapshot(plan, initializer, identity).state();
-            assertEquals(renewed.publishedSequence(), afterCancel.publishedSequence(),
-                "cancelling the public RPC must not undo or duplicate a selected renewal");
             assertEquals(renewed.publishedRevision(), afterCancel.publishedRevision());
+            assertEquals(renewedLease, leaseStateAt(plan, initializer, identity, leaseId,
+                afterCancel.finalizedSequence()),
+                "cancellation must not undo or duplicate the selected renewal");
+            checkpointBeforeRestart = afterCancellationCheckpoint.sequence();
           } finally {
             channel.shutdownNow();
             assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
@@ -826,17 +837,16 @@ class M4LeaseRpcIT {
         M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
         try (RuntimeServer restarted = RuntimeServer.startM3(configuration, activation("2"))) {
           assertTrue(restarted.dataReady());
+          awaitExpiryCheckpoint(plan, initializer, identity, checkpointBeforeRestart + 1);
           CommitState recovered = controlSnapshot(plan, initializer, identity).state();
-          assertEquals(renewed.publishedSequence(), recovered.publishedSequence());
           assertEquals(renewed.publishedRevision(), recovered.publishedRevision());
-          assertEquals(leaseStateAt(plan, initializer, identity, leaseId,
-                  renewed.publishedSequence()),
-              leaseStateAt(plan, initializer, identity, leaseId, recovered.publishedSequence()),
+          assertEquals(renewedLease,
+              leaseStateAt(plan, initializer, identity, leaseId, recovered.finalizedSequence()),
               "restart must retain the exact renewed Lease version selected before cancellation");
           Rpc.LeaseTimeToLiveResponse ttl = timeToLive(restarted, leaseId, true);
           assertEquals(leaseId, ttl.getID());
           assertTrue(ttl.getTTL() > 0, "the durable renewal must survive client cancellation and restart");
-          assertEquals(30, ttl.getGrantedTTL());
+          assertEquals(180, ttl.getGrantedTTL());
           assertEquals(0, ttl.getKeysCount());
           assertEquals(initialized.clusterId(), ttl.getHeader().getClusterId());
           assertEquals(renewed.publishedRevision(), ttl.getHeader().getRevision());
@@ -845,16 +855,20 @@ class M4LeaseRpcIT {
     }
   }
 
-  private static CommitState awaitFinalizedSequence(M3TableGroupPlan plan,
+  private record RenewalObservation(CommitState control, LeaseState lease) {}
+
+  private static RenewalObservation awaitRenewedLease(M3TableGroupPlan plan,
       HBaseBackendIdentityProvider provider,
       io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
-      long expectedSequence, Duration timeout) throws Exception {
+      long leaseId, LeaseState before, Duration timeout) throws Exception {
     long deadline = Math.addExact(System.nanoTime(), timeout.toNanos());
     while (System.nanoTime() < deadline) {
       CommitState state = controlSnapshot(plan, provider, identity).state();
-      if (state.publishedSequence() == expectedSequence
-          && state.finalizedSequence() == expectedSequence) return state;
-      if (state.publishedSequence() > expectedSequence || state.finalizedSequence() > expectedSequence) {
+      LeaseState lease = leaseStateAt(plan, provider, identity, leaseId, state.finalizedSequence());
+      if (lease.renewalGeneration() == before.renewalGeneration() + 1) {
+        return new RenewalObservation(state, lease);
+      }
+      if (lease.renewalGeneration() > before.renewalGeneration() + 1) {
         throw new AssertionError("more than one KeepAlive decision was published before cancellation");
       }
       TimeUnit.MILLISECONDS.sleep(25);
