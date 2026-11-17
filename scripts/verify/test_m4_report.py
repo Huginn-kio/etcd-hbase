@@ -262,6 +262,16 @@ class M4ReportTest(unittest.TestCase):
             with self.assertRaisesRegex(m4_report.ReportError, "owner takeover epoch"):
                 m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
 
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J43")
+            report_path = artifact / "j43/mixed-lease-load.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["owner_takeover"]["new_owner_instance"] = "owner-b"
+            report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(m4_report.ReportError, "owner incarnation"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
     def test_j43_mixed_load_reports_resource_rejection_without_counting_it_as_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)
@@ -1046,6 +1056,7 @@ class M4ReportTest(unittest.TestCase):
                 "old_owner_epoch": 1,
                 "new_owner_epoch": 2,
                 "new_owner": "owner-b",
+                "new_owner_instance": "~PDG6jU2rnh9F3EmdeI0dtEnJFhDBG5ESKxlM1-kF_io:00000000-0000-0000-0000-000000000001",
                 "elapsed_millis": 6001,
             },
         }

@@ -29,8 +29,6 @@ import io.etcdhbase.core.lease.LeaseTimeRules;
 import io.etcdhbase.core.lease.LeaseTimeSource;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
-import io.etcdhbase.hbase.api.HBaseConnectionFactory;
-import io.etcdhbase.hbase.storage.StorageTableBinding;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.etcdhbase.server.observability.RequestMetrics;
 import java.time.Clock;
@@ -39,7 +37,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -66,17 +63,13 @@ public final class LeaseExpiryStepExecutor {
   private final LeaseAuxiliaryMutationPreparation preparation;
   private final CommitPublisher publisher;
   private final LeaseRevocationExecutor revocations;
-  private final HBaseConnectionFactory connections;
-  private final StorageTableBinding primary;
-  private final Executor backendWorker;
   private final RequestMetrics metrics;
 
   public LeaseExpiryStepExecutor(String tableGroup, ByteKey profileFingerprint, int bucketCount,
       CommitControlStore control, ReadViewService views, LeaseReadView leases,
       SystemRecordStore records, LeaseTimeSource time, Clock ownerClock,
       LeaseAuxiliaryMutationPreparation preparation, CommitPublisher publisher,
-      LeaseRevocationExecutor revocations, HBaseConnectionFactory connections,
-      StorageTableBinding primary, Executor backendWorker, RequestMetrics metrics) {
+      LeaseRevocationExecutor revocations, RequestMetrics metrics) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
     this.profileFingerprint = Objects.requireNonNull(profileFingerprint, "profileFingerprint");
     this.control = Objects.requireNonNull(control, "control");
@@ -88,12 +81,9 @@ public final class LeaseExpiryStepExecutor {
     this.preparation = Objects.requireNonNull(preparation, "preparation");
     this.publisher = Objects.requireNonNull(publisher, "publisher");
     this.revocations = Objects.requireNonNull(revocations, "revocations");
-    this.connections = Objects.requireNonNull(connections, "connections");
-    this.primary = Objects.requireNonNull(primary, "primary");
-    this.backendWorker = Objects.requireNonNull(backendWorker, "backendWorker");
     this.metrics = Objects.requireNonNull(metrics, "metrics");
     if (tableGroup.isBlank() || profileFingerprint.length() != 32 || bucketCount < 1
-        || bucketCount > 65_536 || primary.layout() == StorageTableBinding.Layout.CURRENT) {
+        || bucketCount > 65_536) {
       throw new IllegalArgumentException("invalid Lease expiry step configuration");
     }
     this.bucketCount = bucketCount;

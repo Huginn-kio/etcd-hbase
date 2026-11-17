@@ -1477,7 +1477,8 @@ class M4LeaseRpcIT {
     takeoverEvidence.put("scenario", "two-runtime-mtls-owner-takeover");
     takeoverEvidence.put("old_owner_epoch", takeover.oldOwnerEpoch());
     takeoverEvidence.put("new_owner_epoch", takeover.newOwnerEpoch());
-    takeoverEvidence.put("new_owner", takeover.newOwner());
+    takeoverEvidence.put("new_owner", "owner-b");
+    takeoverEvidence.put("new_owner_instance", takeover.newOwner());
     takeoverEvidence.put("elapsed_millis", takeover.elapsedMillis());
     mapper.writerWithDefaultPrettyPrinter().writeValue(evidencePath.toFile(), evidence);
   }

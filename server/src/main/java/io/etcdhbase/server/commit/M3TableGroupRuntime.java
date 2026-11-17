@@ -453,7 +453,6 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private record LeaseComponents(LeaseGrantOwnerProcessor grantProcessor,
       LeaseRenewalOwnerProcessor renewalProcessor,
       LeaseRevocationOwnerProcessor revocationProcessor,
-      LeaseEmptyExpiryOwnerProcessor legacyEmptyExpiryProcessor,
       LeaseExpiryStepOwnerProcessor expiryStepProcessor,
       LeaseReadView readView, LeaseEnumerationReader enumeration, LeaseBindingReader bindings,
       LeaseTimeSource time, LeaseBindingMutationPlanner bindingPlanner) {}
@@ -572,23 +571,18 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         plan.primary().codec().saltProfile().bucketCount());
     var renewalProcessor = new LeaseRenewalOwnerProcessor(plan.source().tableGroupId(), owner::currentToken,
         budgets, revocationReservation, renewalExecutor, stores.outcomes(), invocations, Clock.systemUTC());
-    var legacyEmptyExpiryExecutor = new LeaseEmptyExpiryExecutor(revocationExecutor, time);
-    var legacyEmptyExpiryProcessor = new LeaseEmptyExpiryOwnerProcessor(
-        plan.source().tableGroupId(), owner::currentToken, budgets, revocationReservation,
-        legacyEmptyExpiryExecutor, stores.outcomes(), invocations, Clock.systemUTC());
     var revocationProcessor = new LeaseRevocationOwnerProcessor(plan.source().tableGroupId(),
         owner::currentToken, budgets, revocationReservation, revocationExecutor, stores.outcomes(),
         invocations, Clock.systemUTC());
     var expiryStepExecutor = new LeaseExpiryStepExecutor(plan.source().tableGroupId(),
         plan.system().profileFingerprint(), plan.system().saltProfile().bucketCount(),
         stores.control(), stores.views(), leaseReads, stores.records(), time, Clock.systemUTC(),
-        mutationPreparation, publisher, revocationExecutor, connections, plan.primary(),
-        pending.worker, metrics);
+        mutationPreparation, publisher, revocationExecutor, metrics);
     var expiryStepProcessor = new LeaseExpiryStepOwnerProcessor(plan.source().tableGroupId(),
         owner::currentToken, budgets, revocationReservation, expiryStepExecutor, stores.outcomes(),
         invocations, Clock.systemUTC());
     return new LeaseComponents(processor, renewalProcessor, revocationProcessor,
-        legacyEmptyExpiryProcessor, expiryStepProcessor, leaseReads, enumeration, bindings,
+        expiryStepProcessor, leaseReads, enumeration, bindings,
         time, bindingPlanner);
   }
 
@@ -638,11 +632,6 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           case TRANSACTION, DELETE_RANGE -> business.txnProcessor().process(request, binding, principal, scope);
           case LEASE_GRANT -> business.lease().isPresent()
               ? business.lease().orElseThrow().grantProcessor().process(request, binding, principal, scope)
-              : CompletableFuture.completedFuture(
-                  new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
-          case LEASE_EXPIRE_EMPTY -> business.lease().isPresent()
-              ? business.lease().orElseThrow().legacyEmptyExpiryProcessor()
-                  .process(request, binding, principal, scope)
               : CompletableFuture.completedFuture(
                   new OwnerForwarding.Unknown(BackendFailure.Category.UNAVAILABLE));
           case LEASE_KEEP_ALIVE -> business.lease().isPresent()

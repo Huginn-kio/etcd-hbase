@@ -11,13 +11,12 @@ public final class MutationOperationEnvelope {
   private static final byte[] TXN_V1 = {0, 'T', 'X', 1};
   private static final byte[] DELETE_V1 = {0, 'D', 'L', 1};
   private static final byte[] LEASE_GRANT_V1 = {0, 'L', 'G', 1};
-  private static final byte[] LEASE_EXPIRE_EMPTY_V1 = {0, 'L', 'E', 1};
   private static final byte[] LEASE_KEEP_ALIVE_V1 = {0, 'L', 'K', 1};
   private static final byte[] LEASE_REVOKE_V1 = {0, 'L', 'R', 1};
   private static final byte[] LEASE_EXPIRY_STEP_V1 = {0, 'L', 'X', 1};
 
   public enum Kind {
-    PUT, TRANSACTION, DELETE_RANGE, LEASE_GRANT, LEASE_EXPIRE_EMPTY, LEASE_KEEP_ALIVE,
+    PUT, TRANSACTION, DELETE_RANGE, LEASE_GRANT, LEASE_KEEP_ALIVE,
     LEASE_REVOKE, LEASE_EXPIRY_STEP
   }
 
@@ -48,14 +47,6 @@ public final class MutationOperationEnvelope {
     return tagged(LEASE_EXPIRY_STEP_V1, payload);
   }
 
-  /** Encodes an internal empty-Lease expiry candidate identity, not an etcd wire RPC. */
-  public static ByteKey leaseExpireEmpty(byte[] candidateIdentity) {
-    if (candidateIdentity == null || candidateIdentity.length != Long.BYTES * 4) {
-      throw new IllegalArgumentException("empty-Lease expiry identity must contain 32 bytes");
-    }
-    return tagged(LEASE_EXPIRE_EMPTY_V1, candidateIdentity);
-  }
-
   private static ByteKey tagged(byte[] prefix, byte[] payload) {
     Objects.requireNonNull(payload, "payload");
     if (payload.length > MutationForwardRequest.MAX_OPERATION_BYTES - prefix.length) {
@@ -82,12 +73,6 @@ public final class MutationOperationEnvelope {
     if (Arrays.equals(TXN_V1, prefix)) return Kind.TRANSACTION;
     if (Arrays.equals(DELETE_V1, prefix)) return Kind.DELETE_RANGE;
     if (Arrays.equals(LEASE_GRANT_V1, prefix)) return Kind.LEASE_GRANT;
-    if (Arrays.equals(LEASE_EXPIRE_EMPTY_V1, prefix)) {
-      if (bytes.length != LEASE_EXPIRE_EMPTY_V1.length + Long.BYTES * 4) {
-        throw new IllegalArgumentException("invalid empty-Lease expiry envelope length");
-      }
-      return Kind.LEASE_EXPIRE_EMPTY;
-    }
     if (Arrays.equals(LEASE_KEEP_ALIVE_V1, prefix)) return Kind.LEASE_KEEP_ALIVE;
     if (Arrays.equals(LEASE_REVOKE_V1, prefix)) return Kind.LEASE_REVOKE;
     if (Arrays.equals(LEASE_EXPIRY_STEP_V1, prefix)) {
@@ -117,14 +102,6 @@ public final class MutationOperationEnvelope {
     if (kind(operation) != Kind.LEASE_GRANT) throw new IllegalArgumentException("operation is not a lease grant");
     byte[] bytes = operation.bytes();
     return Arrays.copyOfRange(bytes, LEASE_GRANT_V1.length, bytes.length);
-  }
-
-  public static byte[] leaseExpireEmptyBytes(ByteKey operation) {
-    if (kind(operation) != Kind.LEASE_EXPIRE_EMPTY) {
-      throw new IllegalArgumentException("operation is not an empty-Lease expiry");
-    }
-    byte[] bytes = operation.bytes();
-    return Arrays.copyOfRange(bytes, LEASE_EXPIRE_EMPTY_V1.length, bytes.length);
   }
 
   public static byte[] leaseKeepAliveBytes(ByteKey operation) {

@@ -21,7 +21,6 @@ import io.etcdhbase.core.lease.LeaseCostAdmission;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseFailure;
-import io.etcdhbase.core.lease.LeaseIdentity;
 import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.core.lease.LeaseTimeObservation;
 import io.etcdhbase.core.lease.LeaseTimeRules;
@@ -46,7 +45,7 @@ import java.util.function.Supplier;
 
 /** Executes explicit Revoke and expiry-selected deletion through the shared M2 revocation plan. */
 public final class LeaseRevocationExecutor {
-  public enum CandidateRejection { RECHECK, CLOCK_UNHEALTHY, NOT_EMPTY }
+  public enum CandidateRejection { RECHECK, CLOCK_UNHEALTHY }
 
   public static final class RejectedBeforePreparation extends RuntimeException {
     private static final long serialVersionUID = 1L;
@@ -156,28 +155,6 @@ public final class LeaseRevocationExecutor {
   }
 
   /**
-   * Resolves an on-demand expiry observation through the shared atomic revocation path. The
-   * candidate is only a hint: the owner rechecks the current Lease incarnation, generation,
-   * deadline, and trusted lower time bound before preparing any deletion.
-   */
-  public CompletableFuture<InvocationId> executeExpiredCandidate(ExpiryCandidateIdentity candidate,
-      InvocationBinding binding, CommitOwnerService.OwnerToken owner,
-      AuthorizedBackendIdentity identity, LeaseTimeObservation observation,
-      RequestScope scope, BudgetManager.Account account) {
-    return executeExpiredCandidate(candidate, binding, owner, identity, observation,
-        false, scope, account);
-  }
-
-  /** Keeps the legacy empty-Lease expiry command on the same atomic revocation path. */
-  public CompletableFuture<InvocationId> executeExpiredEmptyCandidate(
-      ExpiryCandidateIdentity candidate, InvocationBinding binding,
-      CommitOwnerService.OwnerToken owner, AuthorizedBackendIdentity identity,
-      LeaseTimeObservation observation, RequestScope scope, BudgetManager.Account account) {
-    return executeExpiredCandidate(candidate, binding, owner, identity, observation,
-        true, scope, account);
-  }
-
-  /**
    * Selects expiry through the current KeepAlive invocation and stores its TTL-zero response as
    * the durable result. The caller already owns the serialized mutation lane, so this method
    * invokes the shared revocation preparation directly instead of relaying into that lane again.
@@ -223,51 +200,6 @@ public final class LeaseRevocationExecutor {
               managed::finish, true, observation, Optional.empty(), scope, account,
               keepAliveResult));
     });
-  }
-
-  private CompletableFuture<InvocationId> executeExpiredCandidate(ExpiryCandidateIdentity candidate,
-      InvocationBinding binding, CommitOwnerService.OwnerToken owner,
-      AuthorizedBackendIdentity identity, LeaseTimeObservation observation,
-      boolean requireEmpty, RequestScope scope, BudgetManager.Account account) {
-    Objects.requireNonNull(candidate, "candidate");
-    Objects.requireNonNull(binding, "binding");
-    Objects.requireNonNull(owner, "owner");
-    Objects.requireNonNull(identity, "identity");
-    Objects.requireNonNull(observation, "observation");
-    Objects.requireNonNull(scope, "scope");
-    Objects.requireNonNull(account, "account");
-    if (binding.state() != InvocationBinding.State.PREPARING
-        || binding.preparedOwnerEpoch() != owner.epoch() || !account.belongsTo(scope)
-        || !identity.scope().tableGroupId().equals(tableGroup)
-        || !identity.allowedTableGroupIds().contains(tableGroup)) {
-      return CompletableFuture.failedFuture(
-          new IllegalArgumentException("invalid Lease expiry candidate attempt"));
-    }
-    if (!observation.healthy()) {
-      return CompletableFuture.failedFuture(
-          new RejectedBeforePreparation(CandidateRejection.CLOCK_UNHEALTHY));
-    }
-    var drained = new CompletableFuture<Void>();
-    if (!scope.startIfOpen(() -> scope.trackPhysicalProducer(drained))) {
-      return CompletableFuture.failedFuture(inactive(scope));
-    }
-    CompletableFuture<InvocationId> operation;
-    try {
-      PutCommitPreparation.retainUntilDrain(scope, account.tryAcquire(FINALIZATION_CAPACITY)
-          .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT)));
-      operation = currentBase(binding, owner, scope)
-          .thenCompose(ignored -> views.openAuxiliary(binding.authorizationScopeDigest(), scope))
-          .thenCompose(pin -> withManagedRead(pin, scope, managed -> prepareCandidate(candidate,
-              binding, owner, identity, observation, requireEmpty, managed, scope, account)));
-    } catch (BackendFailure | RuntimeException failure) {
-      drained.complete(null);
-      return CompletableFuture.failedFuture(failure);
-    } catch (Error fatal) {
-      drained.complete(null);
-      throw fatal;
-    }
-    operation.whenComplete((ignored, failure) -> drained.complete(null));
-    return operation.copy();
   }
 
   /**
@@ -332,36 +264,6 @@ public final class LeaseRevocationExecutor {
         }).copy();
   }
 
-  private CompletableFuture<InvocationId> prepareCandidate(ExpiryCandidateIdentity candidate,
-      InvocationBinding binding, CommitOwnerService.OwnerToken owner,
-      AuthorizedBackendIdentity identity, LeaseTimeObservation observation, boolean requireEmpty,
-      ManagedRead managed, RequestScope scope, BudgetManager.Account account) {
-    PinnedReadView pin = managed.pin();
-    if (!pinnedAtBase(pin, binding)) {
-      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-    }
-    if (!observation.healthy()) {
-      return CompletableFuture.failedFuture(
-          new RejectedBeforePreparation(CandidateRejection.CLOCK_UNHEALTHY));
-    }
-    var proof = new ManifestCatalog.ProofReadBudget(
-        scope, account, MAX_METADATA_RECORDS, MAX_METADATA_BYTES);
-    return leases.find(pin, candidate.leaseId(), scope, proof).thenCompose(found -> {
-      LeaseState state = found.orElseThrow(() -> new RejectedBeforePreparation(CandidateRejection.RECHECK));
-      if (candidateStatus(candidate, state.expiryCandidateSequence(), state) == CandidateStatus.STALE
-          || !LeaseTimeRules.isExpired(state, observation)) {
-        return CompletableFuture.failedFuture(new RejectedBeforePreparation(CandidateRejection.RECHECK));
-      }
-      if (requireEmpty && (state.boundKeyCount() != 0 || state.boundKeyBytes() != 0
-          || state.revokeCostBytes() != 0)) {
-        return CompletableFuture.failedFuture(
-            new RejectedBeforePreparation(CandidateRejection.NOT_EMPTY));
-      }
-      return prepareAndPublish(state, binding, owner, identity, managed,
-          true, observation, Optional.empty(), scope, account);
-    });
-  }
-
   enum CandidateStatus { CURRENT, STALE }
 
   static CandidateStatus candidateStatus(ExpiryCandidateIdentity candidate,
@@ -391,42 +293,6 @@ public final class LeaseRevocationExecutor {
     if (!observation.healthy()) return Optional.of(CandidateRejection.CLOCK_UNHEALTHY);
     return LeaseTimeRules.isExpired(state, observation)
         ? Optional.empty() : Optional.of(CandidateRejection.RECHECK);
-  }
-
-  /** Reuses this invocation and pinned view for a validated expiry candidate. */
-  CompletableFuture<InvocationId> revokePinned(long leaseId, LeaseIdentity identity,
-      InvocationBinding binding, CommitOwnerService.OwnerToken owner,
-      AuthorizedBackendIdentity backendIdentity, PinnedReadView pin,
-      LeaseTimeObservation expiryProof, Optional<LeaseExpiryCheckpoint.Position> nextPosition,
-      RequestScope scope, BudgetManager.Account account) {
-    return withManagedRead(pin, scope, managed -> revokePinned(leaseId, identity, binding,
-        owner, backendIdentity, managed.pin(), managed::finish, expiryProof, nextPosition,
-        scope, account));
-  }
-
-  CompletableFuture<InvocationId> revokePinned(long leaseId, LeaseIdentity identity,
-      InvocationBinding binding, CommitOwnerService.OwnerToken owner,
-      AuthorizedBackendIdentity backendIdentity, PinnedReadView pin,
-      Supplier<CompletableFuture<Void>> finishPinnedRead,
-      LeaseTimeObservation expiryProof, Optional<LeaseExpiryCheckpoint.Position> nextPosition,
-      RequestScope scope, BudgetManager.Account account) {
-    Objects.requireNonNull(identity, "identity");
-    Objects.requireNonNull(pin, "pin");
-    Objects.requireNonNull(finishPinnedRead, "finishPinnedRead");
-    Objects.requireNonNull(expiryProof, "expiryProof");
-    Objects.requireNonNull(nextPosition, "nextPosition");
-    return currentBase(binding, owner, scope).thenCompose(ignored -> {
-      var proof = new ManifestCatalog.ProofReadBudget(
-          scope, account, MAX_METADATA_RECORDS, MAX_METADATA_BYTES);
-      return leases.find(pin, leaseId, scope, proof).thenCompose(found -> {
-        var state = found.orElseThrow(() -> new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
-        if (!state.identity().equals(identity)) {
-          return CompletableFuture.failedFuture(new LeaseFailure(LeaseFailure.Reason.NOT_FOUND));
-        }
-        return prepareAndPublish(state, binding, owner, backendIdentity, pin,
-            finishPinnedRead, true, expiryProof, nextPosition, scope, account);
-      });
-    }).copy();
   }
 
   private CompletableFuture<InvocationId> prepareExplicit(long leaseId,

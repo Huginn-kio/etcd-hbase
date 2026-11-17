@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import math
@@ -13,6 +14,7 @@ from pathlib import PurePosixPath
 import re
 import subprocess
 import sys
+import uuid
 import xml.etree.ElementTree as ET
 
 
@@ -1749,6 +1751,17 @@ def _validate_j29_4_evidence(repository: Path, evidence_root: Path,
             or takeover.get("scenario") != "two-runtime-mtls-owner-takeover"
             or takeover.get("new_owner") != "owner-b"):
         raise ReportError("J29.4 two-runtime owner takeover evidence is missing")
+    route = base64.urlsafe_b64encode(hashlib.sha256(b"owner-b").digest()).decode().rstrip("=")
+    instance = takeover.get("new_owner_instance")
+    prefix = f"~{route}:"
+    if not isinstance(instance, str) or not instance.startswith(prefix):
+        raise ReportError("J29.4 takeover owner incarnation does not match owner-b")
+    try:
+        incarnation = instance[len(prefix):]
+        if str(uuid.UUID(incarnation)) != incarnation:
+            raise ValueError("noncanonical UUID")
+    except ValueError as error:
+        raise ReportError("J29.4 takeover owner incarnation is invalid") from error
     old_epoch = takeover.get("old_owner_epoch")
     new_epoch = takeover.get("new_owner_epoch")
     elapsed_millis = takeover.get("elapsed_millis")

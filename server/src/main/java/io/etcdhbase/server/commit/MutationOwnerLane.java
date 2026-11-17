@@ -68,8 +68,7 @@ public final class MutationOwnerLane {
     long bytes = ENVELOPE_ALLOWANCE + 8L * request.operationBytes().length()
         + 2L * request.authorizationContextReference().length() + 2L * tableGroup.length();
     boolean reserved = operationKind == MutationOperationEnvelope.Kind.LEASE_REVOKE
-        || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRY_STEP
-        || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRE_EMPTY;
+        || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRY_STEP;
     try {
       java.util.function.Function<RequestScope, CompletableFuture<OwnerForwarding.Reply>> work = serviceScope -> {
         long elapsed = nanoTime.getAsLong() - entered;
@@ -79,8 +78,7 @@ public final class MutationOwnerLane {
           metrics.recordLeaseRenewalStage(
               RequestMetrics.LeaseRenewalStage.QUEUE, Math.max(0, elapsed));
         } else if (operationKind == MutationOperationEnvelope.Kind.LEASE_REVOKE
-            || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRY_STEP
-            || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRE_EMPTY) {
+            || operationKind == MutationOperationEnvelope.Kind.LEASE_EXPIRY_STEP) {
           metrics.recordLeaseRevocationStage(
               RequestMetrics.LeaseRevocationStage.QUEUE, Math.max(0, elapsed));
         } else if (operationKind != MutationOperationEnvelope.Kind.LEASE_GRANT) {
