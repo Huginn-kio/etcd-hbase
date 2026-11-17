@@ -723,6 +723,8 @@
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.M3OwnerLeaseTest", "tests": [
           "standbyStartsReadyAndClaimsOwnerAfterActiveOwnerExpires",
+          "samePeerRestartUsesFreshIncarnationAndFencesOldToken",
+          "forwardingResolvesFreshAndLegacyOwnerIdentities",
           "standbyClaimTimeoutCancelsStalledRecoveryAndAllowsRetry"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.MutationForwardReceiverTest", "tests": [

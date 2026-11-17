@@ -359,6 +359,8 @@ J42_CRITICAL_JAVA_TESTS = {
     },
     "io.etcdhbase.server.commit.M3OwnerLeaseTest": {
         "standbyStartsReadyAndClaimsOwnerAfterActiveOwnerExpires",
+        "samePeerRestartUsesFreshIncarnationAndFencesOldToken",
+        "forwardingResolvesFreshAndLegacyOwnerIdentities",
         "standbyClaimTimeoutCancelsStalledRecoveryAndAllowsRetry",
     },
     "io.etcdhbase.server.commit.MutationForwardReceiverTest": {

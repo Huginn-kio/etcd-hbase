@@ -270,7 +270,7 @@ class M4LeaseRpcIT {
               assertPeerCertificateWithoutConfiguredIdentityIsRejected(
                   ownerAPort, "owner-a", trustedPeers, unregisteredPeerCertificate);
               CommitState activeOwner = controlSnapshot(plan, initializer, identity).state();
-              assertEquals("owner-a", activeOwner.ownerInstance().orElseThrow());
+              assertTrue(isOwnerForPeer(activeOwner, "owner-a"));
               long scopeProbeLease = leaseIdForPrefix(run.prefix(), "forwarding-context-probe");
               var invalidContextRequest = keepAliveForwardRequest(source.tableGroupId(),
                   runtimeForwardingIdentity, Rpc.LeaseKeepAliveRequest.newBuilder()
@@ -439,7 +439,7 @@ class M4LeaseRpcIT {
             assertTrue(ownerA.pid() != ownerB.pid());
 
             CommitState active = controlSnapshot(plan, initializer, identity).state();
-            assertEquals("owner-a", active.ownerInstance().orElseThrow());
+            assertTrue(isOwnerForPeer(active, "owner-a"));
             oldEpoch = active.ownerEpoch();
 
             runKeepAliveTargetDriver(beforeFailover, "NATIVE", ownerBClientPort);
@@ -473,7 +473,7 @@ class M4LeaseRpcIT {
             keepAliveClientRevision = keepAliveOnce.revision();
             CommitState afterRecoveryKeepAlive =
                 controlSnapshot(plan, initializer, identity).state();
-            assertEquals("owner-b", afterRecoveryKeepAlive.ownerInstance().orElseThrow());
+            assertTrue(isOwnerForPeer(afterRecoveryKeepAlive, "owner-b"));
             assertEquals(recovered.publishedRevision(), keepAliveOnce.revision(),
                 "the original Go client must observe the unchanged KV revision after owner failover");
             assertEquals(recovered.publishedRevision(), afterRecoveryKeepAlive.publishedRevision(),
@@ -1478,6 +1478,13 @@ class M4LeaseRpcIT {
     }
   }
 
+  private static boolean isOwnerForPeer(CommitState state, String peerId) throws Exception {
+    byte[] digest = MessageDigest.getInstance("SHA-256")
+        .digest(peerId.getBytes(StandardCharsets.UTF_8));
+    String prefix = "~" + java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(digest) + ":";
+    return state.ownerInstance().filter(instance -> instance.startsWith(prefix)).isPresent();
+  }
+
   private static CommitState awaitOwner(M3TableGroupPlan plan,
       HBaseBackendIdentityProvider provider,
       io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
@@ -1486,7 +1493,7 @@ class M4LeaseRpcIT {
     CommitState observed = null;
     while (System.nanoTime() < deadline) {
       observed = controlSnapshot(plan, provider, identity).state();
-      if (observed.ownerInstance().filter(expectedOwner::equals).isPresent()
+      if (isOwnerForPeer(observed, expectedOwner)
           && observed.ownerEpoch() > previousEpoch) {
         return observed;
       }

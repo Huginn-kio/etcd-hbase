@@ -80,6 +80,7 @@ public final class OwnerForwardingRuntime implements OwnerForwarding.Directory,
   private final String localInstanceId;
   private final M3RuntimeConfiguration.OwnerForwardingSettings settings;
   private final Map<String, M3RuntimeConfiguration.OwnerPeer> peersByInstance;
+  private final Map<String, M3RuntimeConfiguration.OwnerPeer> peersByRouteKey;
   private final Map<String, String> identitiesByLowercase;
   private final Map<String, InternalOwnerGrpcService.Handler> handlers = new ConcurrentHashMap<>();
   private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
@@ -110,8 +111,10 @@ public final class OwnerForwardingRuntime implements OwnerForwarding.Directory,
     maxMessageBytes = requestLimits.maxMessageBytes();
     var peers = new java.util.HashMap<String, M3RuntimeConfiguration.OwnerPeer>();
     var identities = new java.util.HashMap<String, String>();
+    var routes = new java.util.HashMap<String, M3RuntimeConfiguration.OwnerPeer>();
     for (var peer : settings.peers()) {
       if (peers.putIfAbsent(peer.instanceId(), peer) != null
+          || routes.putIfAbsent(OwnerIncarnation.routeKey(peer.instanceId()), peer) != null
           || identities.putIfAbsent(peer.peerIdentity().toLowerCase(java.util.Locale.ROOT),
               peer.peerIdentity()) != null) {
         throw new IllegalArgumentException("owner peers must have unique instance and certificate identities");
@@ -121,6 +124,7 @@ public final class OwnerForwardingRuntime implements OwnerForwarding.Directory,
       throw new IllegalArgumentException("local owner instance is absent from its trusted peer directory");
     }
     peersByInstance = Map.copyOf(peers);
+    peersByRouteKey = Map.copyOf(routes);
     identitiesByLowercase = Map.copyOf(identities);
     clientTls = buildClientTls(settings);
   }
@@ -186,12 +190,18 @@ public final class OwnerForwardingRuntime implements OwnerForwarding.Directory,
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       }
     }
-    M3RuntimeConfiguration.OwnerPeer peer = peersByInstance.get(ownerInstance);
+    M3RuntimeConfiguration.OwnerPeer peer = peerForOwner(ownerInstance);
     if (peer == null || ownerEpoch <= 0) {
       return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
     return CompletableFuture.completedFuture(new OwnerForwarding.Route(
-        ownerInstance, ownerEpoch, ownerInstance, peer.peerIdentity()));
+        ownerInstance, ownerEpoch, peer.instanceId(), peer.peerIdentity()));
+  }
+
+  private M3RuntimeConfiguration.OwnerPeer peerForOwner(String ownerInstance) {
+    String routeKey = OwnerIncarnation.routeKeyFromInstance(ownerInstance);
+    // Existing unexpired control rows may contain the legacy peer ID during rolling upgrades.
+    return routeKey == null ? peersByInstance.get(ownerInstance) : peersByRouteKey.get(routeKey);
   }
 
   @Override
@@ -200,7 +210,7 @@ public final class OwnerForwardingRuntime implements OwnerForwarding.Directory,
     Objects.requireNonNull(route, "route");
     Objects.requireNonNull(request, "request");
     Objects.requireNonNull(scope, "scope");
-    M3RuntimeConfiguration.OwnerPeer peer = peersByInstance.get(route.ownerInstance());
+    M3RuntimeConfiguration.OwnerPeer peer = peerForOwner(route.ownerInstance());
     if (peer == null || !route.endpointId().equals(peer.instanceId())
         || !route.peerIdentity().equals(peer.peerIdentity())
         || request.expectedOwnerEpoch() != route.ownerEpoch()

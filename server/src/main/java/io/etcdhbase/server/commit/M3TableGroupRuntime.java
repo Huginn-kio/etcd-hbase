@@ -196,7 +196,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       var recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
           stores.invocations(), stores.outcomes(), stores.finalizer());
       String instance = activation.ownerInstanceId() == null
-          ? CommitOwnerService.newInstanceId() : activation.ownerInstanceId();
+          ? CommitOwnerService.newInstanceId() : OwnerIncarnation.newId(activation.ownerInstanceId());
       Runnable ownerLost = activation.ownerForwarding() == null ? pending.queue::close : () -> {};
       var ownerFuture = activation.ownerForwarding() == null
           ? M3OwnerLease.acquire(recovery, owners, instance,

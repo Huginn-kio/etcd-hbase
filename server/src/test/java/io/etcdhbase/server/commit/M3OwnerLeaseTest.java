@@ -17,16 +17,23 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
 import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.InvocationId;
+import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.InvocationRepository;
 import io.etcdhbase.core.commit.RecoveryManager;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.server.TestTlsCertificate;
+import io.etcdhbase.server.config.M3RuntimeConfiguration;
+import java.net.ServerSocket;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -38,9 +45,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class M3OwnerLeaseTest {
   private static final ByteKey PROFILE = ByteKey.copyOf(new byte[32]);
+  @TempDir Path forwardingDirectory;
 
   @Test
   void recoversBeforeReadyRenewsAndFencesTheLaneOnHeartbeatFailure() throws Exception {
@@ -252,6 +261,87 @@ class M3OwnerLeaseTest {
       } finally {
         lease.close();
         lease.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  @Test
+  void forwardingResolvesFreshAndLegacyOwnerIdentities() throws Exception {
+    try (var certificate = TestTlsCertificate.create(forwardingDirectory, "owner-a")) {
+      int port;
+      try (var socket = new ServerSocket(0)) { port = socket.getLocalPort(); }
+      var peer = new M3RuntimeConfiguration.OwnerPeer(
+          "owner-a", "127.0.0.1", port, "owner-a");
+      var settings = new M3RuntimeConfiguration.OwnerForwardingSettings(
+          "127.0.0.1", port, certificate.certificate().toString(), certificate.privateKey().toString(),
+          certificate.certificate().toString(), List.of(peer));
+      try (var forwarding = new OwnerForwardingRuntime("owner-a", settings,
+          new OwnerForwardingRuntime.RequestLimits(65536, 1, 262144), 1000, 1000)) {
+        forwarding.register("group", (identity, request, scope) ->
+            CompletableFuture.completedFuture(new OwnerForwarding.Unknown(
+                BackendFailure.Category.UNAVAILABLE)));
+        forwarding.start();
+        String incarnation = OwnerIncarnation.newId("owner-a");
+        var route = forwarding.resolve("group", incarnation, 7).join();
+        assertEquals(incarnation, route.ownerInstance());
+        assertEquals("owner-a", route.endpointId());
+        assertEquals("owner-a", route.peerIdentity());
+        assertEquals("owner-a", forwarding.resolve("group", "owner-a", 7).join().endpointId());
+        assertThrows(CompletionException.class,
+            () -> forwarding.resolve("group", OwnerIncarnation.newId("unknown"), 7).join());
+        assertThrows(CompletionException.class,
+            () -> forwarding.resolve("group", OwnerIncarnation.routeKey("owner-a") + ":bad", 7).join());
+      }
+    }
+  }
+
+  @Test
+  void samePeerRestartUsesFreshIncarnationAndFencesOldToken() throws Exception {
+    var clock = new MutableClock(1_000);
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    String originalId = OwnerIncarnation.newId("owner-a");
+    String replacementId = OwnerIncarnation.newId("owner-a");
+    assertFalse(originalId.equals(replacementId));
+    assertEquals(OwnerIncarnation.routeKey("owner-a"),
+        OwnerIncarnation.routeKeyFromInstance(originalId));
+    assertEquals(OwnerIncarnation.routeKey("owner-a"),
+        OwnerIncarnation.routeKeyFromInstance(replacementId));
+    assertTrue(originalId.getBytes(StandardCharsets.UTF_8).length
+        <= CommitState.MAX_OWNER_INSTANCE_BYTES);
+    assertFalse(OwnerIncarnation.routeKey("owner-a").equals(OwnerIncarnation.routeKey("owner-b")));
+    try (var startup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var active = M3OwnerLease.acquireOrStandby(recovery(store, owners), owners, originalId,
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400), startup, () -> {}, clock).join();
+      var overlap = M3OwnerLease.acquireOrStandby(recovery(store, owners), owners, replacementId,
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400), startup, () -> {}, clock).join();
+      M3OwnerLease restart = null;
+      try {
+        var oldToken = active.token();
+        assertTrue(active.isOwner());
+        assertFalse(overlap.isOwner(), "overlapping processes sharing a route must not share a token");
+        overlap.close();
+        overlap.drained().get(5, TimeUnit.SECONDS);
+        active.close();
+        active.drained().get(5, TimeUnit.SECONDS);
+        String restartId = OwnerIncarnation.newId("owner-a");
+        restart = M3OwnerLease.acquireOrStandby(recovery(store, owners), owners, restartId,
+            Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400), startup, () -> {}, clock).join();
+        assertFalse(restart.isOwner(), "restart must wait for the prior durable lease to expire");
+        store.expectedOwnerClaim = restartId;
+        clock.advance(1201);
+        assertTrue(store.expectedOwnerClaimed.await(5, TimeUnit.SECONDS));
+        assertTrue(awaitOwner(restart, Duration.ofSeconds(5)));
+        assertTrue(restart.token().epoch() > oldToken.epoch());
+        assertFalse(owners.heartbeat(oldToken, clock.millis() + 1200, startup).join(),
+            "a late heartbeat with the old token must not renew the replacement's lease");
+      } finally {
+        active.close();
+        overlap.close();
+        if (restart != null) {
+          restart.close();
+          restart.drained().get(5, TimeUnit.SECONDS);
+        }
       }
     }
   }
