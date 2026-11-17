@@ -5,6 +5,7 @@ import io.etcdhbase.core.commit.EventRevisionIndex;
 import io.etcdhbase.core.commit.EventRevisionIndexPage;
 import io.etcdhbase.core.commit.EventRevisionIndexRepository;
 import io.etcdhbase.core.commit.SystemRecordStore;
+import io.etcdhbase.core.commit.SystemRecordRead;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.codec.EventRevisionIndexMessages;
@@ -23,14 +24,23 @@ public final class HBaseEventRevisionIndexRepository implements EventRevisionInd
 
   @Override
   public CompletableFuture<Optional<EventRevisionIndex>> read(long revision, RequestScope scope) {
-    return records.read(SystemRecordType.EVENT_REVISION_INDEX, identity(revision), scope)
-        .thenApply(value -> value.map(encoded -> {
-          EventRevisionIndex index = EventRevisionIndexMessages.decode(encoded.bytes());
-          if (index.decision().revision() != revision) {
-            throw new IllegalStateException("event index row and decision revision differ");
-          }
-          return index;
-        }));
+    return readWithSize(revision, scope).thenApply(SystemRecordRead::value);
+  }
+
+  @Override
+  public CompletableFuture<SystemRecordRead<EventRevisionIndex>> readWithSize(
+      long revision, RequestScope scope) {
+    ByteKey identity = identity(revision);
+    return records.read(SystemRecordType.EVENT_REVISION_INDEX, identity, scope).thenApply(value -> {
+      if (value.isEmpty()) return new SystemRecordRead<>(Optional.empty(), 0);
+      ByteKey encoded = value.orElseThrow();
+      EventRevisionIndex index = EventRevisionIndexMessages.decode(encoded.bytes());
+      if (index.decision().revision() != revision) {
+        throw new IllegalStateException("event index row and decision revision differ");
+      }
+      return new SystemRecordRead<>(Optional.of(index),
+          Math.addExact(identity.length(), encoded.length()));
+    });
   }
 
   @Override

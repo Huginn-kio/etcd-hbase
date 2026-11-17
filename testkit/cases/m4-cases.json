@@ -887,6 +887,8 @@
           "returnsAllOverlappingIntervalsAcrossRotationsAndRemovals"
         ]},
         {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.SealedEventCursorTest", "tests": [
+          "measuredProofReadsChargeActualEncodedBytesAndAllowNinthSmallRead",
+          "measuredProofReadsStillRejectActualBytesBeyondTheirCumulativeLimit",
           "readsEventsInOrderWithPauseAndBoundedPageReads",
           "missingPageAndExhaustedBudgetFailWithoutAdvancingCursor",
           "sharedTailerReadsOnceAndIsolatesSlowSubscriptions",
@@ -926,7 +928,8 @@
           "slowBackfillReadDoesNotBlockHeartbeatAndPublicationUsesOwnerLane"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest", "tests": [
-          "ownerLossBetweenWorkerInstallationsStopsExistingWorkerAndRejectsLateWorker",
+          "eventHistoryWorkerStartsOnlyWhenTailerReadinessIsRequested",
+          "ownerLossBeforeEventHistoryWorkerInstallationRejectsLateWorker",
           "ownerLossBeforeInstallationRejectsBothWorkers"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.observability.RequestMetricsTest", "tests": [

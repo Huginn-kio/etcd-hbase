@@ -14,14 +14,17 @@ public final class EventBackfillWindow implements AutoCloseable {
   private final CommitControlStore control;
   private final RequestScope scope;
   private final Optional<ByteKey> registryNamespace;
+  private final boolean initialCapture;
 
   private EventBackfillWindow(EventIndexBackfillCheckpoint captured, ProtectedEventCursor pin,
-      CommitControlStore control, RequestScope scope, Optional<ByteKey> registryNamespace) {
+      CommitControlStore control, RequestScope scope, Optional<ByteKey> registryNamespace,
+      boolean initialCapture) {
     this.captured = captured;
     this.pin = pin;
     this.control = control;
     this.scope = scope;
     this.registryNamespace = registryNamespace;
+    this.initialCapture = initialCapture;
   }
 
   /** The checkpoint must first be resolved from a selected M2 auxiliary version. */
@@ -67,15 +70,16 @@ public final class EventBackfillWindow implements AutoCloseable {
         return;
       }
       var pin = new ProtectedEventCursor(registered, scope);
-      var window = new EventBackfillWindow(checkpoint, pin, control, scope, pins.namespace());
+      var window = new EventBackfillWindow(checkpoint, pin, control, scope, pins.namespace(), capture);
       if (output.isDone()) {
         window.close();
         return;
       }
       try {
-        Optional<Fence> fence = capture ? Optional.of(new Fence(checkpoint.ownerEpoch(), checkpoint.sequence()))
-            : Optional.empty();
-        window.check(checkpoint, fence, budget, capture).whenComplete((ignored, checkFailure) -> {
+        CompletableFuture<Void> checked = capture
+            ? window.checkHistory(checkpoint, checkpoint.ownerEpoch(), budget)
+            : window.check(checkpoint, Optional.empty(), Optional.empty(), budget);
+        checked.whenComplete((ignored, checkFailure) -> {
           if (checkFailure != null) {
             window.close();
             output.completeExceptionally(checkFailure);
@@ -95,14 +99,26 @@ public final class EventBackfillWindow implements AutoCloseable {
   /** Revalidates both the frozen window and the owner/base for an immediately pending M2 commit. */
   public CompletableFuture<Void> checkPublication(EventIndexBackfillCheckpoint checkpoint,
       long ownerEpoch, long commitSequence, ManifestCatalog.ProofReadBudget budget) {
-    if (ownerEpoch <= 0 || commitSequence <= 0) {
+    Objects.requireNonNull(checkpoint, "checkpoint");
+    if (ownerEpoch <= 0 || commitSequence <= 0 || checkpoint.ownerEpoch() != ownerEpoch
+        || checkpoint.sequence() != commitSequence) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid backfill publication fence"));
     }
-    return check(checkpoint, Optional.of(new Fence(ownerEpoch, commitSequence)), budget, true);
+    return check(checkpoint, Optional.of(new Fence(ownerEpoch, commitSequence)),
+        Optional.of(ownerEpoch), budget);
+  }
+
+  /** Revalidates the fixed legacy interval without requiring the old M2 base to remain current. */
+  CompletableFuture<Void> checkHistory(EventIndexBackfillCheckpoint checkpoint, long ownerEpoch,
+      ManifestCatalog.ProofReadBudget budget) {
+    if (ownerEpoch <= 0) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid backfill history owner"));
+    }
+    return check(checkpoint, Optional.empty(), Optional.of(ownerEpoch), budget);
   }
 
   private CompletableFuture<Void> check(EventIndexBackfillCheckpoint checkpoint,
-      Optional<Fence> fence, ManifestCatalog.ProofReadBudget budget, boolean allowInitialSelection) {
+      Optional<Fence> fence, Optional<Long> expectedOwnerEpoch, ManifestCatalog.ProofReadBudget budget) {
     Objects.requireNonNull(checkpoint, "checkpoint");
     Objects.requireNonNull(budget, "budget");
     if (!budget.belongsTo(scope) || checkpoint.firstSequence() != captured.firstSequence()
@@ -114,24 +130,20 @@ public final class EventBackfillWindow implements AutoCloseable {
         || checkpoint.nextSequence() < captured.nextSequence()) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("event backfill window differs from its protection"));
     }
-    return pin.renew().thenCompose(ignored -> budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-        () -> control.read(scope))).thenCompose(snapshot -> {
+    return pin.renew().thenCompose(ignored -> budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+        () -> control.readWithSize(scope))).thenCompose(snapshot -> {
       CommitState state = snapshot.orElseThrow(
           () -> new IllegalStateException("authoritative commit control is missing")).state();
-      boolean initialSelection = allowInitialSelection && checkpoint.equals(captured)
-          && checkpoint.nextSequence() == checkpoint.firstSequence()
-          && state.finalizedSequence() == checkpoint.sequence() - 1
-          && state.publishedSequence() == state.finalizedSequence();
       if (!state.supportsEventRevisionIndex() || state.compactRevision() != captured.compactRevision()
           || registryNamespace.isPresent() && !registryNamespace.equals(state.eventRegistryNamespace())
-          // A proposed checkpoint belongs to the next commit. The captured checkpoint, not the
-          // proposal, is the durable baseline that must already have been finalized.
-          || state.finalizedSequence() < captured.sequence() && !initialSelection
+          || state.ownerEpoch() < checkpoint.ownerEpoch()
+          || expectedOwnerEpoch.filter(epoch -> state.ownerEpoch() != epoch).isPresent()
+          // The v5 owner-epoch fence prevents legacy writers from selecting after upgrade, and
+          // v5 key-change indexes are materialized before finalization. Newer finalized sequences
+          // may therefore sit outside this fixed legacy interval; compact and registry fences stay strict.
+          || !initialCapture && state.finalizedSequence() < captured.sequence()
           || state.finalizedSequence() < checkpoint.upperSequence()
-          || state.finalizedRevision() < checkpoint.upperRevision()
-          || initialSelection && (state.finalizedSequence() != checkpoint.upperSequence()
-              || state.finalizedRevision() != checkpoint.upperRevision())
-          || state.ownerEpoch() < checkpoint.ownerEpoch()) {
+          || state.finalizedRevision() < checkpoint.upperRevision()) {
         throw new IllegalStateException("event backfill protection no longer covers the captured window");
       }
       if (fence.isPresent()) {

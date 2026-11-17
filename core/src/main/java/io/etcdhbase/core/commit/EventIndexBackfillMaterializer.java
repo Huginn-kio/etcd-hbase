@@ -52,13 +52,12 @@ public final class EventIndexBackfillMaterializer {
           || state.compactRevision() != checkpoint.compactRevision()) {
         throw new IllegalStateException("backfill publication fence or compact boundary changed");
       }
-      // The first checkpoint freezes the complete finalized history at the upgrade boundary.
-      // A later commit could otherwise persist a stale upper bound and incorrectly claim coverage.
+      // The first checkpoint freezes the complete legacy interval captured at the upgrade
+      // boundary. Later finalized commits are already governed by the event-index format and do
+      // not extend this legacy interval.
       if (!materialize && previousRevision.isEmpty()
-          && (checkpoint.nextSequence() != checkpoint.firstSequence()
-              || state.finalizedSequence() != checkpoint.upperSequence()
-              || state.finalizedRevision() != checkpoint.upperRevision())) {
-        throw new IllegalStateException("initial backfill window differs from the finalized barrier");
+          && checkpoint.nextSequence() != checkpoint.firstSequence()) {
+        throw new IllegalStateException("initial backfill checkpoint differs from its captured history boundary");
       }
       if (!materialize && previousRevision.isEmpty()) {
         return EventIndexBackfillCapture.verifyBoundaries(checkpoint, sequence ->

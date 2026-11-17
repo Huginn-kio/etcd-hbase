@@ -3,6 +3,7 @@ package io.etcdhbase.hbase.storage;
 import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.commit.SystemRecordRead;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.hbase.codec.CommitControlMessages;
@@ -70,11 +71,21 @@ public final class HBaseCommitControlStore implements CommitControlStore {
 
   @Override
   public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
+    return readWithSize(scope).thenApply(SystemRecordRead::value);
+  }
+
+  @Override
+  public CompletableFuture<SystemRecordRead<ControlSnapshot>> readWithSize(RequestScope scope) {
     long requestPayloadBytes = (long) binding.controlRow().length + binding.family().length;
     return execute(scope, requestPayloadBytes, table -> {
       var get = new Get(binding.controlRow()).setConsistency(Consistency.STRONG)
           .addFamily(binding.family());
-      return table.get(get).thenApply(this::snapshot);
+      return table.get(get).thenApply(row -> {
+        Optional<ControlSnapshot> snapshot = snapshot(row);
+        long encodedBytes = snapshot.map(value -> Math.addExact((long) binding.controlRow().length,
+            value.comparisonToken().length)).orElse(0L);
+        return new SystemRecordRead<>(snapshot, encodedBytes);
+      });
     });
   }
 

@@ -73,8 +73,8 @@ public final class SelectedEventReader {
       CommitDecision expected, ProtectedEventCursor protectedCursor, RequestScope scope,
       ManifestCatalog.ProofReadBudget budget) {
     return protectedCursor.renew()
-        .thenCompose(ignored -> budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-            () -> control.read(scope)))
+        .thenCompose(ignored -> budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+            () -> control.readWithSize(scope)))
         .thenCompose(snapshot -> {
           validateBarrier(snapshot, expected);
           return decisions.read(expected.sequence(), scope, budget);
@@ -85,8 +85,8 @@ public final class SelectedEventReader {
           if (!expected.equals(decision)) {
             throw new IllegalStateException("event locator differs from selected decision");
           }
-          return budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-              () -> manifests.readRoot(decision.manifestRoot(), scope))
+          return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+              () -> manifests.readRootWithSize(decision.manifestRoot(), scope))
               .thenApply(root -> {
                 ManifestRoot manifest = root.orElseThrow(
                     () -> new IllegalStateException("selected manifest root is missing"));
@@ -95,8 +95,8 @@ public final class SelectedEventReader {
               });
         })
         .thenCompose(root -> protectedCursor.renew()
-            .thenCompose(ignored -> budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-                () -> control.read(scope)))
+            .thenCompose(ignored -> budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+                () -> control.readWithSize(scope)))
             .thenApply(snapshot -> {
               validateBarrier(snapshot, expected);
               protectedCursor.attach(new SealedEventCursor(manifests, expected, root, scope));

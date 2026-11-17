@@ -1,5 +1,6 @@
 package io.etcdhbase.hbase.storage;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -60,6 +61,11 @@ class J44EventIndexControlStoreIT {
       assertTrue(M1TestEnvironment.await(oldStore.initializeIfAbsent(
           CommitState.initial(binding.profileFingerprint(), 1), scope)));
       var initial = M1TestEnvironment.await(oldStore.read(scope)).orElseThrow();
+      var sizedInitial = M1TestEnvironment.await(oldStore.readWithSize(scope));
+      var measuredInitial = sizedInitial.value().orElseThrow();
+      assertArrayEquals(initial.comparisonToken(), measuredInitial.comparisonToken());
+      assertEquals((long) binding.controlRow().length + initial.comparisonToken().length,
+          sizedInitial.encodedBytes());
       var claimed = initial.state().claimOwner("owner", 10, 100);
       assertTrue(M1TestEnvironment.await(oldStore.compareAndSet(initial, claimed, scope)));
       var snapshot = M1TestEnvironment.await(oldStore.read(scope)).orElseThrow();

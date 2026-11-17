@@ -104,6 +104,8 @@ class M4ReportTest(unittest.TestCase):
     def test_j44_registry_requires_pin_lifecycle_and_owner_lane_regressions(self) -> None:
         required_cases = {
             "io.etcdhbase.core.commit.SealedEventCursorTest": {
+                "measuredProofReadsChargeActualEncodedBytesAndAllowNinthSmallRead",
+                "measuredProofReadsStillRejectActualBytesBeyondTheirCumulativeLimit",
                 "sequenceReaderPersistsSelectedEventRootBeforeReadingItsIndex",
                 "synchronousSequenceOpenFailureClosesTailerAndSubscriptions",
             },

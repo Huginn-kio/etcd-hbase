@@ -43,6 +43,7 @@ final class EventBackfillCycle {
           MAX_PROOF_PAGES, MAX_PROOF_PAGES);
 
   record CycleResult(boolean progressed, boolean complete) {}
+  record PublicationPlan(EventIndexBackfillCheckpoint checkpoint, InvocationBinding invocation) {}
 
   private final String tableGroup;
   private final SerialMutationQueue ownerLane;
@@ -132,7 +133,7 @@ final class EventBackfillCycle {
             : verifyNext(owner, state, checkpoint, window, windowScope.scope, budget);
         EventIndexBackfillCheckpoint protectedCheckpoint = current.orElse(checkpoint);
         account.close();
-        publishOnOwnerLane(owner, state, proposal, protectedCheckpoint, windowScope.scope,
+        publishOnOwnerLane(owner, proposal, protectedCheckpoint, windowScope.scope,
             current.isEmpty());
         return new CycleResult(true, proposal.complete());
       } finally {
@@ -171,11 +172,9 @@ final class EventBackfillCycle {
     }
   }
 
-  private void publishOnOwnerLane(CommitOwnerService.OwnerToken owner, CommitState state,
+  private void publishOnOwnerLane(CommitOwnerService.OwnerToken owner,
       EventIndexBackfillCheckpoint checkpoint, EventIndexBackfillCheckpoint protectedCheckpoint,
       RequestScope scope, boolean initialCapture) throws BackendFailure {
-    var proposed = InvocationBinding.begin(InvocationId.create(), digest(checkpoint), authorization,
-        TransactionId.create(), owner.epoch(), state.publishedSequence(), state.publishedRevision());
     var publicationDrained = new CompletableFuture<Void>();
     if (!scope.startIfOpen(() -> scope.trackPhysicalProducer(publicationDrained))) {
       throw inactive(scope);
@@ -187,9 +186,13 @@ final class EventBackfillCycle {
         if (scope.isClosed() || scope.isDeadlineExceeded()) {
           return CompletableFuture.failedFuture(inactive(scope));
         }
-        return invocations.bindOrJoin(proposed, laneScope)
-            .thenCompose(invocation -> publishOnLane(invocation, owner, checkpoint,
-                protectedCheckpoint, laneScope, initialCapture));
+        return readPublicationBase(owner, checkpoint, protectedCheckpoint, initialCapture, laneScope)
+            .thenCompose(state -> {
+              PublicationPlan plan = publicationPlan(owner, checkpoint, state, authorization);
+              return invocations.bindOrJoin(plan.invocation(), laneScope)
+                  .thenCompose(invocation -> publishOnLane(invocation, owner, plan.checkpoint(),
+                      protectedCheckpoint, laneScope, initialCapture));
+            });
       });
     } catch (RuntimeException | Error failure) {
       publicationScope.close();
@@ -204,6 +207,45 @@ final class EventBackfillCycle {
     if (result.state() != CommitOutcomeResolver.State.SELECTED_FINALIZED) {
       throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
+  }
+
+  CompletableFuture<CommitState> readPublicationBase(CommitOwnerService.OwnerToken owner,
+      EventIndexBackfillCheckpoint checkpoint, EventIndexBackfillCheckpoint protectedCheckpoint,
+      boolean initialCapture, RequestScope scope) {
+    return stores.control().read(scope).thenApply(found -> {
+      CommitState state = found.orElseThrow(
+          () -> new IllegalStateException("backfill control row is missing")).state();
+      long minimumFinalizedSequence = initialCapture ? checkpoint.upperSequence() : protectedCheckpoint.sequence();
+      if (!state.supportsEventRevisionIndex()
+          || !pins.namespace().equals(state.eventRegistryNamespace())
+          || !checkpoint.registryIdentity().equals(pins.registryIdentity())
+          || state.ownerEpoch() != owner.epoch()
+          || state.ownerInstance().filter(owner.instance()::equals).isEmpty()
+          || state.ownerLeaseExpired(clock.millis()) || state.publication().isPresent()
+          || state.publishedSequence() != state.finalizedSequence()
+          || state.publishedRevision() != state.finalizedRevision()
+          || state.publishedSequence() == Long.MAX_VALUE
+          || state.compactRevision() != checkpoint.compactRevision()
+          || state.finalizedSequence() < minimumFinalizedSequence
+          || state.finalizedSequence() < checkpoint.upperSequence()
+          || state.finalizedRevision() < checkpoint.upperRevision()) {
+        throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      }
+      return state;
+    });
+  }
+
+  static PublicationPlan publicationPlan(CommitOwnerService.OwnerToken owner,
+      EventIndexBackfillCheckpoint checkpoint, CommitState state, ByteKey authorization) {
+    Objects.requireNonNull(owner, "owner");
+    Objects.requireNonNull(checkpoint, "checkpoint");
+    Objects.requireNonNull(state, "state");
+    Objects.requireNonNull(authorization, "authorization");
+    EventIndexBackfillCheckpoint rebound = checkpoint.rebindPublication(owner.epoch(),
+        Math.addExact(state.publishedSequence(), 1));
+    var invocation = InvocationBinding.begin(InvocationId.create(), digest(rebound), authorization,
+        TransactionId.create(), owner.epoch(), state.publishedSequence(), state.publishedRevision());
+    return new PublicationPlan(rebound, invocation);
   }
 
   private CompletableFuture<CommitOutcomeResolver.Resolution> publishOnLane(

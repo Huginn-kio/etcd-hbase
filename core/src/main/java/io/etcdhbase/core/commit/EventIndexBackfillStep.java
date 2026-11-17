@@ -8,7 +8,10 @@ import java.util.concurrent.CompletableFuture;
 
 /** Bounded proof of one legacy sequence before preparing its owner-fenced backfill commit. */
 public final class EventIndexBackfillStep implements AutoCloseable {
-  /** A proposal only: the caller must atomically publish the index and checkpoint through M2. */
+  /**
+   * A proposal only: {@code checkpoint.sequence()} is provisional until the owner lane rebinds it
+   * to the latest finalized M2 base before publishing through M2.
+   */
   public record Prepared(EventIndexBackfillCheckpoint checkpoint, Optional<EventRevisionIndex> index) {
     public Prepared {
       Objects.requireNonNull(checkpoint, "checkpoint");
@@ -22,39 +25,39 @@ public final class EventIndexBackfillStep implements AutoCloseable {
   private final EventBackfillWindow window;
   private final RequestScope scope;
   private final long ownerEpoch;
-  private final long commitSequence;
+  private final long provisionalCommitSequence;
   private boolean reading;
   private boolean finished;
   private boolean closed;
 
   private EventIndexBackfillStep(EventIndexBackfillCheckpoint before,
       SelectedSequenceReader.Selected selected, CommitControlStore control, EventBackfillWindow window,
-      RequestScope scope, long ownerEpoch, long commitSequence) {
+      RequestScope scope, long ownerEpoch, long provisionalCommitSequence) {
     this.before = before;
     this.selected = selected;
     this.control = control;
     this.window = window;
     this.scope = scope;
     this.ownerEpoch = ownerEpoch;
-    this.commitSequence = commitSequence;
+    this.provisionalCommitSequence = provisionalCommitSequence;
   }
 
   /** The caller supplies a checkpoint read from a selected M2 auxiliary version. */
   public static CompletableFuture<EventIndexBackfillStep> open(SelectedSequenceReader source,
       CommitControlStore control, EventBackfillWindow window, EventIndexBackfillCheckpoint checkpoint,
-      ByteKey authorizationDigest, long ownerEpoch, long commitSequence, RequestScope scope,
+      ByteKey authorizationDigest, long ownerEpoch, long provisionalCommitSequence, RequestScope scope,
       ManifestCatalog.ProofReadBudget budget, ManifestCatalog.ProofReadBudget windowBudget) {
     Objects.requireNonNull(source, "source");
     Objects.requireNonNull(control, "control");
     Objects.requireNonNull(window, "window");
     Objects.requireNonNull(checkpoint, "checkpoint");
     Objects.requireNonNull(scope, "scope");
-    if (ownerEpoch < checkpoint.ownerEpoch() || commitSequence <= checkpoint.sequence()) {
-      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid event backfill publication fence"));
+    if (ownerEpoch < checkpoint.ownerEpoch() || provisionalCommitSequence <= checkpoint.sequence()) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid event backfill sequence proposal"));
     }
     var output = new CompletableFuture<EventIndexBackfillStep>();
     output.whenComplete((ignored, failure) -> { if (output.isCancelled()) scope.cancel(); });
-    window.checkPublication(checkpoint, ownerEpoch, commitSequence, windowBudget)
+    window.checkHistory(checkpoint, ownerEpoch, windowBudget)
         .thenCompose(ignored -> source.openLegacy(checkpoint, authorizationDigest, scope, budget))
         .whenComplete((found, failure) -> {
       if (failure != null) {
@@ -68,7 +71,7 @@ public final class EventIndexBackfillStep implements AutoCloseable {
         return;
       }
       var step = new EventIndexBackfillStep(checkpoint, found.orElseThrow(), control, window,
-          scope, ownerEpoch, commitSequence);
+          scope, ownerEpoch, provisionalCommitSequence);
       if (!output.complete(step)) step.close();
     });
     return output;
@@ -86,7 +89,7 @@ public final class EventIndexBackfillStep implements AutoCloseable {
     CompletableFuture<Optional<Prepared>> operation;
     if (selected.events().isEmpty()) {
       try {
-        operation = window.checkPublication(before, ownerEpoch, commitSequence, windowBudget)
+        operation = window.checkHistory(before, ownerEpoch, windowBudget)
             .thenApply(ignored -> Optional.of(proposal()));
       } catch (RuntimeException failure) {
         reading = false;
@@ -97,17 +100,17 @@ public final class EventIndexBackfillStep implements AutoCloseable {
       ProtectedEventCursor events = selected.events().orElseThrow();
       operation = events.next(budget).thenCompose(event -> {
         if (event.isPresent()) return CompletableFuture.completedFuture(Optional.empty());
-        return events.renew().thenCompose(ignored -> budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-            () -> control.read(scope))).thenCompose(snapshot -> {
+        return events.renew().thenCompose(ignored -> budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+            () -> control.readWithSize(scope))).thenCompose(snapshot -> {
           CommitState current = snapshot.orElseThrow(
               () -> new IllegalStateException("authoritative commit control is missing")).state();
           if (current.compactRevision() != before.compactRevision()
               || current.finalizedSequence() < before.sequence() || current.ownerEpoch() != ownerEpoch
-              || current.publishedSequence() == Long.MAX_VALUE
-              || current.publishedSequence() + 1 != commitSequence) {
+              || current.finalizedSequence() < before.upperSequence()
+              || current.finalizedRevision() < before.upperRevision()) {
             throw new IllegalStateException("event backfill boundary or owner changed");
           }
-          return window.checkPublication(before, ownerEpoch, commitSequence, windowBudget)
+          return window.checkHistory(before, ownerEpoch, windowBudget)
               .thenCompose(ignored -> {
                 events.close();
                 return events.releaseCompletion().thenApply(released -> Optional.of(proposal()))
@@ -138,7 +141,7 @@ public final class EventIndexBackfillStep implements AutoCloseable {
   }
 
   private Prepared proposal() {
-    var next = before.advance(ownerEpoch, commitSequence, selected.decision());
+    var next = before.advance(ownerEpoch, provisionalCommitSequence, selected.decision());
     return new Prepared(next, selected.index());
   }
 

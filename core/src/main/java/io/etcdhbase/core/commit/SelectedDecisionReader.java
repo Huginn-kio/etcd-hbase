@@ -23,14 +23,14 @@ public final class SelectedDecisionReader {
     if (sequence <= 0 || !budget.belongsTo(scope)) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid decision sequence or budget"));
     }
-    return budget.read(ManifestCatalog.maximumProofReadPageBytes(), () -> control.read(scope))
+    return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(), () -> control.readWithSize(scope))
         .thenCompose(found -> {
           CommitState state = found.orElseThrow(
               () -> new IllegalStateException("authoritative commit control is missing")).state();
           if (sequence > state.publishedSequence()) return CompletableFuture.completedFuture(Optional.empty());
-          return budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-              () -> decisions.read(sequence, scope)).thenApply(archived ->
-                  Optional.of(resolve(state, sequence, archived)));
+          return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+              () -> decisions.readWithSize(sequence, scope))
+              .thenApply(archived -> Optional.of(resolve(state, sequence, archived)));
         });
   }
 

@@ -54,8 +54,8 @@ public final class SealedEventCursor implements AutoCloseable {
       return CompletableFuture.failedFuture(new IllegalStateException("event ordinal is outside sealed range"));
     }
     if (reference.level() == 0) {
-      return budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-          () -> repository.readEventPage(reference.identity(), scope)).thenApply(found -> {
+      return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+          () -> repository.readEventPageWithSize(reference.identity(), scope)).thenApply(found -> {
         EventPage page = found.orElseThrow(() -> new IllegalStateException("sealed event page is missing"));
         if (!page.transactionId().equals(root.transactionId()) || !page.reference().equals(reference)) {
           throw new IllegalStateException("event page differs from its sealed reference");
@@ -63,8 +63,8 @@ public final class SealedEventCursor implements AutoCloseable {
         return page.events().get(Math.toIntExact(ordinal - page.firstOrdinal()));
       });
     }
-    return budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-        () -> repository.readEventDirectoryPage(reference.identity(), scope)).thenCompose(found -> {
+    return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+        () -> repository.readEventDirectoryPageWithSize(reference.identity(), scope)).thenCompose(found -> {
       EventDirectoryPage directory = found.orElseThrow(
           () -> new IllegalStateException("sealed event directory is missing"));
       if (!directory.transactionId().equals(root.transactionId()) || !directory.reference().equals(reference)) {
@@ -79,8 +79,8 @@ public final class SealedEventCursor implements AutoCloseable {
 
   private CompletableFuture<PreparedEvent> readEvent(PreparedEventReference reference,
       ManifestCatalog.ProofReadBudget budget) {
-    return budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-        () -> repository.readEvent(reference.identity(), scope)).thenApply(found -> {
+    return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+        () -> repository.readEventWithSize(reference.identity(), scope)).thenApply(found -> {
       PreparedEvent event = found.orElseThrow(() -> new IllegalStateException("sealed event is missing"));
       if (!event.transactionId().equals(root.transactionId()) || event.ownerEpoch() != root.ownerEpoch()
           || event.baseSequence() != root.baseSequence() || event.baseRevision() != root.baseRevision()

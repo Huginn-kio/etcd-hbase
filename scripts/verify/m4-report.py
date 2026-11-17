@@ -62,6 +62,8 @@ J44_CRITICAL_JAVA_TESTS = {
         "returnsAllOverlappingIntervalsAcrossRotationsAndRemovals",
     },
     "io.etcdhbase.core.commit.SealedEventCursorTest": {
+        "measuredProofReadsChargeActualEncodedBytesAndAllowNinthSmallRead",
+        "measuredProofReadsStillRejectActualBytesBeyondTheirCumulativeLimit",
         "readsEventsInOrderWithPauseAndBoundedPageReads",
         "missingPageAndExhaustedBudgetFailWithoutAdvancingCursor",
         "sharedTailerReadsOnceAndIsolatesSlowSubscriptions",
@@ -98,7 +100,8 @@ J44_CRITICAL_JAVA_TESTS = {
         "slowBackfillReadDoesNotBlockHeartbeatAndPublicationUsesOwnerLane",
     },
     "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest": {
-        "ownerLossBetweenWorkerInstallationsStopsExistingWorkerAndRejectsLateWorker",
+        "eventHistoryWorkerStartsOnlyWhenTailerReadinessIsRequested",
+        "ownerLossBeforeEventHistoryWorkerInstallationRejectsLateWorker",
         "ownerLossBeforeInstallationRejectsBothWorkers",
     },
     "io.etcdhbase.server.observability.RequestMetricsTest": {

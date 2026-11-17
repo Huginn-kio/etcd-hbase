@@ -28,8 +28,7 @@ final class EventTailerCycle {
   private static final int MAX_PROOF_PAGES = 4096;
   private static final long MAX_PROOF_BYTES = 512L << 20;
 
-  private record TailerSeed(SelectedSequenceReader source, EventIndexBackfillCheckpoint checkpoint,
-      CommitState state) {}
+  private record TailerSeed(SelectedSequenceReader source, ReadView view, CommitState state) {}
 
   private final String tableGroup;
   private final SerialMutationQueue ownerLane;
@@ -109,7 +108,7 @@ final class EventTailerCycle {
           var source = new SelectedSequenceReader(pins, stores.control(), stores.decisions(),
               stores.manifestRepository(), new HBaseEventRevisionIndexRepository(stores.records()));
           source.observePublishedSequence(state.publishedSequence());
-          return Optional.of(new TailerSeed(source, completed, state));
+          return Optional.of(new TailerSeed(source, view, state));
         });
       }).whenComplete((ignored, failure) -> pinned.close());
     });
@@ -132,8 +131,10 @@ final class EventTailerCycle {
         } catch (BackendFailure failure) {
           return CompletableFuture.failedFuture(failure);
         }
+        // The checkpoint proves the captured legacy window is complete. Live delivery starts
+        // after the finalized barrier that was captured with this same sequence/revision pair.
         var candidate = new SharedEventTailer(seed.source(), authorization, memory,
-            seed.checkpoint().upperSequence(), seed.checkpoint().upperRevision(), 100_000,
+            seed.view().finalizedSequence(), seed.view().stableRevision(), 100_000,
             MAX_REVISION_EVENTS, MAX_REVISION_BYTES);
         try {
           return CompletableFuture.completedFuture(pending.installEventTailer(candidate));

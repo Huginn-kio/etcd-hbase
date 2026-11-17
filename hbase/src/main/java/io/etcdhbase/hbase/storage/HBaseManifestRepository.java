@@ -13,6 +13,7 @@ import io.etcdhbase.core.commit.PreparedCandidate;
 import io.etcdhbase.core.commit.PreparedAuxiliaryRecord;
 import io.etcdhbase.core.commit.PreparedEvent;
 import io.etcdhbase.core.commit.SystemRecordStore;
+import io.etcdhbase.core.commit.SystemRecordRead;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.codec.ManifestMessages;
@@ -153,6 +154,34 @@ public final class HBaseManifestRepository implements ManifestRepository {
   }
 
   @Override
+  public CompletableFuture<SystemRecordRead<ManifestRoot>> readRootWithSize(
+      ByteKey identity, RequestScope scope) {
+    return readWithSize(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeRoot,
+        ManifestRoot::systemIdentity, scope);
+  }
+
+  @Override
+  public CompletableFuture<SystemRecordRead<EventPage>> readEventPageWithSize(
+      ByteKey identity, RequestScope scope) {
+    return readWithSize(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeEventPage,
+        EventPage::systemIdentity, scope);
+  }
+
+  @Override
+  public CompletableFuture<SystemRecordRead<EventDirectoryPage>> readEventDirectoryPageWithSize(
+      ByteKey identity, RequestScope scope) {
+    return readWithSize(SystemRecordType.MANIFEST, identity, ManifestMessages::decodeEventDirectory,
+        EventDirectoryPage::systemIdentity, scope);
+  }
+
+  @Override
+  public CompletableFuture<SystemRecordRead<PreparedEvent>> readEventWithSize(
+      ByteKey identity, RequestScope scope) {
+    return readWithSize(SystemRecordType.EVENT, identity, ManifestMessages::decodeEvent,
+        PreparedEvent::systemIdentity, scope);
+  }
+
+  @Override
   public CompletableFuture<Optional<PreparedAuxiliaryRecord>> readAuxiliaryRecord(
       ByteKey identity, RequestScope scope) {
     return read(SystemRecordType.AUXILIARY, identity, ManifestMessages::decodeAuxiliaryRecord,
@@ -174,21 +203,21 @@ public final class HBaseManifestRepository implements ManifestRepository {
   }
 
   @Override
-  public CompletableFuture<ReadValue<PreparedAuxiliaryRecord>> readAuxiliaryRecordWithSize(
+  public CompletableFuture<SystemRecordRead<PreparedAuxiliaryRecord>> readAuxiliaryRecordWithSize(
       ByteKey identity, RequestScope scope) {
     return readWithSize(SystemRecordType.AUXILIARY, identity,
         ManifestMessages::decodeAuxiliaryRecord, PreparedAuxiliaryRecord::systemIdentity, scope);
   }
 
   @Override
-  public CompletableFuture<ReadValue<AuxiliaryPage>> readAuxiliaryPageWithSize(
+  public CompletableFuture<SystemRecordRead<AuxiliaryPage>> readAuxiliaryPageWithSize(
       ByteKey identity, RequestScope scope) {
     return readWithSize(SystemRecordType.AUXILIARY, identity,
         ManifestMessages::decodeAuxiliaryPage, AuxiliaryPage::systemIdentity, scope);
   }
 
   @Override
-  public CompletableFuture<ReadValue<AuxiliaryDirectory>> readAuxiliaryDirectoryWithSize(
+  public CompletableFuture<SystemRecordRead<AuxiliaryDirectory>> readAuxiliaryDirectoryWithSize(
       ByteKey identity, RequestScope scope) {
     return readWithSize(SystemRecordType.AUXILIARY, identity,
         ManifestMessages::decodeAuxiliaryDirectory, AuxiliaryDirectory::systemIdentity, scope);
@@ -206,18 +235,18 @@ public final class HBaseManifestRepository implements ManifestRepository {
     }));
   }
 
-  private <T> CompletableFuture<ReadValue<T>> readWithSize(SystemRecordType type,
+  private <T> CompletableFuture<SystemRecordRead<T>> readWithSize(SystemRecordType type,
       ByteKey identity, java.util.function.Function<byte[], T> decoder,
       java.util.function.Function<T, ByteKey> identityOf, RequestScope scope) {
     return records.read(type, identity, scope).thenApply(value -> {
-      if (value.isEmpty()) return new ReadValue<>(Optional.empty(), 0);
+      if (value.isEmpty()) return new SystemRecordRead<>(Optional.empty(), 0);
       ByteKey encoded = value.orElseThrow();
       T decoded = decoder.apply(encoded.bytes());
       if (!identityOf.apply(decoded).equals(identity)) {
         throw new IllegalArgumentException("manifest record row identity differs from its payload");
       }
       long encodedBytes = Math.addExact(identity.length(), encoded.length());
-      return new ReadValue<>(Optional.of(decoded), encodedBytes);
+      return new SystemRecordRead<>(Optional.of(decoded), encodedBytes);
     });
   }
 

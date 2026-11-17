@@ -102,6 +102,19 @@ public record EventIndexBackfillCheckpoint(long ownerEpoch, long sequence, long 
         verifiedDecision.revision(), upperRevision, compactRevision, registryIdentity);
   }
 
+  /**
+   * Rebinds verified history progress to the current owner and next M2 publication sequence.
+   * The captured legacy interval and its cursor remain unchanged; only the selection fence moves.
+   */
+  public EventIndexBackfillCheckpoint rebindPublication(long nextOwnerEpoch, long nextCommitSequence) {
+    if (nextOwnerEpoch < ownerEpoch || nextCommitSequence < sequence) {
+      throw new IllegalArgumentException("event backfill publication fence cannot regress");
+    }
+    return new EventIndexBackfillCheckpoint(nextOwnerEpoch, nextCommitSequence, firstSequence,
+        upperSequence, nextSequence, firstBaseRevision, currentRevision, upperRevision,
+        compactRevision, registryIdentity);
+  }
+
   /** Rejects altered windows or cursor jumps when a newer checkpoint is prepared. */
   public static void requireForwardProgress(EventIndexBackfillCheckpoint previous,
       EventIndexBackfillCheckpoint replacement) {

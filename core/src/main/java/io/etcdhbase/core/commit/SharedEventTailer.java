@@ -35,6 +35,7 @@ public final class SharedEventTailer implements AutoCloseable {
     private final SharedEventTailer owner;
     private final long expectedSequence;
     private final long expectedRevision;
+    private final long sequenceThrough;
     private final Step step;
     private final RequestScope scope;
     private final Optional<SelectedSequenceReader.Selected> selected;
@@ -46,12 +47,14 @@ public final class SharedEventTailer implements AutoCloseable {
     private final AtomicBoolean consumed = new AtomicBoolean();
 
     private StepProposal(SharedEventTailer owner, long expectedSequence, long expectedRevision,
-        Step step, RequestScope scope, Optional<SelectedSequenceReader.Selected> selected,
+        long sequenceThrough, Step step, RequestScope scope,
+        Optional<SelectedSequenceReader.Selected> selected,
         ProtectedEventCursor expectedCursor, CommitDecision expectedDecision,
         ProtectedEventCursor cursor, CommitDecision decision, PreparedEvent event) {
       this.owner = owner;
       this.expectedSequence = expectedSequence;
       this.expectedRevision = expectedRevision;
+      this.sequenceThrough = sequenceThrough;
       this.step = step;
       this.scope = scope;
       this.selected = selected;
@@ -91,7 +94,7 @@ public final class SharedEventTailer implements AutoCloseable {
     this.source = Objects.requireNonNull(source, "source");
     this.authorizationDigest = Objects.requireNonNull(authorizationDigest, "authorizationDigest");
     this.memory = Objects.requireNonNull(memory, "memory");
-    if (authorizationDigest.length() != 32 || completedSequence < 0 || completedSequence == Long.MAX_VALUE
+    if (authorizationDigest.length() != 32 || completedSequence < 0
         || completedRevision <= 0 || maximumSubscriptions < 1 || maximumRevisionEvents < 1
         || maximumRevisionBytes < 1 || maximumRevisionBytes > ManifestRoot.MAX_EVENT_BYTES) {
       throw new IllegalArgumentException("invalid shared tailer checkpoint or limits");
@@ -268,19 +271,25 @@ public final class SharedEventTailer implements AutoCloseable {
 
   private CompletableFuture<StepProposal> open(long expectedSequence, long expectedRevision,
       RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
-    long nextSequence = Math.addExact(expectedSequence, 1);
-    return source.open(nextSequence, expectedRevision, authorizationDigest, scope, budget)
-        .thenApply(found -> found.isEmpty()
-            ? proposal(expectedSequence, expectedRevision, Step.WAITING, scope, Optional.empty(),
-                null, null, null, null, null)
-            : selectedProposal(expectedSequence, expectedRevision, scope, found.orElseThrow()));
+    return source.openNext(expectedSequence, expectedRevision, authorizationDigest, scope, budget)
+        .thenApply(readAhead -> readAhead.nextEvent().isEmpty()
+            ? metadataProposal(expectedSequence, expectedRevision,
+                readAhead.metadataThroughSequence(), scope)
+            : selectedProposal(expectedSequence, expectedRevision,
+                readAhead.metadataThroughSequence(), scope, readAhead.nextEvent().orElseThrow()));
   }
 
-  private StepProposal selectedProposal(long expectedSequence, long expectedRevision, RequestScope scope,
-      SelectedSequenceReader.Selected selected) {
-    Step step = selected.events().isEmpty() ? Step.METADATA : Step.OPENED;
-    return proposal(expectedSequence, expectedRevision, step, scope, Optional.of(selected),
-        null, null, null, selected.decision(), null);
+  private StepProposal metadataProposal(long expectedSequence, long expectedRevision,
+      long sequenceThrough, RequestScope scope) {
+    Step step = sequenceThrough == expectedSequence ? Step.WAITING : Step.METADATA;
+    return proposal(expectedSequence, expectedRevision, sequenceThrough, step, scope,
+        Optional.empty(), null, null, null, null, null);
+  }
+
+  private StepProposal selectedProposal(long expectedSequence, long expectedRevision,
+      long sequenceThrough, RequestScope scope, SelectedSequenceReader.Selected selected) {
+    return proposal(expectedSequence, expectedRevision, sequenceThrough, Step.OPENED, scope,
+        Optional.of(selected), null, null, selected.events().orElseThrow(), selected.decision(), null);
   }
 
   private CompletableFuture<StepProposal> readEvent(long expectedSequence, long expectedRevision,
@@ -289,20 +298,23 @@ public final class SharedEventTailer implements AutoCloseable {
     return cursor.next(budget).thenCompose(found -> {
       if (found.isPresent()) {
         return CompletableFuture.completedFuture(proposal(expectedSequence, expectedRevision,
-            Step.BUFFERED, scope, Optional.empty(), cursor, decision,
+            expectedSequence, Step.BUFFERED, scope, Optional.empty(), cursor, decision,
             cursor, decision, found.orElseThrow()));
       }
       return CompletableFuture.completedFuture(proposal(expectedSequence, expectedRevision,
-          Step.PUBLISHED, scope, Optional.empty(), cursor, decision,
+          expectedSequence, Step.PUBLISHED, scope, Optional.empty(), cursor, decision,
           cursor, decision, null));
     });
   }
 
-  private StepProposal proposal(long expectedSequence, long expectedRevision, Step step,
-      RequestScope scope, Optional<SelectedSequenceReader.Selected> selected,
+  private StepProposal proposal(long expectedSequence, long expectedRevision, long sequenceThrough,
+      Step step, RequestScope scope, Optional<SelectedSequenceReader.Selected> selected,
       ProtectedEventCursor expectedCursor, CommitDecision expectedDecision,
       ProtectedEventCursor cursor, CommitDecision decision, PreparedEvent event) {
-    return new StepProposal(this, expectedSequence, expectedRevision, step, scope,
+    if (sequenceThrough < expectedSequence) {
+      throw new IllegalArgumentException("event tailer proposal moves its sequence backwards");
+    }
+    return new StepProposal(this, expectedSequence, expectedRevision, sequenceThrough, step, scope,
         selected, expectedCursor, expectedDecision, cursor, decision, event);
   }
 
@@ -318,14 +330,20 @@ public final class SharedEventTailer implements AutoCloseable {
     return switch (proposal.step) {
       case WAITING -> Step.WAITING;
       case METADATA -> {
-        CommitDecision decision = proposal.decision;
-        requireContiguous(decision, proposal.expectedSequence, proposal.expectedRevision);
-        sequence = decision.sequence();
+        if (proposal.selected.isPresent() || proposal.sequenceThrough == proposal.expectedSequence
+            || proposal.expectedCursor != null || proposal.expectedDecision != null
+            || proposal.cursor != null || proposal.decision != null || proposal.event != null) {
+          throw new java.util.concurrent.CompletionException(
+              new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        }
+        sequence = proposal.sequenceThrough;
         yield Step.METADATA;
       }
       case OPENED -> {
         CommitDecision decision = proposal.decision;
-        requireContiguous(decision, proposal.expectedSequence, proposal.expectedRevision);
+        requireEventAfterMetadata(decision, proposal.expectedSequence,
+            proposal.sequenceThrough, proposal.expectedRevision);
+        sequence = proposal.sequenceThrough;
         active = proposal.selected.orElseThrow().events().orElseThrow();
         activeScope = proposal.scope;
         activeDecision = decision;
@@ -353,9 +371,11 @@ public final class SharedEventTailer implements AutoCloseable {
     };
   }
 
-  private static void requireContiguous(CommitDecision decision, long sequence, long revision) {
-    if (decision == null || decision.sequence() != Math.addExact(sequence, 1)
-        || decision.baseRevision() != revision) {
+  private static void requireEventAfterMetadata(CommitDecision decision, long completedSequence,
+      long metadataThroughSequence, long revision) {
+    if (decision == null || metadataThroughSequence < completedSequence
+        || decision.sequence() != Math.addExact(metadataThroughSequence, 1)
+        || decision.baseRevision() != revision || !decision.containsKeyChanges()) {
       throw new java.util.concurrent.CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
   }

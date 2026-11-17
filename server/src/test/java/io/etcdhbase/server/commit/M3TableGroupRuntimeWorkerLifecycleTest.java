@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
 
@@ -41,7 +42,24 @@ class M3TableGroupRuntimeWorkerLifecycleTest {
   }
 
   @Test
-  void ownerLossBetweenWorkerInstallationsStopsExistingWorkerAndRejectsLateWorker() {
+  void eventHistoryWorkerStartsOnlyWhenTailerReadinessIsRequested() {
+    try (var scope = RequestScope.withoutDeadline()) {
+      var pending = new M3TableGroupRuntime.Pending(scope, null, true);
+      var history = mock(EventHistoryWorker.class);
+      pending.installEventHistoryWorker(history);
+
+      verify(history, never()).start();
+      assertFalse(pending.eventTailerReady().isDone());
+      assertFalse(pending.eventTailerReady().isDone());
+
+      verify(history, times(1)).start();
+      pending.ownerLost();
+      verify(history).stop();
+    }
+  }
+
+  @Test
+  void ownerLossBeforeEventHistoryWorkerInstallationRejectsLateWorker() {
     try (var scope = RequestScope.withoutDeadline()) {
       var pending = new M3TableGroupRuntime.Pending(scope, null);
       var expiry = mock(LeaseExpiryWorker.class);
@@ -51,7 +69,7 @@ class M3TableGroupRuntimeWorkerLifecycleTest {
       pending.ownerLost();
 
       verify(expiry).stop();
-      assertThrows(IllegalStateException.class, () -> pending.startEventHistoryWorker(history));
+      assertThrows(IllegalStateException.class, () -> pending.installEventHistoryWorker(history));
       verify(history, never()).start();
     }
   }
@@ -65,7 +83,7 @@ class M3TableGroupRuntimeWorkerLifecycleTest {
       pending.ownerLost();
 
       assertThrows(IllegalStateException.class, () -> pending.startExpiryWorker(expiry));
-      assertThrows(IllegalStateException.class, () -> pending.startEventHistoryWorker(history));
+      assertThrows(IllegalStateException.class, () -> pending.installEventHistoryWorker(history));
       verify(expiry, never()).start();
       verify(history, never()).start();
     }

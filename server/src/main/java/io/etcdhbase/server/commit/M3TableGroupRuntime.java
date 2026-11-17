@@ -777,7 +777,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           owner::currentToken, stores, pending.eventPins, budgets, authorization,
           pending, business.metrics());
       var history = new EventHistoryCycle(backfill, tailer, business.metrics());
-      pending.startEventHistoryWorker(new EventHistoryWorker(
+      pending.installEventHistoryWorker(new EventHistoryWorker(
           pending.leaseTimers, owner::currentToken, history::run, business.metrics()));
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
@@ -920,6 +920,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     private volatile LeaseExpiryWorker expiryWorker;
     private volatile EventHistoryWorker eventHistoryWorker;
     private volatile boolean leaseEnabled;
+    private boolean eventHistoryWorkerStarted;
     private boolean ownerLost;
 
     Pending(RequestScope startup, ScheduledExecutorService leaseTimers) {
@@ -999,13 +1000,24 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       worker.start();
     }
 
-    synchronized void startEventHistoryWorker(EventHistoryWorker worker) {
+    synchronized void installEventHistoryWorker(EventHistoryWorker worker) {
       Objects.requireNonNull(worker, "worker");
       if (closing.get() || ownerLost || eventHistoryWorker != null) {
         throw new IllegalStateException("event history worker cannot be installed now");
       }
       eventHistoryWorker = worker;
-      worker.start();
+    }
+
+    private void startEventHistoryWorkerOnDemand() {
+      if (closing.get() || ownerLost || eventTailer != null || eventHistoryWorkerStarted
+          || eventHistoryWorker == null) return;
+      eventHistoryWorkerStarted = true;
+      try {
+        eventHistoryWorker.start();
+      } catch (RuntimeException | Error failure) {
+        eventHistoryWorkerStarted = false;
+        throw failure;
+      }
     }
 
     synchronized BudgetManager.Account eventTailerMemory(BudgetManager budgets, String tableGroup)
@@ -1048,7 +1060,10 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       return true;
     }
 
-    synchronized CompletableFuture<SharedEventTailer> eventTailerReady() { return eventTailerReady.copy(); }
+    synchronized CompletableFuture<SharedEventTailer> eventTailerReady() {
+      startEventHistoryWorkerOnDemand();
+      return eventTailerReady.copy();
+    }
 
     private CompletableFuture<Void> initialReadiness() {
       if (!leaseEnabled) return CompletableFuture.completedFuture(null);

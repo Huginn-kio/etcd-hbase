@@ -39,6 +39,9 @@ class HBaseEventRevisionIndexRepositoryTest {
 
     try (RequestScope scope = RequestScope.withoutDeadline()) {
       assertEquals(Optional.of(index), repository.read(9, scope).join());
+      var sized = repository.readWithSize(9, scope).join();
+      assertEquals(Optional.of(index), sized.value());
+      assertEquals(Long.BYTES + encoded.length(), sized.encodedBytes());
       assertEquals(SystemRecordStore.CreateResult.CREATED, repository.createIfAbsent(index, scope).join());
       assertThrows(CompletionException.class, () -> repository.read(10, scope).join());
       assertThrows(IllegalArgumentException.class, () -> repository.read(0, scope));

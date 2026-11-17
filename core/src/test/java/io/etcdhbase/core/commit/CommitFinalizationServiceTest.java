@@ -19,7 +19,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class CommitFinalizationServiceTest {
@@ -73,6 +75,55 @@ class CommitFinalizationServiceTest {
           () -> fixture.service.finish(fixture.invocation, pending, scope).get());
       assertEquals(0, fixture.control.state.finalizedSequence());
       assertTrue(fixture.control.state.publication().isPresent());
+    }
+  }
+
+  @Test
+  void persistsEventIndexBeforeAdvancingFinalizedSequence() throws Exception {
+    Fixture fixture = new Fixture(SystemRecordStore.CreateResult.ALREADY_PRESENT, true, false);
+    CommitState state = fixture.control.state;
+    fixture.control.state = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION,
+        state.profileFingerprint(), state.ownerInstance(), state.ownerEpoch(),
+        state.ownerLeaseDeadlineEpochMillis(), state.stateVersion(), state.publishedSequence(),
+        state.publishedRevision(), state.finalizedSequence(), state.finalizedRevision(),
+        state.publication(), state.compactRevision());
+
+    var stored = new AtomicReference<EventRevisionIndex>();
+    var writeStarted = new CompletableFuture<Void>();
+    var writeResult = new CompletableFuture<SystemRecordStore.CreateResult>();
+    EventRevisionIndexRepository indexes = new EventRevisionIndexRepository() {
+      @Override public CompletableFuture<Optional<EventRevisionIndex>> read(long revision,
+          RequestScope scope) {
+        return CompletableFuture.completedFuture(Optional.ofNullable(stored.get()));
+      }
+
+      @Override public CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
+          EventRevisionIndex index, RequestScope scope) {
+        writeStarted.complete(null);
+        return writeResult.thenApply(result -> {
+          stored.set(index);
+          return result;
+        });
+      }
+    };
+    var service = new CommitFinalizationService(fixture.control,
+        new CommitOutcomeResolver(fixture.control, fixture.decisions), fixture.decisions,
+        fixture.catalog, fixture.materialization, null, null, indexes);
+    var pending = new CommitOutcomeResolver.Resolution(
+        CommitOutcomeResolver.State.SELECTED_PENDING, Optional.of(fixture.decision), Optional.empty());
+
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var result = service.finish(fixture.invocation, pending, scope);
+      writeStarted.get(5, TimeUnit.SECONDS);
+
+      assertFalse(result.isDone());
+      assertEquals(0, fixture.control.state.finalizedSequence());
+      assertTrue(fixture.control.state.publication().isPresent());
+
+      writeResult.complete(SystemRecordStore.CreateResult.CREATED);
+      assertEquals(CommitOutcomeResolver.State.SELECTED_FINALIZED, result.join().state());
+      assertEquals(1, fixture.control.state.finalizedSequence());
+      assertEquals(EventRevisionIndex.fromSelected(fixture.decision, fixture.root), stored.get());
     }
   }
 
@@ -217,6 +268,8 @@ class CommitFinalizationServiceTest {
     private final MemoryControl control = new MemoryControl();
     private final MemoryDecisions decisions;
     private final AtomicInteger materializationCalls = new AtomicInteger();
+    private final ManifestCatalog catalog;
+    private final MaterializationStore materialization;
     private final CommitFinalizationService service;
 
     private Fixture(SystemRecordStore.CreateResult archiveResult) {
@@ -243,10 +296,18 @@ class CommitFinalizationServiceTest {
                 new StorageMetadata(1, 2, 2, 0, StorageMetadata.State.LIVE, value.length), value));
         ManifestPage page = ManifestPage.create(transactionId, 0,
             List.of(ManifestCandidateReference.from(candidate, 0)));
+        PreparedEvent event = new PreparedEvent(transactionId, 1, 0, 1, 0,
+            PreparedEvent.Kind.PUT, candidate.record(), Optional.empty());
+        EventPage eventPage = EventPage.create(transactionId, 0,
+            List.of(PreparedEventReference.from(event)));
+        EventDirectoryPage eventDirectory = EventDirectoryPage.create(transactionId, 0, 1,
+            List.of(eventPage.reference()));
         root = withResult
             ? ManifestRoot.createWithResult(transactionId, 1, 0, 1, 1, value.length,
-                Optional.of(page.reference()), 0, 0, Optional.empty(), resultDirectory.reference())
-            : ManifestRoot.create(transactionId, 1, 0, 1, 1, value.length, Optional.of(page.reference()));
+                Optional.of(page.reference()), 1, event.retainedBytes(),
+                Optional.of(eventDirectory.reference()), resultDirectory.reference())
+            : ManifestRoot.create(transactionId, 1, 0, 1, 1, value.length,
+                Optional.of(page.reference()), 1, event.retainedBytes(), Optional.of(eventDirectory.reference()));
         invocation = preparing.seal(root.systemIdentity());
         decision = new CommitDecision(transactionId, invocationId,
             1, 1, 2, root.systemIdentity(), root.digest(), true);
@@ -269,8 +330,8 @@ class CommitFinalizationServiceTest {
       ManifestRepository repository = new StubManifestRepository(root, candidate,
           withCandidate ? ManifestPage.create(transactionId, 0,
               List.of(ManifestCandidateReference.from(candidate, 0))) : null);
-      ManifestCatalog catalog = new ManifestCatalog(repository);
-      MaterializationStore materialization = new MaterializationStore() {
+      catalog = new ManifestCatalog(repository);
+      materialization = new MaterializationStore() {
         @Override
         public CompletableFuture<ApplyResult> applySelected(
             CommitDecision selected, PreparedCandidate candidate, RequestScope scope) {

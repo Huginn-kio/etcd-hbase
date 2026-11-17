@@ -3,6 +3,7 @@ package io.etcdhbase.hbase.storage;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.CommitDecision;
 import io.etcdhbase.core.commit.CommitDecisionRepository;
+import io.etcdhbase.core.commit.SystemRecordRead;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.request.RequestScope;
@@ -23,14 +24,23 @@ public final class HBaseCommitDecisionRepository implements CommitDecisionReposi
   @Override
   public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope scope) {
     ByteKey identity = identity(sequence);
-    return records.read(SystemRecordType.DECISION, identity, scope).thenApply(value ->
-        value.map(encoded -> {
-          CommitDecision decision = CommitDecisionMessages.decode(encoded.bytes());
-          if (decision.sequence() != sequence) {
-            throw new IllegalArgumentException("decision row key and sequence do not match");
-          }
-          return decision;
-        }));
+    return readWithSize(sequence, scope).thenApply(SystemRecordRead::value);
+  }
+
+  @Override
+  public CompletableFuture<SystemRecordRead<CommitDecision>> readWithSize(
+      long sequence, RequestScope scope) {
+    ByteKey identity = identity(sequence);
+    return records.read(SystemRecordType.DECISION, identity, scope).thenApply(value -> {
+      if (value.isEmpty()) return new SystemRecordRead<>(Optional.empty(), 0);
+      ByteKey encoded = value.orElseThrow();
+      CommitDecision decision = CommitDecisionMessages.decode(encoded.bytes());
+      if (decision.sequence() != sequence) {
+        throw new IllegalArgumentException("decision row key and sequence do not match");
+      }
+      return new SystemRecordRead<>(Optional.of(decision),
+          Math.addExact(identity.length(), encoded.length()));
+    });
   }
 
   @Override

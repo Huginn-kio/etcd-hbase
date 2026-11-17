@@ -117,6 +117,12 @@ public final class ManifestCatalog {
       return new ProofPageRead<T>(lease, maximumPageBytes, encodedBytes, true).start(work);
     }
 
+    <T> CompletableFuture<Optional<T>> readMeasured(long maximumPageBytes,
+        Supplier<CompletableFuture<SystemRecordRead<T>>> work) {
+      return readMeasured(maximumPageBytes, SystemRecordRead::encodedBytes, work)
+          .thenApply(SystemRecordRead::value);
+    }
+
     /** Reserves a bounded scan page without charging it as a point Get. */
     <T> CompletableFuture<T> scan(long maximumBytes, Supplier<CompletableFuture<T>> work) {
       BudgetManager.Lease lease;
@@ -449,12 +455,10 @@ public final class ManifestCatalog {
   private record AuxiliaryTarget(SystemRecordType type, ByteKey identity) {}
 
   private static <T> CompletableFuture<Optional<T>> readAuxiliary(ProofReadBudget budget,
-      Supplier<CompletableFuture<ManifestRepository.ReadValue<T>>> work) {
-    CompletableFuture<ManifestRepository.ReadValue<T>> read = budget == null
-        ? work.get()
-        : budget.readMeasured(PROOF_SYSTEM_RECORD_ENVELOPE,
-            ManifestRepository.ReadValue::encodedBytes, work);
-    return read.thenApply(ManifestRepository.ReadValue::value);
+      Supplier<CompletableFuture<SystemRecordRead<T>>> work) {
+    return budget == null
+        ? work.get().thenApply(SystemRecordRead::value)
+        : budget.readMeasured(PROOF_SYSTEM_RECORD_ENVELOPE, work);
   }
 
   private static void requireAuxiliaryActive(RequestScope scope) {

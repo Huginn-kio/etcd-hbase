@@ -5,26 +5,9 @@ import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.ToLongFunction;
 
 /** Append-only persistence for private candidates and the sealed manifest tree. */
 public interface ManifestRepository {
-  /** A decoded immutable record together with its stored row and payload byte count. */
-  record ReadValue<T>(Optional<T> value, long encodedBytes) {
-    public ReadValue {
-      Objects.requireNonNull(value, "value");
-      if (encodedBytes < 0 || value.isEmpty() && encodedBytes != 0) {
-        throw new IllegalArgumentException("invalid manifest read byte count");
-      }
-    }
-
-    static <T> ReadValue<T> estimated(Optional<T> value, ToLongFunction<T> size) {
-      Objects.requireNonNull(value, "value");
-      Objects.requireNonNull(size, "size");
-      return new ReadValue<>(value, value.map(item -> size.applyAsLong(item)).orElse(0L));
-    }
-  }
-
   /** Validates a candidate row identity and returns its fixed salt bucket. */
   int candidateBucket(PreparedCandidate candidate);
 
@@ -78,6 +61,35 @@ public interface ManifestRepository {
   CompletableFuture<Optional<EventDirectoryPage>> readEventDirectoryPage(
       ByteKey identity, RequestScope scope);
 
+  /** Reads an event root and accounts its stored identity and value bytes. */
+  default CompletableFuture<SystemRecordRead<ManifestRoot>> readRootWithSize(
+      ByteKey identity, RequestScope scope) {
+    return SystemRecordRead.map(readRoot(identity, scope), root ->
+        Math.addExact(root.systemIdentity().length(), 16L << 10));
+  }
+
+  /** Reads a sealed event page and accounts its stored identity and value bytes. */
+  default CompletableFuture<SystemRecordRead<EventPage>> readEventPageWithSize(
+      ByteKey identity, RequestScope scope) {
+    return SystemRecordRead.map(readEventPage(identity, scope), page ->
+        Math.addExact(page.systemIdentity().length(), Math.addExact(page.encodedBytes(), 4096L)));
+  }
+
+  /** Reads an event directory page and accounts its stored identity and value bytes. */
+  default CompletableFuture<SystemRecordRead<EventDirectoryPage>> readEventDirectoryPageWithSize(
+      ByteKey identity, RequestScope scope) {
+    return SystemRecordRead.map(readEventDirectoryPage(identity, scope), page ->
+        Math.addExact(page.systemIdentity().length(), Math.addExact(
+            Math.multiplyExact(page.children().size(), 256L), 4096L)));
+  }
+
+  /** Reads one prepared event and accounts its stored identity and value bytes. */
+  default CompletableFuture<SystemRecordRead<PreparedEvent>> readEventWithSize(
+      ByteKey identity, RequestScope scope) {
+    return SystemRecordRead.map(readEvent(identity, scope), event ->
+        Math.addExact(event.systemIdentity().length(), Math.addExact(event.retainedBytes(), 4096L)));
+  }
+
   default CompletableFuture<Optional<PreparedAuxiliaryRecord>> readAuxiliaryRecord(
       ByteKey identity, RequestScope scope) {
     return CompletableFuture.failedFuture(new UnsupportedOperationException(
@@ -97,23 +109,23 @@ public interface ManifestRepository {
   }
 
   /** Reads an auxiliary record with its stored-byte cost; adapters should return the exact size. */
-  default CompletableFuture<ReadValue<PreparedAuxiliaryRecord>> readAuxiliaryRecordWithSize(
+  default CompletableFuture<SystemRecordRead<PreparedAuxiliaryRecord>> readAuxiliaryRecordWithSize(
       ByteKey identity, RequestScope scope) {
-    return readAuxiliaryRecord(identity, scope).thenApply(value -> ReadValue.estimated(value,
+    return readAuxiliaryRecord(identity, scope).thenApply(value -> SystemRecordRead.estimated(value,
         ManifestRepository::estimatedAuxiliaryRecordBytes));
   }
 
   /** Reads an auxiliary page with its stored-byte cost; the default is a conservative model size. */
-  default CompletableFuture<ReadValue<AuxiliaryPage>> readAuxiliaryPageWithSize(
+  default CompletableFuture<SystemRecordRead<AuxiliaryPage>> readAuxiliaryPageWithSize(
       ByteKey identity, RequestScope scope) {
-    return readAuxiliaryPage(identity, scope).thenApply(value -> ReadValue.estimated(value,
+    return readAuxiliaryPage(identity, scope).thenApply(value -> SystemRecordRead.estimated(value,
         ManifestRepository::estimatedAuxiliaryPageBytes));
   }
 
   /** Reads an auxiliary directory with its stored-byte cost; the default is a conservative model size. */
-  default CompletableFuture<ReadValue<AuxiliaryDirectory>> readAuxiliaryDirectoryWithSize(
+  default CompletableFuture<SystemRecordRead<AuxiliaryDirectory>> readAuxiliaryDirectoryWithSize(
       ByteKey identity, RequestScope scope) {
-    return readAuxiliaryDirectory(identity, scope).thenApply(value -> ReadValue.estimated(value,
+    return readAuxiliaryDirectory(identity, scope).thenApply(value -> SystemRecordRead.estimated(value,
         ManifestRepository::estimatedAuxiliaryDirectoryBytes));
   }
 

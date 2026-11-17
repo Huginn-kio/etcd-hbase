@@ -8,6 +8,14 @@ import java.util.concurrent.CompletableFuture;
 public interface EventRevisionIndexRepository {
   CompletableFuture<Optional<EventRevisionIndex>> read(long revision, RequestScope scope);
 
+  /** Reads a revision locator with its encoded storage cost for bounded proof work. */
+  default CompletableFuture<SystemRecordRead<EventRevisionIndex>> readWithSize(
+      long revision, RequestScope scope) {
+    return SystemRecordRead.map(read(revision, scope), index ->
+        Math.addExact(160L, Math.addExact(index.events().identity().length(),
+            index.events().digest().length())));
+  }
+
   CompletableFuture<SystemRecordStore.CreateResult> createIfAbsent(
       EventRevisionIndex index, RequestScope scope);
 

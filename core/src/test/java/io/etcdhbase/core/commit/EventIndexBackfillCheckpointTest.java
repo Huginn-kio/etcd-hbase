@@ -45,6 +45,31 @@ class EventIndexBackfillCheckpointTest {
         () -> EventIndexBackfillCheckpoint.sequence(ByteKey.copyOf(new byte[EventIndexBackfillCheckpoint.IDENTITY_BYTES])));
   }
 
+  @Test
+  void rebindsPublicationSequenceWithoutChangingCapturedProgress() {
+    var initial = new EventIndexBackfillCheckpoint(2, 8, 2, 7, 2, 10, 10, 11, 4,
+        ByteKey.copyOf(new byte[16]));
+    var metadata = decision(2, 10, false);
+    var advanced = initial.advance(2, 9, metadata);
+    var reboundInitial = initial.rebindPublication(2, 12);
+    var reboundAdvanced = advanced.rebindPublication(3, 13);
+
+    assertEquals(12, reboundInitial.sequence());
+    assertEquals(3, reboundAdvanced.ownerEpoch());
+    assertEquals(13, reboundAdvanced.sequence());
+    assertEquals(advanced.firstSequence(), reboundAdvanced.firstSequence());
+    assertEquals(advanced.upperSequence(), reboundAdvanced.upperSequence());
+    assertEquals(advanced.nextSequence(), reboundAdvanced.nextSequence());
+    assertEquals(advanced.firstBaseRevision(), reboundAdvanced.firstBaseRevision());
+    assertEquals(advanced.currentRevision(), reboundAdvanced.currentRevision());
+    assertEquals(advanced.upperRevision(), reboundAdvanced.upperRevision());
+    assertEquals(advanced.compactRevision(), reboundAdvanced.compactRevision());
+    assertEquals(advanced.registryIdentity(), reboundAdvanced.registryIdentity());
+
+    assertThrows(IllegalArgumentException.class, () -> advanced.rebindPublication(1, 13));
+    assertThrows(IllegalArgumentException.class, () -> advanced.rebindPublication(3, 8));
+  }
+
   private CommitDecision decision(long sequence, long baseRevision, boolean changesKey) {
     return new CommitDecision(TransactionId.create(), InvocationId.create(), sequence, baseRevision,
         baseRevision + (changesKey ? 1 : 0), root, digest, changesKey);

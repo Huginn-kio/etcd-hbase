@@ -5,6 +5,7 @@ import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.BiFunction;
 
 /** Reads the next selected sequence under a durable event-history pin. */
 public final class SelectedSequenceReader {
@@ -39,6 +40,29 @@ public final class SelectedSequenceReader {
     }
   }
 
+  /** The metadata-only sequence prefix through which the reader proved no KV event is missing. */
+  public record ReadAhead(long metadataThroughSequence, Optional<Selected> nextEvent) {
+    public ReadAhead {
+      Objects.requireNonNull(nextEvent, "nextEvent");
+      if (metadataThroughSequence < 0) {
+        throw new IllegalArgumentException("metadata sequence watermark must be non-negative");
+      }
+      nextEvent.ifPresent(selected -> {
+        if (selected.decision().sequence() != Math.addExact(metadataThroughSequence, 1)
+            || !selected.decision().containsKeyChanges()) {
+          throw new IllegalArgumentException("event decision does not follow the metadata watermark");
+        }
+      });
+    }
+  }
+
+  private record LocatedEvent(long sequence, Optional<EventRevisionIndex> index) {
+    private LocatedEvent {
+      Objects.requireNonNull(index, "index");
+      if (sequence <= 0) throw new IllegalArgumentException("event sequence must be positive");
+    }
+  }
+
   /**
    * The caller supplies the last complete revision and the next sequence from its own verified
    * checkpoint. The scope belongs exclusively to this step. Empty means no sequence was selected
@@ -47,6 +71,118 @@ public final class SelectedSequenceReader {
   public CompletableFuture<Optional<Selected>> open(long sequence, long baseRevision,
       ByteKey authorizationDigest, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
     return open(sequence, baseRevision, authorizationDigest, scope, budget, Optional.empty());
+  }
+
+  /**
+   * Finds the next event-bearing decision without reading every intervening metadata-only sequence.
+   * An unchanged authoritative revision proves that the selected prefix contains no KV events;
+   * otherwise the complete revision index must locate the next event before the prefix is skipped.
+   */
+  public CompletableFuture<ReadAhead> openNext(long completedSequence, long completedRevision,
+      ByteKey authorizationDigest, RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    Objects.requireNonNull(authorizationDigest, "authorizationDigest");
+    Objects.requireNonNull(scope, "scope");
+    Objects.requireNonNull(budget, "budget");
+    if (completedSequence < 0 || completedRevision <= 0
+        || authorizationDigest.length() != 32 || !budget.belongsTo(scope)) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException("invalid event read-ahead request"));
+    }
+    CompletableFuture<ReadAhead> readAhead = readControl(scope, budget).thenCompose(state -> readAhead(state, completedSequence,
+        completedRevision, authorizationDigest, scope, budget));
+    readAhead.whenComplete((ignored, failure) -> {
+      if (readAhead.isCancelled()) scope.cancel();
+    });
+    return readAhead;
+  }
+
+  private CompletableFuture<ReadAhead> readAhead(CommitState state, long completedSequence,
+      long completedRevision, ByteKey authorizationDigest, RequestScope scope,
+      ManifestCatalog.ProofReadBudget budget) {
+    try {
+      validateControl(state, completedRevision, Optional.empty());
+      if (state.publishedSequence() < completedSequence
+          || state.publishedRevision() < completedRevision) {
+        throw new IllegalStateException("event tailer cursor is ahead of the control barrier");
+      }
+      if (state.publishedSequence() == completedSequence) {
+        if (state.publishedRevision() != completedRevision) {
+          throw new IllegalStateException("event tailer revision differs at an equal sequence");
+        }
+        return CompletableFuture.completedFuture(new ReadAhead(completedSequence, Optional.empty()));
+      }
+      if (state.publishedRevision() == completedRevision) {
+        if (state.publication().filter(PublicationSlot::containsKeyChanges).isPresent()) {
+          throw new IllegalStateException("control revision hides a selected KV change");
+        }
+        return CompletableFuture.completedFuture(
+            new ReadAhead(state.publishedSequence(), Optional.empty()));
+      }
+      return openNextEvent(completedSequence, completedRevision, authorizationDigest, scope, budget);
+    } catch (RuntimeException failure) {
+      return CompletableFuture.failedFuture(failure);
+    }
+  }
+
+  private CompletableFuture<ReadAhead> openNextEvent(long completedSequence, long completedRevision,
+      ByteKey authorizationDigest, RequestScope scope,
+      ManifestCatalog.ProofReadBudget budget) {
+    long nextRevision = nextRevision(completedRevision);
+    long minimumSequence = Math.addExact(completedSequence, 1);
+    var requirement = new EventHistoryPinManager.Requirement(nextRevision, minimumSequence,
+        authorizationDigest, Optional.empty(), Optional.empty());
+    return withPin(requirement, scope, (protectedCursor, pin) -> protectedCursor.renew()
+        .thenCompose(ignored -> readControl(scope, budget))
+        .thenCompose(current -> {
+          validateControl(current, completedRevision, Optional.empty());
+          return readIndex(nextRevision, scope, budget).thenCompose(index ->
+              protectedCursor.renew().thenApply(ignored -> locateNextEvent(index, current,
+                  completedSequence, completedRevision, nextRevision)));
+        })
+        .thenCompose(located -> read(located.sequence(), completedRevision, protectedCursor,
+            pin, requirement, scope, budget, Optional.empty(), located.index()).thenApply(found -> {
+              Selected selected = found.orElseThrow(
+                  () -> new IllegalStateException("indexed event is not selected by the control barrier"));
+              if (selected.decision().sequence() != located.sequence()
+                  || selected.decision().baseRevision() != completedRevision
+                  || !selected.decision().containsKeyChanges()) {
+                throw new IllegalStateException("selected next event differs from its locator");
+              }
+              return new ReadAhead(located.sequence() - 1, Optional.of(selected));
+            })));
+  }
+
+  private LocatedEvent locateNextEvent(Optional<EventRevisionIndex> index, CommitState state,
+      long completedSequence, long completedRevision, long nextRevision) {
+    long eventSequence;
+    if (index.isPresent()) {
+      EventRevisionIndex located = index.orElseThrow();
+      CommitDecision decision = located.decision();
+      if (decision.revision() != nextRevision || decision.baseRevision() != completedRevision
+          || decision.sequence() <= completedSequence
+          || decision.sequence() > state.publishedSequence()) {
+        throw new IllegalStateException("next event index is outside the captured control barrier");
+      }
+      eventSequence = decision.sequence();
+    } else if (state.finalizedRevision() < nextRevision) {
+      eventSequence = pendingEventSequence(state, completedRevision, nextRevision);
+    } else {
+      throw new IllegalStateException("finalized next event revision index is missing");
+    }
+    if (eventSequence <= completedSequence) {
+      throw new IllegalStateException("next event sequence is behind the tailer cursor");
+    }
+    return new LocatedEvent(eventSequence, index);
+  }
+
+  private long pendingEventSequence(CommitState state, long completedRevision, long nextRevision) {
+    PublicationSlot slot = state.publication().orElseThrow(
+        () -> new IllegalStateException("selected next event has no revision index or publication slot"));
+    if (state.finalizedRevision() != completedRevision || !slot.containsKeyChanges()
+        || slot.baseRevision() != completedRevision || slot.revision() != nextRevision
+        || slot.sequence() != state.publishedSequence()) {
+      throw new IllegalStateException("pending publication cannot prove the next event gap");
+    }
+    return slot.sequence();
   }
 
   /** Latest selected sequence observed by this reader; it is a lag watermark, not a read barrier. */
@@ -82,7 +218,15 @@ public final class SelectedSequenceReader {
     }
     var requirement = new EventHistoryPinManager.Requirement(nextRevision(baseRevision), sequence,
         authorizationDigest, Optional.empty(), Optional.empty());
-    var output = new CompletableFuture<Optional<Selected>>();
+    return withPin(requirement, scope, (protectedCursor, pin) ->
+        read(sequence, baseRevision, protectedCursor, pin, requirement, scope, budget, legacy,
+            Optional.empty()));
+  }
+
+  private <T> CompletableFuture<T> withPin(EventHistoryPinManager.Requirement requirement,
+      RequestScope scope,
+      BiFunction<ProtectedEventCursor, EventHistoryPinManager.Pin, CompletableFuture<T>> operation) {
+    var output = new CompletableFuture<T>();
     output.whenComplete((ignored, failure) -> { if (output.isCancelled()) scope.cancel(); });
     pins.register(requirement, scope).whenComplete((pin, failure) -> {
       if (failure != null) {
@@ -94,21 +238,23 @@ public final class SelectedSequenceReader {
         protectedCursor.close();
         return;
       }
+      CompletableFuture<T> reading;
       try {
-        read(sequence, baseRevision, protectedCursor, pin, requirement, scope, budget, legacy)
-            .whenComplete((selected, readFailure) -> {
-              if (readFailure != null) {
-                protectedCursor.close();
-                output.completeExceptionally(readFailure);
-              } else if (!output.complete(selected)) {
-                protectedCursor.close();
-              }
-            });
+        reading = Objects.requireNonNull(operation.apply(protectedCursor, pin), "pinned event read");
       } catch (RuntimeException | Error problem) {
         protectedCursor.close();
         output.completeExceptionally(problem);
         if (problem instanceof Error fatal) throw fatal;
+        return;
       }
+      reading.whenComplete((value, readFailure) -> {
+        if (readFailure != null) {
+          protectedCursor.close();
+          output.completeExceptionally(readFailure);
+        } else if (!output.complete(value)) {
+          protectedCursor.close();
+        }
+      });
     });
     return output;
   }
@@ -116,7 +262,8 @@ public final class SelectedSequenceReader {
   private CompletableFuture<Optional<Selected>> read(long sequence, long baseRevision,
       ProtectedEventCursor protectedCursor, EventHistoryPinManager.Pin pin,
       EventHistoryPinManager.Requirement pinRequirement, RequestScope scope,
-      ManifestCatalog.ProofReadBudget budget, Optional<EventIndexBackfillCheckpoint> legacy) {
+      ManifestCatalog.ProofReadBudget budget, Optional<EventIndexBackfillCheckpoint> legacy,
+      Optional<EventRevisionIndex> locatedIndex) {
     return protectedCursor.renew().thenCompose(ignored -> readControl(scope, budget)).thenCompose(state -> {
       validateControl(state, baseRevision, legacy);
       if (sequence > state.publishedSequence()) return closeEmpty(protectedCursor);
@@ -126,8 +273,8 @@ public final class SelectedSequenceReader {
         if (decision.sequence() != sequence || decision.baseRevision() != baseRevision) {
           throw new IllegalStateException("selected sequence is not contiguous with the cursor");
         }
-        return budget.read(ManifestCatalog.maximumProofReadPageBytes(),
-            () -> manifests.readRoot(decision.manifestRoot(), scope)).thenCompose(foundRoot -> {
+        return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+            () -> manifests.readRootWithSize(decision.manifestRoot(), scope)).thenCompose(foundRoot -> {
           ManifestRoot root = foundRoot.orElseThrow(
               () -> new IllegalStateException("selected manifest root is missing"));
           validateRoot(decision, root);
@@ -135,7 +282,7 @@ public final class SelectedSequenceReader {
               ? promoteEventRoot(decision, root, pin, pinRequirement, protectedCursor, scope)
               : CompletableFuture.completedFuture(null);
           return rootProtection.thenCompose(ignored -> readSelectedIndex(decision, root, scope, budget,
-              legacy)).thenCompose(ignored -> protectedCursor.renew())
+              legacy, locatedIndex)).thenCompose(ignored -> protectedCursor.renew())
               .thenCompose(ignored -> readControl(scope, budget))
               .thenCompose(latest -> {
                 validateControl(latest, baseRevision, legacy);
@@ -168,8 +315,12 @@ public final class SelectedSequenceReader {
 
   private CompletableFuture<Void> readSelectedIndex(CommitDecision decision, ManifestRoot root,
       RequestScope scope, ManifestCatalog.ProofReadBudget budget,
-      Optional<EventIndexBackfillCheckpoint> legacy) {
+      Optional<EventIndexBackfillCheckpoint> legacy, Optional<EventRevisionIndex> locatedIndex) {
     if (!decision.containsKeyChanges()) return CompletableFuture.completedFuture(null);
+    if (locatedIndex.isPresent()) {
+      locatedIndex.orElseThrow().verifySelected(decision, root);
+      return CompletableFuture.completedFuture(null);
+    }
     return verifyIndex(decision, root, scope, budget, legacy.isPresent());
   }
 
@@ -200,11 +351,12 @@ public final class SelectedSequenceReader {
 
   private CompletableFuture<Optional<EventRevisionIndex>> readIndex(long revision,
       RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
-    return budget.read(ManifestCatalog.maximumProofReadPageBytes(), () -> indexes.read(revision, scope));
+    return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(),
+        () -> indexes.readWithSize(revision, scope));
   }
 
   private CompletableFuture<CommitState> readControl(RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
-    return budget.read(ManifestCatalog.maximumProofReadPageBytes(), () -> control.read(scope))
+    return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(), () -> control.readWithSize(scope))
         .thenApply(snapshot -> {
           CommitState state = snapshot.orElseThrow(
               () -> new IllegalStateException("authoritative commit control is missing")).state();

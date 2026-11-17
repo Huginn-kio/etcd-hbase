@@ -39,8 +39,7 @@ public final class EventIndexBackfillCapture {
           }
           try {
             verifyBoundaries(checkpoint, sequence -> read(sequence, scope, budget))
-                .thenCompose(ignored -> window.checkPublication(checkpoint, checkpoint.ownerEpoch(),
-                    checkpoint.sequence(), budget))
+                .thenCompose(ignored -> window.checkHistory(checkpoint, checkpoint.ownerEpoch(), budget))
                 .whenComplete((ignored, validationFailure) -> {
                   if (validationFailure != null) {
                     window.close();

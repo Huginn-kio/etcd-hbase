@@ -27,7 +27,7 @@ public final class EventIndexBackfillPlanner {
     if (namespace.length() != 16 || registry.length() != 16 || !budget.belongsTo(scope)) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("invalid backfill planner scope or registry"));
     }
-    return budget.read(ManifestCatalog.maximumProofReadPageBytes(), () -> control.read(scope))
+    return budget.readMeasured(ManifestCatalog.maximumProofReadPageBytes(), () -> control.readWithSize(scope))
         .thenCompose(found -> {
           CommitState state = found.orElseThrow(() -> new IllegalStateException("backfill control row is missing")).state();
           if (state.ownerEpoch() != owner.epoch()
