@@ -85,18 +85,6 @@ public record M3RuntimeConfiguration(
     }
   }
 
-  /** Preserve callers using the full J41 activation shape before owner transport was added. */
-  public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
-      int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
-      int pinShards, int pinSlotsPerShard, int pinLeaseMs, boolean readCacheEnabled,
-      boolean m4LeaseApiEnabled, long leaseMinTtlSeconds, long leaseClockUncertaintyMs,
-      int leaseMaximumBindings, long leaseMaximumKeyBytes, long leaseMaximumRevokeCostBytes) {
-    this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
-        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
-        m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs, leaseMaximumBindings,
-        leaseMaximumKeyBytes, leaseMaximumRevokeCostBytes, null, null);
-  }
-
   /** Existing callers retain the disabled-cache behavior. */
   public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
       int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
@@ -105,7 +93,7 @@ public record M3RuntimeConfiguration(
         maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, false, false, 1, 1_000,
         LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
-        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null);
   }
 
   /** Preserve callers that explicitly set the disabled-cache state. */
@@ -116,7 +104,7 @@ public record M3RuntimeConfiguration(
         maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
         false, 1, 1_000, LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
-        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null);
   }
 
   /** Preserve callers that predate the explicit J41 Lease revocation limits. */
@@ -129,7 +117,7 @@ public record M3RuntimeConfiguration(
         m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs,
         LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
-        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null);
   }
 
   public M3RuntimeConfiguration {

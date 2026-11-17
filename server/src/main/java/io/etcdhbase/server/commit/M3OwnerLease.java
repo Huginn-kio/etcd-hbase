@@ -210,81 +210,98 @@ final class M3OwnerLease implements AutoCloseable {
       previousHeartbeat = heartbeatCompletion;
     }
 
-    CompletableFuture<TransitionResult> prepared = previousHeartbeat.thenCompose(ignored -> {
-      if (!scopeIsUsable(scope)) {
-        return CompletableFuture.failedFuture(scopeFailure(scope));
-      }
-      synchronized (lock) {
-        if (stopping || !fenceTransition) {
-          return CompletableFuture.failedFuture(
-              new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-        }
-      }
-      long refreshedDeadline = Math.addExact(clock.millis(), leaseMillis);
-      return previousOwners.heartbeat(previousToken, refreshedDeadline, scope)
-          .thenCompose(renewed -> {
-            if (!Boolean.TRUE.equals(renewed) || clock.millis() >= refreshedDeadline
-                || !scopeIsUsable(scope)) {
-              return CompletableFuture.failedFuture(scopeFailure(scope));
-            }
-            synchronized (lock) {
-              if (stopping || !fenceTransition) {
-                return CompletableFuture.failedFuture(
-                    new BackendFailure(BackendFailure.Category.UNAVAILABLE));
-              }
-              verifiedDeadlineMillis = Math.max(verifiedDeadlineMillis, refreshedDeadline);
-            }
-            return transition.apply(previousToken).thenApply(nextToken -> {
-              if (nextToken == null || !nextToken.instance().equals(previousToken.instance())
-                  || nextToken.epoch() < previousToken.epoch()
-                  || clock.millis() >= refreshedDeadline || !scopeIsUsable(scope)) {
-                throw new CompletionException(scopeFailure(scope));
-              }
-              return new TransitionResult(nextToken, refreshedDeadline);
-            });
-          });
-    });
+    return previousHeartbeat.thenCompose(ignored ->
+        renewPreviousFence(previousOwners, previousToken, transition, scope))
+        .thenCompose(prepared -> verifyNextFence(nextOwners, prepared, scope))
+        .handle((result, failure) ->
+            publishFenceTransition(nextOwners, nextRecovery, result, failure)).copy();
+  }
 
-    CompletableFuture<TransitionResult> verified = prepared.thenCompose(preparedToken -> {
-      long nextDeadline = Math.addExact(clock.millis(), leaseMillis);
-      if (clock.millis() >= preparedToken.deadlineMillis() || !scopeIsUsable(scope)) {
-        return CompletableFuture.failedFuture(scopeFailure(scope));
+  private CompletableFuture<TransitionResult> renewPreviousFence(CommitOwnerService previousOwners,
+      CommitOwnerService.OwnerToken previousToken,
+      Function<CommitOwnerService.OwnerToken, CompletableFuture<CommitOwnerService.OwnerToken>> transition,
+      RequestScope scope) {
+    if (!scopeIsUsable(scope)) {
+      return CompletableFuture.failedFuture(scopeFailure(scope));
+    }
+    synchronized (lock) {
+      if (stopping || !fenceTransition) {
+        return CompletableFuture.failedFuture(
+            new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       }
-      return nextOwners.heartbeat(preparedToken.token(), nextDeadline, scope)
-          .thenApply(renewed -> {
-            if (!Boolean.TRUE.equals(renewed) || clock.millis() >= nextDeadline
-                || !scopeIsUsable(scope)) {
-              throw new CompletionException(scopeFailure(scope));
-            }
-            return new TransitionResult(preparedToken.token(), nextDeadline);
-          });
-    });
+    }
+    long refreshedDeadline = Math.addExact(clock.millis(), leaseMillis);
+    return previousOwners.heartbeat(previousToken, refreshedDeadline, scope)
+        .thenCompose(renewed -> applyFenceTransition(previousToken, refreshedDeadline,
+            renewed, transition, scope));
+  }
 
-    return verified.handle((result, failure) -> {
-      DrainStatus status;
-      synchronized (lock) {
-        transitionScope = null;
-        fenceTransition = false;
-        if (failure == null && !stopping) {
-          owners = nextOwners;
-          if (nextRecovery != null) recovery = nextRecovery;
-          token = result.token();
-          verifiedDeadlineMillis = result.deadlineMillis();
-        }
-        status = drainStatus();
+  private CompletableFuture<TransitionResult> applyFenceTransition(
+      CommitOwnerService.OwnerToken previousToken, long refreshedDeadline, Boolean renewed,
+      Function<CommitOwnerService.OwnerToken, CompletableFuture<CommitOwnerService.OwnerToken>> transition,
+      RequestScope scope) {
+    if (!Boolean.TRUE.equals(renewed) || clock.millis() >= refreshedDeadline
+        || !scopeIsUsable(scope)) {
+      return CompletableFuture.failedFuture(scopeFailure(scope));
+    }
+    synchronized (lock) {
+      if (stopping || !fenceTransition) {
+        return CompletableFuture.failedFuture(
+            new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       }
-      if (failure != null) {
-        stop(LossReason.FENCE_TRANSITION_FAILED);
-        completeDrain(status);
-        throw new CompletionException(failure);
+      verifiedDeadlineMillis = Math.max(verifiedDeadlineMillis, refreshedDeadline);
+    }
+    return transition.apply(previousToken).thenApply(nextToken -> {
+      if (nextToken == null || !nextToken.instance().equals(previousToken.instance())
+          || nextToken.epoch() < previousToken.epoch()
+          || clock.millis() >= refreshedDeadline || !scopeIsUsable(scope)) {
+        throw new CompletionException(scopeFailure(scope));
       }
-      if (stopping) {
-        completeDrain(status);
-        throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      return new TransitionResult(nextToken, refreshedDeadline);
+    });
+  }
+
+  private CompletableFuture<TransitionResult> verifyNextFence(CommitOwnerService nextOwners,
+      TransitionResult preparedToken, RequestScope scope) {
+    long nextDeadline = Math.addExact(clock.millis(), leaseMillis);
+    if (clock.millis() >= preparedToken.deadlineMillis() || !scopeIsUsable(scope)) {
+      return CompletableFuture.failedFuture(scopeFailure(scope));
+    }
+    return nextOwners.heartbeat(preparedToken.token(), nextDeadline, scope)
+        .thenApply(renewed -> {
+          if (!Boolean.TRUE.equals(renewed) || clock.millis() >= nextDeadline
+              || !scopeIsUsable(scope)) {
+            throw new CompletionException(scopeFailure(scope));
+          }
+          return new TransitionResult(preparedToken.token(), nextDeadline);
+        });
+  }
+
+  private CommitOwnerService.OwnerToken publishFenceTransition(CommitOwnerService nextOwners,
+      RecoveryManager nextRecovery, TransitionResult result, Throwable failure) {
+    DrainStatus status;
+    synchronized (lock) {
+      transitionScope = null;
+      fenceTransition = false;
+      if (failure == null && !stopping) {
+        owners = nextOwners;
+        if (nextRecovery != null) recovery = nextRecovery;
+        token = result.token();
+        verifiedDeadlineMillis = result.deadlineMillis();
       }
+      status = drainStatus();
+    }
+    if (failure != null) {
+      stop(LossReason.FENCE_TRANSITION_FAILED);
       completeDrain(status);
-      return result.token();
-    }).copy();
+      throw new CompletionException(failure);
+    }
+    if (stopping) {
+      completeDrain(status);
+      throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
+    completeDrain(status);
+    return result.token();
   }
 
   CompletableFuture<Void> refreshServices(CommitOwnerService nextOwners,
