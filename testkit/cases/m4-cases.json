@@ -891,7 +891,9 @@
           "missingPageAndExhaustedBudgetFailWithoutAdvancingCursor",
           "sharedTailerReadsOnceAndIsolatesSlowSubscriptions",
           "watchRangeIndexMemoryIsAccountedAndReleasedOnCancellation",
-          "sharedTailerDeliversOnlySparsePointAndRangeMatches"
+          "sharedTailerDeliversOnlySparsePointAndRangeMatches",
+          "sequenceReaderPersistsSelectedEventRootBeforeReadingItsIndex",
+          "synchronousSequenceOpenFailureClosesTailerAndSubscriptions"
         ]},
         {"module": "hbase", "kind": "surefire", "class": "io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepositoryTest", "tests": [
           "readsAndCreatesAnImmutableRevisionRecord"
@@ -920,7 +922,8 @@
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.EventHistoryWorkerTest", "tests": [
           "retriesResourceLimitAndOnlyCompletesAfterSuccessfulProgress",
           "stopCancelsActiveCycleAndWaitsForLaneCleanup",
-          "rejectedSchedulingStopsAndReportsTheFailure"
+          "rejectedSchedulingStopsAndReportsTheFailure",
+          "slowBackfillReadDoesNotBlockHeartbeatAndPublicationUsesOwnerLane"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest", "tests": [
           "ownerLossBetweenWorkerInstallationsStopsExistingWorkerAndRejectsLateWorker",

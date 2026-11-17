@@ -67,6 +67,8 @@ J44_CRITICAL_JAVA_TESTS = {
         "sharedTailerReadsOnceAndIsolatesSlowSubscriptions",
         "watchRangeIndexMemoryIsAccountedAndReleasedOnCancellation",
         "sharedTailerDeliversOnlySparsePointAndRangeMatches",
+        "sequenceReaderPersistsSelectedEventRootBeforeReadingItsIndex",
+        "synchronousSequenceOpenFailureClosesTailerAndSubscriptions",
     },
     "io.etcdhbase.hbase.storage.J44EventIndexControlStoreIT": {
         "requiresDescriptorAndReopenedStoreForFencedControlUpgrade",
@@ -93,6 +95,7 @@ J44_CRITICAL_JAVA_TESTS = {
         "retriesResourceLimitAndOnlyCompletesAfterSuccessfulProgress",
         "stopCancelsActiveCycleAndWaitsForLaneCleanup",
         "rejectedSchedulingStopsAndReportsTheFailure",
+        "slowBackfillReadDoesNotBlockHeartbeatAndPublicationUsesOwnerLane",
     },
     "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest": {
         "ownerLossBetweenWorkerInstallationsStopsExistingWorkerAndRejectsLateWorker",

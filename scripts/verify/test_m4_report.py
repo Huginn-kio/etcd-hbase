@@ -101,6 +101,28 @@ class M4ReportTest(unittest.TestCase):
                 with self.assertRaises(m4_report.ReportError):
                     m4_report.validate_registry_document(changed)
 
+    def test_j44_registry_requires_pin_lifecycle_and_owner_lane_regressions(self) -> None:
+        required_cases = {
+            "io.etcdhbase.core.commit.SealedEventCursorTest": {
+                "sequenceReaderPersistsSelectedEventRootBeforeReadingItsIndex",
+                "synchronousSequenceOpenFailureClosesTailerAndSubscriptions",
+            },
+            "io.etcdhbase.server.commit.EventHistoryWorkerTest": {
+                "slowBackfillReadDoesNotBlockHeartbeatAndPublicationUsesOwnerLane",
+            },
+        }
+
+        for class_name, methods in required_cases.items():
+            for method_name in methods:
+                with self.subTest(class_name=class_name, method_name=method_name):
+                    changed = copy.deepcopy(self.registry)
+                    task = next(item for item in changed["tasks"] if item["id"] == "J44")
+                    suite = next(item for item in task["maven_tests"]
+                                 if item["class"] == class_name)
+                    suite["tests"].remove(method_name)
+                    with self.assertRaises(m4_report.ReportError):
+                        m4_report.validate_registry_document(changed)
+
     def test_both_registries_reject_malformed_or_duplicate_go_packages(self) -> None:
         for task_id in ("J40", "J41"):
             for invalid in (None, {"package": 1}, {"package": "extra", "tests": []},
