@@ -243,6 +243,8 @@ class M4LeaseRpcIT {
          var intervalMemory = budgets.admit("events", intervalScope, retained);
          var exact = tailer.subscribe(KeyRange.point(key), exactMemory, 64, 1L << 20);
          var interval = tailer.subscribe(KeyRange.all(), intervalMemory, 64, 1L << 20)) {
+        var metrics = groupRuntime.metrics();
+        var metricsBefore = metrics.eventTailer();
         Rpc.PutResponse response = putThrough(runtime, "j44-index-key", 2);
         try {
           try (var pointEvent = awaitDelivery(exact, Duration.ofSeconds(30));
@@ -263,7 +265,8 @@ class M4LeaseRpcIT {
         }
         assertTrue(exact.poll().isEmpty());
         assertTrue(interval.poll().isEmpty());
-        assertTrue(groupRuntime.metrics().eventTailer().events() > 0);
+        awaitEventTailerMetrics(metrics, metricsBefore, response.getHeader().getRevision(),
+            Duration.ofSeconds(30));
         return response;
     }
   }
@@ -280,6 +283,23 @@ class M4LeaseRpcIT {
       Thread.sleep(10);
     }
     throw new AssertionError("runtime event tailer did not deliver the committed event");
+  }
+
+  private static io.etcdhbase.server.observability.RequestMetrics.EventTailerSnapshot awaitEventTailerMetrics(
+      io.etcdhbase.server.observability.RequestMetrics metrics,
+      io.etcdhbase.server.observability.RequestMetrics.EventTailerSnapshot before,
+      long expectedRevision, Duration timeout) throws InterruptedException {
+    long timeoutNanos = timeout.toNanos();
+    long startedAtNanos = System.nanoTime();
+    io.etcdhbase.server.observability.RequestMetrics.EventTailerSnapshot observed;
+    while (System.nanoTime() - startedAtNanos < timeoutNanos) {
+      observed = metrics.eventTailer();
+      if (observed.events() > before.events() && observed.revision() >= expectedRevision) return observed;
+      TimeUnit.MILLISECONDS.sleep(25);
+    }
+    observed = metrics.eventTailer();
+    throw new AssertionError("event tailer metrics did not record the delivered event revision "
+        + expectedRevision + ": before=" + before + ", observed=" + observed);
   }
 
   private static io.etcdhbase.core.commit.EventRevisionIndex awaitBackfilledIndex(
