@@ -848,7 +848,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 完成标准：多 watchId、精确 key/区间、inclusive startRevision、Created、PrevKV 及过滤正确；内存随活跃订阅增长，不维护全部 KV 树。
   - 范围说明：J45 对照零、负数及未来 startRevision 的创建行为，并按 raw proto 契约接受 `watch_id=-1` 的 Create/Cancel；`startRevision > 0` 且目标不晚于当前 revision 的历史回放与 inclusive 交接由 J46.1 实现，J45 不宣称已支持历史回放。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=实现与定向验证进行中，依赖 J44 收敛；负责人=Codex；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=实现与公开验证完成，PR #52 已开放；依赖 PR #51（J44）；负责人=Codex；完成日期=2026-11-18；PR/commit=[PR #52](https://github.com/Reidddddd/etcd-hbase/pull/52) / `5a6162e2714288a075cbc22136664d5c2b3d7777`；验证报告=`j45-pr-20261118-r2`（PR head `5a6162e`，JDK 21，Java 1150 项、Go 定向 8 项，失败/错误/跳过均为 0；原生 39 条 trace、7 个 startRevision 用例、2 个 raw Watch ID 用例；本地服务 30 条 trace）；作者自审=完成；独立复核=完成（未发现 P1/P2，复核提交 `ef074f7` 与 PR head 的 J45 patch-id 相同）；正式 reviewer=`Reidddddd`，待 PR #51 合并后请求；目标环境与 M4 阶段验收=未完成。
 
 - [ ] **J46｜历史回放、实时交接、progress 与 fragment**
   - 依赖：J45。
