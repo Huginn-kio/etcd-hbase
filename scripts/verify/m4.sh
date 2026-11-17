@@ -29,7 +29,7 @@ while (($#)); do
       artifact_request="$2"; seen_artifact=true; shift 2 ;;
     --help)
       cat <<'USAGE'
-用法：scripts/verify/m4.sh --scope public --task J40|J41|J42|J43|J44|J45 --artifact-root .artifacts/m4/<fresh-run-id>
+用法：scripts/verify/m4.sh --scope public --task J40|J41|J42|J43|J44|J45|J46 --artifact-root .artifacts/m4/<fresh-run-id>
      或 scripts/verify/m4.sh --scope public --all --artifact-root .artifacts/m4/<fresh-run-id>
 USAGE
       exit 0 ;;
@@ -51,7 +51,7 @@ if [[ "$run_all" == true ]]; then
   exit 2
 fi
 if [[ "$task" != J40 && "$task" != J41 && "$task" != J42 && "$task" != J43 && \
-      "$task" != J44 && "$task" != J45 ]]; then
+      "$task" != J44 && "$task" != J45 && "$task" != J46 ]]; then
   echo "M4 task is not registered for public execution: $task" >&2
   exit 2
 fi
@@ -100,7 +100,7 @@ import json
 import sys
 
 path, run_id, source, base, clean, started, task = sys.argv[1:]
-scope = "public-local-unit" if task == "J45" else "public-local-minicluster"
+scope = "public-local-unit" if task in {"J45", "J46"} else "public-local-minicluster"
 record = {
     "schema": "etcd-hbase-m4-run/v1",
     "run_id": run_id,
@@ -237,6 +237,9 @@ if [[ "$task" == J45 ]]; then
     --native-data-dir "$artifact_root/j45/native-data" --scope native-etcd \
     --prefix "$native_prefix" --trace "$artifact_root/j45/native-trace.jsonl" \
     --metadata "$artifact_root/j45/native-metadata.json"
+elif [[ "$task" == J46 ]]; then
+  run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
+    -run '^TestM4WatchProgressRequestMatchesPinnedNativeOracle$' ./internal/scenario
 elif [[ "$task" != J44 ]]; then
   run_logged go-module-lock go-module-lock.log go-module-lock.stderr python3 scripts/verify/go-module-lock.py
   run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
@@ -245,6 +248,7 @@ fi
 maven_profile=m4-j40-public
 maven_goal=verify
 maven_command=maven-verify
+maven_extra_args=()
 if [[ "$task" == J41 ]]; then
   maven_profile=m4-j41-public
 elif [[ "$task" == J42 ]]; then
@@ -257,9 +261,14 @@ elif [[ "$task" == J45 ]]; then
   maven_profile=m4-j45-public
   maven_goal=test
   maven_command=maven-unit-tests
+elif [[ "$task" == J46 ]]; then
+  maven_profile=m4-j46-public
+  maven_goal=test
+  maven_command=maven-unit-tests
+  maven_extra_args=(-Dtest=WatchHistoryReplayTest,WatchStreamTest#explicitProgressFollowsAllEligibleEventsAndUsesTheAuthoritativeRevision+explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch+progressRequestIsDroppedWhenAnyWatchHasNotFinishedHistoricalReplay+progressRequestIsDroppedUntilFutureStartRevisionIsReached -Dsurefire.failIfNoSpecifiedTests=false)
 fi
 run_logged "$maven_command" maven.log maven.stderr.log scripts/dev/mvn21.sh -B -ntp \
-  -pl server -am clean "$maven_goal" -P"$maven_profile"
+  -pl server -am clean "$maven_goal" -P"$maven_profile" "${maven_extra_args[@]}"
 
 collection_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set +e

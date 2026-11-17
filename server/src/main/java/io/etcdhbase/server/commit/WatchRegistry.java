@@ -26,6 +26,7 @@ final class WatchRegistry {
   /** State for an active subscription; all subscription access is serialized with close. */
   static final class Watcher implements AutoCloseable {
     private final long id;
+    private final long startRevision;
     private final long minimumEventRevision;
     private final boolean previousKv;
     private final boolean filterPut;
@@ -35,10 +36,11 @@ final class WatchRegistry {
     private volatile boolean createdSent;
     private boolean closed;
 
-    private Watcher(long id, long minimumEventRevision,
+    private Watcher(long id, long startRevision, long minimumEventRevision,
         boolean previousKv, boolean filterPut, boolean filterDelete,
         WatchStream.Subscription subscription) {
       this.id = id;
+      this.startRevision = startRevision;
       this.minimumEventRevision = minimumEventRevision;
       this.previousKv = previousKv;
       this.filterPut = filterPut;
@@ -47,6 +49,10 @@ final class WatchRegistry {
     }
 
     long id() { return id; }
+    long startRevision() { return startRevision; }
+    synchronized boolean progressReady(long revision) {
+      return !closed && subscription.progressReady(revision);
+    }
     long minimumEventRevision() { return minimumEventRevision; }
     boolean previousKv() { return previousKv; }
     boolean filterPut() { return filterPut; }
@@ -123,13 +129,13 @@ final class WatchRegistry {
     return Rejection.NONE;
   }
 
-  synchronized Registration registerActive(long requestedId, long minimumEventRevision,
+  synchronized Registration registerActive(long requestedId, long startRevision, long minimumEventRevision,
       boolean previousKv, boolean filterPut, boolean filterDelete,
       WatchStream.Subscription subscription) {
     Rejection rejection = checkCreate(requestedId);
     if (rejection != Rejection.NONE) return rejected(rejection);
     long id = requestedId == 0 ? allocateWatchIdLocked() : requestedId;
-    Watcher watcher = new Watcher(id, minimumEventRevision, previousKv,
+    Watcher watcher = new Watcher(id, startRevision, minimumEventRevision, previousKv,
         filterPut, filterDelete, subscription);
     active.put(id, watcher);
     return new Registration(id, watcher, Rejection.NONE);

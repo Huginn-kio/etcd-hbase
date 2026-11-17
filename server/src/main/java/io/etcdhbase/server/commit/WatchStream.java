@@ -42,11 +42,23 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         throws BackendFailure;
   }
 
-  record OpenedWatch(long revision, long compactRevision, Subscription subscription) {
-    OpenedWatch(long revision, Subscription subscription) { this(revision, -1, subscription); }
+  record OpenedWatch(long revision, long barrierSequence, long compactRevision,
+      Subscription subscription, boolean historicalReplaySupported) {
+    OpenedWatch(long revision, Subscription subscription) {
+      this(revision, 0, -1, subscription, false);
+    }
+
+    OpenedWatch(long revision, long compactRevision, Subscription subscription) {
+      this(revision, 0, compactRevision, subscription, false);
+    }
+
+    OpenedWatch(long revision, long barrierSequence, long compactRevision,
+        Subscription subscription) {
+      this(revision, barrierSequence, compactRevision, subscription, false);
+    }
 
     OpenedWatch {
-      if (revision < 0 || compactRevision < -1) {
+      if (revision < 0 || barrierSequence < 0 || compactRevision < -1) {
         throw new IllegalArgumentException("invalid Watch revision checkpoint");
       }
       Objects.requireNonNull(subscription, "subscription");
@@ -57,23 +69,34 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     Optional<Delivery> poll();
     Optional<String> terminationReason();
     void setWakeup(Runnable wakeup);
+    default boolean progressReady(long revision) { return true; }
     @Override void close();
   }
 
   static final class Delivery implements AutoCloseable {
+    private final long sequence;
     private final long revision;
     private final PreparedEvent event;
     private final Runnable release;
     private final AtomicBoolean closed = new AtomicBoolean();
 
     Delivery(long revision, PreparedEvent event, Runnable release) {
+      this(Math.addExact(Objects.requireNonNull(event, "event").baseSequence(), 1),
+          revision, event, release);
+    }
+
+    Delivery(long sequence, long revision, PreparedEvent event, Runnable release) {
+      if (sequence <= 0) throw new IllegalArgumentException("watch event sequence must be positive");
       if (revision <= 0) throw new IllegalArgumentException("watch event revision must be positive");
+      this.sequence = sequence;
       this.revision = revision;
       this.event = Objects.requireNonNull(event, "event");
       this.release = Objects.requireNonNull(release, "release");
     }
 
+    long sequence() { return sequence; }
     long revision() { return revision; }
+    long ordinal() { return event.ordinal(); }
     PreparedEvent event() { return event; }
 
     @Override public void close() {
@@ -92,6 +115,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   private record DrainAction(
       DrainKind kind, PendingResponse response, Rpc.WatchRequest request, Throwable failure) {}
+  private record ProgressBarrier(long revision) {}
 
   private enum PumpResult { RESPONSE_SENT, ADVANCED, IDLE }
 
@@ -122,6 +146,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private boolean terminal;
   private boolean peerCancelled;
   private Throwable terminalFailure;
+  private ProgressBarrier pendingProgress;
 
   WatchStream(StreamObserver<Rpc.WatchResponse> responseObserver, RequestScope streamScope,
       Executor worker, ScheduledExecutorService timers, SessionProvider sessions,
@@ -291,6 +316,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         }
         continue;
       }
+      if (enqueuePendingProgress()) continue;
       requestNext();
       return;
     }
@@ -364,8 +390,71 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     switch (request.getRequestUnionCase()) {
       case CREATE_REQUEST -> processCreate(request.getCreateRequest());
       case CANCEL_REQUEST -> processCancel(request.getCancelRequest());
-      case PROGRESS_REQUEST, REQUESTUNION_NOT_SET -> finishRequestWithoutResponse();
+      case PROGRESS_REQUEST -> processProgressRequest();
+      case REQUESTUNION_NOT_SET -> finishRequestWithoutResponse();
     }
+  }
+
+  private void processProgressRequest() {
+    boolean hasActiveWatch;
+    synchronized (lock) {
+      hasActiveWatch = watchRegistry.activeSnapshot().stream()
+          .anyMatch(watcher -> watcher.createdSent() && !watcher.isClosed());
+    }
+    if (!hasActiveWatch) {
+      finishRequestWithoutResponse();
+      return;
+    }
+    session().whenComplete((openedSession, sessionFailure) -> executeCompletion(() -> {
+      if (sessionFailure != null) {
+        fail(sessionFailure);
+        return;
+      }
+      CompletionStage<Long> revision;
+      try {
+        revision = Objects.requireNonNull(openedSession.currentRevision(),
+            "current Watch revision future");
+      } catch (RuntimeException | Error failure) {
+        fail(failure);
+        if (failure instanceof Error fatal) throw fatal;
+        return;
+      }
+      revision.whenComplete((currentRevision, revisionFailure) -> executeCompletion(() ->
+          completeProgressRequest(openedSession, currentRevision, revisionFailure)));
+    }));
+  }
+
+  private void completeProgressRequest(Session openedSession, Long revision, Throwable failure) {
+    if (failure != null) {
+      fail(unwrap(failure));
+      return;
+    }
+    if (revision == null || revision < 0) {
+      fail(new IllegalStateException("Watch session revision is invalid"));
+      return;
+    }
+    boolean ready;
+    try {
+      synchronized (lock) {
+        if (terminal || peerCancelled) return;
+        List<WatchRegistry.Watcher> active = watchRegistry.activeSnapshot().stream()
+            .filter(watcher -> watcher.createdSent() && !watcher.isClosed())
+            .toList();
+        // etcd v3.5.23 drops the request while a stream watcher is unsynced or starts in the future.
+        ready = !active.isEmpty() && openedSession.completedRevision() >= revision
+            && active.stream().allMatch(watcher -> watcher.startRevision() <= 0
+                || watcher.startRevision() <= revision)
+            && active.stream().allMatch(watcher -> watcher.progressReady(revision));
+        if (ready) pendingProgress = new ProgressBarrier(revision);
+        else processingRequest = false;
+      }
+    } catch (RuntimeException | Error failureToCheck) {
+      fail(failureToCheck);
+      if (failureToCheck instanceof Error fatal) throw fatal;
+      return;
+    }
+    if (!ready) requestNext();
+    scheduleDrain();
   }
 
   private void processCreate(Rpc.WatchCreateRequest request) {
@@ -463,7 +552,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         completeCompactedCreate(opened, request);
         return;
       }
-      if (request.getStartRevision() > 0 && request.getStartRevision() <= opened.revision()) {
+      if (request.getStartRevision() > 0 && request.getStartRevision() <= opened.revision()
+          && !opened.historicalReplaySupported()) {
         rejectUnsupportedHistoricalReplay(opened);
         return;
       }
@@ -497,7 +587,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       if (!stopped) {
         long minimumEventRevision = request.getStartRevision() <= 0
             ? nextRevision(opened.revision()) : request.getStartRevision();
-        registration = watchRegistry.registerActive(request.getWatchId(), minimumEventRevision,
+        registration = watchRegistry.registerActive(request.getWatchId(), request.getStartRevision(), minimumEventRevision,
             request.getPrevKv(),
             request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NOPUT),
             request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NODELETE),
@@ -687,10 +777,12 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   private PumpResult pumpOneWatcher() {
     List<WatchRegistry.Watcher> snapshot;
+    Long progressRevision;
     int first;
     synchronized (lock) {
       snapshot = watchRegistry.activeSnapshot();
       if (snapshot.isEmpty()) return PumpResult.IDLE;
+      progressRevision = pendingProgress == null ? null : pendingProgress.revision();
       first = Math.floorMod(nextWatchIndex, snapshot.size());
     }
     for (int offset = 0; offset < snapshot.size(); offset++) {
@@ -698,7 +790,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       WatchRegistry.Watcher watcher = snapshot.get(index);
       if (!watcher.createdSent()) continue;
       WatchEventBatchEncoder.Poll poll;
-      synchronized (watcher) { poll = eventBatchEncoder.nextBatch(watcher); }
+      synchronized (watcher) { poll = eventBatchEncoder.nextBatch(watcher, progressRevision); }
       if (poll.terminationReason() != null) {
         terminateWatcher(watcher, poll.terminationReason());
         advanceWatchIndex(index);
@@ -731,6 +823,28 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     synchronized (lock) {
       nextWatchIndex = (index + 1) % Math.max(1, watchRegistry.activeCount());
     }
+  }
+
+  private boolean enqueuePendingProgress() {
+    boolean noActiveWatch;
+    synchronized (lock) {
+      if (pendingProgress == null) return false;
+      noActiveWatch = watchRegistry.activeSnapshot().stream()
+          .noneMatch(watcher -> watcher.createdSent() && !watcher.isClosed());
+      long revision = pendingProgress.revision();
+      pendingProgress = null;
+      if (noActiveWatch) {
+        processingRequest = false;
+      } else {
+        responses.addLast(new PendingResponse(
+            Rpc.WatchResponse.newBuilder().setHeader(header(revision)).setWatchId(-1).build(), () -> {
+              synchronized (lock) { processingRequest = false; }
+              requestNext();
+            }));
+      }
+    }
+    if (noActiveWatch) requestNext();
+    return true;
   }
 
   private void terminateWatcher(WatchRegistry.Watcher watcher, String reason) {
@@ -933,6 +1047,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       peerCancelled = true;
       requestOutstanding = false;
       pendingRequest = null;
+      pendingProgress = null;
       responses.clear();
     }
     streamScope.cancel();
@@ -957,6 +1072,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       terminalFailure = failure;
       requestOutstanding = false;
       pendingRequest = null;
+      pendingProgress = null;
       responses.clear();
     }
     cancelDrainYield();
@@ -987,6 +1103,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       terminal = true;
       requestOutstanding = false;
       pendingRequest = null;
+      pendingProgress = null;
       responses.clear();
       closing = watchRegistry.detachAll();
     }

@@ -95,6 +95,48 @@ public final class SelectedSequenceReader {
     return readAhead;
   }
 
+  /** Reads the authoritative control state through the same bounded proof-read path as replay. */
+  public CompletableFuture<CommitState> readPublishedState(RequestScope scope,
+      ManifestCatalog.ProofReadBudget budget) {
+    Objects.requireNonNull(scope, "scope");
+    Objects.requireNonNull(budget, "budget");
+    if (!budget.belongsTo(scope)) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException(
+          "event replay budget belongs to another scope"));
+    }
+    return readControl(scope, budget);
+  }
+
+  /**
+   * Resolves the durable event sequence for one published KV revision. Absence is accepted only
+   * for the selected, not-yet-finalized control publication; a finalized missing index fails closed.
+   */
+  public CompletableFuture<Long> sequenceForRevision(long revision, CommitState barrier,
+      RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    Objects.requireNonNull(barrier, "barrier");
+    Objects.requireNonNull(scope, "scope");
+    Objects.requireNonNull(budget, "budget");
+    if (revision <= 1 || revision > barrier.publishedRevision()
+        || !barrier.supportsEventRevisionIndex() || !budget.belongsTo(scope)) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException(
+          "invalid published event revision lookup"));
+    }
+    return readIndex(revision, scope, budget).thenApply(index -> {
+      if (index.isPresent()) {
+        CommitDecision decision = index.orElseThrow().decision();
+        if (decision.revision() != revision || decision.baseRevision() != revision - 1
+            || decision.sequence() > barrier.publishedSequence()) {
+          throw new IllegalStateException("event revision index is outside its control barrier");
+        }
+        return decision.sequence();
+      }
+      if (barrier.finalizedRevision() < revision) {
+        return pendingEventSequence(barrier, revision - 1, revision);
+      }
+      throw new IllegalStateException("finalized event revision index is missing");
+    });
+  }
+
   private CompletableFuture<ReadAhead> readAhead(CommitState state, long completedSequence,
       long completedRevision, ByteKey authorizationDigest, RequestScope scope,
       ManifestCatalog.ProofReadBudget budget) {

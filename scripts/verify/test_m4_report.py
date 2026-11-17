@@ -363,6 +363,67 @@ class M4ReportTest(unittest.TestCase):
                     m4_report._j45_header_fields(
                         invalid_identity, "local Watch", allow_zero_raft_term=True)
 
+    def test_j46_registry_requires_replay_handoff_progress_and_native_oracle_tests(self) -> None:
+        for class_name, methods in m4_report.J46_CRITICAL_JAVA_TESTS.items():
+            for method_name in methods:
+                with self.subTest(class_name=class_name, method_name=method_name):
+                    changed = copy.deepcopy(self.registry)
+                    task = next(item for item in changed["tasks"] if item["id"] == "J46")
+                    suite = next(item for item in task["maven_tests"]
+                                 if item["class"] == class_name)
+                    suite["tests"].remove(method_name)
+                    with self.assertRaisesRegex(m4_report.ReportError, "coverage is incomplete"):
+                        m4_report.validate_registry_document(changed)
+
+        changed = copy.deepcopy(self.registry)
+        task = next(item for item in changed["tasks"] if item["id"] == "J46")
+        task["go_tests"][0]["tests"].clear()
+        with self.assertRaisesRegex(m4_report.ReportError, "Go package has no named required tests"):
+            m4_report.validate_registry_document(changed)
+
+        integration_suite = copy.deepcopy(self.registry)
+        task = next(item for item in integration_suite["tasks"] if item["id"] == "J46")
+        task["maven_tests"][0]["kind"] = "failsafe"
+        with self.assertRaisesRegex(m4_report.ReportError, "JVM unit tests"):
+            m4_report.validate_registry_document(integration_suite)
+
+    def test_complete_j46_unit_artifact_requires_registered_surefire_and_native_suites(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J46")
+
+            summary = m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+            self.assertEqual("J46", summary["task"])
+            self.assertEqual("public-local-unit", summary["scope"])
+            self.assertEqual(1, summary["go_test_count"])
+            self.assertEqual(6, summary["java_test_count"])
+            self.assertEqual(
+                "J46.1-replay-J46.2-progress-barrier-and-pinned-native-oracle",
+                summary["evidence"],
+            )
+
+            run_path = artifact / "run.json"
+            original_run = run_path.read_bytes()
+            run = json.loads(original_run)
+            maven = next(command for command in run["commands"]
+                         if command["name"] == "maven-unit-tests")
+            maven["argv"] = [argument for argument in maven["argv"]
+                             if not argument.startswith("-Dtest=")]
+            run_path.write_text(json.dumps(run) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(m4_report.ReportError, "only the registered Surefire suite"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+            run_path.write_bytes(original_run)
+
+            report = artifact / "server/target/failsafe-reports/TEST-unexpected.xml"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(
+                '<testsuite name="unexpected" tests="1" failures="0" errors="0" skipped="0">'
+                '<testcase name="unexpected"/></testsuite>', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(m4_report.ReportError, "JVM unit reports only"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
     def test_complete_j44_minicluster_artifact_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)
@@ -824,6 +885,8 @@ class M4ReportTest(unittest.TestCase):
         self._write_run_manifest(artifact, task["id"], run_id, source_commit, base_commit, commands)
         self._write_go_test_events(artifact, task)
         self._write_maven_test_reports(artifact, task)
+        if task_id == "J46":
+            return
         suite_hash, prefix_hash = m4_report._scenario_hashes(m4_report.REPO, task, run_id)
         self._write_trace_artifacts(
             evidence_root, task, run_id, source_commit, suite_hash, prefix_hash
@@ -846,6 +909,26 @@ class M4ReportTest(unittest.TestCase):
 
     @staticmethod
     def _write_command_logs(artifact: Path, task_id: str, run_id: str) -> dict[str, str]:
+        if task_id == "J46":
+            command_logs = {
+                "registry-check": "registry-check.log",
+                "report-tests": "report-tests.log",
+                "go-tests": "go-test.jsonl",
+                "maven-unit-tests": "maven.log",
+                "collect-maven-reports": "maven-reports.log",
+            }
+            stderr_logs = {
+                "registry-check": "registry-check.stderr",
+                "report-tests": "report-tests.stderr",
+                "go-tests": "go-test.stderr",
+                "maven-unit-tests": "maven.stderr.log",
+                "collect-maven-reports": "maven-reports.stderr",
+            }
+            for path in [*command_logs.values(), *stderr_logs.values()]:
+                target = artifact / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("completed\n", encoding="utf-8")
+            return command_logs
         if task_id == "J45":
             command_logs = {
                 "registry-check": "registry-check.log",
@@ -885,6 +968,37 @@ class M4ReportTest(unittest.TestCase):
     def _command_records(
         command_logs: dict[str, str], task_id: str, artifact: Path, run_id: str,
     ) -> list[dict[str, object]]:
+        if task_id == "J46":
+            go_test_pattern = "^TestM4WatchProgressRequestMatchesPinnedNativeOracle$"
+            argv_by_name = {
+                "registry-check": ["python3", "scripts/verify/m4-report.py", "--validate-registry"],
+                "report-tests": ["python3", "scripts/verify/test_m4_report.py"],
+                "go-tests": ["scripts/dev/go-m0.sh", "test", "-json", "-count=1", "-run",
+                             go_test_pattern, "./internal/scenario"],
+                "maven-unit-tests": ["scripts/dev/mvn21.sh", "-B", "-ntp", "-pl", "server", "-am",
+                                     "clean", "test", "-Pm4-j46-public",
+                                     m4_report.J46_MAVEN_TEST_SELECTOR,
+                                     "-Dsurefire.failIfNoSpecifiedTests=false"],
+                "collect-maven-reports": ["collect-maven-reports"],
+            }
+            stderr_by_name = {
+                "registry-check": "registry-check.stderr", "report-tests": "report-tests.stderr",
+                "go-tests": "go-test.stderr",
+                "maven-unit-tests": "maven.stderr.log",
+                "collect-maven-reports": "maven-reports.stderr",
+            }
+            return [
+                {
+                    "name": name,
+                    "argv": argv_by_name[name],
+                    "exit_code": 0,
+                    "started_at": "2026-11-18T00:00:00Z",
+                    "finished_at": "2026-11-18T00:00:01Z",
+                    "stdout_log": path,
+                    "stderr_log": stderr_by_name[name],
+                }
+                for name, path in command_logs.items()
+            ]
         if task_id == "J45":
             go_test_pattern = (
                 "^(TestM4WatchStartScenarioMatchesPinnedNativeOracle|"
@@ -953,7 +1067,7 @@ class M4ReportTest(unittest.TestCase):
         run = {
             "schema": "etcd-hbase-m4-run/v1",
             "run_id": run_id,
-            "scope": "public-local-unit" if task_id == "J45" else "public-local-minicluster",
+            "scope": "public-local-unit" if task_id in {"J45", "J46"} else "public-local-minicluster",
             "tasks": [task_id],
             "status": "passed",
             "source_commit": source_commit,

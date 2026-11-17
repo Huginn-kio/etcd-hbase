@@ -40,7 +40,7 @@ final class WatchEventBatchEncoder {
     this.maximumResponseBytes = maximumResponseBytes;
   }
 
-  Poll nextBatch(WatchRegistry.Watcher watcher) {
+  Poll nextBatch(WatchRegistry.Watcher watcher, Long maximumRevision) {
     Objects.requireNonNull(watcher, "watcher");
     List<WatchStream.Delivery> deliveries = new ArrayList<>();
     boolean transferred = false;
@@ -52,6 +52,10 @@ final class WatchEventBatchEncoder {
         return new Poll(null, terminationReason != null, terminationReason);
       }
 
+      if (maximumRevision != null && first.revision() > maximumRevision) {
+        watcher.defer(first);
+        return new Poll(null, false, null);
+      }
       long revision = first.revision();
       deliveries.add(first);
       while (deliveries.size() < MAX_PENDING_EVENTS_PER_WATCH) {

@@ -391,23 +391,14 @@ class WatchGatewayTest {
       queued.add(eventAtBarrier);
       queued.add(eventAfterBarrier);
       when(eventAtBarrier.revision()).thenReturn(4L);
+      when(eventAtBarrier.sequence()).thenReturn(4L);
       when(eventAtBarrier.event()).thenReturn(event(4));
       when(eventAfterBarrier.revision()).thenReturn(5L);
+      when(eventAfterBarrier.sequence()).thenReturn(5L);
       when(eventAfterBarrier.event()).thenReturn(event(5));
       when(sharedSubscription.poll()).thenAnswer(ignored -> Optional.ofNullable(queued.pollFirst()));
       when(sharedSubscription.termination()).thenReturn(Optional.empty());
-      doAnswer(invocation -> {
-        long minimumRevision = invocation.getArgument(0);
-        var iterator = queued.iterator();
-        while (iterator.hasNext()) {
-          var delivery = iterator.next();
-          if (delivery.revision() < minimumRevision) {
-            iterator.remove();
-            delivery.close();
-          }
-        }
-        return null;
-      }).when(sharedSubscription).requireRevisionAtLeast(anyLong());
+      doAnswer(invocation -> null).when(sharedSubscription).requireRevisionAtLeast(anyLong());
       when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
           anyInt(), anyLong(), anyLong()))
           .thenReturn(new SharedEventTailer.SubscriptionStart(sharedSubscription, 2, 3));
@@ -429,16 +420,17 @@ class WatchGatewayTest {
           eq((long) RESPONSE_BYTES), eq(startRevision));
       order.verify(control).read(scope);
 
-      barrier.complete(Optional.of(snapshot(4, 2)));
+      barrier.complete(Optional.of(snapshot(4, 2, 4)));
       WatchStream.OpenedWatch opened = opening.toCompletableFuture().join();
 
       assertEquals(4, opened.revision());
       assertEquals(2, opened.compactRevision(), "compact boundary comes from the same control snapshot");
+      assertEquals(4, opened.barrierSequence(), "the handoff captures the selected sequence too");
       verify(sharedSubscription).requireRevisionAtLeast(5L);
-      verify(eventAtBarrier).close();
       try (var delivery = opened.subscription().poll().orElseThrow()) {
         assertEquals(5, delivery.revision(), "B+1 is retained after raising the floor");
       }
+      verify(eventAtBarrier).close();
       verify(eventAfterBarrier).close();
       opened.subscription().close();
       assertReleased(budgets);
@@ -617,8 +609,13 @@ class WatchGatewayTest {
   }
 
   private static ControlSnapshot snapshot(long revision, long compactRevision) {
+    return snapshot(revision, compactRevision, 0);
+  }
+
+  private static ControlSnapshot snapshot(long revision, long compactRevision, long sequence) {
     CommitState state = CommitState.restore(CommitState.FORMAT_VERSION, ByteKey.copyOf(new byte[32]),
-        Optional.empty(), 0, 0, 1, 0, revision, 0, revision, Optional.empty(), compactRevision);
+        Optional.empty(), 0, 0, 1, sequence, revision, sequence, revision,
+        Optional.empty(), compactRevision);
     return new ControlSnapshot(state, new byte[] {1});
   }
 

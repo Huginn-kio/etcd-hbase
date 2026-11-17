@@ -581,6 +581,116 @@ class WatchStreamTest {
   }
 
   @Test
+  void explicitProgressFollowsAllEligibleEventsAndUsesTheAuthoritativeRevision() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {4};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(31, key, new byte[0], 0, false));
+      session.revision = 5;
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {5}, Optional.empty()));
+
+      stream.onNext(progressRequest());
+
+      assertEquals(3, observer.responses.size());
+      assertTrue(observer.responses.get(0).getCreated());
+      Rpc.WatchResponse event = observer.responses.get(1);
+      assertEquals(31, event.getWatchId());
+      assertEquals(5, event.getHeader().getRevision());
+      assertEquals(1, event.getEventsCount());
+      Rpc.WatchResponse progress = observer.responses.get(2);
+      assertEquals(-1, progress.getWatchId());
+      assertEquals(5, progress.getHeader().getRevision());
+      assertEquals(0, progress.getEventsCount());
+      assertEquals(1, subscription.releases.get());
+      stream.close();
+    }
+  }
+
+  @Test
+  void explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {5};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(32, key, new byte[0], 0, false,
+          Rpc.WatchCreateRequest.FilterType.NOPUT));
+      session.revision = 5;
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {6}, Optional.empty()));
+
+      stream.onNext(progressRequest());
+
+      assertEquals(2, observer.responses.size());
+      assertTrue(observer.responses.getFirst().getCreated());
+      Rpc.WatchResponse progress = observer.responses.get(1);
+      assertEquals(-1, progress.getWatchId());
+      assertEquals(5, progress.getHeader().getRevision());
+      assertEquals(0, progress.getEventsCount());
+      assertEquals(1, subscription.releases.get(), "filtered events are consumed before progress");
+      stream.close();
+    }
+  }
+
+  @Test
+  void progressRequestIsDroppedWhenAnyWatchHasNotFinishedHistoricalReplay() {
+    var ready = new RecordingSubscription();
+    var replaying = new RecordingSubscription();
+    replaying.progressReady = false;
+    var session = new RecordingSession(8, true, ready, replaying);
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(33, new byte[] {1}, new byte[0], 0, false));
+      stream.onNext(createRequest(34, new byte[] {2}, new byte[0], 3, false));
+
+      stream.onNext(progressRequest());
+      assertEquals(2, observer.responses.size(),
+          "the all-watch progress request has no response while one replay is incomplete");
+
+      replaying.progressReady = true;
+      stream.onNext(progressRequest());
+      assertEquals(3, observer.responses.size());
+      assertEquals(-1, observer.responses.get(2).getWatchId());
+      assertEquals(8, observer.responses.get(2).getHeader().getRevision());
+      stream.close();
+    }
+  }
+
+  @Test
+  void progressRequestIsDroppedUntilFutureStartRevisionIsReached() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {6};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(35, key, new byte[0], 7, false));
+
+      stream.onNext(progressRequest());
+      assertEquals(1, observer.responses.size(), "future-start Watch blocks stream progress");
+
+      session.revision = 7;
+      subscription.add(event(7, PreparedEvent.Kind.PUT, key, new byte[] {7}, Optional.empty()));
+      stream.onNext(progressRequest());
+
+      assertEquals(3, observer.responses.size());
+      assertEquals(35, observer.responses.get(1).getWatchId());
+      assertEquals(7, observer.responses.get(1).getHeader().getRevision());
+      assertEquals(-1, observer.responses.get(2).getWatchId());
+      assertEquals(7, observer.responses.get(2).getHeader().getRevision());
+      stream.close();
+    }
+  }
+
+  @Test
   void zeroStartWaitsForCreatedBarrierAndExcludesEarlierEvents() {
     long startRevision = 0;
     var subscription = new RecordingSubscription();
@@ -1163,7 +1273,7 @@ class WatchStreamTest {
     var subscriptionFailure = new IllegalStateException("subscription cleanup failed");
     subscription.closeFailure = subscriptionFailure;
     var watcher = new WatchRegistry(new CompactedWatchIdBudget(1))
-        .registerActive(1, 1, false, false, false, subscription).watcher();
+        .registerActive(1, 1, 1, false, false, false, subscription).watcher();
     var deliveryFailure = new AssertionError("pending delivery cleanup failed");
     var pendingDelivery = new WatchStream.Delivery(2,
         event(2, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {2}, Optional.empty()),
@@ -1334,6 +1444,11 @@ class WatchStreamTest {
     return Rpc.WatchRequest.newBuilder().setCreateRequest(create).build();
   }
 
+  private static Rpc.WatchRequest progressRequest() {
+    return Rpc.WatchRequest.newBuilder()
+        .setProgressRequest(Rpc.WatchProgressRequest.getDefaultInstance()).build();
+  }
+
   private static PreparedEvent event(long revision, PreparedEvent.Kind kind, byte[] key,
       byte[] value, Optional<StoredRecord> previous) {
     ByteKey eventKey = ByteKey.copyOf(key);
@@ -1385,8 +1500,9 @@ class WatchStreamTest {
   }
 
   private static final class RecordingSession implements WatchStream.Session {
-    private final long revision;
+    private long revision;
     private final long compactRevision;
+    private final boolean historicalReplaySupported;
     private final ArrayDeque<RecordingSubscription> available = new ArrayDeque<>();
     private final List<RecordingSubscription> subscriptions = new ArrayList<>();
     private final List<KeyRange> ranges = new ArrayList<>();
@@ -1395,12 +1511,23 @@ class WatchStreamTest {
     private KeyRange range;
 
     private RecordingSession(long revision, RecordingSubscription... subscriptions) {
-      this(revision, -1, subscriptions);
+      this(revision, -1, false, subscriptions);
     }
 
     private RecordingSession(long revision, long compactRevision, RecordingSubscription... subscriptions) {
+      this(revision, compactRevision, false, subscriptions);
+    }
+
+    private RecordingSession(long revision, boolean historicalReplaySupported,
+        RecordingSubscription... subscriptions) {
+      this(revision, -1, historicalReplaySupported, subscriptions);
+    }
+
+    private RecordingSession(long revision, long compactRevision, boolean historicalReplaySupported,
+        RecordingSubscription... subscriptions) {
       this.revision = revision;
       this.compactRevision = compactRevision;
+      this.historicalReplaySupported = historicalReplaySupported;
       available.addAll(List.of(subscriptions));
     }
 
@@ -1419,7 +1546,8 @@ class WatchStreamTest {
       RecordingSubscription subscription = available.removeFirst();
       subscriptions.add(subscription);
       return CompletableFuture.completedFuture(
-          new WatchStream.OpenedWatch(revision, compactRevision, subscription));
+          new WatchStream.OpenedWatch(revision, 0, compactRevision, subscription,
+              historicalReplaySupported));
     }
   }
 
@@ -1431,6 +1559,7 @@ class WatchStreamTest {
     private Runnable afterPoll;
     private Runnable wakeup;
     private String terminationReason;
+    private boolean progressReady = true;
     private boolean closed;
 
     private void add(PreparedEvent event) {
@@ -1458,6 +1587,8 @@ class WatchStreamTest {
 
     @Override
     public Optional<String> terminationReason() { return Optional.ofNullable(terminationReason); }
+
+    @Override public boolean progressReady(long revision) { return progressReady; }
 
     @Override
     public void setWakeup(Runnable wakeup) {

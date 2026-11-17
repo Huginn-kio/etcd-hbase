@@ -4,6 +4,8 @@ import etcdserverpb.Rpc;
 import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.commit.EventHistoryPinManager;
+import io.etcdhbase.core.commit.SelectedSequenceReader;
 import io.etcdhbase.core.commit.SharedEventTailer;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
@@ -21,10 +23,23 @@ import java.util.function.Function;
 /** Adapts a table-group's shared tailer and per-watch budgets to the Watch RPC stream controller. */
 final class WatchGateway {
   private static final long ACTIVE_WATCH_STATE_BYTES = 512;
+  private record EventPosition(long sequence, long ordinal) implements Comparable<EventPosition> {
+    private EventPosition {
+      if (sequence < 0 || ordinal < 0) throw new IllegalArgumentException("invalid Watch event position");
+    }
+
+    @Override public int compareTo(EventPosition other) {
+      int sequenceOrder = Long.compare(sequence, other.sequence);
+      return sequenceOrder != 0 ? sequenceOrder : Long.compare(ordinal, other.ordinal);
+    }
+  }
 
   private final String tableGroup;
   private final M3TableGroupRuntime.Pending pending;
   private final CommitControlStore control;
+  private final EventHistoryPinManager historyPins;
+  private final SelectedSequenceReader selectedEvents;
+  private final io.etcdhbase.core.bytes.ByteKey authorization;
   private final BudgetManager budgets;
   private final Executor worker;
   private final ScheduledExecutorService timers;
@@ -36,9 +51,25 @@ final class WatchGateway {
       BudgetManager budgets,
       Executor worker, ScheduledExecutorService timers, long clusterId, long memberId,
       int maximumResponseBytes) {
+    this(tableGroup, pending, control, budgets, worker, timers, clusterId, memberId,
+        maximumResponseBytes, null, null, null);
+  }
+
+  WatchGateway(String tableGroup, M3TableGroupRuntime.Pending pending, CommitControlStore control,
+      BudgetManager budgets, Executor worker, ScheduledExecutorService timers,
+      long clusterId, long memberId, int maximumResponseBytes,
+      EventHistoryPinManager historyPins, SelectedSequenceReader selectedEvents,
+      io.etcdhbase.core.bytes.ByteKey authorization) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
     this.pending = Objects.requireNonNull(pending, "pending");
     this.control = Objects.requireNonNull(control, "control");
+    this.historyPins = historyPins;
+    this.selectedEvents = selectedEvents;
+    this.authorization = authorization;
+    if ((historyPins == null || selectedEvents == null || authorization == null)
+        && !(historyPins == null && selectedEvents == null && authorization == null)) {
+      throw new IllegalArgumentException("Watch replay dependencies must be provided together");
+    }
     this.budgets = Objects.requireNonNull(budgets, "budgets");
     this.worker = Objects.requireNonNull(worker, "worker");
     this.timers = Objects.requireNonNull(timers, "timers");
@@ -139,7 +170,7 @@ final class WatchGateway {
         throw failure;
       }
       return barrier
-          .thenApply(snapshot -> openedWatch(snapshot, start, subscription, account,
+          .thenCompose(snapshot -> openedWatch(range, snapshot, start, subscription, account,
               retainedStateMemory, request))
           .whenComplete((opened, failure) -> {
             if (failure == null) return;
@@ -149,7 +180,8 @@ final class WatchGateway {
           });
     }
 
-    private WatchStream.OpenedWatch openedWatch(Optional<ControlSnapshot> snapshot,
+    private CompletionStage<WatchStream.OpenedWatch> openedWatch(KeyRange range,
+        Optional<ControlSnapshot> snapshot,
         SharedEventTailer.SubscriptionStart start, SharedEventTailer.Subscription subscription,
         BudgetManager.Account account, BudgetManager.Lease stateMemory,
         Rpc.WatchCreateRequest request) {
@@ -163,11 +195,37 @@ final class WatchGateway {
       }
       if (request.getStartRevision() <= 0) {
         subscription.requireRevisionAtLeast(nextRevision(revision));
+        return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
+            state.publishedSequence(),
+            state.compactRevision() == 0 ? -1 : state.compactRevision(),
+            new TailerSubscription(subscription, account, stateMemory, null,
+                state.publishedSequence())));
       }
-      return new WatchStream.OpenedWatch(revision,
+      if (request.getStartRevision() <= revision) {
+        if (historyPins == null) {
+          return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
+              state.publishedSequence(),
+              state.compactRevision() == 0 ? -1 : state.compactRevision(),
+              new TailerSubscription(subscription, account, stateMemory, null,
+                  state.publishedSequence())));
+        }
+        subscription.requireRevisionAtLeast(nextRevision(revision));
+        var barrierSnapshot = snapshot.orElseThrow(WatchGateway::unavailable);
+        return WatchHistoryReplay.open(tableGroup, range, request.getStartRevision(),
+            barrierSnapshot, state.publishedSequence(), authorization, historyPins, selectedEvents,
+            budgets, account).thenApply(replay -> new WatchStream.OpenedWatch(revision,
+                state.publishedSequence(),
+                state.compactRevision() == 0 ? -1 : state.compactRevision(),
+                new TailerSubscription(subscription, account, stateMemory, replay,
+                    state.publishedSequence()), true));
+      }
+      return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
+          state.publishedSequence(),
           state.compactRevision() == 0 ? -1 : state.compactRevision(),
-          new TailerSubscription(subscription, account, stateMemory));
+          new TailerSubscription(subscription, account, stateMemory, null,
+              state.publishedSequence())));
     }
+
   }
 
   private static java.util.concurrent.CompletionException unavailable() {
@@ -207,44 +265,82 @@ final class WatchGateway {
     private final SharedEventTailer.Subscription subscription;
     private final BudgetManager.Account account;
     private final BudgetManager.Lease stateMemory;
+    private final WatchHistoryReplay history;
+    private final long barrierSequence;
     private boolean closed;
 
     private TailerSubscription(SharedEventTailer.Subscription subscription,
-        BudgetManager.Account account, BudgetManager.Lease stateMemory) {
+        BudgetManager.Account account, BudgetManager.Lease stateMemory,
+        WatchHistoryReplay history, long barrierSequence) {
       this.subscription = subscription;
       this.account = account;
       this.stateMemory = stateMemory;
+      this.history = history;
+      this.barrierSequence = barrierSequence;
     }
 
     @Override
     public synchronized Optional<WatchStream.Delivery> poll() {
       if (closed) return Optional.empty();
-      Optional<SharedEventTailer.Delivery> polled = subscription.poll();
+      if (history != null) {
+        Optional<WatchStream.Delivery> replayed = history.poll();
+        if (replayed.isPresent()) return replayed;
+        if (!history.complete() || history.terminationReason().isPresent()) return Optional.empty();
+      }
+      Optional<SharedEventTailer.Delivery> polled;
+      do {
+        polled = subscription.poll();
+        if (polled.isEmpty()) return Optional.empty();
+        SharedEventTailer.Delivery candidate = polled.orElseThrow();
+        // The snapshot barrier is the exclusive cursor (sequence, Long.MAX_VALUE). Revision
+        // filtering is only a queue optimization; this identity check owns the handoff.
+        var position = new EventPosition(candidate.sequence(), candidate.event().ordinal());
+        if (position.compareTo(new EventPosition(barrierSequence, Long.MAX_VALUE)) <= 0) {
+          candidate.close();
+          polled = Optional.empty();
+        }
+      } while (polled.isEmpty() && !closed);
       if (closed) {
         polled.ifPresent(SharedEventTailer.Delivery::close);
         return Optional.empty();
       }
       return polled.map(delivery -> new WatchStream.Delivery(
-          delivery.revision(), delivery.event(), delivery::close));
+          delivery.sequence(), delivery.revision(), delivery.event(), delivery::close));
     }
 
     @Override
     public synchronized Optional<String> terminationReason() {
       if (closed) return Optional.empty();
+      if (history != null) {
+        Optional<String> historyTermination = history.terminationReason();
+        if (historyTermination.isPresent()) return historyTermination;
+        if (!history.complete()) return Optional.empty();
+      }
       return subscription.termination().map(WatchGateway::cancelReason);
     }
 
     @Override
+    public synchronized boolean progressReady(long revision) {
+      return !closed && (history == null || history.complete());
+    }
+
+    @Override
     public synchronized void setWakeup(Runnable wakeup) {
-      if (!closed) subscription.setWakeup(wakeup);
+      if (closed) return;
+      if (history != null) history.setWakeup(wakeup);
+      subscription.setWakeup(wakeup);
     }
 
     @Override
     public synchronized void close() {
       if (closed) return;
       closed = true;
-      subscription.setWakeup(null);
-      Throwable failure = WatchCleanup.closeAndCollect(subscription::close, null);
+      Throwable failure = WatchCleanup.closeAndCollect(() -> subscription.setWakeup(null), null);
+      if (history != null) {
+        failure = WatchCleanup.closeAndCollect(() -> history.setWakeup(null), failure);
+        failure = WatchCleanup.closeAndCollect(history::close, failure);
+      }
+      failure = WatchCleanup.closeAndCollect(subscription::close, failure);
       failure = WatchCleanup.closeAndCollect(stateMemory::close, failure);
       failure = WatchCleanup.closeAndCollect(account::close, failure);
       WatchCleanup.throwIfPresent(failure);

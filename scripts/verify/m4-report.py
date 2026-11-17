@@ -37,6 +37,16 @@ J45_REQUIRED_COMMANDS = {
     "registry-check", "report-tests", "go-tests", "native-watch-oracle",
     "maven-unit-tests", "collect-maven-reports",
 }
+J46_REQUIRED_COMMANDS = {
+    "registry-check", "report-tests", "go-tests", "maven-unit-tests", "collect-maven-reports",
+}
+J46_MAVEN_TEST_SELECTOR = (
+    "-Dtest=WatchHistoryReplayTest,WatchStreamTest#"
+    "explicitProgressFollowsAllEligibleEventsAndUsesTheAuthoritativeRevision+"
+    "explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch+"
+    "progressRequestIsDroppedWhenAnyWatchHasNotFinishedHistoricalReplay+"
+    "progressRequestIsDroppedUntilFutureStartRevisionIsReached"
+)
 J45_VERIFICATION_BOUNDARY = (
     "J45 public protocol evidence covers negative/zero startRevision cases, negative watch ID "
     "Create/Cancel, future startRevision Create/Cancel, and the Compact-boundary lifecycle. Future-event "
@@ -204,6 +214,33 @@ J45_GO_TESTS = {
         "TestValidateM4LeaseAcceptsLocalServiceEvidenceScope",
     },
     "internal/trace": {"TestTraceAcceptsLocalServiceEvidenceScope"},
+}
+J46_VERIFICATION_BOUNDARY = (
+    "J46.1 unit evidence covers inclusive positive historical start revisions, complete per-revision "
+    "ordinal ordering, and deterministic replay-to-live handoff at the captured (sequence, ordinal) "
+    "barrier. J46.2 covers explicit stream-wide ProgressRequest barriers, event-before-progress ordering, "
+    "filtered revisions, incomplete history, future starts, and the pinned etcd v3.5.23 raw-proto oracle. "
+    "It does not claim periodic progress notifications, fragment delivery, MiniCluster persistence, or Go "
+    "client interoperability against the Java service; those remain separate J46.2/J46.3 or integration evidence"
+)
+J46_JAVA_CLASS_MODULES = {
+    "io.etcdhbase.server.commit.WatchHistoryReplayTest": "server",
+    "io.etcdhbase.server.commit.WatchStreamTest": "server",
+}
+J46_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.server.commit.WatchHistoryReplayTest": {
+        "replaysInclusiveStartInRevisionAndOrdinalOrder",
+        "replayToLiveHandoffDropsTheWholeBarrierSequenceWithoutGapsOrDuplicates",
+    },
+    "io.etcdhbase.server.commit.WatchStreamTest": {
+        "explicitProgressFollowsAllEligibleEventsAndUsesTheAuthoritativeRevision",
+        "explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch",
+        "progressRequestIsDroppedWhenAnyWatchHasNotFinishedHistoricalReplay",
+        "progressRequestIsDroppedUntilFutureStartRevisionIsReached",
+    },
+}
+J46_GO_TESTS = {
+    "internal/scenario": {"TestM4WatchProgressRequestMatchesPinnedNativeOracle"},
 }
 J45_LOCAL_SERVICE_PHASES = (("initial", 2, -1), ("compacted", 8, 4))
 J45_START_MATRIX = (
@@ -794,6 +831,9 @@ def validate_registry_document(document: object) -> dict[str, object]:
     j45 = task_map.get("J45")
     if j45 is not None:
         _validate_j45_registration(j45)
+    j46 = task_map.get("J46")
+    if j46 is not None:
+        _validate_j46_registration(j46)
     return document
 
 
@@ -813,6 +853,15 @@ def _validate_task_shape(task: dict[str, object]) -> None:
                 or not isinstance(task.get("watch_start_matrix"), list)
                 or task.get("verification_boundary") != J45_VERIFICATION_BOUNDARY):
             raise ReportError("J45 must register its raw-proto oracle and local Watch suites")
+        return
+    if task.get("id") == "J46":
+        if (task.get("kind") != "watch-replay"
+                or not isinstance(task.get("maven_tests"), list)
+                or not task["maven_tests"]
+                or not isinstance(task.get("go_tests"), list)
+                or not task["go_tests"]
+                or task.get("verification_boundary") != J46_VERIFICATION_BOUNDARY):
+            raise ReportError("J46 must register replay/progress suites and its verification boundary")
         return
     if not isinstance(task.get("api_ids"), list) or not task["api_ids"]:
         raise ReportError("registered M4 task must identify API coverage")
@@ -1207,6 +1256,42 @@ def _validate_j45_java_registration(task: dict[str, object]) -> None:
         )
 
 
+def _validate_j46_registration(task: dict[str, object]) -> None:
+    if task.get("kind") != "watch-replay" or task.get("id") != "J46":
+        raise ReportError("J46 Watch replay registration changed")
+    if (task.get("api_ids") != ["C19"]
+            or task.get("verification_boundary") != J46_VERIFICATION_BOUNDARY):
+        raise ReportError("J46 Watch replay/progress scope or verification boundary changed")
+    go_tests = _registered_go_tests(task["go_tests"], "J46")
+    if any(not expected.issubset(go_tests.get(package, set()))
+           for package, expected in J46_GO_TESTS.items()):
+        raise ReportError("J46 pinned ProgressRequest native oracle is incomplete")
+    java_methods: dict[str, set[str]] = {}
+    java_modules: dict[str, str] = {}
+    for suite in task["maven_tests"]:
+        if not isinstance(suite, dict):
+            raise ReportError("J46 Maven test registration is malformed")
+        module, kind, class_name, tests = (
+            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
+        )
+        if module not in JAVA_MODULES or kind != "surefire" or not isinstance(class_name, str):
+            raise ReportError("J46 Maven suites must be JVM unit tests in known modules")
+        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
+            raise ReportError("J46 Maven suite has no named required tests")
+        previous_module = java_modules.setdefault(class_name, module)
+        if previous_module != module:
+            raise ReportError("J46 Maven suite is registered in multiple modules")
+        java_methods.setdefault(class_name, set()).update(tests)
+    if set(java_modules) != set(J46_JAVA_CLASS_MODULES):
+        raise ReportError("J46 replay, handoff, and progress suites are incomplete")
+    if any(java_modules.get(class_name) != module
+           for class_name, module in J46_JAVA_CLASS_MODULES.items()):
+        raise ReportError("J46 Java suites must be collected from their declared modules")
+    if any(not methods.issubset(java_methods.get(class_name, set()))
+           for class_name, methods in J46_CRITICAL_JAVA_TESTS.items()):
+        raise ReportError("J46 replay ordering, handoff, or progress barrier coverage is incomplete")
+
+
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, object]:
     return validate_registry_document(read_json(path))
 
@@ -1291,6 +1376,7 @@ def _validate_commands(artifact: Path, run: dict[str, object], task: dict[str, o
     required = {
         "J44": J44_REQUIRED_COMMANDS,
         "J45": J45_REQUIRED_COMMANDS,
+        "J46": J46_REQUIRED_COMMANDS,
     }.get(task.get("id"), REQUIRED_COMMANDS)
     if not required.issubset(names):
         raise ReportError("M4 run is missing a required task verification command")
@@ -1327,6 +1413,27 @@ def _validate_commands(artifact: Path, run: dict[str, object], task: dict[str, o
                 raise ReportError("J45 native oracle outputs must stay inside the artifact directory") from error
             if flag != "--native-data-dir" and (not resolved.is_file() or resolved.is_symlink()):
                 raise ReportError("J45 native oracle trace or metadata is missing or unsafe")
+    if task.get("id") == "J46":
+        if names != J46_REQUIRED_COMMANDS:
+            raise ReportError("J46 verification must run its pinned Go oracle and JVM unit profile")
+        go_tests = next(command for command in commands if command["name"] == "go-tests")
+        go_test_pattern = (
+            go_tests["argv"][go_tests["argv"].index("-run") + 1]
+            if "-run" in go_tests["argv"] and go_tests["argv"].index("-run") + 1 < len(go_tests["argv"])
+            else ""
+        )
+        if ("scripts/dev/go-m0.sh" not in go_tests["argv"] or "test" not in go_tests["argv"]
+                or "-json" not in go_tests["argv"] or "-run" not in go_tests["argv"]
+                or "./internal/scenario" not in go_tests["argv"]
+                or any(test_name not in go_test_pattern
+                       for tests in J46_GO_TESTS.values() for test_name in tests)):
+            raise ReportError("J46 Go tests must run the registered etcd v3.5.23 raw-proto progress oracle")
+        maven = next(command for command in commands if command["name"] == "maven-unit-tests")
+        if ("-Pm4-j46-public" not in maven["argv"] or "test" not in maven["argv"]
+                or "verify" in maven["argv"]
+                or J46_MAVEN_TEST_SELECTOR not in maven["argv"]
+                or "-Dsurefire.failIfNoSpecifiedTests=false" not in maven["argv"]):
+            raise ReportError("J46 Maven verification must run only the registered Surefire suite")
 
 
 def _validate_go_tests(artifact: Path, task: dict[str, object]) -> int:
@@ -2215,7 +2322,7 @@ def _load_run_and_task(
     task = next((item for item in registry["tasks"] if item["id"] == task_id), None)
     if task is None:
         raise ReportError("M4 run task is not registered")
-    expected_scope = "public-local-unit" if task_id == "J45" else "public-local-minicluster"
+    expected_scope = "public-local-unit" if task_id in {"J45", "J46"} else "public-local-minicluster"
     if run.get("scope") != expected_scope:
         raise ReportError("M4 run scope does not match its task verification profile")
     _validate_run_identity(artifact, run)
@@ -2629,6 +2736,21 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
         }
     if task.get("id") == "J45":
         return _validate_j45_artifact(repository, artifact, run, task, java_test_count)
+    if task.get("id") == "J46":
+        if any(kind != "surefire" for _, kind, _ in _java_test_report_paths(artifact)):
+            raise ReportError("J46 evidence must contain JVM unit reports only")
+        go_test_count = _validate_go_tests(artifact, task)
+        return {
+            "task": run["tasks"][0],
+            "run_id": run["run_id"],
+            "source_commit": run["source_commit"],
+            "base_commit": run["base_commit"],
+            "evidence_class": "official-clean" if run["worktree_clean"] else "development-dirty",
+            "go_test_count": go_test_count,
+            "java_test_count": java_test_count,
+            "evidence": "J46.1-replay-J46.2-progress-barrier-and-pinned-native-oracle",
+            "scope": "public-local-unit",
+        }
     evidence_root = _task_artifact_root(artifact, task)
     go_test_count = _validate_go_tests(artifact, task)
     run_id = run["run_id"]

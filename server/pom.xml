@@ -190,6 +190,12 @@
       </properties>
     </profile>
     <profile>
+      <id>m4-j46-public</id>
+      <properties>
+        <j03.skipWire>true</j03.skipWire>
+      </properties>
+    </profile>
+    <profile>
       <id>m3-j34-public</id>
       <properties>
         <j03.skipWire>false</j03.skipWire>
