@@ -38,6 +38,7 @@ import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.grpc.service.KvService;
 import io.etcdhbase.grpc.service.LeaseService;
+import io.etcdhbase.grpc.service.WatchService;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.hbase.codec.LeaseStateMessages;
 import io.etcdhbase.hbase.codec.LeaseBindingMessages;
@@ -90,16 +91,19 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private final Pending resources;
   private final KvService kvService;
   private final LeaseService leaseService;
+  private final WatchService watchService;
   private final Optional<LeaseTimeSource> leaseTime;
   private final long clusterId;
   private final long memberId;
   private final RequestMetrics metrics;
 
   private M3TableGroupRuntime(Pending resources, KvService kvService, LeaseService leaseService,
+      WatchService watchService,
       Optional<LeaseTimeSource> leaseTime, long clusterId, long memberId, RequestMetrics metrics) {
     this.resources = resources;
     this.kvService = kvService;
     this.leaseService = leaseService;
+    this.watchService = watchService;
     this.leaseTime = Objects.requireNonNull(leaseTime, "leaseTime");
     this.clusterId = clusterId;
     this.memberId = memberId;
@@ -245,7 +249,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         verifyExistingLeaseLimits(plan, activation, budgets, stores, authorization,
             business.lease().orElseThrow(), startup);
       }
-      ServiceComponents services = assembleService(plan, activation, identity, authorization, budgets,
+      ServiceComponents services = assembleService(plan, activation, limits, identity, authorization, budgets,
           pending, stores, invocations, owner, business, ownerForwarding);
       await(pending.initialReadiness(), startup);
       startup.closeAsync(CLEANUP);
@@ -256,6 +260,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
             new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       }
       return new M3TableGroupRuntime(pending, services.kvService(), services.leaseService(),
+          services.watchService(),
           leaseTime, stores.clusterId(), activation.memberIdBits(), business.metrics());
     } catch (Exception failure) {
       throw new StartupException(failure, abort(startup, pending, failure));
@@ -549,7 +554,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       LeaseReadView readView, LeaseEnumerationReader enumeration, LeaseBindingReader bindings,
       LeaseTimeSource time, LeaseBindingMutationPlanner bindingPlanner) {}
 
-  private record ServiceComponents(KvService kvService, LeaseService leaseService) {}
+  private record ServiceComponents(KvService kvService, LeaseService leaseService,
+      WatchService watchService) {}
 
   record CacheLimits(long maximumBytes, int maximumEntries, int maximumRecords,
       int maximumDecisions, long maximumCandidateBytes, BudgetManager.Reservation proofReservation,
@@ -697,7 +703,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   }
 
   private static ServiceComponents assembleService(M3TableGroupPlan plan,
-      M3RuntimeConfiguration activation,
+      M3RuntimeConfiguration activation, RuntimeConfiguration.ResourceBudgets limits,
       AuthorizedBackendIdentity identity, ByteKey authorization, BudgetManager budgets, Pending pending,
       TableGroupStores stores, InvocationService invocations, M3OwnerLease owner,
       BusinessComponents business, OwnerForwardingRuntime ownerForwarding) {
@@ -751,6 +757,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         stores.clusterId(), activation.memberIdBits(), activation.maxEtcdRequestBytes(),
         stores.control(), relay, stores.invocationResults(), business.txnReads(), budgets, REQUEST_MEMORY, pending.worker, business.metrics());
     LeaseService leaseService = new LeaseService();
+    WatchService watchService = new WatchService();
     if (business.lease().isPresent()) {
       LeaseComponents lease = business.lease().orElseThrow();
       var leaseGateway = new LeaseGateway(plan.source().tableGroupId(), identity, authorization,
@@ -779,9 +786,13 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       var history = new EventHistoryCycle(backfill, tailer, business.metrics());
       pending.installEventHistoryWorker(new EventHistoryWorker(
           pending.leaseTimers, owner::currentToken, history::run, business.metrics()));
+      var watchGateway = new WatchGateway(plan.source().tableGroupId(), pending,
+          stores.control(), budgets, pending.worker, pending.leaseTimers,
+          stores.clusterId(), activation.memberIdBits(), limits.maxRpcBytes());
+      watchService = new WatchService(watchGateway.handler());
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
-        txnGateway::range), leaseService);
+        txnGateway::range), leaseService, watchService);
   }
 
   private static MutationRelay localOwnerRelay(String tableGroupId, CommitControlStore control,
@@ -805,6 +816,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
 
   public KvService kvService() { return kvService; }
   public LeaseService leaseService() { return leaseService; }
+  public WatchService watchService() { return watchService; }
   public CompletableFuture<SharedEventTailer> eventTailerReady() { return resources.eventTailerReady(); }
   public Optional<SharedEventTailer> eventTailer() { return resources.eventTailer(); }
   public long clusterId() { return clusterId; }

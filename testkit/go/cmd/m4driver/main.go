@@ -104,15 +104,19 @@ func runLeaseKeepAliveOnce(parent context.Context, arguments []string, stdout, s
 }
 
 type runOptions struct {
-	endpoint   string
-	nativeData string
-	scenario   string
-	scope      string
-	prefix     string
-	tracePath  string
-	metadata   string
-	layout     string
-	timeout    time.Duration
+	endpoint             string
+	nativeData           string
+	scenario             string
+	scope                string
+	prefix               string
+	tracePath            string
+	metadata             string
+	layout               string
+	watchPhase           string
+	watchRevision        int64
+	watchCompactRevision int64
+	watchLifecycle       bool
+	timeout              time.Duration
 }
 
 func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr io.Writer) (runErr error) {
@@ -131,7 +135,13 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 		suite, suiteDigest, err = scenario.LoadM4LeaseRevokeSuite(options.scenario)
 	}
 	if err != nil {
+		suite, suiteDigest, err = scenario.LoadM4WatchStartSuite(options.scenario)
+	}
+	if err != nil {
 		return err
+	}
+	if options.scope == "local-service" && suite.ID != "m4-watch-starts-v1" {
+		return errors.New("local-service scope is registered only for the J45 Watch start scenario")
 	}
 	build, err := scenario.BuildMetadata(suite)
 	if err != nil {
@@ -139,8 +149,11 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 	}
 	if options.nativeData == "" {
 		build.Distribution = "remote endpoint; Go build metadata does not attest the server version"
+		if options.scope == "local-service" {
+			build.Distribution = "local Java WatchService endpoint; Go build metadata does not attest Java runtime"
+		}
 	}
-	evidence, err := openEvidence(options, build, suiteDigest, stdout)
+	evidence, err := openEvidence(options, build, suiteDigest, suite.ID, stdout)
 	if err != nil {
 		return err
 	}
@@ -148,7 +161,25 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 
 	ctx, cancel := context.WithTimeout(parent, options.timeout)
 	defer cancel()
+	if options.scope == "local-service" {
+		connection, err := client.New(client.Options{Endpoint: options.endpoint, Timeout: options.timeout})
+		if err != nil {
+			return errors.New("M4 local Watch service client initialization failed")
+		}
+		defer func() { runErr = errors.Join(runErr, connection.Close()) }()
+		if err := scenario.RunM4WatchStartEndpoint(ctx, connection, options.prefix,
+			options.watchPhase, options.watchRevision, options.watchCompactRevision, evidence.trace); err != nil {
+			return err
+		}
+		if options.watchLifecycle {
+			return scenario.RunM4WatchLifecycleInterop(ctx, connection, options.prefix, stdout)
+		}
+		return nil
+	}
 	if options.nativeData != "" {
+		if suite.ID == "m4-watch-starts-v1" {
+			return scenario.RunM4NativeWatchStart(ctx, options.nativeData, options.prefix, evidence.trace)
+		}
 		if suite.ID == "m4-lease-bindings-v1" {
 			return scenario.RunM4NativeLeaseBindings(ctx, options.nativeData, options.prefix, evidence.trace)
 		}
@@ -159,6 +190,9 @@ func runLeaseScenario(parent context.Context, arguments []string, stdout, stderr
 			return scenario.RunM4NativeLeaseRevoke(ctx, options.nativeData, options.prefix, evidence.trace)
 		}
 		return scenario.RunM4NativeLease(ctx, options.nativeData, options.prefix, evidence.trace)
+	}
+	if suite.ID == "m4-watch-starts-v1" {
+		return errors.New("M4 Watch start oracle requires an isolated embedded native etcd run")
 	}
 	connection, err := client.New(client.Options{Endpoint: options.endpoint, Timeout: options.timeout})
 	if err != nil {
@@ -184,11 +218,17 @@ func parseRunOptions(arguments []string, stderr io.Writer) (runOptions, error) {
 	flags.StringVar(&options.endpoint, "endpoint", "", "explicit etcd-compatible endpoint")
 	flags.StringVar(&options.nativeData, "native-data-dir", "", "new isolated embedded etcd data directory")
 	flags.StringVar(&options.scenario, "scenario", "", "registered pinned M4 scenario manifest")
-	flags.StringVar(&options.scope, "scope", "", "native-etcd or target-hbase")
+	flags.StringVar(&options.scope, "scope", "", "native-etcd, target-hbase, or local-service")
 	flags.StringVar(&options.layout, "layout", "", "target layout HISTORY or NATIVE")
 	flags.StringVar(&options.prefix, "prefix", "", "fresh isolated M4 test prefix")
 	flags.StringVar(&options.tracePath, "trace", "", "new JSONL trace path")
 	flags.StringVar(&options.metadata, "metadata", "", "new JSON evidence metadata path")
+	flags.StringVar(&options.watchPhase, "watch-phase", "", "expected local Watch phase: initial or compacted")
+	flags.Int64Var(&options.watchRevision, "watch-revision", 0, "expected local Watch published revision")
+	flags.Int64Var(&options.watchCompactRevision, "watch-compact-revision", 0,
+		"expected local Watch compact revision, or -1 for the initial state")
+	flags.BoolVar(&options.watchLifecycle, "watch-lifecycle", false,
+		"also verify the local Java WatchService live-event lifecycle")
 	flags.DurationVar(&options.timeout, "timeout", 2*time.Minute, "whole-scenario deadline")
 	if err := flags.Parse(arguments); err != nil {
 		return runOptions{}, err
@@ -205,12 +245,27 @@ func parseRunOptions(arguments []string, stderr io.Writer) (runOptions, error) {
 		if err := (client.Options{Endpoint: options.endpoint, Timeout: options.timeout}).Validate(); err != nil {
 			return runOptions{}, err
 		}
-		if options.layout != "HISTORY" && options.layout != "NATIVE" {
+		if options.scope == "local-service" {
+			if options.layout != "" || options.watchRevision < 1 || options.watchCompactRevision < -1 ||
+				(options.watchPhase != "initial" && options.watchPhase != "compacted") ||
+				(options.watchPhase == "initial" && options.watchCompactRevision != -1) ||
+				(options.watchPhase == "compacted" && (options.watchCompactRevision < 1 ||
+					options.watchCompactRevision > options.watchRevision)) {
+				return runOptions{}, errors.New("local M4 Watch mode requires a valid phase and revision checkpoint")
+			}
+		} else if options.layout != "HISTORY" && options.layout != "NATIVE" {
 			return runOptions{}, errors.New("M4 target mode requires an explicit HISTORY or NATIVE layout")
 		}
 	}
 	if err := scenario.ValidateM4Lease(options.scope, options.prefix); err != nil {
 		return runOptions{}, err
+	}
+	if options.scope != "local-service" &&
+		(options.watchPhase != "" || options.watchRevision != 0 || options.watchCompactRevision != 0) {
+		return runOptions{}, errors.New("Watch checkpoint options require local-service scope")
+	}
+	if options.watchLifecycle && options.scope != "local-service" {
+		return runOptions{}, errors.New("Watch lifecycle interop requires local-service scope")
 	}
 	if (options.scope == "native-etcd") != (options.nativeData != "") {
 		return runOptions{}, errors.New("M4 evidence scope does not match the selected endpoint mode")
@@ -219,23 +274,27 @@ func parseRunOptions(arguments []string, stderr io.Writer) (runOptions, error) {
 }
 
 type runMetadata struct {
-	Schema         string            `json:"schema"`
-	RunID          string            `json:"run_id,omitempty"`
-	SourceCommit   string            `json:"source_commit,omitempty"`
-	Build          scenario.Metadata `json:"build"`
-	SuiteSHA256    string            `json:"suite_sha256"`
-	EvidenceScope  string            `json:"evidence_scope"`
-	PrefixSHA256   string            `json:"prefix_sha256"`
-	TraceSHA256    string            `json:"trace_sha256"`
-	EmbeddedNative bool              `json:"embedded_native"`
-	Layout         string            `json:"layout"`
-	Status         string            `json:"status"`
+	Schema               string            `json:"schema"`
+	RunID                string            `json:"run_id,omitempty"`
+	SourceCommit         string            `json:"source_commit,omitempty"`
+	Build                scenario.Metadata `json:"build"`
+	SuiteSHA256          string            `json:"suite_sha256"`
+	EvidenceScope        string            `json:"evidence_scope"`
+	PrefixSHA256         string            `json:"prefix_sha256"`
+	TraceSHA256          string            `json:"trace_sha256"`
+	EmbeddedNative       bool              `json:"embedded_native"`
+	Layout               string            `json:"layout"`
+	WatchPhase           string            `json:"watch_phase,omitempty"`
+	WatchRevision        int64             `json:"watch_revision,omitempty"`
+	WatchCompactRevision int64             `json:"watch_compact_revision,omitempty"`
+	Status               string            `json:"status"`
 }
 
 type evidenceOutput struct {
 	options     runOptions
 	build       scenario.Metadata
 	suiteSHA256 string
+	successText string
 	stdout      io.Writer
 	trace       io.Writer
 	traceHash   hash.Hash
@@ -243,7 +302,7 @@ type evidenceOutput struct {
 	metadata    *os.File
 }
 
-func openEvidence(options runOptions, build scenario.Metadata, suiteSHA256 string,
+func openEvidence(options runOptions, build scenario.Metadata, suiteSHA256, scenarioID string,
 	stdout io.Writer) (*evidenceOutput, error) {
 	if filepath.Clean(options.tracePath) == filepath.Clean(options.metadata) {
 		return nil, errors.New("M4 trace and metadata paths must differ")
@@ -263,7 +322,12 @@ func openEvidence(options runOptions, build scenario.Metadata, suiteSHA256 strin
 		return nil, errors.Join(errors.New("M4 metadata output could not be opened exclusively"), traceFile.Close())
 	}
 	traceHash := sha256.New()
-	return &evidenceOutput{options: options, build: build, suiteSHA256: suiteSHA256, stdout: stdout,
+	successText := "M4 Lease scenario passed"
+	if scenarioID == "m4-watch-starts-v1" {
+		successText = "M4 Watch start scenario passed"
+	}
+	return &evidenceOutput{options: options, build: build, suiteSHA256: suiteSHA256,
+		successText: successText, stdout: stdout,
 		trace: io.MultiWriter(traceFile, traceHash), traceHash: traceHash,
 		closeTrace: traceFile.Close, metadata: metadataFile}, nil
 }
@@ -285,13 +349,18 @@ func (output *evidenceOutput) finish(runErr error) error {
 		PrefixSHA256: hex.EncodeToString(prefixHash[:]), TraceSHA256: hex.EncodeToString(output.traceHash.Sum(nil)),
 		EmbeddedNative: output.options.nativeData != "", Layout: output.options.layout, Status: status,
 	}
+	if output.options.scope == "local-service" {
+		metadata.WatchPhase = output.options.watchPhase
+		metadata.WatchRevision = output.options.watchRevision
+		metadata.WatchCompactRevision = output.options.watchCompactRevision
+	}
 	encodeErr := json.NewEncoder(output.metadata).Encode(metadata)
 	closeMetadataErr := output.metadata.Close()
 	if encodeErr != nil || closeMetadataErr != nil {
 		runErr = errors.Join(runErr, errors.New("M4 metadata could not be finalized"), encodeErr, closeMetadataErr)
 	}
 	if runErr == nil && output.options.tracePath != "-" {
-		_, runErr = fmt.Fprintln(output.stdout, "M4 Lease scenario passed")
+		_, runErr = fmt.Fprintln(output.stdout, output.successText)
 	}
 	return runErr
 }

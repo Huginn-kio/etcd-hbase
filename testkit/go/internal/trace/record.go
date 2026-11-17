@@ -99,7 +99,7 @@ func (record Record) ValidateMetadata() error {
 		return errors.New("invalid method path")
 	}
 	switch record.EvidenceScope {
-	case "transport", "transport-fixture", "native-etcd", "target-hbase":
+	case "transport", "transport-fixture", "native-etcd", "target-hbase", "local-service":
 	default:
 		return errors.New("invalid evidence_scope")
 	}

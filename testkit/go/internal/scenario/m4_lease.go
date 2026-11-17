@@ -161,8 +161,8 @@ func RunM4Lease(ctx context.Context, client *clientv3.Client, evidenceScope, pre
 
 // ValidateM4Lease prevents a test scenario from mutating an unscoped endpoint or keyspace.
 func ValidateM4Lease(evidenceScope, prefix string) error {
-	if evidenceScope != "native-etcd" && evidenceScope != "target-hbase" {
-		return errors.New("M4 lease scope must be native-etcd or target-hbase")
+	if evidenceScope != "native-etcd" && evidenceScope != "target-hbase" && evidenceScope != "local-service" {
+		return errors.New("M4 lease scope must be native-etcd, target-hbase, or local-service")
 	}
 	if len(prefix) < len("etcd-hbase-m4-test/run/") || len(prefix) > 256 ||
 		!strings.HasPrefix(prefix, "etcd-hbase-m4-test/") || !strings.HasSuffix(prefix, "/") ||

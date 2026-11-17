@@ -123,15 +123,30 @@ public final class SharedEventTailer implements AutoCloseable {
   /** Installs the subscription and captures the live cursor under the same lock as publication. */
   public synchronized SubscriptionStart subscribeWithCheckpoint(KeyRange range, BudgetManager.Account account,
       int maximumEvents, long maximumBytes) throws BackendFailure {
+    return subscribeWithCheckpoint(range, account, maximumEvents, maximumBytes, 0);
+  }
+
+  /**
+   * Installs a subscription with an inclusive event floor. Zero means the live checkpoint captured
+   * under this lock; callers may raise the floor after reading the authoritative creation barrier.
+   */
+  public synchronized SubscriptionStart subscribeWithCheckpoint(KeyRange range, BudgetManager.Account account,
+      int maximumEvents, long maximumBytes, long minimumRevision) throws BackendFailure {
     Objects.requireNonNull(range, "range");
     Objects.requireNonNull(account, "account");
-    if (closed || subscriptions.size() >= maximumSubscriptions || maximumEvents < 1 || maximumBytes < 1) {
-      throw new IllegalStateException("shared tailer cannot admit another subscription");
+    if (closed) throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    if (subscriptions.size() >= maximumSubscriptions) {
+      throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    }
+    if (maximumEvents < 1 || maximumBytes < 1) {
+      throw new IllegalArgumentException("subscription limits must be positive");
     }
     long indexBytes = subscriptionIndexMemoryBytes(range);
     BudgetManager.Lease indexMemory = account.tryRetain(BudgetManager.Memory.OUTPUT, indexBytes)
         .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-    var subscription = new Subscription(range, account, maximumEvents, maximumBytes, indexMemory);
+    long effectiveMinimum = minimumRevision == 0 ? nextRevision(revision) : minimumRevision;
+    var subscription = new Subscription(range, account, maximumEvents, maximumBytes,
+        indexMemory, effectiveMinimum);
     try {
       subscriptions.add(subscription);
       subscriptionIndex.add(subscription, range);
@@ -153,6 +168,10 @@ public final class SharedEventTailer implements AutoCloseable {
     return bytes;
   }
 
+  private static long nextRevision(long revision) {
+    return revision == Long.MAX_VALUE ? Long.MAX_VALUE : revision + 1;
+  }
+
   /** Reads at most one selected sequence or event without advancing shared tailer state. */
   public CompletableFuture<StepProposal> prepareStep(RequestScope scope,
       ManifestCatalog.ProofReadBudget budget) {
@@ -163,9 +182,12 @@ public final class SharedEventTailer implements AutoCloseable {
     long expectedRevision;
     CommitDecision decision;
     synchronized (this) {
-      if (closed || busy || !budget.belongsTo(scope) || active != null && activeScope != scope) {
+      if (closed) {
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      }
+      if (busy || !budget.belongsTo(scope) || active != null && activeScope != scope) {
         return CompletableFuture.failedFuture(
-            new IllegalStateException("shared tailer is closed, busy, or has another scope"));
+            new IllegalStateException("shared tailer is busy or has another active scope"));
       }
       busy = true;
       inFlightScope = scope;
@@ -419,7 +441,10 @@ public final class SharedEventTailer implements AutoCloseable {
   }
 
   private void requireOpen() {
-    if (closed) throw new IllegalStateException("shared tailer is closed");
+    if (closed) {
+      throw new java.util.concurrent.CompletionException(
+          new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
   }
 
   private void releaseBuffered() {
@@ -446,19 +471,22 @@ public final class SharedEventTailer implements AutoCloseable {
     private final long maximumBytes;
     private final BudgetManager.Lease indexMemory;
     private final ArrayDeque<Delivery> pending = new ArrayDeque<>();
+    private long minimumRevision;
     private long pendingBytes;
     private Termination termination;
 
     private Subscription(KeyRange range, BudgetManager.Account account, int maximumEvents, long maximumBytes,
-        BudgetManager.Lease indexMemory) {
+        BudgetManager.Lease indexMemory, long minimumRevision) {
       this.range = range;
       this.account = account;
       this.maximumEvents = maximumEvents;
       this.maximumBytes = maximumBytes;
       this.indexMemory = indexMemory;
+      this.minimumRevision = minimumRevision;
     }
 
     private void offer(Buffered item, CommitDecision decision) {
+      if (decision.revision() < minimumRevision) return;
       PreparedEvent event = item.event();
       long eventBytes = event.retainedBytes();
       if (pending.size() >= maximumEvents || eventBytes > maximumBytes - pendingBytes) {
@@ -480,6 +508,27 @@ public final class SharedEventTailer implements AutoCloseable {
         throw failure;
       }
       pendingBytes += eventBytes;
+    }
+
+    /** Raises the inclusive revision floor and releases any live events captured before the barrier. */
+    public void requireRevisionAtLeast(long revision) {
+      if (revision <= 0) throw new IllegalArgumentException("minimum event revision must be positive");
+      synchronized (SharedEventTailer.this) {
+        if (termination != null) return;
+        if (revision < minimumRevision) {
+          throw new IllegalArgumentException("minimum event revision cannot move backwards");
+        }
+        minimumRevision = revision;
+        var queued = pending.iterator();
+        while (queued.hasNext()) {
+          Delivery delivery = queued.next();
+          if (delivery.revision() < minimumRevision) {
+            queued.remove();
+            pendingBytes -= delivery.event().retainedBytes();
+            delivery.close();
+          }
+        }
+      }
     }
 
     /** The receiver owns the returned delivery and must close it after its last use. */

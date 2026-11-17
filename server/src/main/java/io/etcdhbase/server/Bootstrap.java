@@ -57,7 +57,7 @@ public final class Bootstrap implements AutoCloseable {
         binding.port(),
         binding.tableGroupId(),
         new RuntimeConfiguration.ResourceBudgets(65536, 64, 5000, 1048576, 2097152, 16, 0),
-        new KvService(), new LeaseService(), new RequestMetrics());
+        new KvService(), new LeaseService(), new WatchService(), new RequestMetrics());
   }
 
   static Bootstrap startConfigured(
@@ -83,17 +83,25 @@ public final class Bootstrap implements AutoCloseable {
   static Bootstrap startConfigured(
       RuntimeConfiguration.Listener binding, RuntimeConfiguration.ResourceBudgets resources,
       KvService kv, LeaseService lease, RequestMetrics metrics) throws IOException {
+    return startConfigured(binding, resources, kv, lease, new WatchService(), metrics);
+  }
+
+  /** Binds the Watch surface selected by the activated table-group runtime. */
+  static Bootstrap startConfigured(
+      RuntimeConfiguration.Listener binding, RuntimeConfiguration.ResourceBudgets resources,
+      KvService kv, LeaseService lease, WatchService watch, RequestMetrics metrics) throws IOException {
     String host = ListenerAddress.parse(binding.bindHost()).connectionName();
     if (host.equals("localhost")) host = "127.0.0.1";
-    return start(host, binding.port(), binding.tableGroupId(), resources, kv, lease, metrics);
+    return start(host, binding.port(), binding.tableGroupId(), resources, kv, lease, watch, metrics);
   }
 
   private static Bootstrap start(
       String host, int port, String tableGroup, RuntimeConfiguration.ResourceBudgets resources,
-      KvService kv, LeaseService lease, RequestMetrics metrics)
+      KvService kv, LeaseService lease, WatchService watch, RequestMetrics metrics)
       throws IOException {
     Objects.requireNonNull(kv, "kv");
     Objects.requireNonNull(lease, "lease");
+    Objects.requireNonNull(watch, "watch");
     Objects.requireNonNull(metrics, "metrics");
     var deadlines =
         new java.util.concurrent.ScheduledThreadPoolExecutor(
@@ -112,7 +120,7 @@ public final class Bootstrap implements AutoCloseable {
             .maxInboundMessageSize(resources.maxRpcBytes())
             .intercept(requests)
             .addService(kv)
-            .addService(new WatchService())
+            .addService(watch)
             .addService(lease)
             .addService(new AuthService())
             .addService(new ClusterService())

@@ -146,4 +146,26 @@ class SkeletonServiceTest {
         "etcd-hbase M0: Watch.Watch is not implemented",
         Status.fromThrowable(failure.get()).getDescription());
   }
+
+  @Test
+  void assembledWatchServiceDelegatesTheResponseObserverAndReturnsItsRequestHandler() {
+    StreamObserver<Rpc.WatchResponse> responseObserver = new StreamObserver<>() {
+      @Override public void onNext(Rpc.WatchResponse value) {}
+      @Override public void onError(Throwable value) {}
+      @Override public void onCompleted() {}
+    };
+    StreamObserver<Rpc.WatchRequest> requestObserver = new StreamObserver<>() {
+      @Override public void onNext(Rpc.WatchRequest value) {}
+      @Override public void onError(Throwable value) {}
+      @Override public void onCompleted() {}
+    };
+    AtomicReference<StreamObserver<Rpc.WatchResponse>> forwarded = new AtomicReference<>();
+
+    StreamObserver<Rpc.WatchRequest> returned =
+        new WatchService(observer -> { forwarded.set(observer); return requestObserver; })
+            .watch(responseObserver);
+
+    assertSame(responseObserver, forwarded.get());
+    assertSame(requestObserver, returned);
+  }
 }

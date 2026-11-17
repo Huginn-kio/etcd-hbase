@@ -846,8 +846,9 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
 - [ ] **J45｜Watch 双向流 create/cancel、范围订阅索引**
   - 依赖：J44。
   - 完成标准：多 watchId、精确 key/区间、inclusive startRevision、Created、PrevKV 及过滤正确；内存随活跃订阅增长，不维护全部 KV 树。
+  - 范围说明：J45 对照零、负数及未来 startRevision 的创建行为，并按 raw proto 契约接受 `watch_id=-1` 的 Create/Cancel；`startRevision > 0` 且目标不晚于当前 revision 的历史回放与 inclusive 交接由 J46.1 实现，J45 不宣称已支持历史回放。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=实现与定向验证进行中，依赖 J44 收敛；负责人=Codex；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
 
 - [ ] **J46｜历史回放、实时交接、progress 与 fragment**
   - 依赖：J45。

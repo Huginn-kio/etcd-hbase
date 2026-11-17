@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -242,6 +243,59 @@ func TestRunNativeLeaseRevokeWritesFreshTraceAndVerifiableMetadata(t *testing.T)
 	}
 }
 
+func TestRunNativeWatchStartWritesFreshTraceAndVerifiableMetadata(t *testing.T) {
+	root := repositoryRoot(t)
+	artifact := t.TempDir()
+	tracePath := filepath.Join(artifact, "native-watch-starts.jsonl")
+	metadataPath := filepath.Join(artifact, "native-watch-starts.json")
+	dataPath := filepath.Join(artifact, "native-watch-starts-data")
+	scenarioPath := filepath.Join(root, "testkit/scenarios/m4-watch-starts.yaml")
+	suite, suiteDigest, err := scenario.LoadM4WatchStartSuite(scenarioPath)
+	if err != nil {
+		t.Fatalf("load registered J45 Watch start scenario: %v", err)
+	}
+	prefix := "etcd-hbase-m4-test/driver/watch-starts/"
+	t.Setenv("M4_RUN_ID", "j45-driver-test")
+	t.Setenv("M4_SOURCE_COMMIT", strings.Repeat("a", 40))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	var stdout bytes.Buffer
+	args := []string{"run", "--scenario", scenarioPath,
+		"--native-data-dir", dataPath, "--scope", "native-etcd", "--prefix", prefix,
+		"--trace", tracePath, "--metadata", metadataPath}
+	if err := run(ctx, args, &stdout, io.Discard); err != nil {
+		t.Fatalf("run native J45 Watch start scenario: %v", err)
+	}
+	if stdout.String() != "M4 Watch start scenario passed\n" {
+		t.Fatalf("unexpected J45 success marker: %q", stdout.String())
+	}
+	traceBytes, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := trace.ReadJSONL(bytes.NewReader(traceBytes))
+	if err != nil || len(records) != len(suite.Steps) {
+		t.Fatalf("J45 native trace has %d records, want %d, err=%v", len(records), len(suite.Steps), err)
+	}
+	var metadata runMetadata
+	encoded, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	traceDigest := sha256.Sum256(traceBytes)
+	prefixDigest := sha256.Sum256([]byte(prefix))
+	if metadata.Schema != "etcd-hbase-m4-run/v1" || metadata.Status != "passed" ||
+		metadata.RunID != "j45-driver-test" || metadata.SourceCommit != strings.Repeat("a", 40) ||
+		metadata.Build.ScenarioID != suite.ID || metadata.SuiteSHA256 != suiteDigest ||
+		metadata.EvidenceScope != "native-etcd" || metadata.PrefixSHA256 != hex.EncodeToString(prefixDigest[:]) ||
+		metadata.TraceSHA256 != hex.EncodeToString(traceDigest[:]) || !metadata.EmbeddedNative || metadata.Layout != "" {
+		t.Fatalf("J45 native metadata does not describe its trace: %#v", metadata)
+	}
+}
+
 func TestParseRunOptionsRejectsMissingLayoutAndUnscopedPrefix(t *testing.T) {
 	base := []string{"--scenario", "suite.yaml", "--scope", "target-hbase",
 		"--prefix", "etcd-hbase-m4-test/run/", "--endpoint", "127.0.0.1:2379",
@@ -253,6 +307,66 @@ func TestParseRunOptionsRejectsMissingLayoutAndUnscopedPrefix(t *testing.T) {
 	base = append(base, "--layout", "HISTORY")
 	if _, err := parseRunOptions(base, io.Discard); err == nil {
 		t.Fatal("unscoped M4 prefix was accepted")
+	}
+}
+
+func TestParseRunOptionsPinsLocalWatchPhaseAndCheckpoint(t *testing.T) {
+	base := []string{"--scenario", "watch.yaml", "--scope", "local-service",
+		"--prefix", "etcd-hbase-m4-test/run/watch/", "--endpoint", "127.0.0.1:2379",
+		"--trace", "trace.jsonl", "--metadata", "metadata.json", "--watch-phase", "initial",
+		"--watch-revision", "1", "--watch-compact-revision", "-1"}
+	options, err := parseRunOptions(base, io.Discard)
+	if err != nil || options.watchPhase != "initial" || options.watchRevision != 1 ||
+		options.watchCompactRevision != -1 {
+		t.Fatalf("valid local Watch checkpoint was rejected or changed: options=%#v err=%v", options, err)
+	}
+	lifecycleOptions, err := parseRunOptions(append(append([]string(nil), base...), "--watch-lifecycle"), io.Discard)
+	if err != nil || !lifecycleOptions.watchLifecycle {
+		t.Fatalf("local Watch lifecycle option was rejected or changed: options=%#v err=%v", lifecycleOptions, err)
+	}
+
+	for _, invalid := range [][]string{
+		{"--watch-phase", "compacted", "--watch-revision", "4", "--watch-compact-revision", "5"},
+		{"--watch-phase", "initial", "--watch-revision", "1", "--watch-compact-revision", "0"},
+	} {
+		arguments := append(append([]string(nil), base[:len(base)-6]...), invalid...)
+		if _, err := parseRunOptions(arguments, io.Discard); err == nil {
+			t.Fatalf("invalid local Watch checkpoint was accepted: %v", invalid)
+		}
+	}
+}
+
+func TestOpenEvidenceWritesLocalWatchCheckpointMetadata(t *testing.T) {
+	artifact := t.TempDir()
+	options := runOptions{
+		tracePath: filepath.Join(artifact, "trace.jsonl"),
+		metadata:  filepath.Join(artifact, "metadata.json"),
+		prefix:    "etcd-hbase-m4-test/run/watch/", scope: "local-service",
+		watchPhase: "compacted", watchRevision: 8, watchCompactRevision: 4,
+	}
+	var stdout bytes.Buffer
+	output, err := openEvidence(options, scenario.Metadata{}, "suite", "m4-watch-starts-v1", &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(output.trace, "trace\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := output.finish(nil); err != nil {
+		t.Fatal(err)
+	}
+	var metadata runMetadata
+	encoded, err := os.ReadFile(options.metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.EvidenceScope != "local-service" || metadata.WatchPhase != "compacted" ||
+		metadata.WatchRevision != 8 || metadata.WatchCompactRevision != 4 || metadata.EmbeddedNative ||
+		metadata.Status != "passed" || stdout.String() != "M4 Watch start scenario passed\n" {
+		t.Fatalf("local Watch metadata does not match the requested fixture: %#v", metadata)
 	}
 }
 

@@ -155,3 +155,9 @@ func TestValidateM4LeaseRejectsUnscopedPrefixBeforeRPC(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateM4LeaseAcceptsLocalServiceEvidenceScope(t *testing.T) {
+	if err := ValidateM4Lease("local-service", "etcd-hbase-m4-test/run/watch/"); err != nil {
+		t.Fatalf("valid local-service evidence namespace was rejected: %v", err)
+	}
+}

@@ -29,7 +29,7 @@ while (($#)); do
       artifact_request="$2"; seen_artifact=true; shift 2 ;;
     --help)
       cat <<'USAGE'
-用法：scripts/verify/m4.sh --scope public --task J40|J41|J42|J43|J44 --artifact-root .artifacts/m4/<fresh-run-id>
+用法：scripts/verify/m4.sh --scope public --task J40|J41|J42|J43|J44|J45 --artifact-root .artifacts/m4/<fresh-run-id>
      或 scripts/verify/m4.sh --scope public --all --artifact-root .artifacts/m4/<fresh-run-id>
 USAGE
       exit 0 ;;
@@ -50,7 +50,8 @@ if [[ "$run_all" == true ]]; then
   echo 'M4 bulk execution is unavailable until every registered task has an execution profile.' >&2
   exit 2
 fi
-if [[ "$task" != J40 && "$task" != J41 && "$task" != J42 && "$task" != J43 && "$task" != J44 ]]; then
+if [[ "$task" != J40 && "$task" != J41 && "$task" != J42 && "$task" != J43 && \
+      "$task" != J44 && "$task" != J45 ]]; then
   echo "M4 task is not registered for public execution: $task" >&2
   exit 2
 fi
@@ -99,10 +100,11 @@ import json
 import sys
 
 path, run_id, source, base, clean, started, task = sys.argv[1:]
+scope = "public-local-unit" if task == "J45" else "public-local-minicluster"
 record = {
     "schema": "etcd-hbase-m4-run/v1",
     "run_id": run_id,
-    "scope": "public-local-minicluster",
+    "scope": scope,
     "tasks": [task],
     "status": "running",
     "source_commit": source,
@@ -224,12 +226,25 @@ export M4_RUN_ID="$run_id"
 export M4_SOURCE_COMMIT="$source_commit"
 run_logged registry-check registry-check.log registry-check.stderr python3 scripts/verify/m4-report.py --validate-registry
 run_logged report-tests report-tests.log report-tests.stderr python3 scripts/verify/test_m4_report.py
-if [[ "$task" != J44 ]]; then
+if [[ "$task" == J45 ]]; then
+  run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
+    -run '^(TestM4WatchStartScenarioMatchesPinnedNativeOracle|TestM4WatchLifecycleMatchesPinnedNativeOracle|TestLoadM4WatchStartSuiteRejectsMissingOrChangedCoverage|TestRunNativeWatchStartWritesFreshTraceAndVerifiableMetadata|TestParseRunOptionsPinsLocalWatchPhaseAndCheckpoint|TestOpenEvidenceWritesLocalWatchCheckpointMetadata|TestValidateM4LeaseAcceptsLocalServiceEvidenceScope|TestTraceAcceptsLocalServiceEvidenceScope)$' \
+    ./internal/scenario ./cmd/m4driver ./internal/trace
+  mkdir -p "$artifact_root/j45"
+  native_prefix="etcd-hbase-m4-test/$run_id/watch/"
+  run_logged native-watch-oracle j45/native.log j45/native.stderr scripts/dev/go-m0.sh run \
+    ./cmd/m4driver run --scenario ../scenarios/m4-watch-starts.yaml \
+    --native-data-dir "$artifact_root/j45/native-data" --scope native-etcd \
+    --prefix "$native_prefix" --trace "$artifact_root/j45/native-trace.jsonl" \
+    --metadata "$artifact_root/j45/native-metadata.json"
+elif [[ "$task" != J44 ]]; then
   run_logged go-module-lock go-module-lock.log go-module-lock.stderr python3 scripts/verify/go-module-lock.py
   run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
     ./internal/trace ./internal/scenario ./internal/compare ./cmd/m4driver
 fi
 maven_profile=m4-j40-public
+maven_goal=verify
+maven_command=maven-verify
 if [[ "$task" == J41 ]]; then
   maven_profile=m4-j41-public
 elif [[ "$task" == J42 ]]; then
@@ -238,9 +253,13 @@ elif [[ "$task" == J43 ]]; then
   maven_profile=m4-j43-public
 elif [[ "$task" == J44 ]]; then
   maven_profile=m4-j44-public
+elif [[ "$task" == J45 ]]; then
+  maven_profile=m4-j45-public
+  maven_goal=test
+  maven_command=maven-unit-tests
 fi
-run_logged maven-verify maven.log maven.stderr.log scripts/dev/mvn21.sh -B -ntp \
-  -pl server -am clean verify -P"$maven_profile"
+run_logged "$maven_command" maven.log maven.stderr.log scripts/dev/mvn21.sh -B -ntp \
+  -pl server -am clean "$maven_goal" -P"$maven_profile"
 
 collection_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set +e

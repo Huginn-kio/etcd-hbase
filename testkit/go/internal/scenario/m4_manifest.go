@@ -111,6 +111,48 @@ var expectedM4LeaseRevokeSteps = []Step{
 	{CaseID: "R01", ID: "expiry-range-after-b"},
 }
 
+var expectedM4WatchStartSteps = []Step{
+	{CaseID: "P01", ID: "watch-start-history-put"},
+	{CaseID: "C19", ID: "initial-minus-two-created"},
+	{CaseID: "C19", ID: "initial-minus-two-compacted"},
+	{CaseID: "C19", ID: "initial-minus-two-duplicate-id"},
+	{CaseID: "C19", ID: "initial-minus-two-cancel-id"},
+	{CaseID: "C19", ID: "initial-minus-two-reused-created"},
+	{CaseID: "C19", ID: "initial-minus-two-reused-cancelled"},
+	{CaseID: "C19", ID: "initial-minus-one-created"},
+	{CaseID: "C19", ID: "initial-minus-one-cancelled"},
+	{CaseID: "C19", ID: "initial-zero-created"},
+	{CaseID: "C19", ID: "initial-zero-cancelled"},
+	{CaseID: "C19", ID: "initial-watch-id-minus-one-created"},
+	{CaseID: "C19", ID: "initial-watch-id-minus-one-cancelled"},
+	{CaseID: "C19", ID: "initial-future-created"},
+	{CaseID: "C19", ID: "initial-future-cancelled"},
+	{CaseID: "C19", ID: "watch-negative-live-created"},
+	{CaseID: "C19", ID: "watch-negative-live-progress"},
+	{CaseID: "P01", ID: "watch-negative-live-put"},
+	{CaseID: "C19", ID: "watch-negative-live-event"},
+	{CaseID: "C19", ID: "watch-negative-live-cancelled"},
+	{CaseID: "P01", ID: "watch-compact-fixture-put"},
+	{CaseID: "R01", ID: "watch-compact-fixture-range"},
+	{CaseID: "C14", ID: "watch-compact-fixture-compact"},
+	{CaseID: "C19", ID: "compacted-minus-two-created"},
+	{CaseID: "C19", ID: "compacted-minus-two-compacted"},
+	{CaseID: "C19", ID: "compacted-minus-two-duplicate-id"},
+	{CaseID: "C19", ID: "compacted-minus-two-cancel-id"},
+	{CaseID: "C19", ID: "compacted-minus-two-reused-created"},
+	{CaseID: "C19", ID: "compacted-minus-two-reused-cancelled"},
+	{CaseID: "C19", ID: "compacted-minus-one-created"},
+	{CaseID: "C19", ID: "compacted-minus-one-compacted"},
+	{CaseID: "C19", ID: "compacted-minus-one-duplicate-id"},
+	{CaseID: "C19", ID: "compacted-minus-one-cancel-id"},
+	{CaseID: "C19", ID: "compacted-minus-one-reused-created"},
+	{CaseID: "C19", ID: "compacted-minus-one-reused-cancelled"},
+	{CaseID: "C19", ID: "compacted-zero-created"},
+	{CaseID: "C19", ID: "compacted-zero-cancelled"},
+	{CaseID: "C19", ID: "compacted-watch-id-minus-one-created"},
+	{CaseID: "C19", ID: "compacted-watch-id-minus-one-cancelled"},
+}
+
 // LoadM4LeaseSuite accepts only the pinned J40 public lease-query scenario.
 func LoadM4LeaseSuite(path string) (Suite, string, error) {
 	return loadM4Suite(path, "m4-lease-v1", expectedM4LeaseSteps)
@@ -131,27 +173,32 @@ func LoadM4LeaseRevokeSuite(path string) (Suite, string, error) {
 	return loadM4Suite(path, "m4-lease-revoke-v1", expectedM4LeaseRevokeSteps)
 }
 
+// LoadM4WatchStartSuite accepts only the pinned J45 raw-proto Watch start matrix.
+func LoadM4WatchStartSuite(path string) (Suite, string, error) {
+	return loadM4Suite(path, "m4-watch-starts-v1", expectedM4WatchStartSteps)
+}
+
 func loadM4Suite(path, expectedID string, expectedSteps []Step) (Suite, string, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return Suite{}, "", errors.New("M4 lease scenario manifest cannot be opened")
+		return Suite{}, "", errors.New("M4 scenario manifest cannot be opened")
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, 65_537))
 	if err != nil || len(data) == 0 || len(data) > 65_536 {
-		return Suite{}, "", errors.New("M4 lease scenario manifest is empty or oversized")
+		return Suite{}, "", errors.New("M4 scenario manifest is empty or oversized")
 	}
 	var suite Suite
 	if err := yaml.UnmarshalStrict(data, &suite); err != nil {
-		return Suite{}, "", errors.New("M4 lease scenario manifest is invalid")
+		return Suite{}, "", errors.New("M4 scenario manifest is invalid")
 	}
 	if suite.SchemaVersion != 1 || suite.ID != expectedID || suite.Protocol != protocolVersion ||
 		len(suite.Steps) != len(expectedSteps) {
-		return Suite{}, "", errors.New("M4 lease scenario identity or coverage is not pinned")
+		return Suite{}, "", errors.New("M4 scenario identity or coverage is not pinned")
 	}
 	for index, expected := range expectedSteps {
 		if suite.Steps[index] != expected {
-			return Suite{}, "", errors.New("M4 lease scenario coverage differs from its pinned steps")
+			return Suite{}, "", errors.New("M4 scenario coverage differs from its pinned steps")
 		}
 	}
 	digest := sha256.Sum256(data)

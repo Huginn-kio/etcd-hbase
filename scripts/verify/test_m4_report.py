@@ -197,6 +197,164 @@ class M4ReportTest(unittest.TestCase):
         with self.assertRaisesRegex(m4_report.ReportError, "fairness"):
             m4_report.validate_registry_document(missing_fairness)
 
+    def test_j45_registry_requires_revision_barrier_and_cancellation_coverage(self) -> None:
+        required_cases = (
+            ("io.etcdhbase.server.commit.WatchStreamTest",
+             "zeroStartWaitsForCreatedBarrierAndExcludesEarlierEvents"),
+            ("io.etcdhbase.server.commit.WatchStreamTest",
+             "negativeStartWithUncompactedHistorySkipsOldEventsAndDeliversNewEvents"),
+            ("io.etcdhbase.server.commit.WatchGatewayTest",
+             "currentRevisionReadsTheAuthoritativeControlSnapshotInsteadOfTheTailerCheckpoint"),
+            ("io.etcdhbase.server.commit.WatchStreamTest",
+             "cancelAcknowledgementWaitsForAndUsesTheCurrentSessionRevision"),
+            ("io.etcdhbase.server.commit.WatchStreamTest",
+             "createsAndCancelsRawWatchIdMinusOne"),
+            ("io.etcdhbase.server.commit.WatchStreamTest",
+             "createRejectionUsesTheCurrentSessionRevision"),
+        )
+        for class_name, required_case in required_cases:
+            with self.subTest(class_name=class_name, required_case=required_case):
+                missing_case = copy.deepcopy(self.registry)
+                task = next(item for item in missing_case["tasks"] if item["id"] == "J45")
+                suite = next(item for item in task["maven_tests"]
+                             if item["class"] == class_name)
+                suite["tests"].remove(required_case)
+                with self.assertRaisesRegex(m4_report.ReportError, "revision floors"):
+                    m4_report.validate_registry_document(missing_case)
+
+        integration_suite = copy.deepcopy(self.registry)
+        task = next(item for item in integration_suite["tasks"] if item["id"] == "J45")
+        task["maven_tests"][0]["kind"] = "failsafe"
+        with self.assertRaisesRegex(m4_report.ReportError, "JVM unit tests"):
+            m4_report.validate_registry_document(integration_suite)
+
+        missing_native_case = copy.deepcopy(self.registry)
+        task = next(item for item in missing_native_case["tasks"] if item["id"] == "J45")
+        task["watch_start_matrix"].pop()
+        with self.assertRaisesRegex(m4_report.ReportError, "initial -2/-1/0/future"):
+            m4_report.validate_registry_document(missing_native_case)
+
+        missing_raw_watch_id = copy.deepcopy(self.registry)
+        task = next(item for item in missing_raw_watch_id["tasks"] if item["id"] == "J45")
+        task.pop("watch_id_matrix")
+        with self.assertRaisesRegex(m4_report.ReportError, "raw Watch ID -1"):
+            m4_report.validate_registry_document(missing_raw_watch_id)
+
+    def test_j45_covers_future_create_and_cancel_but_defers_future_delivery_to_j46_1(self) -> None:
+        task = next(item for item in self.registry["tasks"] if item["id"] == "J45")
+        expected_boundary = (
+            "J45 public protocol evidence covers negative/zero startRevision cases, negative watch ID "
+            "Create/Cancel, future startRevision Create/Cancel, and the Compact-boundary lifecycle. Future-event "
+            "delivery, positive historical startRevision behavior, and replay/live handoff are assigned to J46.1. "
+            "The native raw-proto event probe waits for etcd's synced progress marker as a harness barrier; this "
+            "does not claim Java progress-request support, which is assigned to J46.2. Native raw-proto and local-service "
+            "Go traces compare the registered start/cancel matrix; a separate Go-client lifecycle run exercises multiple "
+            "watch IDs, byte ranges, filters/PrevKV, cancellation and stream close against Java WatchService. "
+            "MiniCluster acceptance remains outside this unit evidence"
+        )
+        self.assertEqual(m4_report.J45_VERIFICATION_BOUNDARY, expected_boundary)
+        self.assertEqual(task["verification_boundary"], expected_boundary)
+
+        registered_tests = {
+            test for suite in task["maven_tests"] for test in suite["tests"]
+        }
+        out_of_scope_tests = {
+            "passesInclusiveStartRevisionToTailerSoEarlierEventsDoNotConsumeWatchBudget",
+            "futureStartRevisionDropsOlderLiveEventsAndDeliversTheTargetInclusively",
+            "rejectsHistoricalStartWithoutPublishingAWatchThatWouldMissEvents",
+        }
+        self.assertTrue(out_of_scope_tests.isdisjoint(registered_tests))
+
+        broadened_boundary = copy.deepcopy(self.registry)
+        j45 = next(item for item in broadened_boundary["tasks"] if item["id"] == "J45")
+        j45["verification_boundary"] += "; J45 covers future start revisions"
+        with self.assertRaisesRegex(m4_report.ReportError, "raw-proto oracle"):
+            m4_report.validate_registry_document(broadened_boundary)
+
+        missing_native_test = copy.deepcopy(self.registry)
+        task = next(item for item in missing_native_test["tasks"] if item["id"] == "J45")
+        task["go_tests"][1]["tests"].remove("TestM4WatchStartScenarioMatchesPinnedNativeOracle")
+        with self.assertRaisesRegex(m4_report.ReportError, "native oracle tests are incomplete"):
+            m4_report.validate_registry_document(missing_native_test)
+
+        missing_local_service = copy.deepcopy(self.registry)
+        task = next(item for item in missing_local_service["tasks"] if item["id"] == "J45")
+        task["evidence"].pop("local_service")
+        with self.assertRaisesRegex(m4_report.ReportError, "native and local Java WatchService"):
+            m4_report.validate_registry_document(missing_local_service)
+
+    def test_complete_j45_local_unit_artifact_is_accepted_without_minicluster_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J45")
+
+            summary = m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+            self.assertEqual("J45", summary["task"])
+            self.assertEqual("public-local-unit", summary["scope"])
+            self.assertEqual(
+                "JVM-Watch-units-plus-native-start-and-local-service-start-and-lifecycle-matrices",
+                summary["evidence"]
+            )
+            self.assertEqual(8, summary["go_test_count"])
+            self.assertEqual(39, summary["native_trace_cases"])
+            self.assertEqual(7, summary["native_watch_start_cases"])
+            self.assertEqual(2, summary["native_watch_id_cases"])
+            self.assertEqual(30, summary["local_service_trace_cases"])
+            self.assertGreater(summary["java_test_count"], 0)
+
+            trace_path = artifact / "j45/native-trace.jsonl"
+            records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            compacted = next(item for item in records if item["case_id"] == "initial-minus-two-compacted")
+            compacted["response"]["fields"]["header"]["fields"]["revision"] = "1"
+            trace_path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+            with self.assertRaisesRegex(m4_report.ReportError, "response fields differ"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+    def test_j45_initial_local_service_artifact_requires_lifecycle_success_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J45")
+            log_path = artifact / "j45/local-lifecycle/initial.log"
+            log_path.write_text("M4 Watch start scenario passed\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(m4_report.ReportError, "lifecycle success record"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+    def test_j45_local_service_trace_enforces_the_reported_compact_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J45")
+            trace_path = artifact / "j45/local-service/compacted-trace.jsonl"
+            records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            compacted = next(item for item in records
+                             if item["case_id"] == "compacted-minus-two-compacted")
+            compacted["response"]["fields"]["compactRevision"] = "5"
+            trace_path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+            with self.assertRaisesRegex(m4_report.ReportError, "response fields differ"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+    def test_j45_zero_raft_term_is_valid_only_for_local_service_headers(self) -> None:
+        response_fields = {
+            "header": {
+                "fields": {"clusterId": "11", "memberId": "22", "raftTerm": "0", "revision": "1"},
+                "oneofs": {},
+            },
+        }
+
+        self.assertEqual("0", m4_report._j45_header_fields(
+            response_fields, "local Watch", allow_zero_raft_term=True)["raftTerm"])
+        with self.assertRaisesRegex(m4_report.ReportError, "raftTerm must be positive"):
+            m4_report._j45_header_fields(response_fields, "native Watch")
+
+        for field in ("clusterId", "memberId"):
+            with self.subTest(field=field):
+                invalid_identity = copy.deepcopy(response_fields)
+                invalid_identity["header"]["fields"][field] = "0"
+                with self.assertRaisesRegex(m4_report.ReportError, f"header {field} must be positive"):
+                    m4_report._j45_header_fields(
+                        invalid_identity, "local Watch", allow_zero_raft_term=True)
+
     def test_complete_j44_minicluster_artifact_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)
@@ -653,8 +811,8 @@ class M4ReportTest(unittest.TestCase):
         base_commit = "b" * 40
         evidence_root = artifact / task.get("artifact_subdir", "")
         evidence_root.mkdir(parents=True, exist_ok=True)
-        command_logs = self._write_command_logs(artifact)
-        commands = self._command_records(command_logs)
+        command_logs = self._write_command_logs(artifact, task_id, run_id)
+        commands = self._command_records(command_logs, task_id, artifact, run_id)
         self._write_run_manifest(artifact, task["id"], run_id, source_commit, base_commit, commands)
         self._write_go_test_events(artifact, task)
         self._write_maven_test_reports(artifact, task)
@@ -662,7 +820,12 @@ class M4ReportTest(unittest.TestCase):
         self._write_trace_artifacts(
             evidence_root, task, run_id, source_commit, suite_hash, prefix_hash
         )
-        self._write_comparison_logs(evidence_root, task)
+        if task_id == "J45":
+            self._write_j45_local_service_artifacts(
+                evidence_root, task, run_id, source_commit, suite_hash
+            )
+        if task.get("evidence", {}).get("compare_logs"):
+            self._write_comparison_logs(evidence_root, task)
         if task_id == "J43":
             self._write_valid_j29_4_evidence(evidence_root, run_id, source_commit)
 
@@ -674,7 +837,29 @@ class M4ReportTest(unittest.TestCase):
         metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
 
     @staticmethod
-    def _write_command_logs(artifact: Path) -> dict[str, str]:
+    def _write_command_logs(artifact: Path, task_id: str, run_id: str) -> dict[str, str]:
+        if task_id == "J45":
+            command_logs = {
+                "registry-check": "registry-check.log",
+                "report-tests": "report-tests.log",
+                "go-tests": "go-test.jsonl",
+                "native-watch-oracle": "j45/native.log",
+                "maven-unit-tests": "maven.log",
+                "collect-maven-reports": "maven-reports.log",
+            }
+            stderr_logs = {
+                "registry-check": "registry-check.stderr",
+                "report-tests": "report-tests.stderr",
+                "go-tests": "go-test.stderr",
+                "native-watch-oracle": "j45/native.stderr",
+                "maven-unit-tests": "maven.stderr.log",
+                "collect-maven-reports": "maven-reports.stderr",
+            }
+            for path in [*command_logs.values(), *stderr_logs.values()]:
+                target = artifact / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("completed\n" if path != "go-test.jsonl" else "", encoding="utf-8")
+            return command_logs
         command_logs = {
             "go-module-lock": "go-module-lock.log",
             "go-tests": "go-test.jsonl",
@@ -689,7 +874,56 @@ class M4ReportTest(unittest.TestCase):
         return command_logs
 
     @staticmethod
-    def _command_records(command_logs: dict[str, str]) -> list[dict[str, object]]:
+    def _command_records(
+        command_logs: dict[str, str], task_id: str, artifact: Path, run_id: str,
+    ) -> list[dict[str, object]]:
+        if task_id == "J45":
+            go_test_pattern = (
+                "^(TestM4WatchStartScenarioMatchesPinnedNativeOracle|"
+                "TestM4WatchLifecycleMatchesPinnedNativeOracle|"
+                "TestLoadM4WatchStartSuiteRejectsMissingOrChangedCoverage|"
+                "TestRunNativeWatchStartWritesFreshTraceAndVerifiableMetadata|"
+                "TestParseRunOptionsPinsLocalWatchPhaseAndCheckpoint|"
+                "TestOpenEvidenceWritesLocalWatchCheckpointMetadata|"
+                "TestValidateM4LeaseAcceptsLocalServiceEvidenceScope|"
+                "TestTraceAcceptsLocalServiceEvidenceScope)$"
+            )
+            prefix = f"etcd-hbase-m4-test/{run_id}/watch/"
+            argv_by_name = {
+                "registry-check": ["python3", "scripts/verify/m4-report.py", "--validate-registry"],
+                "report-tests": ["python3", "scripts/verify/test_m4_report.py"],
+                "go-tests": ["scripts/dev/go-m0.sh", "test", "-json", "-count=1", "-run",
+                             go_test_pattern, "./internal/scenario", "./cmd/m4driver",
+                             "./internal/trace"],
+                "native-watch-oracle": [
+                    "scripts/dev/go-m0.sh", "run", "./cmd/m4driver", "run", "--scenario",
+                    "../scenarios/m4-watch-starts.yaml", "--native-data-dir",
+                    str(artifact / "j45/native-data"), "--scope", "native-etcd", "--prefix", prefix,
+                    "--trace", str(artifact / "j45/native-trace.jsonl"), "--metadata",
+                    str(artifact / "j45/native-metadata.json"),
+                ],
+                "maven-unit-tests": ["scripts/dev/mvn21.sh", "-B", "-ntp", "-pl", "server", "-am",
+                                     "clean", "test", "-Pm4-j45-public"],
+                "collect-maven-reports": ["collect-maven-reports"],
+            }
+            stderr_by_name = {
+                "registry-check": "registry-check.stderr", "report-tests": "report-tests.stderr",
+                "go-tests": "go-test.stderr", "native-watch-oracle": "j45/native.stderr",
+                "maven-unit-tests": "maven.stderr.log",
+                "collect-maven-reports": "maven-reports.stderr",
+            }
+            return [
+                {
+                    "name": name,
+                    "argv": argv_by_name[name],
+                    "exit_code": 0,
+                    "started_at": "2026-11-17T00:00:00Z",
+                    "finished_at": "2026-11-17T00:00:01Z",
+                    "stdout_log": path,
+                    "stderr_log": stderr_by_name[name],
+                }
+                for name, path in command_logs.items()
+            ]
         return [
             {
                 "name": name,
@@ -711,7 +945,7 @@ class M4ReportTest(unittest.TestCase):
         run = {
             "schema": "etcd-hbase-m4-run/v1",
             "run_id": run_id,
-            "scope": "public-local-minicluster",
+            "scope": "public-local-unit" if task_id == "J45" else "public-local-minicluster",
             "tasks": [task_id],
             "status": "passed",
             "source_commit": source_commit,
@@ -781,6 +1015,8 @@ class M4ReportTest(unittest.TestCase):
     @staticmethod
     def _trace_variants(task: dict[str, object]) -> list[tuple[dict[str, object], str, str, str]]:
         evidence = task["evidence"]
+        if task.get("id") == "J45":
+            return [(evidence["native"], "native", "native-trace.jsonl", "native-metadata.json")]
         trace_variants = [(evidence["native"], "native", "native-trace.jsonl", "native-metadata.json")]
         for target in evidence["targets"]:
             suffix = target["layout"].lower()
@@ -796,6 +1032,48 @@ class M4ReportTest(unittest.TestCase):
                 evidence_root, task, descriptor, suffix, trace_name, metadata_name,
                 run_id, source_commit, suite_hash, prefix_hash,
             )
+
+    @classmethod
+    def _write_j45_local_service_artifacts(
+        cls, evidence_root: Path, task: dict[str, object], run_id: str,
+        source_commit: str, suite_hash: str,
+    ) -> None:
+        local_root = evidence_root / "local-service"
+        local_root.mkdir(parents=True, exist_ok=True)
+        native_records = cls._valid_j45_trace_records(task, {"scope": "native-etcd"})
+        descriptor = task["evidence"]["local_service"]
+        for phase, revision, compact_revision in m4_report.J45_LOCAL_SERVICE_PHASES:
+            records = cls._valid_j45_local_trace_records(
+                native_records, phase, revision, compact_revision
+            )
+            trace_bytes = "".join(
+                json.dumps(record, separators=(",", ":")) + "\n" for record in records
+            ).encode()
+            (local_root / f"{phase}-trace.jsonl").write_bytes(trace_bytes)
+            prefix = f"etcd-hbase-m4-test/{run_id}/watch/{phase}/"
+            metadata = {
+                "schema": "etcd-hbase-m4-run/v1", "run_id": run_id,
+                "source_commit": source_commit, "suite_sha256": suite_hash,
+                "evidence_scope": descriptor["scope"],
+                "prefix_sha256": hashlib.sha256(prefix.encode()).hexdigest(),
+                "trace_sha256": hashlib.sha256(trace_bytes).hexdigest(),
+                "embedded_native": descriptor["embedded_native"], "layout": "",
+                "watch_phase": phase, "watch_revision": revision,
+                "watch_compact_revision": compact_revision, "status": "passed",
+            }
+            (local_root / f"{phase}-metadata.json").write_text(
+                json.dumps(metadata) + "\n", encoding="utf-8"
+            )
+            (local_root / f"{phase}.log").write_text(
+                "M4 Watch start scenario passed\n",
+                encoding="utf-8",
+            )
+        lifecycle_root = evidence_root / "local-lifecycle"
+        lifecycle_root.mkdir(parents=True, exist_ok=True)
+        (lifecycle_root / "initial.log").write_text(
+            "M4 Watch start scenario passed\nM4 Watch lifecycle interop passed\n",
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _write_trace_artifact(
@@ -824,12 +1102,15 @@ class M4ReportTest(unittest.TestCase):
         }
         (evidence_root / metadata_name).write_text(json.dumps(metadata) + "\n", encoding="utf-8")
         log_name = "native.log" if embedded_native else f"target-{suffix}.log"
-        (evidence_root / log_name).write_text("M4 Lease scenario passed\n", encoding="utf-8")
+        marker = "M4 Watch start scenario passed" if task["id"] == "J45" else "M4 Lease scenario passed"
+        (evidence_root / log_name).write_text(marker + "\n", encoding="utf-8")
 
     @staticmethod
     def _valid_trace_records(
         task: dict[str, object], descriptor: dict[str, object],
     ) -> list[dict[str, object]]:
+        if task["id"] == "J45":
+            return M4ReportTest._valid_j45_trace_records(task, descriptor)
         if task["id"] == "J41":
             return M4ReportTest._valid_binding_trace_records(task, descriptor)
         if task["id"] == "J42":
@@ -854,6 +1135,183 @@ class M4ReportTest(unittest.TestCase):
                 "evidence_scope": descriptor["scope"],
                 "elapsed_ns": "1",
             })
+        return records
+
+    @classmethod
+    def _valid_j45_trace_records(
+        cls, task: dict[str, object], descriptor: dict[str, object],
+    ) -> list[dict[str, object]]:
+        initial_revision = 2
+        compact_revision = 3
+        fixture_key = "am00"
+        history_key = "aW5pdGlhbC1taW51cy1vbmU="
+        history_value = "ajQ1LWhpc3Rvcnk="
+        live_value = "ajQ1LXdhdGNoLWxpdmU="
+
+        def header(revision: int) -> dict[str, object]:
+            return cls._snapshot({
+                "clusterId": "11", "memberId": "22", "raftTerm": "1",
+                "revision": str(revision),
+            })
+
+        def watch_response(watch_id: int, revision: int, *, created: bool,
+                           canceled: bool, compact: int = 0, reason: str = "") -> dict[str, object]:
+            return cls._snapshot({
+                "header": header(revision), "watchId": str(watch_id), "created": created,
+                "canceled": canceled, "compactRevision": str(compact),
+                "cancelReason": reason, "events": [],
+            })
+
+        def create_request(watch_id: int, start_revision: int, key: str = history_key) -> dict[str, object]:
+            return {
+                "fields": {"createRequest": cls._snapshot({
+                    "key": key, "watchId": str(watch_id),
+                    "startRevision": str(start_revision),
+                })},
+                "oneofs": {"request_union": "create_request"},
+            }
+
+        def cancel_request(watch_id: int) -> dict[str, object]:
+            return {
+                "fields": {"cancelRequest": cls._snapshot({"watchId": str(watch_id)})},
+                "oneofs": {"request_union": "cancel_request"},
+            }
+
+        fixture_value = "ajQ1LXdhdGNoLWNvbXBhY3Q="
+        setup = {
+            "watch-start-history-put": (
+                cls._snapshot({"key": history_key, "value": history_value}),
+                cls._snapshot({"header": header(initial_revision)}),
+            ),
+            "watch-negative-live-put": (
+                cls._snapshot({"key": history_key, "value": live_value}),
+                cls._snapshot({"header": header(initial_revision + 1)}),
+            ),
+            "watch-compact-fixture-put": (
+                cls._snapshot({"key": fixture_key, "value": fixture_value}),
+                cls._snapshot({"header": header(compact_revision)}),
+            ),
+            "watch-compact-fixture-range": (
+                cls._snapshot({"key": fixture_key}),
+                cls._snapshot({
+                    "header": header(compact_revision),
+                    "kvs": [cls._snapshot({"key": fixture_key, "value": fixture_value})],
+                }),
+            ),
+            "watch-compact-fixture-compact": (
+                cls._snapshot({"revision": str(compact_revision)}),
+                cls._snapshot({"header": header(compact_revision)}),
+            ),
+        }
+
+        records = []
+        for expected in task["trace_cases"]:
+            case_id = expected["id"]
+            request, reply = setup.get(case_id, (None, None))
+            if request is None:
+                if case_id.startswith("watch-negative-live-"):
+                    if case_id.endswith("-created"):
+                        request = create_request(45, -1)
+                        reply = watch_response(45, initial_revision, created=True, canceled=False)
+                    elif case_id.endswith("-progress"):
+                        request = {
+                            "fields": {"progressRequest": cls._snapshot({})},
+                            "oneofs": {"request_union": "progress_request"},
+                        }
+                        reply = cls._snapshot({
+                            "header": header(initial_revision), "watchId": "-1", "created": False,
+                            "canceled": False, "compactRevision": "0", "cancelReason": "",
+                            "events": [],
+                        })
+                    elif case_id.endswith("-event"):
+                        request = create_request(45, -1)
+                        reply = cls._snapshot({
+                            "header": header(initial_revision + 1), "watchId": "45", "created": False,
+                            "canceled": False, "compactRevision": "0", "cancelReason": "",
+                            "events": [cls._snapshot({
+                                "type": 0,
+                                "kv": cls._snapshot({
+                                    "key": history_key, "createRevision": str(initial_revision),
+                                    "modRevision": str(initial_revision + 1), "version": "2",
+                                    "value": live_value, "lease": "0",
+                                }),
+                            })],
+                        })
+                    elif case_id.endswith("-cancelled"):
+                        request = cancel_request(45)
+                        reply = watch_response(
+                            45, initial_revision + 1, created=False, canceled=True,
+                        )
+                    else:
+                        raise AssertionError(f"unregistered J45 trace case {case_id}")
+                    records.append({
+                        "schema": "etcd-hbase-trace/v1", "case_id": case_id, "ordinal": 1,
+                        "method": expected["method"], "request": request, "response": reply,
+                        "error": None, "stream_terminal": None, "evidence_scope": descriptor["scope"],
+                        "elapsed_ns": "1",
+                    })
+                    continue
+
+                phase = "initial" if case_id.startswith("initial-") else "compacted"
+                if case_id.startswith(f"{phase}-watch-id-minus-one-"):
+                    base_id = f"{phase}-watch-id-minus-one"
+                    start_revision = 0
+                    watch_id = -1
+                else:
+                    start_name = next(name for name in ("minus-two", "minus-one", "zero", "future")
+                                      if case_id.startswith(f"{phase}-{name}-"))
+                    base_id = f"{phase}-{start_name}"
+                    start_revision = {"minus-two": -2, "minus-one": -1, "zero": 0, "future": 3}[start_name]
+                    watch_id = {-2: 41, -1: 42, 0: 43, 3: 44}[start_revision]
+                suffix = case_id[len(base_id) + 1:]
+                header_revision = initial_revision if phase == "initial" else compact_revision
+                compact_boundary = -1 if phase == "initial" else compact_revision
+                if suffix in {"created", "compacted"}:
+                    request = create_request(watch_id, start_revision)
+                    if suffix == "created":
+                        reply = watch_response(watch_id, header_revision, created=True, canceled=False)
+                    else:
+                        reply = watch_response(watch_id, 0, created=False, canceled=True,
+                                               compact=compact_boundary)
+                elif suffix == "duplicate-id":
+                    request = create_request(watch_id, 0)
+                    reply = watch_response(
+                        -1, header_revision, created=True, canceled=True,
+                        reason="mvcc: duplicate watch ID provided on the WatchStream",
+                    )
+                elif suffix in {"cancel-id", "cancelled", "reused-cancelled"}:
+                    request = cancel_request(watch_id)
+                    reply = watch_response(watch_id, header_revision, created=False, canceled=True)
+                elif suffix == "reused-created":
+                    request = create_request(watch_id, 0)
+                    reply = watch_response(watch_id, header_revision, created=True, canceled=False)
+                else:
+                    raise AssertionError(f"unregistered J45 trace case {case_id}")
+            records.append({
+                "schema": "etcd-hbase-trace/v1", "case_id": case_id, "ordinal": 1,
+                "method": expected["method"], "request": request, "response": reply,
+                "error": None, "stream_terminal": None, "evidence_scope": descriptor["scope"],
+                "elapsed_ns": "1",
+            })
+        return records
+
+    @staticmethod
+    def _valid_j45_local_trace_records(
+        native_records: list[dict[str, object]], phase: str, revision: int,
+        compact_revision: int,
+    ) -> list[dict[str, object]]:
+        records = [copy.deepcopy(record) for record in native_records
+                   if record["case_id"].startswith(f"{phase}-")]
+        for record in records:
+            record["evidence_scope"] = "local-service"
+            response = record["response"]["fields"]
+            response_header = response["header"]["fields"]
+            response_header["raftTerm"] = "0"
+            if record["case_id"].endswith("-compacted"):
+                response_header["revision"] = "0"
+                response["compactRevision"] = str(compact_revision)
+            else:
+                response_header["revision"] = str(revision)
         return records
 
     @staticmethod

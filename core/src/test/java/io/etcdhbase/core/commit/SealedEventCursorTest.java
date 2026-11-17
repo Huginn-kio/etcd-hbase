@@ -1223,6 +1223,45 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void subscriptionCapacityIsResourceLimitAndClosedTailerIsUnavailable() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope firstWatchScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope rejectedWatchScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope readScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account tailMemory = fixture.account(tailScope);
+         BudgetManager.Account firstWatchMemory = fixture.account(firstWatchScope);
+         BudgetManager.Account rejectedWatchMemory = fixture.account(rejectedWatchScope);
+         BudgetManager.Account readMemory = fixture.account(readScope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+      var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 1, 4, 8192)) {
+        var existing = tailer.subscribeWithCheckpoint(KeyRange.all(), firstWatchMemory, 4, 8192, 0);
+
+        BackendFailure atCapacity = assertThrows(BackendFailure.class,
+            () -> tailer.subscribeWithCheckpoint(
+                KeyRange.point(fixture.first.current().key()), rejectedWatchMemory, 4, 8192, 0));
+
+        assertEquals(BackendFailure.Category.RESOURCE_LIMIT, atCapacity.category());
+        assertEquals(1, tailer.subscriptionCount(), "capacity rejection must not replace the existing watch");
+        assertTrue(existing.subscription().termination().isEmpty(),
+            "capacity rejection leaves the existing watch active");
+
+        tailer.close();
+        BackendFailure afterClose = assertThrows(BackendFailure.class,
+            () -> tailer.subscribeWithCheckpoint(KeyRange.all(), rejectedWatchMemory, 4, 8192, 0));
+        assertEquals(BackendFailure.Category.UNAVAILABLE, afterClose.category());
+        assertEquals(Optional.of(SharedEventTailer.Termination.TAILER_CLOSED),
+            existing.subscription().termination());
+      }
+    }
+  }
+
+  @Test
   void sharedTailerDeliversOnlySparsePointAndRangeMatches() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();
@@ -1266,6 +1305,59 @@ class SealedEventCursorTest {
         assertTrue(missing.poll().isEmpty());
         assertTrue(cancelled.poll().isEmpty());
         assertEquals(2, fixture.eventReads.get());
+      }
+    }
+  }
+
+  @Test
+  void sharedTailerAppliesInclusiveRevisionFloorsAndDropsEventsBeforeCreateBarrier() throws Exception {
+    Fixture fixture = new Fixture();
+    var records = new MemoryRecords();
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope firstScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope zeroScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope futureScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope negativeScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope readScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         BudgetManager.Account tailMemory = fixture.account(tailScope);
+         BudgetManager.Account firstMemory = fixture.account(firstScope);
+         BudgetManager.Account zeroMemory = fixture.account(zeroScope);
+         BudgetManager.Account futureMemory = fixture.account(futureScope);
+         BudgetManager.Account negativeMemory = fixture.account(negativeScope);
+         BudgetManager.Account readMemory = fixture.account(readScope)) {
+      var pins = EventHistoryPinManager.initializeFresh(records,
+          new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
+      var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
+      var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 4, 4, 8192)) {
+        var first = tailer.subscribeWithCheckpoint(KeyRange.all(), firstMemory, 4, 8192, 11);
+        var zero = tailer.subscribeWithCheckpoint(KeyRange.all(), zeroMemory, 4, 8192, 0);
+        var future = tailer.subscribeWithCheckpoint(KeyRange.all(), futureMemory, 4, 8192, 12);
+        var negative = tailer.subscribeWithCheckpoint(KeyRange.all(), negativeMemory, 4, 8192, -1);
+        assertEquals(10, first.revision());
+        assertEquals(10, zero.revision());
+        assertEquals(10, future.revision());
+        assertEquals(10, negative.revision());
+
+        tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 10, 1024L << 20)).join();
+        tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join();
+        tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join();
+        tailer.step(readScope,
+            new ManifestCatalog.ProofReadBudget(readScope, readMemory, 1, 512L << 20)).join();
+
+        try (var inclusive = first.subscription().poll().orElseThrow()) {
+          assertEquals(11, inclusive.revision(), "a positive start is inclusive at the live tailer layer");
+        }
+        assertTrue(future.subscription().poll().isEmpty(), "a future start must not receive earlier revisions");
+
+        zero.subscription().requireRevisionAtLeast(12);
+        negative.subscription().requireRevisionAtLeast(12);
+        assertTrue(zero.subscription().poll().isEmpty(), "zero start drops events at the creation barrier");
+        assertTrue(negative.subscription().poll().isEmpty(), "negative start begins after the creation barrier");
       }
     }
   }

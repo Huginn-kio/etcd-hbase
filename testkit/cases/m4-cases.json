@@ -946,7 +946,127 @@
           "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts"
         ]}
       ]
+    },
+    {
+      "id": "J45",
+      "kind": "watch-stream",
+      "api_ids": ["C14", "C19", "P01", "R01"],
+      "scenario": "m4-watch-starts-v1",
+      "manifest": "m4-watch-starts.yaml",
+      "artifact_subdir": "j45",
+      "watch_start_matrix": [
+        {"id": "initial-minus-two", "state": "initial", "start_revision": -2, "compacted": true, "compact_revision": -1},
+        {"id": "initial-minus-one", "state": "initial", "start_revision": -1, "compacted": false, "compact_revision": -1},
+        {"id": "initial-zero", "state": "initial", "start_revision": 0, "compacted": false, "compact_revision": -1},
+        {"id": "initial-future", "state": "initial", "start_revision": 3, "compacted": false, "compact_revision": -1},
+        {"id": "compacted-minus-two", "state": "compacted", "start_revision": -2, "compacted": true, "compact_revision": "fixture"},
+        {"id": "compacted-minus-one", "state": "compacted", "start_revision": -1, "compacted": true, "compact_revision": "fixture"},
+        {"id": "compacted-zero", "state": "compacted", "start_revision": 0, "compacted": false, "compact_revision": "fixture"}
+      ],
+      "watch_id_matrix": [
+        {"id": "initial-watch-id-minus-one", "state": "initial", "watch_id": -1, "start_revision": 0},
+        {"id": "compacted-watch-id-minus-one", "state": "compacted", "watch_id": -1, "start_revision": 0}
+      ],
+      "trace_cases": [
+        {"id": "watch-start-history-put", "api_id": "P01", "method": "etcdserverpb.KV/Put"},
+        {"id": "initial-minus-two-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-minus-two-compacted", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-minus-two-duplicate-id", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-minus-two-cancel-id", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-minus-two-reused-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-minus-two-reused-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-minus-one-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-minus-one-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-zero-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-zero-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-watch-id-minus-one-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-watch-id-minus-one-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-future-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "initial-future-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "watch-negative-live-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "watch-negative-live-progress", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "watch-negative-live-put", "api_id": "P01", "method": "etcdserverpb.KV/Put"},
+        {"id": "watch-negative-live-event", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "watch-negative-live-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "watch-compact-fixture-put", "api_id": "P01", "method": "etcdserverpb.KV/Put"},
+        {"id": "watch-compact-fixture-range", "api_id": "R01", "method": "etcdserverpb.KV/Range"},
+        {"id": "watch-compact-fixture-compact", "api_id": "C14", "method": "etcdserverpb.KV/Compact"},
+        {"id": "compacted-minus-two-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-two-compacted", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-two-duplicate-id", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-two-cancel-id", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-two-reused-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-two-reused-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-one-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-one-compacted", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-one-duplicate-id", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-one-cancel-id", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-one-reused-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-minus-one-reused-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-zero-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-zero-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-watch-id-minus-one-created", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"},
+        {"id": "compacted-watch-id-minus-one-cancelled", "api_id": "C19", "method": "etcdserverpb.Watch/Watch"}
+      ],
+      "go_tests": [
+        {"package": "cmd/m4driver", "tests": [
+          "TestRunNativeWatchStartWritesFreshTraceAndVerifiableMetadata",
+          "TestParseRunOptionsPinsLocalWatchPhaseAndCheckpoint",
+          "TestOpenEvidenceWritesLocalWatchCheckpointMetadata"
+        ]},
+        {"package": "internal/scenario", "tests": [
+          "TestM4WatchStartScenarioMatchesPinnedNativeOracle",
+          "TestM4WatchLifecycleMatchesPinnedNativeOracle",
+          "TestLoadM4WatchStartSuiteRejectsMissingOrChangedCoverage",
+          "TestValidateM4LeaseAcceptsLocalServiceEvidenceScope"
+        ]},
+        {"package": "internal/trace", "tests": [
+          "TestTraceAcceptsLocalServiceEvidenceScope"
+        ]}
+      ],
+      "maven_tests": [
+        {"module": "core", "kind": "surefire", "class": "io.etcdhbase.core.commit.SealedEventCursorTest", "tests": [
+          "sharedTailerAppliesInclusiveRevisionFloorsAndDropsEventsBeforeCreateBarrier",
+          "subscriptionCapacityIsResourceLimitAndClosedTailerIsUnavailable"
+        ]},
+        {"module": "grpc", "kind": "surefire", "class": "io.etcdhbase.grpc.service.SkeletonServiceTest", "tests": [
+          "assembledWatchServiceDelegatesTheResponseObserverAndReturnsItsRequestHandler"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchGatewayTest", "tests": [
+          "gatewayChargesRetainedRangeBytesAndReleasesThemOnClose",
+          "tailerShutdownRacePreservesUnavailableAndReleasesWatchReservation",
+          "passesNegativeStartRevisionAndCompactBoundaryWithoutDroppingRpcStateBudget",
+          "currentRevisionReadsTheAuthoritativeControlSnapshotInsteadOfTheTailerCheckpoint",
+          "pollCancellationHandoffClosesTheDetachedDeliveryBeforeReleasingItsAccount"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchStreamTest", "tests": [
+          "emitsCreatedBeforeInclusiveLiveEventsAndAppliesFilterAndPrevKv",
+          "resourceLimitedCreateLeavesExistingWatchActive",
+          "duplicateIdDoesNotReplaceExistingWatchAndCancelClosesOnlyItsSubscription",
+          "emptyRequestAndUnknownCancelHaveNoResponseAndKeepActiveWatch",
+          "zeroStartWaitsForCreatedBarrierAndExcludesEarlierEvents",
+          "initialNegativeStartWithNoHistoryUsesTheLiveBarrier",
+          "negativeStartWithUncompactedHistorySkipsOldEventsAndDeliversNewEvents",
+          "startBelowInitialCompactBoundaryCreatesThenCancelsAndKeepsIdUntilCancel",
+          "negativeStartsBelowAnAdvancedCompactBoundaryReportTheNativeBoundary",
+          "zeroStartUsesTheLiveBarrierEvenWhenTheCompactBoundaryIsPositive",
+          "cancellationDuringPollClosesTheEventBeforeItCanEscapeTheWatcher",
+          "cancelAcknowledgementWaitsForAndUsesTheCurrentSessionRevision",
+          "createsAndCancelsRawWatchIdMinusOne",
+          "createRejectionUsesTheCurrentSessionRevision",
+          "terminalFailureWaitsForTheCurrentResponseWriter",
+          "cancellingOneWatchKeepsOtherByteRangeSubscriptionActive"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchGoInteropTest", "tests": [
+          "pinnedGoClientMatchesStartAndLifecycleCasesAgainstJavaWatchService"
+        ]}
+      ],
+      "evidence": {
+        "native": {"scope": "native-etcd", "layout": "", "embedded_native": true},
+        "local_service": {"scope": "local-service", "layout": "", "embedded_native": false}
+      },
+      "verification_boundary": "J45 public protocol evidence covers negative/zero startRevision cases, negative watch ID Create/Cancel, future startRevision Create/Cancel, and the Compact-boundary lifecycle. Future-event delivery, positive historical startRevision behavior, and replay/live handoff are assigned to J46.1. The native raw-proto event probe waits for etcd's synced progress marker as a harness barrier; this does not claim Java progress-request support, which is assigned to J46.2. Native raw-proto and local-service Go traces compare the registered start/cancel matrix; a separate Go-client lifecycle run exercises multiple watch IDs, byte ranges, filters/PrevKV, cancellation and stream close against Java WatchService. MiniCluster acceptance remains outside this unit evidence"
     }
   ],
-  "pending_tasks": ["J45","J46","J47","J29.4"]
+  "pending_tasks": ["J46","J47","J29.4"]
 }

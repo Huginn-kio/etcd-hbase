@@ -1,0 +1,82 @@
+schema_version: 1
+id: m4-watch-starts-v1
+protocol: etcd-v3.5.23
+steps:
+  - case_id: P01
+    id: watch-start-history-put
+  - case_id: C19
+    id: initial-minus-two-created
+  - case_id: C19
+    id: initial-minus-two-compacted
+  - case_id: C19
+    id: initial-minus-two-duplicate-id
+  - case_id: C19
+    id: initial-minus-two-cancel-id
+  - case_id: C19
+    id: initial-minus-two-reused-created
+  - case_id: C19
+    id: initial-minus-two-reused-cancelled
+  - case_id: C19
+    id: initial-minus-one-created
+  - case_id: C19
+    id: initial-minus-one-cancelled
+  - case_id: C19
+    id: initial-zero-created
+  - case_id: C19
+    id: initial-zero-cancelled
+  - case_id: C19
+    id: initial-watch-id-minus-one-created
+  - case_id: C19
+    id: initial-watch-id-minus-one-cancelled
+  - case_id: C19
+    id: initial-future-created
+  - case_id: C19
+    id: initial-future-cancelled
+  - case_id: C19
+    id: watch-negative-live-created
+  - case_id: C19
+    id: watch-negative-live-progress
+  - case_id: P01
+    id: watch-negative-live-put
+  - case_id: C19
+    id: watch-negative-live-event
+  - case_id: C19
+    id: watch-negative-live-cancelled
+  - case_id: P01
+    id: watch-compact-fixture-put
+  - case_id: R01
+    id: watch-compact-fixture-range
+  - case_id: C14
+    id: watch-compact-fixture-compact
+  - case_id: C19
+    id: compacted-minus-two-created
+  - case_id: C19
+    id: compacted-minus-two-compacted
+  - case_id: C19
+    id: compacted-minus-two-duplicate-id
+  - case_id: C19
+    id: compacted-minus-two-cancel-id
+  - case_id: C19
+    id: compacted-minus-two-reused-created
+  - case_id: C19
+    id: compacted-minus-two-reused-cancelled
+  - case_id: C19
+    id: compacted-minus-one-created
+  - case_id: C19
+    id: compacted-minus-one-compacted
+  - case_id: C19
+    id: compacted-minus-one-duplicate-id
+  - case_id: C19
+    id: compacted-minus-one-cancel-id
+  - case_id: C19
+    id: compacted-minus-one-reused-created
+  - case_id: C19
+    id: compacted-minus-one-reused-cancelled
+  - case_id: C19
+    id: compacted-zero-created
+  - case_id: C19
+    id: compacted-zero-cancelled
+  - case_id: C19
+    id: compacted-watch-id-minus-one-created
+  - case_id: C19
+    id: compacted-watch-id-minus-one-cancelled

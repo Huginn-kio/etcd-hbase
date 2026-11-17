@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -360,6 +361,14 @@ func TestClassifyEtcdClientErrorPreservesConsumerAndGRPCViews(t *testing.T) {
 	classified := ClassifyError(rpctypes.Error(rpctypes.ErrCompacted))
 	if classified == nil || classified.GRPCCode != codes.OutOfRange.String() || classified.ConsumerKind != "etcd-client-error" {
 		t.Fatalf("unexpected etcd error classification: %#v", classified)
+	}
+}
+
+func TestTraceAcceptsLocalServiceEvidenceScope(t *testing.T) {
+	record := testRecord("local-watch", 1)
+	record.EvidenceScope = "local-service"
+	if err := WriteJSONL(io.Discard, record); err != nil {
+		t.Fatalf("local Java service evidence scope was rejected: %v", err)
 	}
 }
 
