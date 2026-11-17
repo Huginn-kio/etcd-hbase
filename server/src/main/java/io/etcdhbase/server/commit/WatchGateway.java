@@ -112,6 +112,7 @@ final class WatchGateway {
     }
 
     @Override public long completedRevision() { return tailer.completedRevision(); }
+    @Override public long completedSequence() { return tailer.completedSequence(); }
 
     @Override
     public CompletionStage<Long> currentRevision() {

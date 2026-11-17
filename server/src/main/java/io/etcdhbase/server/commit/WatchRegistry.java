@@ -31,20 +31,25 @@ final class WatchRegistry {
     private final boolean previousKv;
     private final boolean filterPut;
     private final boolean filterDelete;
+    private final boolean progressNotify;
+    private final boolean fragment;
+    private WatchStream.ProgressBarrier pendingNotifyProgress;
     private final WatchStream.Subscription subscription;
     private WatchStream.Delivery pendingDelivery;
     private volatile boolean createdSent;
     private boolean closed;
 
     private Watcher(long id, long startRevision, long minimumEventRevision,
-        boolean previousKv, boolean filterPut, boolean filterDelete,
-        WatchStream.Subscription subscription) {
+        boolean previousKv, boolean filterPut, boolean filterDelete, boolean progressNotify,
+        boolean fragment, WatchStream.Subscription subscription) {
       this.id = id;
       this.startRevision = startRevision;
       this.minimumEventRevision = minimumEventRevision;
       this.previousKv = previousKv;
       this.filterPut = filterPut;
       this.filterDelete = filterDelete;
+      this.progressNotify = progressNotify;
+      this.fragment = fragment;
       this.subscription = Objects.requireNonNull(subscription, "subscription");
     }
 
@@ -57,6 +62,23 @@ final class WatchRegistry {
     boolean previousKv() { return previousKv; }
     boolean filterPut() { return filterPut; }
     boolean filterDelete() { return filterDelete; }
+    boolean progressNotify() { return progressNotify; }
+    boolean fragment() { return fragment; }
+    synchronized WatchStream.ProgressBarrier pendingNotifyProgress() { return pendingNotifyProgress; }
+    synchronized void requestNotifyProgress(WatchStream.ProgressBarrier barrier) {
+      if (!progressNotify || closed) return;
+      if (pendingNotifyProgress == null || barrier.revision() > pendingNotifyProgress.revision()
+          || barrier.revision() == pendingNotifyProgress.revision()
+              && barrier.sequence() > pendingNotifyProgress.sequence()) pendingNotifyProgress = barrier;
+    }
+    synchronized boolean clearNotifyProgress(WatchStream.ProgressBarrier barrier) {
+      if (pendingNotifyProgress != barrier) return false;
+      pendingNotifyProgress = null;
+      return true;
+    }
+    synchronized void clearNotifyProgressThrough(long revision) {
+      if (pendingNotifyProgress != null && pendingNotifyProgress.revision() <= revision) pendingNotifyProgress = null;
+    }
 
     boolean createdSent() { return createdSent; }
 
@@ -130,13 +152,13 @@ final class WatchRegistry {
   }
 
   synchronized Registration registerActive(long requestedId, long startRevision, long minimumEventRevision,
-      boolean previousKv, boolean filterPut, boolean filterDelete,
-      WatchStream.Subscription subscription) {
+      boolean previousKv, boolean filterPut, boolean filterDelete, boolean progressNotify,
+      boolean fragment, WatchStream.Subscription subscription) {
     Rejection rejection = checkCreate(requestedId);
     if (rejection != Rejection.NONE) return rejected(rejection);
     long id = requestedId == 0 ? allocateWatchIdLocked() : requestedId;
     Watcher watcher = new Watcher(id, startRevision, minimumEventRevision, previousKv,
-        filterPut, filterDelete, subscription);
+        filterPut, filterDelete, progressNotify, fragment, subscription);
     active.put(id, watcher);
     return new Registration(id, watcher, Rejection.NONE);
   }
@@ -163,6 +185,8 @@ final class WatchRegistry {
     compactedIdBudget.release(1);
     return true;
   }
+
+  synchronized boolean containsActive(long id, Watcher expected) { return active.get(id) == expected; }
 
   synchronized boolean removeActive(long id, Watcher expected) {
     if (active.get(id) != expected) return false;

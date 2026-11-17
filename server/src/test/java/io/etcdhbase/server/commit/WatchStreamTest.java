@@ -691,6 +691,201 @@ class WatchStreamTest {
   }
 
   @Test
+  void periodicProgressNotifyDrainsEventsBeforeItsPerWatchWatermark() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    var periodicTick = new AtomicReference<Runnable>();
+    byte[] key = {9};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run,
+          timers(periodicTick, 1_000), () -> CompletableFuture.completedFuture(session),
+          CLUSTER_ID, MEMBER_ID, 1 << 20, 1_000);
+      stream.onNext(createRequest(39, key, new byte[0], 0, false, true, false));
+      session.revision = 5;
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {5}, Optional.empty()));
+
+      Runnable tick = periodicTick.getAndSet(null);
+      assertTrue(tick != null, "progress_notify schedules a periodic trigger after Created");
+      tick.run();
+
+      assertEquals(3, observer.responses.size());
+      Rpc.WatchResponse deliveredEvent = observer.responses.get(1);
+      assertEquals(39, deliveredEvent.getWatchId());
+      assertEquals(5, deliveredEvent.getHeader().getRevision());
+      Rpc.WatchResponse progress = observer.responses.get(2);
+      assertEquals(39, progress.getWatchId(), "periodic progress is scoped to its watcher");
+      assertEquals(5, progress.getHeader().getRevision());
+      assertEquals(0, progress.getEventsCount());
+      assertEquals(1, subscription.releases.get());
+
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
+  void periodicProgressNotifySkipsFutureAndUnsyncedWatchersIndependently() {
+    var ready = new RecordingSubscription();
+    var future = new RecordingSubscription();
+    future.progressReady = false;
+    var session = new RecordingSession(5, ready, future);
+    var observer = new RecordingObserver();
+    var periodicTick = new AtomicReference<Runnable>();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run,
+          timers(periodicTick, 1_000), () -> CompletableFuture.completedFuture(session),
+          CLUSTER_ID, MEMBER_ID, 1 << 20, 1_000);
+      stream.onNext(createRequest(40, new byte[] {1}, new byte[0], 0, false, true, false));
+      stream.onNext(createRequest(41, new byte[] {2}, new byte[0], 9, false, true, false));
+
+      Runnable tick = periodicTick.getAndSet(null);
+      assertTrue(tick != null, "the stream has one timer for all opted-in watchers");
+      tick.run();
+
+      assertEquals(3, observer.responses.size());
+      Rpc.WatchResponse progress = observer.responses.get(2);
+      assertEquals(40, progress.getWatchId(), "one unsynced watcher does not block another");
+      assertEquals(5, progress.getHeader().getRevision());
+
+      stream.close();
+      assertEquals(1, ready.closeCount.get());
+      assertEquals(1, future.closeCount.get());
+    }
+  }
+
+  @Test
+  void fragmentsKeepTheRevisionContiguousAheadOfProgressAndOtherWatches() {
+    var fragmented = new RecordingSubscription();
+    var other = new RecordingSubscription();
+    var session = new RecordingSession(4, fragmented, other);
+    var observer = new RecordingObserver();
+    var values = List.of(new byte[80], new byte[80], new byte[80]);
+    byte[] fragmentedKey = {1};
+    byte[] otherKey = {2};
+    var fragmentedEvents = values.stream()
+        .map(value -> event(5, PreparedEvent.Kind.PUT, fragmentedKey, value, Optional.empty()))
+        .toList();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run, timers(),
+          () -> CompletableFuture.completedFuture(session), CLUSTER_ID, MEMBER_ID, 220);
+      stream.onNext(createRequest(31, fragmentedKey, new byte[0], 0, false,
+          false, true));
+      stream.onNext(createRequest(32, otherKey, new byte[0], 0, false));
+
+      session.revision = 5;
+      fragmentedEvents.forEach(fragmented::add);
+      other.add(event(6, PreparedEvent.Kind.PUT, otherKey, new byte[] {6}, Optional.empty()));
+      AtomicInteger blockedAfterFirstFragment = new AtomicInteger();
+      observer.onNextHook = () -> {
+        Rpc.WatchResponse sent = observer.responses.getLast();
+        if (sent.getWatchId() == 31 && sent.getFragment()
+            && blockedAfterFirstFragment.compareAndSet(0, 1)) {
+          observer.ready = false;
+          stream.onNext(progressRequest());
+        }
+      };
+
+      stream.onNext(Rpc.WatchRequest.getDefaultInstance());
+      assertEquals(1, blockedAfterFirstFragment.get());
+      assertEquals(3, observer.responses.size(), "only Created responses and the first fragment were sent");
+      assertEquals(0, fragmented.releases.get(), "event leases remain held during an incomplete revision");
+
+      observer.ready = true;
+      observer.readyHandler.run();
+
+      List<Rpc.WatchResponse> fragments = observer.responses.stream()
+          .filter(response -> response.getWatchId() == 31 && response.getEventsCount() > 0)
+          .toList();
+      assertTrue(fragments.size() > 1);
+      assertTrue(fragments.getFirst().getFragment());
+      assertFalse(fragments.getLast().getFragment());
+      assertTrue(fragments.stream().allMatch(response -> response.getSerializedSize() <= 220));
+      List<ByteString> deliveredValues = fragments.stream()
+          .flatMap(response -> response.getEventsList().stream())
+          .map(event -> event.getKv().getValue()).toList();
+      assertEquals(values.stream().map(ByteString::copyFrom).toList(), deliveredValues);
+
+      int firstFragmentIndex = observer.responses.indexOf(fragments.getFirst());
+      int finalFragmentIndex = observer.responses.indexOf(fragments.getLast());
+      assertEquals(fragments.size(), finalFragmentIndex - firstFragmentIndex + 1,
+          "no other watch or control response may split a fragment sequence");
+      int progressIndex = indexOfResponse(observer.responses, response -> response.getWatchId() == -1);
+      int otherWatchEventIndex = indexOfResponse(observer.responses,
+          response -> response.getWatchId() == 32 && response.getEventsCount() > 0);
+      assertTrue(progressIndex > finalFragmentIndex);
+      assertTrue(otherWatchEventIndex > progressIndex);
+      assertEquals(3, fragmented.releases.get(), "the final fragment releases the complete revision");
+
+      stream.close();
+      assertEquals(1, fragmented.closeCount.get());
+      assertEquals(1, other.closeCount.get());
+    }
+  }
+
+  @Test
+  void rejectsARevisionBeyondTheAggregationBoundWithoutSendingAPartialRevision() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {4};
+    for (int index = 0; index <= WatchStream.MAX_PENDING_EVENTS_PER_WATCH; index++) {
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {(byte) index}, Optional.empty()));
+    }
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(33, key, new byte[0], 0, false, false, true));
+
+      assertEquals(2, observer.responses.size());
+      assertTrue(observer.responses.getFirst().getCreated());
+      Rpc.WatchResponse cancelled = observer.responses.getLast();
+      assertTrue(cancelled.getCanceled());
+      assertEquals(33, cancelled.getWatchId());
+      assertTrue(cancelled.getCancelReason().contains("aggregation budget"));
+      assertEquals(WatchStream.MAX_PENDING_EVENTS_PER_WATCH + 1, subscription.releases.get());
+
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
+  void closingDuringAFragmentSequenceReleasesTheUnfinishedRevision() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {5};
+    for (int value = 0; value < 3; value++) {
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[80], Optional.empty()));
+    }
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run, timers(),
+          () -> CompletableFuture.completedFuture(session), CLUSTER_ID, MEMBER_ID, 220);
+      observer.onNextHook = () -> {
+        Rpc.WatchResponse sent = observer.responses.getLast();
+        if (sent.getWatchId() == 34 && sent.getFragment()) observer.ready = false;
+      };
+      stream.onNext(createRequest(34, key, new byte[0], 0, false, false, true));
+
+      assertEquals(2, observer.responses.size());
+      assertTrue(observer.responses.getLast().getFragment());
+      assertEquals(0, subscription.releases.get());
+
+      stream.close();
+      assertEquals(3, subscription.releases.get());
+      assertEquals(1, subscription.closeCount.get());
+      observer.ready = true;
+      observer.readyHandler.run();
+      assertEquals(2, observer.responses.size(), "closing must discard the unfinished fragment tail");
+    }
+  }
+
+  @Test
   void zeroStartWaitsForCreatedBarrierAndExcludesEarlierEvents() {
     long startRevision = 0;
     var subscription = new RecordingSubscription();
@@ -1273,7 +1468,7 @@ class WatchStreamTest {
     var subscriptionFailure = new IllegalStateException("subscription cleanup failed");
     subscription.closeFailure = subscriptionFailure;
     var watcher = new WatchRegistry(new CompactedWatchIdBudget(1))
-        .registerActive(1, 1, 1, false, false, false, subscription).watcher();
+        .registerActive(1, 1, 1, false, false, false, false, false, subscription).watcher();
     var deliveryFailure = new AssertionError("pending delivery cleanup failed");
     var pendingDelivery = new WatchStream.Delivery(2,
         event(2, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {2}, Optional.empty()),
@@ -1438,9 +1633,16 @@ class WatchStreamTest {
 
   private static Rpc.WatchRequest createRequest(long id, byte[] key, byte[] rangeEnd,
       long startRevision, boolean prevKv, Rpc.WatchCreateRequest.FilterType... filters) {
+    return createRequest(id, key, rangeEnd, startRevision, prevKv, false, false, filters);
+  }
+
+  private static Rpc.WatchRequest createRequest(long id, byte[] key, byte[] rangeEnd,
+      long startRevision, boolean prevKv, boolean progressNotify, boolean fragment,
+      Rpc.WatchCreateRequest.FilterType... filters) {
     var create = Rpc.WatchCreateRequest.newBuilder().setWatchId(id)
         .setKey(ByteString.copyFrom(key)).setRangeEnd(ByteString.copyFrom(rangeEnd))
-        .setStartRevision(startRevision).setPrevKv(prevKv).addAllFilters(List.of(filters)).build();
+        .setStartRevision(startRevision).setPrevKv(prevKv).setProgressNotify(progressNotify)
+        .setFragment(fragment).addAllFilters(List.of(filters)).build();
     return Rpc.WatchRequest.newBuilder().setCreateRequest(create).build();
   }
 
@@ -1478,6 +1680,19 @@ class WatchStreamTest {
     return timers;
   }
 
+  private static ScheduledExecutorService timers(
+      AtomicReference<Runnable> periodicTick, long periodicDelayMillis) {
+    ScheduledExecutorService timers = mock(ScheduledExecutorService.class);
+    ScheduledFuture<?> future = mock(ScheduledFuture.class);
+    doAnswer(invocation -> {
+      Runnable task = invocation.getArgument(0);
+      long delay = invocation.getArgument(1);
+      if (delay == periodicDelayMillis) periodicTick.set(task);
+      return future;
+    }).when(timers).schedule(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS));
+    return timers;
+  }
+
   private static ScheduledExecutorService immediateZeroDelayTimers() {
     ScheduledExecutorService timers = mock(ScheduledExecutorService.class);
     ScheduledFuture<?> future = mock(ScheduledFuture.class);
@@ -1488,6 +1703,14 @@ class WatchStreamTest {
       return future;
     }).when(timers).schedule(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS));
     return timers;
+  }
+
+  private static int indexOfResponse(List<Rpc.WatchResponse> responses,
+      java.util.function.Predicate<Rpc.WatchResponse> predicate) {
+    for (int index = 0; index < responses.size(); index++) {
+      if (predicate.test(responses.get(index))) return index;
+    }
+    return -1;
   }
 
   private static final class CountingDirectExecutor implements Executor {

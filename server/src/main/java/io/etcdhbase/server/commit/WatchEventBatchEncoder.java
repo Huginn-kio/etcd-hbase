@@ -68,6 +68,16 @@ final class WatchEventBatchEncoder {
         deliveries.add(next);
       }
 
+      if (deliveries.size() == MAX_PENDING_EVENTS_PER_WATCH) {
+        WatchStream.Delivery overflow = watcher.pollNext();
+        if (overflow != null) {
+          if (overflow.revision() == revision) {
+            overflow.close();
+            return new Poll(null, true, "etcd-hbase: Watch revision exceeds the configured aggregation budget");
+          }
+          watcher.defer(overflow);
+        }
+      }
       Rpc.WatchResponse.Builder response = Rpc.WatchResponse.newBuilder()
           .setHeader(header(revision))
           .setWatchId(watcher.id());
@@ -84,7 +94,7 @@ final class WatchEventBatchEncoder {
       if (response.getEventsCount() == 0) return new Poll(null, true, null);
 
       Rpc.WatchResponse built = response.build();
-      if (built.getSerializedSize() > maximumResponseBytes) {
+      if (built.getSerializedSize() > maximumResponseBytes && !watcher.fragment()) {
         return new Poll(null, true, OVERSIZED_RESPONSE_REASON);
       }
       Output output = new Output(built, deliveries);
