@@ -15,10 +15,12 @@ import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
@@ -118,7 +120,9 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private final long clusterId;
   private final long memberId;
   private final int maximumResponseBytes;
+  private final CompactedWatchIdBudget compactedWatchIdBudget;
   private final LinkedHashMap<Long, Watcher> watchers = new LinkedHashMap<>();
+  private final Set<Long> compactedWatchIds = new HashSet<>();
   private final ArrayDeque<PendingResponse> responses = new ArrayDeque<>();
   private final AtomicBoolean draining = new AtomicBoolean();
   private final AtomicBoolean drainRequested = new AtomicBoolean();
@@ -139,11 +143,21 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   WatchStream(StreamObserver<Rpc.WatchResponse> responseObserver, RequestScope streamScope,
       Executor worker, ScheduledExecutorService timers, SessionProvider sessions,
       long clusterId, long memberId, int maximumResponseBytes) {
+    this(responseObserver, streamScope, worker, timers, sessions, clusterId, memberId,
+        maximumResponseBytes, CompactedWatchIdBudget.processWide());
+  }
+
+  WatchStream(StreamObserver<Rpc.WatchResponse> responseObserver, RequestScope streamScope,
+      Executor worker, ScheduledExecutorService timers, SessionProvider sessions,
+      long clusterId, long memberId, int maximumResponseBytes,
+      CompactedWatchIdBudget compactedWatchIdBudget) {
     this.responseObserver = Objects.requireNonNull(responseObserver, "responseObserver");
     this.streamScope = Objects.requireNonNull(streamScope, "streamScope");
     this.worker = Objects.requireNonNull(worker, "worker");
     this.timers = Objects.requireNonNull(timers, "timers");
     this.sessions = Objects.requireNonNull(sessions, "sessions");
+    this.compactedWatchIdBudget = Objects.requireNonNull(
+        compactedWatchIdBudget, "compactedWatchIdBudget");
     if (clusterId == 0 || memberId == 0 || maximumResponseBytes < 1) {
       throw new IllegalArgumentException("invalid Watch stream identity or response budget");
     }
@@ -416,8 +430,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       synchronized (lock) {
         stopped = terminal || peerCancelled || inboundClosed;
         duplicate = !stopped && request.getWatchId() != 0
-            && watchers.containsKey(request.getWatchId());
-        atLimit = !stopped && !duplicate && watchers.size() >= MAX_WATCHES_PER_STREAM;
+            && containsWatchIdLocked(request.getWatchId());
+        atLimit = !stopped && !duplicate && watchIdCountLocked() >= MAX_WATCHES_PER_STREAM;
         if (stopped) processingRequest = false;
       }
       if (stopped) {
@@ -488,8 +502,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       synchronized (lock) {
         stopped = terminal || peerCancelled || inboundClosed;
         duplicate = !stopped && request.getWatchId() != 0
-            && watchers.containsKey(request.getWatchId());
-        atLimit = !stopped && !duplicate && watchers.size() >= MAX_WATCHES_PER_STREAM;
+            && containsWatchIdLocked(request.getWatchId());
+        atLimit = !stopped && !duplicate && watchIdCountLocked() >= MAX_WATCHES_PER_STREAM;
         if (!stopped && !duplicate && !atLimit) {
           long id = request.getWatchId() == 0 ? allocateWatchIdLocked() : request.getWatchId();
           long minimumEventRevision = request.getStartRevision() <= 0
@@ -498,7 +512,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
               request.getPrevKv(),
               request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NOPUT),
               request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NODELETE),
-              opened.subscription(), false);
+              opened.subscription());
           watchers.put(id, createdWatcher);
           watcher = createdWatcher;
           enqueueResponse(createdResponse(id, opened.revision()), () -> {
@@ -549,54 +563,52 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   private void completeCompactedCreate(OpenedWatch opened, Rpc.WatchCreateRequest request) {
     try {
-      opened.subscription().closeLiveDelivery();
+      opened.subscription().close();
     } catch (RuntimeException | Error failure) {
-      try {
-        opened.subscription().close();
-      } catch (RuntimeException | Error cleanupFailure) {
-        if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
-      }
       fail(failure);
       if (failure instanceof Error fatal) throw fatal;
       return;
     }
 
-    Watcher watcher = null;
     boolean stopped;
     boolean duplicate;
     boolean atLimit;
+    boolean retentionLimit;
     synchronized (lock) {
       stopped = terminal || peerCancelled || inboundClosed;
       duplicate = !stopped && request.getWatchId() != 0
-          && watchers.containsKey(request.getWatchId());
-      atLimit = !stopped && !duplicate && watchers.size() >= MAX_WATCHES_PER_STREAM;
+          && containsWatchIdLocked(request.getWatchId());
+      atLimit = !stopped && !duplicate && watchIdCountLocked() >= MAX_WATCHES_PER_STREAM;
+      retentionLimit = false;
       if (!stopped && !duplicate && !atLimit) {
         long id = request.getWatchId() == 0 ? allocateWatchIdLocked() : request.getWatchId();
-        Watcher compacted = new Watcher(id, request.getStartRevision(), request.getPrevKv(),
-            request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NOPUT),
-            request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NODELETE),
-            opened.subscription(), true);
-        watchers.put(id, compacted);
-        watcher = compacted;
-        enqueueResponse(createdResponse(id, opened.revision()), () -> compacted.createdSent = true);
-        enqueueResponse(compactedResponse(id, 0, opened.compactRevision()), this::requestNext);
+        if (compactedWatchIdBudget.tryAcquire()) {
+          try {
+            // The subscription's object graph contains its range and budget state; retain only
+            // the protocol ID so those per-watch objects are no longer reachable from this stream.
+            compactedWatchIds.add(id);
+            enqueueResponse(createdResponse(id, opened.revision()), () -> {});
+            enqueueResponse(compactedResponse(id, 0, opened.compactRevision()), this::requestNext);
+          } catch (RuntimeException | Error failure) {
+            compactedWatchIds.remove(id);
+            compactedWatchIdBudget.release(1);
+            throw failure;
+          }
+        } else {
+          retentionLimit = true;
+        }
       }
       processingRequest = false;
     }
-    if (watcher == null) {
-      try {
-        opened.subscription().close();
-      } catch (RuntimeException | Error failure) {
-        fail(failure);
-        if (failure instanceof Error fatal) throw fatal;
-        return;
-      }
+    if (stopped || duplicate || atLimit || retentionLimit) {
       if (stopped) {
         scheduleDrain();
       } else if (duplicate) {
         rejectCreate(opened.revision(), "mvcc: duplicate watch ID provided on the WatchStream");
       } else if (atLimit) {
         rejectCreate(opened.revision(), "etcd-hbase: Watch stream subscription limit exceeded");
+      } else if (retentionLimit) {
+        rejectCreate(opened.revision(), "etcd-hbase: compacted Watch ID retention limit exceeded");
       }
       return;
     }
@@ -609,22 +621,27 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       return;
     }
     Watcher watcher;
+    boolean compactedTombstone;
     Session currentSession;
     synchronized (lock) {
       watcher = watchers.remove(request.getWatchId());
+      compactedTombstone = watcher == null && compactedWatchIds.remove(request.getWatchId());
+      if (compactedTombstone) compactedWatchIdBudget.release(1);
       currentSession = session;
       if (watcher == null) processingRequest = false;
     }
-    if (watcher == null) {
+    if (watcher == null && !compactedTombstone) {
       requestNext();
       return;
     }
-    try {
-      watcher.close();
-    } catch (RuntimeException | Error failure) {
-      fail(failure);
-      if (failure instanceof Error fatal) throw fatal;
-      return;
+    if (watcher != null) {
+      try {
+        watcher.close();
+      } catch (RuntimeException | Error failure) {
+        fail(failure);
+        if (failure instanceof Error fatal) throw fatal;
+        return;
+      }
     }
     CompletionStage<Long> revision;
     try {
@@ -638,10 +655,10 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       return;
     }
     revision.whenComplete((currentRevision, failure) -> executeCompletion(() ->
-        completeCancel(watcher, currentRevision, failure)));
+        completeCancel(request.getWatchId(), currentRevision, failure)));
   }
 
-  private void completeCancel(Watcher watcher, Long revision, Throwable failure) {
+  private void completeCancel(long watchId, Long revision, Throwable failure) {
     if (failure != null) {
       synchronized (lock) { processingRequest = false; }
       fail(unwrap(failure));
@@ -655,7 +672,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     synchronized (lock) {
       processingRequest = false;
       if (terminal || peerCancelled) return;
-      enqueueResponse(cancelledResponse(watcher.id, revision), this::requestNext);
+      enqueueResponse(cancelledResponse(watchId, revision), this::requestNext);
     }
     scheduleDrain();
     if (!hasCreatedWatcher()) cancelPoll();
@@ -694,7 +711,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     for (int offset = 0; offset < snapshot.size(); offset++) {
       int index = (first + offset) % snapshot.size();
       Watcher watcher = snapshot.get(index);
-      if (!watcher.createdSent || watcher.compacted) continue;
+      if (!watcher.createdSent) continue;
       EventPoll poll = nextEventResponse(watcher);
       EventOutput output = poll.output();
       if (output != null) {
@@ -843,7 +860,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   }
 
   private boolean hasCreatedWatcherLocked() {
-    return watchers.values().stream().anyMatch(watcher -> watcher.createdSent && !watcher.compacted);
+    return watchers.values().stream().anyMatch(watcher -> watcher.createdSent);
   }
 
   private boolean hasRunnableWork() {
@@ -867,9 +884,17 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   private long allocateWatchIdLocked() {
     long id = nextAutoId;
-    while (watchers.containsKey(id)) id = Math.addExact(id, 1);
+    while (containsWatchIdLocked(id)) id = Math.addExact(id, 1);
     nextAutoId = Math.addExact(id, 1);
     return id;
+  }
+
+  private boolean containsWatchIdLocked(long id) {
+    return watchers.containsKey(id) || compactedWatchIds.contains(id);
+  }
+
+  private int watchIdCountLocked() {
+    return watchers.size() + compactedWatchIds.size();
   }
 
   private static long nextRevision(long revision) {
@@ -989,13 +1014,14 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   public void close() {
     List<Watcher> closing;
     synchronized (lock) {
-      if (terminal && watchers.isEmpty()) return;
+      if (terminal && watchers.isEmpty() && compactedWatchIds.isEmpty()) return;
       terminal = true;
       requestOutstanding = false;
       pendingRequest = null;
       responses.clear();
       closing = new ArrayList<>(watchers.values());
       watchers.clear();
+      releaseCompactedWatchIdsLocked();
     }
     cancelPoll();
     closeWatchers(closing);
@@ -1006,8 +1032,15 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     synchronized (lock) {
       closing = new ArrayList<>(watchers.values());
       watchers.clear();
+      releaseCompactedWatchIdsLocked();
     }
     return closeWatchersCollecting(closing);
+  }
+
+  private void releaseCompactedWatchIdsLocked() {
+    int releasedIds = compactedWatchIds.size();
+    compactedWatchIds.clear();
+    compactedWatchIdBudget.release(releasedIds);
   }
 
   private void closeWatchers() {
@@ -1053,21 +1086,18 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     private final boolean filterPut;
     private final boolean filterDelete;
     private final Subscription subscription;
-    private final boolean compacted;
     private Delivery pendingDelivery;
     private boolean createdSent;
     private boolean closed;
 
     private Watcher(long id, long minimumEventRevision,
-        boolean previousKv, boolean filterPut, boolean filterDelete, Subscription subscription,
-        boolean compacted) {
+        boolean previousKv, boolean filterPut, boolean filterDelete, Subscription subscription) {
       this.id = id;
       this.minimumEventRevision = minimumEventRevision;
       this.previousKv = previousKv;
       this.filterPut = filterPut;
       this.filterDelete = filterDelete;
       this.subscription = Objects.requireNonNull(subscription, "subscription");
-      this.compacted = compacted;
     }
 
     private synchronized Delivery takeNext() {

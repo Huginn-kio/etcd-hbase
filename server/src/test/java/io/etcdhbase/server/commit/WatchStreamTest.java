@@ -347,6 +347,81 @@ class WatchStreamTest {
   }
 
   @Test
+  void automaticIdsSkipCompactedExplicitIdsUntilTheyAreCancelled() {
+    var active = new RecordingSubscription();
+    var compacted = new RecordingSubscription();
+    var next = new RecordingSubscription();
+    var session = new RecordingSession(3, 2, active, compacted, next);
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(0, new byte[] {1}, new byte[0], 0, false));
+      stream.onNext(createRequest(1, new byte[] {2}, new byte[0], -1, false));
+      stream.onNext(createRequest(0, new byte[] {3}, new byte[0], 0, false));
+
+      assertEquals(List.of(0L, 1L, 1L, 2L),
+          observer.responses.stream().map(Rpc.WatchResponse::getWatchId).toList());
+      assertTrue(observer.responses.get(1).getCreated());
+      assertTrue(observer.responses.get(2).getCanceled());
+      assertEquals(1, compacted.closeCount.get(),
+          "the compacted subscription is closed while its ID remains reserved");
+      stream.close();
+      assertEquals(1, active.closeCount.get());
+      assertEquals(1, next.closeCount.get());
+    }
+  }
+
+  @Test
+  void rejectsCompactedCreateWhenProcessTombstoneBudgetIsExhausted() {
+    var budget = new CompactedWatchIdBudget(1);
+    var firstSubscription = new RecordingSubscription();
+    var firstSession = new RecordingSession(3, 2, firstSubscription);
+    var firstObserver = new RecordingObserver();
+    var secondSubscription = new RecordingSubscription();
+    var retrySubscription = new RecordingSubscription();
+    var secondSession = new RecordingSession(3, 2, secondSubscription, retrySubscription);
+    var secondObserver = new RecordingObserver();
+
+    try (var firstScope = RequestScope.withoutDeadline();
+         var secondScope = RequestScope.withoutDeadline()) {
+      var firstStream = stream(firstObserver, firstScope, timers(),
+          () -> CompletableFuture.completedFuture(firstSession), budget);
+      var secondStream = stream(secondObserver, secondScope, timers(),
+          () -> CompletableFuture.completedFuture(secondSession), budget);
+
+      firstStream.onNext(createRequest(7, new byte[] {1}, new byte[0], -1, false));
+      assertEquals(1, budget.retainedIds());
+
+      secondStream.onNext(createRequest(8, new byte[] {2}, new byte[0], -1, false));
+      assertEquals(1, secondObserver.responses.size());
+      Rpc.WatchResponse rejected = secondObserver.responses.getFirst();
+      assertTrue(rejected.getCreated());
+      assertTrue(rejected.getCanceled());
+      assertEquals(-1, rejected.getWatchId());
+      assertTrue(rejected.getCancelReason().contains("retention limit"));
+      assertEquals(1, secondSubscription.closeCount.get(),
+          "a rejected compacted create releases its opened subscription");
+
+      firstStream.onNext(Rpc.WatchRequest.newBuilder().setCancelRequest(
+          Rpc.WatchCancelRequest.newBuilder().setWatchId(7)).build());
+      assertEquals(0, budget.retainedIds(), "explicit cancel releases the process-wide ID slot");
+
+      secondStream.onNext(createRequest(8, new byte[] {2}, new byte[0], -1, false));
+      assertEquals(3, secondObserver.responses.size());
+      assertTrue(secondObserver.responses.get(1).getCreated());
+      assertTrue(secondObserver.responses.get(2).getCanceled());
+      assertEquals(8, secondObserver.responses.get(1).getWatchId());
+      assertEquals(1, budget.retainedIds());
+
+      firstStream.close();
+      secondStream.close();
+      assertEquals(0, budget.retainedIds(), "closing a stream releases retained IDs");
+      assertEquals(1, retrySubscription.closeCount.get());
+    }
+  }
+
+  @Test
   void futureStartRevisionDropsOlderLiveEventsAndDeliversTheTargetInclusively() {
     var subscription = new RecordingSubscription();
     var session = new RecordingSession(4, subscription);
@@ -526,7 +601,8 @@ class WatchStreamTest {
       assertEquals(-1, cancelled.getCompactRevision());
       assertEquals("", cancelled.getCancelReason());
       assertEquals(1, compacted.liveCloseCount.get(), "compaction removes the range subscription");
-      assertEquals(0, compacted.closeCount.get(), "RPC watch state remains owned until explicit cancel");
+      assertEquals(1, compacted.closeCount.get(),
+          "compaction releases subscription resources while retaining the RPC watch ID");
 
       stream.onNext(createRequest(7, new byte[] {2}, new byte[0], 0, false));
       assertEquals(3, observer.responses.size());
@@ -574,6 +650,8 @@ class WatchStreamTest {
         assertEquals(2, observer.responses.get(1).getCompactRevision());
         assertEquals(0, observer.responses.get(1).getHeader().getRevision());
         assertEquals(1, subscription.liveCloseCount.get());
+        assertEquals(1, subscription.closeCount.get(),
+            "compaction releases per-watch resources before waiting for client cancellation");
         stream.close();
         assertEquals(1, subscription.closeCount.get());
       }
@@ -887,8 +965,14 @@ class WatchStreamTest {
 
   private static WatchStream stream(RecordingObserver observer, RequestScope scope,
       ScheduledExecutorService timers, WatchStream.SessionProvider sessions) {
+    return stream(observer, scope, timers, sessions, CompactedWatchIdBudget.processWide());
+  }
+
+  private static WatchStream stream(RecordingObserver observer, RequestScope scope,
+      ScheduledExecutorService timers, WatchStream.SessionProvider sessions,
+      CompactedWatchIdBudget compactedWatchIdBudget) {
     return new WatchStream(observer, scope, Runnable::run, timers, sessions,
-        CLUSTER_ID, MEMBER_ID, 1 << 20);
+        CLUSTER_ID, MEMBER_ID, 1 << 20, compactedWatchIdBudget);
   }
 
   private static Rpc.WatchRequest createRequest(long id, byte[] key, byte[] rangeEnd,
