@@ -33,7 +33,8 @@ class EventBackfillCycleBudgetTest {
     when(stores.control()).thenReturn(mock(HBaseCommitControlStore.class));
     var pins = mock(EventHistoryPinManager.class);
     when(pins.namespace()).thenReturn(Optional.of(ByteKey.copyOf(new byte[16])));
-    var cycle = new EventBackfillCycle("group", stores, pins, mock(InvocationService.class),
+    var cycle = new EventBackfillCycle("group", mock(SerialMutationQueue.class), stores, pins,
+        mock(InvocationService.class),
         mock(EventBackfillPreparation.class), mock(CommitPublisher.class), budgets,
         ByteKey.copyOf(new byte[32]), Clock.systemUTC());
     try (var scope = RequestScope.withTimeout(Duration.ofSeconds(10))) {

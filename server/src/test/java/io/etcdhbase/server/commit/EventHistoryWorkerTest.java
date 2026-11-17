@@ -2,11 +2,12 @@ package io.etcdhbase.server.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.etcdhbase.core.commit.CommitOwnerService;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.server.observability.RequestMetrics;
 import java.time.Duration;
 import java.util.Optional;
@@ -28,7 +29,7 @@ class EventHistoryWorkerTest {
     timer.shutdown();
     var lane = new SerialMutationQueue(0, 1024, 1, 1024, Duration.ofSeconds(5));
     var metrics = new RequestMetrics();
-    var worker = new EventHistoryWorker(lane, timer, () -> Optional.of(OWNER),
+    var worker = new EventHistoryWorker(timer, () -> Optional.of(OWNER),
         (owner, scope) -> CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(true, false)), metrics);
     try {
       worker.start();
@@ -53,7 +54,7 @@ class EventHistoryWorkerTest {
     var metrics = new RequestMetrics();
     var observedFailure = new AtomicReference<Optional<BackendFailure.Category>>();
     var workerReference = new AtomicReference<EventHistoryWorker>();
-    var worker = new EventHistoryWorker(lane, timer, () -> Optional.of(OWNER), (owner, scope) -> {
+    var worker = new EventHistoryWorker(timer, () -> Optional.of(OWNER), (owner, scope) -> {
       int attempt = calls.incrementAndGet();
       if (attempt == 1) {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
@@ -87,7 +88,7 @@ class EventHistoryWorkerTest {
     var lane = new SerialMutationQueue(0, 1024, 1, 1024, Duration.ofSeconds(5));
     var started = new CountDownLatch(1);
     var physical = new CompletableFuture<Void>();
-    var worker = new EventHistoryWorker(lane, timer, () -> Optional.of(OWNER), (owner, scope) -> {
+    var worker = new EventHistoryWorker(timer, () -> Optional.of(OWNER), (owner, scope) -> {
       var operation = new CompletableFuture<EventHistoryWorker.CycleResult>();
       scope.startIfOpen(() -> scope.trackPhysicalProducer(physical));
       scope.registerCleanup(() -> operation.completeExceptionally(
@@ -112,6 +113,60 @@ class EventHistoryWorkerTest {
       timer.shutdownNow();
       assertTrue(timer.awaitTermination(10, TimeUnit.SECONDS));
       assertTrue(lane.awaitTermination(Duration.ofSeconds(10)));
+    }
+  }
+
+  @Test
+  void slowBackfillReadDoesNotBlockHeartbeatAndPublicationUsesOwnerLane() throws Exception {
+    var timer = new ScheduledThreadPoolExecutor(1);
+    var lane = new SerialMutationQueue(1, 1024, 1, 1024, Duration.ofSeconds(5));
+    var readStarted = new CountDownLatch(1);
+    var releaseRead = new CountDownLatch(1);
+    var producerDrained = new CompletableFuture<Void>();
+    var publicationUsedOwnerLane = new AtomicReference<Boolean>();
+    var worker = new EventHistoryWorker(timer, () -> Optional.of(OWNER), (owner, scope) -> {
+      scope.startIfOpen(() -> scope.trackPhysicalProducer(producerDrained));
+      readStarted.countDown();
+      try {
+        assertTrue(releaseRead.await(5, TimeUnit.SECONDS), "test read should be released");
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        return CompletableFuture.failedFuture(interrupted);
+      }
+      var publicationScope = RequestScope.withoutDeadline();
+      return lane.submitBackground(publicationScope, laneScope -> {
+        publicationUsedOwnerLane.set(lane.snapshot().active());
+        return CompletableFuture.completedFuture(null);
+      }).whenComplete((ignored, failure) -> {
+        publicationScope.close();
+        producerDrained.complete(null);
+      }).thenApply(ignored -> new EventHistoryWorker.CycleResult(true, true));
+    }, new RequestMetrics());
+    try {
+      worker.start();
+      assertTrue(readStarted.await(5, TimeUnit.SECONDS));
+
+      var heartbeatScope = RequestScope.withTimeout(Duration.ofSeconds(2));
+      var heartbeat = lane.submit(1, heartbeatScope,
+          ignored -> CompletableFuture.completedFuture(Boolean.TRUE));
+      assertTrue(heartbeat.get(1, TimeUnit.SECONDS),
+          "a slow event backfill read must leave the serial owner lane available");
+      heartbeatScope.close();
+
+      releaseRead.countDown();
+      worker.completion().get(5, TimeUnit.SECONDS);
+      assertEquals(Boolean.TRUE, publicationUsedOwnerLane.get(),
+          "the backfill publication must still be dispatched through the owner lane");
+    } finally {
+      releaseRead.countDown();
+      producerDrained.complete(null);
+      worker.stop();
+      worker.drained().get(5, TimeUnit.SECONDS);
+      lane.close();
+      lane.drained().get(5, TimeUnit.SECONDS);
+      timer.shutdownNow();
+      assertTrue(timer.awaitTermination(5, TimeUnit.SECONDS));
+      assertTrue(lane.awaitTermination(Duration.ofSeconds(5)));
     }
   }
 }

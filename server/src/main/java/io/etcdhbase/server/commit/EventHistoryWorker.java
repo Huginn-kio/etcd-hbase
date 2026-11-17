@@ -7,16 +7,18 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.server.observability.RequestMetrics;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
-/** Schedules one bounded backfill or live-tail step at a time on the owner mutation lane. */
+/** Runs one bounded event-history cycle away from the owner lane at a time. */
 final class EventHistoryWorker {
   enum State { WAITING, RUNNING, COMPLETE, RETRYING, STOPPED }
 
@@ -25,9 +27,10 @@ final class EventHistoryWorker {
   private static final long PROGRESS_DELAY_MILLIS = 20;
   private static final long IDLE_DELAY_MILLIS = 250;
   private static final long RETRY_DELAY_MILLIS = 1000;
-  private static final Executor CLEANUP = task -> Thread.ofVirtual().name("event-history-cleanup").start(task);
+  private static final java.util.concurrent.Executor CLEANUP =
+      task -> Thread.ofVirtual().name("event-history-cleanup").start(task);
   private final Object lock = new Object();
-  private final SerialMutationQueue lane;
+  private final ThreadPoolExecutor cycles;
   private final ScheduledExecutorService timer;
   private final Supplier<Optional<CommitOwnerService.OwnerToken>> owner;
   private final BiFunction<Optional<CommitOwnerService.OwnerToken>, RequestScope,
@@ -35,25 +38,29 @@ final class EventHistoryWorker {
   private final RequestMetrics metrics;
   private final CompletableFuture<Void> drained = new CompletableFuture<>();
   private final CompletableFuture<Void> complete = new CompletableFuture<>();
+  private final AtomicBoolean drainStarted = new AtomicBoolean();
   private ScheduledFuture<?> scheduled;
-  private RequestScope waiter;
   private RequestScope service;
   private State state = State.WAITING;
   private Optional<BackendFailure.Category> lastFailure = Optional.empty();
+  private Throwable drainFailure;
   private boolean started;
   private boolean running;
   private boolean outstanding;
 
-  EventHistoryWorker(SerialMutationQueue lane, ScheduledExecutorService timer,
+  EventHistoryWorker(ScheduledExecutorService timer,
       Supplier<Optional<CommitOwnerService.OwnerToken>> owner,
       BiFunction<Optional<CommitOwnerService.OwnerToken>, RequestScope,
           CompletableFuture<CycleResult>> cycle,
       RequestMetrics metrics) {
-    this.lane = Objects.requireNonNull(lane, "lane");
     this.timer = Objects.requireNonNull(timer, "timer");
     this.owner = Objects.requireNonNull(owner, "owner");
     this.cycle = Objects.requireNonNull(cycle, "cycle");
     this.metrics = Objects.requireNonNull(metrics, "metrics");
+    cycles = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue<>(1),
+        Thread.ofPlatform().daemon().name("event-history-cycle-", 0).factory(),
+        new ThreadPoolExecutor.AbortPolicy());
   }
 
   void start() {
@@ -74,17 +81,19 @@ final class EventHistoryWorker {
     RequestScope cancel;
     boolean idle;
     synchronized (lock) {
-      if (!running) return;
+      if (!running && started) return;
+      started = true;
       running = false;
       state = State.STOPPED;
       if (scheduled != null) scheduled.cancel(false);
       scheduled = null;
-      cancel = service == null ? waiter : service;
+      cancel = service;
       idle = !outstanding;
     }
     complete.completeExceptionally(new CancellationException("event history worker stopped"));
-    if (idle) drained.complete(null);
+    cycles.shutdown();
     if (cancel != null) cancel.cancelAsync(CLEANUP);
+    if (idle) drainAfterExecutorStops();
   }
 
   private void schedule(long delayMillis) {
@@ -94,10 +103,12 @@ final class EventHistoryWorker {
     } catch (RuntimeException failure) {
       running = false;
       state = State.STOPPED;
+      drainFailure = failure;
       lastFailure = Optional.of(BackendFailure.Category.UNAVAILABLE);
       metrics.recordEventHistoryFailure(BackendFailure.Category.UNAVAILABLE);
       complete.completeExceptionally(failure);
-      drained.completeExceptionally(failure);
+      cycles.shutdown();
+      drainAfterExecutorStops();
     }
   }
 
@@ -109,31 +120,62 @@ final class EventHistoryWorker {
       outstanding = true;
       state = State.RUNNING;
       request = RequestScope.withoutDeadline();
-      waiter = request;
+      service = request;
     }
     try {
-      CompletableFuture<CycleResult> result = lane.submitBackground(request, this::runOnLane);
-      result.whenComplete((cycleResult, failure) -> finish(request, cycleResult, failure));
+      cycles.execute(() -> runCycle(request));
     } catch (RuntimeException | Error failure) {
-      finish(request, null, failure);
+      settle(request, null, new BackendFailure(BackendFailure.Category.UNAVAILABLE, failure));
       if (failure instanceof Error fatal) throw fatal;
     }
   }
 
-  private CompletableFuture<CycleResult> runOnLane(RequestScope scope) {
+  private void runCycle(RequestScope scope) {
     synchronized (lock) {
-      if (!running) return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.CANCELLED));
-      service = scope;
+      if (!running) {
+        settle(scope, null, new BackendFailure(BackendFailure.Category.CANCELLED));
+        return;
+      }
     }
-    return Objects.requireNonNull(cycle.apply(owner.get(), scope), "event history cycle future");
+    CompletableFuture<CycleResult> result;
+    try {
+      result = Objects.requireNonNull(cycle.apply(owner.get(), scope), "event history cycle future");
+    } catch (RuntimeException | Error failure) {
+      settle(scope, null, failure);
+      if (failure instanceof Error fatal) throw fatal;
+      return;
+    }
+    result.whenComplete((cycleResult, failure) -> settle(scope, cycleResult, failure));
+  }
+
+  private void settle(RequestScope request, CycleResult result, Throwable failure) {
+    try {
+      request.closeAsync(CLEANUP);
+    } catch (RuntimeException | Error cleanup) {
+      if (failure == null) failure = cleanup;
+      else if (failure != cleanup) failure.addSuppressed(cleanup);
+    }
+    Throwable primaryFailure = failure;
+    CompletableFuture.allOf(request.cleanupCompletion().toCompletableFuture(),
+        request.physicalProducersCompletion().toCompletableFuture()).whenComplete((ignored, drainProblem) -> {
+          Throwable settledFailure = primaryFailure;
+          if (drainProblem != null) {
+            Throwable cause = CompletionFailures.unwrapCompletion(drainProblem);
+            if (settledFailure == null) settledFailure = cause;
+            else if (settledFailure != cause) settledFailure.addSuppressed(cause);
+          }
+          if (request.cleanupFailureCount() != 0 && settledFailure == null) {
+            settledFailure = new IllegalStateException("event history cycle cleanup failed");
+          }
+          finish(request, result, settledFailure);
+        });
   }
 
   private void finish(RequestScope request, CycleResult result, Throwable failure) {
-    request.close();
     boolean stopped = false;
     boolean finished = false;
     synchronized (lock) {
-      waiter = null;
+      if (service != request || !outstanding) return;
       service = null;
       outstanding = false;
       if (!running) {
@@ -155,7 +197,29 @@ final class EventHistoryWorker {
         schedule(result.progressed() ? PROGRESS_DELAY_MILLIS : IDLE_DELAY_MILLIS);
       }
     }
-    if (stopped) drained.complete(null);
+    if (stopped) drainAfterExecutorStops();
     if (finished) complete.complete(null);
+  }
+
+  private void drainAfterExecutorStops() {
+    if (!drainStarted.compareAndSet(false, true)) return;
+    CLEANUP.execute(() -> {
+      boolean interrupted = false;
+      try {
+        while (true) {
+          try {
+            if (cycles.awaitTermination(30, TimeUnit.SECONDS)) break;
+          } catch (InterruptedException failure) {
+            interrupted = true;
+          }
+        }
+      } finally {
+        if (interrupted) Thread.currentThread().interrupt();
+      }
+      Throwable failure;
+      synchronized (lock) { failure = drainFailure; }
+      if (failure == null) drained.complete(null);
+      else drained.completeExceptionally(failure);
+    });
   }
 }

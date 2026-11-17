@@ -771,13 +771,14 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           new ResultPreparation(stores.resultRepository()), stores.results(),
           new ManifestPreparation(stores.manifestRepository(), new ManifestPreparation.Limits(0, 0, 0, 0)),
           invocations));
-      var backfill = new EventBackfillCycle(plan.source().tableGroupId(), stores, pending.eventPins,
+      var backfill = new EventBackfillCycle(plan.source().tableGroupId(), pending.queue, stores, pending.eventPins,
           invocations, backfillPreparation, business.publisher(), budgets, authorization, Clock.systemUTC());
-      var tailer = new EventTailerCycle(plan.source().tableGroupId(), stores, pending.eventPins,
-          budgets, authorization, pending, business.metrics());
+      var tailer = new EventTailerCycle(plan.source().tableGroupId(), pending.queue,
+          owner::currentToken, stores, pending.eventPins, budgets, authorization,
+          pending, business.metrics());
       var history = new EventHistoryCycle(backfill, tailer, business.metrics());
       pending.startEventHistoryWorker(new EventHistoryWorker(
-          pending.queue, pending.leaseTimers, owner::currentToken, history::run, business.metrics()));
+          pending.leaseTimers, owner::currentToken, history::run, business.metrics()));
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
         txnGateway::range), leaseService);

@@ -1,6 +1,8 @@
 package io.etcdhbase.server.commit;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.commit.CommitOwnerService;
+import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.EventHistoryPinManager;
 import io.etcdhbase.core.commit.EventIndexBackfillCheckpoint;
 import io.etcdhbase.core.commit.EventIndexBackfillReader;
@@ -9,6 +11,7 @@ import io.etcdhbase.core.commit.ReadView;
 import io.etcdhbase.core.commit.SelectedSequenceReader;
 import io.etcdhbase.core.commit.SharedEventTailer;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepository;
@@ -16,15 +19,21 @@ import io.etcdhbase.server.observability.RequestMetrics;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
-/** Creates one table-group tailer from the durable backfill barrier and advances bounded work. */
+/** Creates one table-group tailer and applies its read proposals on the owner lane. */
 final class EventTailerCycle {
   private static final int MAX_REVISION_EVENTS = 4096;
   private static final long MAX_REVISION_BYTES = LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES;
   private static final int MAX_PROOF_PAGES = 4096;
   private static final long MAX_PROOF_BYTES = 512L << 20;
 
+  private record TailerSeed(SelectedSequenceReader source, EventIndexBackfillCheckpoint checkpoint,
+      CommitState state) {}
+
   private final String tableGroup;
+  private final SerialMutationQueue ownerLane;
+  private final Supplier<Optional<CommitOwnerService.OwnerToken>> owner;
   private final TableGroupStores stores;
   private final EventHistoryPinManager pins;
   private final BudgetManager budgets;
@@ -32,10 +41,13 @@ final class EventTailerCycle {
   private final M3TableGroupRuntime.Pending pending;
   private final RequestMetrics metrics;
 
-  EventTailerCycle(String tableGroup, TableGroupStores stores, EventHistoryPinManager pins,
-      BudgetManager budgets, ByteKey authorization, M3TableGroupRuntime.Pending pending,
-      RequestMetrics metrics) {
+  EventTailerCycle(String tableGroup, SerialMutationQueue ownerLane,
+      Supplier<Optional<CommitOwnerService.OwnerToken>> owner, TableGroupStores stores,
+      EventHistoryPinManager pins, BudgetManager budgets, ByteKey authorization,
+      M3TableGroupRuntime.Pending pending, RequestMetrics metrics) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
+    this.ownerLane = Objects.requireNonNull(ownerLane, "ownerLane");
+    this.owner = Objects.requireNonNull(owner, "owner");
     this.stores = Objects.requireNonNull(stores, "stores");
     this.pins = Objects.requireNonNull(pins, "pins");
     this.budgets = Objects.requireNonNull(budgets, "budgets");
@@ -47,19 +59,22 @@ final class EventTailerCycle {
     }
   }
 
-  CompletableFuture<EventHistoryWorker.CycleResult> run(RequestScope scope) {
+  CompletableFuture<EventHistoryWorker.CycleResult> run(
+      Optional<CommitOwnerService.OwnerToken> expectedOwner, RequestScope scope) {
+    Objects.requireNonNull(expectedOwner, "expectedOwner");
     Objects.requireNonNull(scope, "scope");
     SharedEventTailer current = pending.eventTailer().orElse(null);
-    if (current != null) return advance(current, scope);
-    return create(scope).thenCompose(created -> {
-      if (created.isEmpty()) return idle(scope, null);
-      SharedEventTailer installed = pending.installEventTailer(created.orElseThrow());
-      if (installed.subscriptionCount() == 0) return idle(scope, installed);
-      return advance(installed, scope);
+    if (current != null) return advance(current, expectedOwner, scope);
+    return create(scope).thenCompose(seed -> {
+      if (seed.isEmpty()) return idle(scope, null);
+      return installOnOwnerLane(seed.orElseThrow(), expectedOwner, scope).thenCompose(installed ->
+          installed.subscriptionCount() == 0
+              ? idle(scope, installed)
+              : CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(true, false)));
     });
   }
 
-  private CompletableFuture<Optional<SharedEventTailer>> create(RequestScope scope) {
+  private CompletableFuture<Optional<TailerSeed>> create(RequestScope scope) {
     Child pinScope = new Child(scope);
     BudgetManager.Account readAccount;
     try {
@@ -72,40 +87,79 @@ final class EventTailerCycle {
     }
     var proof = new ManifestCatalog.ProofReadBudget(pinScope.scope, readAccount,
         MAX_PROOF_PAGES, MAX_PROOF_BYTES);
-    CompletableFuture<Optional<SharedEventTailer>> creation =
+    CompletableFuture<Optional<TailerSeed>> creation =
         stores.views().openAuxiliary(authorization, pinScope.scope).thenCompose(pinned -> {
       var reader = new EventIndexBackfillReader(stores.records(), stores.manifests());
       return reader.read(pinned, pinScope.scope, proof).thenCompose(checkpoint -> {
         ReadView view = pinned.view();
         pinned.close();
         if (checkpoint.isEmpty()) {
-          return CompletableFuture.completedFuture(Optional.<SharedEventTailer>empty());
+          return CompletableFuture.completedFuture(Optional.<TailerSeed>empty());
         }
         EventIndexBackfillCheckpoint completed = checkpoint.orElseThrow();
         return stores.control().read(scope).thenApply(snapshot -> {
-          var state = snapshot.orElseThrow(() -> new IllegalStateException("event control is missing")).state();
+          CommitState state = snapshot.orElseThrow(
+              () -> new IllegalStateException("event control is missing")).state();
           if (!completed.complete() || completed.sequence() > view.finalizedSequence()
               || !completed.registryIdentity().equals(pins.registryIdentity())
               || !pins.namespace().equals(state.eventRegistryNamespace())) {
             throw new java.util.concurrent.CompletionException(
                 new BackendFailure(BackendFailure.Category.UNAVAILABLE));
           }
-          BudgetManager.Account memory;
-          try {
-            memory = pending.eventTailerMemory(budgets, tableGroup);
-          } catch (BackendFailure failure) {
-            throw new java.util.concurrent.CompletionException(failure);
-          }
           var source = new SelectedSequenceReader(pins, stores.control(), stores.decisions(),
               stores.manifestRepository(), new HBaseEventRevisionIndexRepository(stores.records()));
           source.observePublishedSequence(state.publishedSequence());
-          return Optional.of(new SharedEventTailer(source, authorization, memory,
-              completed.upperSequence(), completed.upperRevision(), 100_000, MAX_REVISION_EVENTS,
-              MAX_REVISION_BYTES));
+          return Optional.of(new TailerSeed(source, completed, state));
         });
       }).whenComplete((ignored, failure) -> pinned.close());
     });
     return creation.whenComplete((ignored, failure) -> close(pinScope, failure));
+  }
+
+  private CompletableFuture<SharedEventTailer> installOnOwnerLane(TailerSeed seed,
+      Optional<CommitOwnerService.OwnerToken> expectedOwner, RequestScope cycleScope) {
+    var laneRequest = RequestScope.withoutDeadline();
+    CompletableFuture<SharedEventTailer> installed;
+    try {
+      installed = ownerLane.submitBackground(laneRequest, laneScope -> {
+        if (cycleScope.isCancelled() || cycleScope.isDeadlineExceeded()
+            || !isCurrentOwner(expectedOwner) || !seedMatchesOwner(seed, expectedOwner)) {
+          return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        }
+        BudgetManager.Account memory;
+        try {
+          memory = pending.eventTailerMemory(budgets, tableGroup);
+        } catch (BackendFailure failure) {
+          return CompletableFuture.failedFuture(failure);
+        }
+        var candidate = new SharedEventTailer(seed.source(), authorization, memory,
+            seed.checkpoint().upperSequence(), seed.checkpoint().upperRevision(), 100_000,
+            MAX_REVISION_EVENTS, MAX_REVISION_BYTES);
+        try {
+          return CompletableFuture.completedFuture(pending.installEventTailer(candidate));
+        } catch (RuntimeException | Error failure) {
+          candidate.close();
+          throw failure;
+        }
+      });
+    } catch (RuntimeException | Error failure) {
+      laneRequest.close();
+      if (failure instanceof Error fatal) throw fatal;
+      return CompletableFuture.failedFuture(failure);
+    }
+    return installed.whenComplete((ignored, failure) -> laneRequest.close());
+  }
+
+  private static boolean seedMatchesOwner(TailerSeed seed,
+      Optional<CommitOwnerService.OwnerToken> expectedOwner) {
+    if (expectedOwner.isEmpty()) return true;
+    var token = expectedOwner.orElseThrow();
+    return seed.state().ownerEpoch() == token.epoch()
+        && seed.state().ownerInstance().filter(token.instance()::equals).isPresent();
+  }
+
+  private boolean isCurrentOwner(Optional<CommitOwnerService.OwnerToken> expectedOwner) {
+    return expectedOwner.equals(owner.get());
   }
 
   private static void close(Child child, Throwable primary) {
@@ -121,7 +175,7 @@ final class EventTailerCycle {
   }
 
   private CompletableFuture<EventHistoryWorker.CycleResult> advance(SharedEventTailer tailer,
-      RequestScope scope) {
+      Optional<CommitOwnerService.OwnerToken> expectedOwner, RequestScope scope) {
     if (tailer.subscriptionCount() == 0) return idle(scope, tailer);
     BudgetManager.Account readAccount;
     try {
@@ -133,7 +187,7 @@ final class EventTailerCycle {
     var budget = new ManifestCatalog.ProofReadBudget(scope, readAccount, MAX_PROOF_PAGES, MAX_PROOF_BYTES);
     var before = scope.storageCostSnapshot();
     long previousRevision = tailer.completedRevision();
-    return advanceOneRevision(tailer, scope, budget, false).thenApply(result -> {
+    return advanceOneRevision(tailer, expectedOwner, scope, budget, false).thenApply(result -> {
       boolean publishedRevision = tailer.completedRevision() > previousRevision;
       metrics.recordEventTailerCycle(result.progressed(),
           publishedRevision ? tailer.lastPublishedEventCount() : 0,
@@ -143,11 +197,7 @@ final class EventTailerCycle {
           tailer.subscriptionCount());
       return result;
     }).exceptionallyCompose(failure -> {
-      Throwable cause = failure;
-      while ((cause instanceof java.util.concurrent.CompletionException
-          || cause instanceof java.util.concurrent.ExecutionException) && cause.getCause() != null) {
-        cause = cause.getCause();
-      }
+      Throwable cause = CompletionFailures.unwrapCompletion(failure);
       if (tailer.isClosed()) pending.detachClosedEventTailer(tailer);
       metrics.recordEventTailerFailure(cause instanceof BackendFailure backend
           ? backend.category() : BackendFailure.Category.UNKNOWN);
@@ -156,12 +206,38 @@ final class EventTailerCycle {
   }
 
   private CompletableFuture<EventHistoryWorker.CycleResult> advanceOneRevision(SharedEventTailer tailer,
-      RequestScope scope, ManifestCatalog.ProofReadBudget budget, boolean progressed) {
-    return tailer.step(scope, budget).thenCompose(step -> switch (step) {
-      case WAITING -> CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(progressed, false));
-      case METADATA -> CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(true, false));
-      case PUBLISHED -> CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(true, false));
-      case OPENED, BUFFERED -> advanceOneRevision(tailer, scope, budget, true);
+      Optional<CommitOwnerService.OwnerToken> expectedOwner, RequestScope scope,
+      ManifestCatalog.ProofReadBudget budget, boolean progressed) {
+    return tailer.prepareStep(scope, budget)
+        .thenCompose(proposal -> applyOnOwnerLane(tailer, proposal, expectedOwner, scope))
+        .thenCompose(step -> switch (step) {
+          case WAITING -> CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(progressed, false));
+          case METADATA -> CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(true, false));
+          case PUBLISHED -> CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(true, false));
+          case OPENED, BUFFERED -> advanceOneRevision(tailer, expectedOwner, scope, budget, true);
+        });
+  }
+
+  private CompletableFuture<SharedEventTailer.Step> applyOnOwnerLane(
+      SharedEventTailer tailer, SharedEventTailer.StepProposal proposal,
+      Optional<CommitOwnerService.OwnerToken> expectedOwner, RequestScope cycleScope) {
+    var laneRequest = RequestScope.withoutDeadline();
+    CompletableFuture<SharedEventTailer.Step> applied;
+    try {
+      applied = ownerLane.submitBackground(laneRequest, laneScope -> {
+        if (cycleScope.isCancelled() || cycleScope.isDeadlineExceeded() || !isCurrentOwner(expectedOwner)) {
+          return tailer.discardStep(proposal).thenCompose(ignored ->
+              CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE)));
+        }
+        return tailer.applyStep(proposal);
+      });
+    } catch (RuntimeException | Error failure) {
+      laneRequest.close();
+      return tailer.discardStep(proposal).thenCompose(ignored -> CompletableFuture.failedFuture(failure));
+    }
+    return applied.whenComplete((ignored, failure) -> {
+      laneRequest.close();
+      if (failure != null) tailer.discardStep(proposal);
     });
   }
 
@@ -175,7 +251,12 @@ final class EventTailerCycle {
     return CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(false, false));
   }
 
-  /** The pin owns this child; closing it must not cancel the owner-lane cycle scope. */
+  private static BackendFailure inactive(RequestScope scope) {
+    return new BackendFailure(scope.isDeadlineExceeded()
+        ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
+  }
+
+  /** The pin owns this child; closing it waits for its actual backend producers. */
   private static final class Child implements AutoCloseable {
     private final RequestScope scope;
     private final CompletableFuture<Void> drained;

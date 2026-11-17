@@ -19,6 +19,7 @@ import io.etcdhbase.core.commit.ManifestCatalog;
 import io.etcdhbase.core.commit.SelectedSequenceReader;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepository;
@@ -28,6 +29,7 @@ import java.time.Clock;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /** One owner-lane backfill cycle, including protected reads and one durable M2 publication. */
 final class EventBackfillCycle {
@@ -43,6 +45,7 @@ final class EventBackfillCycle {
   record CycleResult(boolean progressed, boolean complete) {}
 
   private final String tableGroup;
+  private final SerialMutationQueue ownerLane;
   private final TableGroupStores stores;
   private final EventHistoryPinManager pins;
   private final InvocationService invocations;
@@ -51,10 +54,12 @@ final class EventBackfillCycle {
   private final ByteKey authorization;
   private final Clock clock;
 
-  EventBackfillCycle(String tableGroup, TableGroupStores stores, EventHistoryPinManager pins,
+  EventBackfillCycle(String tableGroup, SerialMutationQueue ownerLane, TableGroupStores stores,
+      EventHistoryPinManager pins,
       InvocationService invocations, EventBackfillPreparation preparation, CommitPublisher publisher,
       BudgetManager budgets, ByteKey authorization, Clock clock) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
+    this.ownerLane = Objects.requireNonNull(ownerLane, "ownerLane");
     this.stores = Objects.requireNonNull(stores, "stores");
     this.pins = Objects.requireNonNull(pins, "pins");
     this.invocations = Objects.requireNonNull(invocations, "invocations");
@@ -125,7 +130,8 @@ final class EventBackfillCycle {
       try (window) {
         EventIndexBackfillCheckpoint proposal = current.isEmpty() ? checkpoint
             : verifyNext(owner, state, checkpoint, window, windowScope.scope, budget);
-        publish(owner, state, proposal, window, windowScope.scope, account, budget);
+        account.close();
+        publishOnOwnerLane(owner, state, proposal, windowScope.scope, current.isEmpty());
         return new CycleResult(true, proposal.complete());
       } finally {
         window.releaseCompletion().toCompletableFuture().join();
@@ -163,16 +169,91 @@ final class EventBackfillCycle {
     }
   }
 
-  private void publish(CommitOwnerService.OwnerToken owner, CommitState state,
-      EventIndexBackfillCheckpoint checkpoint, EventBackfillWindow window, RequestScope scope,
-      BudgetManager.Account account, ManifestCatalog.ProofReadBudget budget) {
+  private void publishOnOwnerLane(CommitOwnerService.OwnerToken owner, CommitState state,
+      EventIndexBackfillCheckpoint checkpoint, RequestScope scope, boolean initialCapture)
+      throws BackendFailure {
     var proposed = InvocationBinding.begin(InvocationId.create(), digest(checkpoint), authorization,
         TransactionId.create(), owner.epoch(), state.publishedSequence(), state.publishedRevision());
-    var invocation = invocations.bindOrJoin(proposed, scope).join();
-    var result = publisher.publish(invocation, owner, checkpoint, window, scope, account, budget).join();
-    if (result.state() != CommitOutcomeResolver.State.SELECTED_FINALIZED) {
-      throw new java.util.concurrent.CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    var publicationDrained = new CompletableFuture<Void>();
+    if (!scope.startIfOpen(() -> scope.trackPhysicalProducer(publicationDrained))) {
+      throw inactive(scope);
     }
+    var publicationScope = RequestScope.withoutDeadline();
+    CompletableFuture<CommitOutcomeResolver.Resolution> publication;
+    try {
+      publication = ownerLane.submitBackground(publicationScope, laneScope -> {
+        if (scope.isClosed() || scope.isDeadlineExceeded()) {
+          return CompletableFuture.failedFuture(inactive(scope));
+        }
+        return invocations.bindOrJoin(proposed, laneScope)
+            .thenCompose(invocation -> publishOnLane(invocation, owner, checkpoint, laneScope, initialCapture));
+      });
+    } catch (RuntimeException | Error failure) {
+      publicationScope.close();
+      publicationDrained.complete(null);
+      throw failure;
+    }
+    publication.whenComplete((ignored, failure) -> {
+      publicationScope.close();
+      publicationDrained.complete(null);
+    });
+    var result = publication.join();
+    if (result.state() != CommitOutcomeResolver.State.SELECTED_FINALIZED) {
+      throw new CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
+  }
+
+  private CompletableFuture<CommitOutcomeResolver.Resolution> publishOnLane(
+      InvocationBinding invocation, CommitOwnerService.OwnerToken owner,
+      EventIndexBackfillCheckpoint checkpoint, RequestScope scope, boolean initialCapture) {
+    BudgetManager.Account account;
+    try {
+      account = budgets.admitReserved(tableGroup, scope, RESERVATION, READ_LIMITS);
+    } catch (BackendFailure failure) {
+      return CompletableFuture.failedFuture(failure);
+    }
+    var budget = proof(scope, account);
+    CompletableFuture<EventBackfillWindow> window = initialCapture
+        ? new EventIndexBackfillCapture(pins, stores.control(), stores.decisions())
+            .open(checkpoint, authorization, scope, budget)
+        : EventBackfillWindow.open(pins, stores.control(), checkpoint, authorization, scope, budget);
+    return window.thenCompose(protectedWindow -> {
+      CompletableFuture<CommitOutcomeResolver.Resolution> publication;
+      try {
+        publication = publisher.publish(invocation, owner, checkpoint, protectedWindow,
+            scope, account, budget);
+      } catch (RuntimeException | Error failure) {
+        protectedWindow.close();
+        return awaitWindowRelease(protectedWindow, CompletableFuture.failedFuture(failure));
+      }
+      return awaitWindowRelease(protectedWindow, publication);
+    });
+  }
+
+  private static <T> CompletableFuture<T> awaitWindowRelease(EventBackfillWindow window,
+      CompletableFuture<T> operation) {
+    var result = new CompletableFuture<T>();
+    operation.whenComplete((value, operationFailure) -> {
+      Throwable failure = operationFailure == null ? null : CompletionFailures.unwrapCompletion(operationFailure);
+      try {
+        window.close();
+      } catch (RuntimeException | Error cleanup) {
+        if (failure == null) failure = cleanup;
+        else if (failure != cleanup) failure.addSuppressed(cleanup);
+      }
+      Throwable primary = failure;
+      window.releaseCompletion().whenComplete((ignored, releaseFailure) -> {
+        Throwable settledFailure = primary;
+        if (releaseFailure != null) {
+          Throwable cause = CompletionFailures.unwrapCompletion(releaseFailure);
+          if (settledFailure == null) settledFailure = cause;
+          else if (settledFailure != cause) settledFailure.addSuppressed(cause);
+        }
+        if (settledFailure == null) result.complete(value);
+        else result.completeExceptionally(settledFailure);
+      });
+    });
+    return result;
   }
 
   private CommitState requireOwner(CommitOwnerService.OwnerToken owner, RequestScope scope) {

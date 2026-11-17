@@ -27,7 +27,7 @@ final class EventHistoryCycle {
       Optional<CommitOwnerService.OwnerToken> owner, RequestScope scope) {
     Objects.requireNonNull(owner, "owner");
     Objects.requireNonNull(scope, "scope");
-    if (backfillComplete.get() || owner.isEmpty()) return tailer.run(scope);
+    if (backfillComplete.get() || owner.isEmpty()) return tailer.run(owner, scope);
     return backfill.run(owner.orElseThrow(), scope).handle((result, failure) -> {
       if (failure != null) {
         Throwable cause = failure;
@@ -45,7 +45,7 @@ final class EventHistoryCycle {
         return CompletableFuture.completedFuture(
             new EventHistoryWorker.CycleResult(result.progressed(), false));
       }
-      return tailer.run(scope);
+      return tailer.run(owner, scope);
     });
   }
 }

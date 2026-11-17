@@ -83,8 +83,10 @@ class EventBackfillPublicationIT {
         var budgets = new BudgetManager(limits, Map.of(tableGroup, limits), limits, reserved,
             Map.of(tableGroup, reserved));
         var handoff = new BoundedPublicationHandoff(1, 1, TIMEOUT);
+        var ownerLane = new SerialMutationQueue(0, 1024, 1,
+            LeaseBudgetProfile.RESERVED_OWNER_QUEUE_BYTES, TIMEOUT);
         try {
-          var cycle = backfillCycle(fixture, stores, selected.registry(), budgets, handoff);
+          var cycle = backfillCycle(fixture, stores, selected.registry(), budgets, handoff, ownerLane);
           var first = cycle.run(owner, scope).join();
           assertTrue(first.progressed());
           assertFalse(first.complete());
@@ -97,7 +99,7 @@ class EventBackfillPublicationIT {
               fixture.primary(), fixture.current(), PINS, scope).join();
           var pins = io.etcdhbase.core.commit.EventHistoryPinManager.openSelected(
               reopened.records(), reopened.control(), PINS, Clock.systemUTC(), scope).join();
-          cycle = backfillCycle(fixture, reopened, pins, budgets, handoff);
+          cycle = backfillCycle(fixture, reopened, pins, budgets, handoff, ownerLane);
           var resumed = cycle.run(owner, scope).join();
           assertTrue(resumed.progressed());
           assertTrue(resumed.complete());
@@ -115,6 +117,9 @@ class EventBackfillPublicationIT {
         } finally {
           handoff.close();
           handoff.drained().join();
+          ownerLane.close();
+          ownerLane.drained().join();
+          assertTrue(ownerLane.awaitTermination(Duration.ofSeconds(10)));
         }
       }
     }
@@ -122,7 +127,7 @@ class EventBackfillPublicationIT {
 
   private static EventBackfillCycle backfillCycle(M3TestEnvironment fixture, TableGroupStores stores,
       io.etcdhbase.core.commit.EventHistoryPinManager pins, BudgetManager budgets,
-      BoundedPublicationHandoff handoff) {
+      BoundedPublicationHandoff handoff, SerialMutationQueue ownerLane) {
     var invocations = new InvocationService(stores.invocations());
     var preparation = new EventBackfillPreparation(new LeaseAuxiliaryMutationPreparation(
         new ResultPreparation(stores.resultRepository()), stores.results(),
@@ -133,7 +138,7 @@ class EventBackfillPublicationIT {
             stores.auxiliaryMaterialization(), new AuxiliaryLeasePlanVerifier(
                 LeaseStateMessages::decode, LeaseBindingMessages::decode)),
         stores.invocations(), handoff, stores.finalizer());
-    return new EventBackfillCycle(fixture.system().tableGroupId(), stores, pins, invocations,
+    return new EventBackfillCycle(fixture.system().tableGroupId(), ownerLane, stores, pins, invocations,
         preparation, publisher, budgets, AUTHORIZATION, Clock.systemUTC());
   }
 
