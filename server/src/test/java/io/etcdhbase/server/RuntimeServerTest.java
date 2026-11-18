@@ -98,6 +98,12 @@ class RuntimeServerTest {
         "--m3-config", activationFile.toString()}));
   }
 
+  @Test
+  void productionRuntimeCliRejectsLeaseActivationBeforeStartingTheBackend() {
+    assertEquals(2, RuntimeServer.run(new String[] {"--config", "../config/examples/m3/server.json",
+        "--m3-config", "../config/examples/m4/activation.json"}));
+  }
+
   private ObjectNode example() throws Exception {
     return (ObjectNode)
         mapper.readTree(Files.readAllBytes(Path.of("../config/examples/j06/server.json")));

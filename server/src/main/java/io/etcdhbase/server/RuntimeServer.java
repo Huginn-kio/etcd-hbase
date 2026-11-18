@@ -184,6 +184,10 @@ public final class RuntimeServer implements AutoCloseable {
   }
 
   static int run(String[] arguments) {
+    return run(arguments, M3RuntimeConfiguration.ActivationProfile.PRODUCTION);
+  }
+
+  static int run(String[] arguments, M3RuntimeConfiguration.ActivationProfile activationProfile) {
     if ((arguments.length != 2 && arguments.length != 4) || !arguments[0].equals("--config")
         || arguments.length == 4 && !arguments[2].equals("--m3-config")) {
       System.err.println("usage: runtime-server --config <json-file> [--m3-config <json-file>]");
@@ -194,7 +198,9 @@ public final class RuntimeServer implements AutoCloseable {
       RuntimeServer activated;
       if (arguments.length == 4) {
         try (var activationInput = Files.newInputStream(Path.of(arguments[3]))) {
-          activated = startM3(configuration, new M3RuntimeConfigurationLoader().load(activationInput));
+          var loader = new M3RuntimeConfigurationLoader(
+              Objects.requireNonNull(activationProfile, "activationProfile"));
+          activated = startM3(configuration, loader.load(activationInput));
         }
       } else {
         activated = start(configuration);

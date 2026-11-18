@@ -2594,7 +2594,7 @@ class M4LeaseRpcIT {
   private static Process startOwnerProcess(Path runtime, Path activation, Path log) throws Exception {
     Files.createDirectories(log.getParent());
     var process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-        "-cp", System.getProperty("java.class.path"), RuntimeServer.class.getName(),
+        "-cp", System.getProperty("java.class.path"), M4LeaseRuntimeProcess.class.getName(),
         "--config", runtime.toString(), "--m3-config", activation.toString())
         .directory(runtime.getParent().toFile())
         .redirectErrorStream(true).redirectOutput(log.toFile()).start();
