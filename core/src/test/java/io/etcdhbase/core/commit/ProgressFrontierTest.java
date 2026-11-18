@@ -69,6 +69,14 @@ class ProgressFrontierTest {
   }
 
   @Test
+  void rawProtoNegativeWatchIdCanAdvertiseProgress() {
+    var rawWatch = watcher(-1, Optional.of(frontier(23, 6)), true, true, false);
+
+    assertEquals(OptionalLong.of(6), ProgressFrontier.forWatcher(List.of(rawWatch), -1));
+    assertEquals(OptionalLong.of(6), ProgressFrontier.forAllActive(List.of(rawWatch)));
+  }
+
+  @Test
   void aBlockedWatchDoesNotPreventAnotherWatchFromReportingItsOwnFrontier() {
     var ready = watcher(1, Optional.of(frontier(12, 10)), true, true, false);
     var waiting = watcher(2, Optional.of(frontier(13, 11)), true, false, false);

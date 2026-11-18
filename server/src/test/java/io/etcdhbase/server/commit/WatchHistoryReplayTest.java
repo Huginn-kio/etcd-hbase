@@ -124,6 +124,33 @@ class WatchHistoryReplayTest {
     }
   }
 
+  @Test
+  void compactAdvancingDuringReplayRegistrationReturnsPerWatchCancellationBoundary()
+      throws Exception {
+    var fixture = new ReplayFixture();
+    CommitState compacted = CommitState.restore(CommitState.EVENT_INDEX_FORMAT_VERSION,
+        ByteKey.copyOf(new byte[32]), Optional.empty(), 0, 0, 2, 8, 6, 8, 6,
+        Optional.empty(), 4);
+    when(fixture.selected.readPublishedState(any(RequestScope.class),
+        any(ManifestCatalog.ProofReadBudget.class)))
+        .thenReturn(CompletableFuture.completedFuture(compacted));
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      WatchHistoryReplay.OpenResult result = WatchHistoryReplay.open(TABLE_GROUP, KeyRange.all(), 3,
+          fixture.snapshot, 6, AUTHORIZATION, fixture.pins, fixture.selected,
+          fixture.budgets, watchAccount).join();
+
+      assertEquals(6, result.revision());
+      assertEquals(8, result.sequence());
+      assertEquals(4, result.compactRevision());
+      assertTrue(result.replay().isEmpty(), "a compacted registration has no replay cursor");
+      verify(fixture.pin).close();
+      watchAccount.close();
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
+
   private static List<Position> drainReplay(WatchHistoryReplay replay) {
     List<Position> actual = new ArrayList<>();
     for (int attempt = 0; attempt < 16 && !replay.complete(); attempt++) {
@@ -221,7 +248,7 @@ class WatchHistoryReplayTest {
     private WatchHistoryReplay openReplay(BudgetManager.Account watchAccount,
         KeyRange range, long startRevision) {
       return WatchHistoryReplay.open(TABLE_GROUP, range, startRevision, snapshot, 6,
-          AUTHORIZATION, pins, selected, budgets, watchAccount).join();
+          AUTHORIZATION, pins, selected, budgets, watchAccount).join().replay().orElseThrow();
     }
 
     private static SelectedSequenceReader.Selected selected(long revision, long sequence,

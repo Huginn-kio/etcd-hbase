@@ -691,7 +691,7 @@ class WatchStreamTest {
   }
 
   @Test
-  void periodicProgressNotifyDrainsEventsBeforeItsPerWatchWatermark() {
+  void periodicProgressNotifySupportsRawNegativeIdAndDrainsEventsBeforeItsWatermark() {
     var subscription = new RecordingSubscription();
     var session = new RecordingSession(4, subscription);
     var observer = new RecordingObserver();
@@ -702,7 +702,7 @@ class WatchStreamTest {
       var stream = new WatchStream(observer, scope, Runnable::run,
           timers(periodicTick, 1_000), () -> CompletableFuture.completedFuture(session),
           CLUSTER_ID, MEMBER_ID, 1 << 20, 1_000);
-      stream.onNext(createRequest(39, key, new byte[0], 0, false, true, false));
+      stream.onNext(createRequest(-1, key, new byte[0], 0, false, true, false));
       session.revision = 5;
       subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {5}, Optional.empty()));
 
@@ -712,10 +712,10 @@ class WatchStreamTest {
 
       assertEquals(3, observer.responses.size());
       Rpc.WatchResponse deliveredEvent = observer.responses.get(1);
-      assertEquals(39, deliveredEvent.getWatchId());
+      assertEquals(-1, deliveredEvent.getWatchId());
       assertEquals(5, deliveredEvent.getHeader().getRevision());
       Rpc.WatchResponse progress = observer.responses.get(2);
-      assertEquals(39, progress.getWatchId(), "periodic progress is scoped to its watcher");
+      assertEquals(-1, progress.getWatchId(), "periodic progress is scoped to its raw-proto watcher");
       assertEquals(5, progress.getHeader().getRevision());
       assertEquals(0, progress.getEventsCount());
       assertEquals(1, subscription.releases.get());
@@ -1414,6 +1414,45 @@ class WatchStreamTest {
   }
 
   @Test
+  void matchingCancelStopsTheRemainingFragmentsAndReleasesTheirDeliveries() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    var cancelSent = new AtomicInteger();
+    byte[] key = {1};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(),
+          () -> CompletableFuture.completedFuture(session), 512);
+      stream.onNext(createRequest(7, key, new byte[0], 0, false, false, true));
+      for (int index = 0; index < 5; index++) {
+        subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[160], Optional.empty()));
+      }
+      observer.onNextHook = () -> {
+        if (observer.responses.size() == 2 && cancelSent.compareAndSet(0, 1)) {
+          stream.onNext(Rpc.WatchRequest.newBuilder().setCancelRequest(
+              Rpc.WatchCancelRequest.newBuilder().setWatchId(7)).build());
+        }
+      };
+      observer.readyHandler.run();
+
+      assertEquals(3, observer.responses.size(),
+          "cancellation discards every unsent fragment of the active revision");
+      Rpc.WatchResponse sentFragment = observer.responses.get(1);
+      assertEquals(7, sentFragment.getWatchId());
+      assertTrue(sentFragment.getFragment());
+      assertTrue(observer.responses.get(2).getCanceled());
+      assertEquals(7, observer.responses.get(2).getWatchId());
+      assertEquals(5, subscription.releases.get(),
+          "all retained event deliveries are released exactly once");
+      assertEquals(1, subscription.closeCount.get());
+      stream.close();
+      assertEquals(5, subscription.releases.get());
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
   void peerCancellationClosesEveryActiveSubscription() {
     var first = new RecordingSubscription();
     var second = new RecordingSubscription();
@@ -1629,6 +1668,13 @@ class WatchStreamTest {
       CompactedWatchIdBudget compactedWatchIdBudget) {
     return new WatchStream(observer, scope, Runnable::run, timers, sessions,
         CLUSTER_ID, MEMBER_ID, 1 << 20, compactedWatchIdBudget);
+  }
+
+  private static WatchStream stream(RecordingObserver observer, RequestScope scope,
+      ScheduledExecutorService timers, WatchStream.SessionProvider sessions,
+      int maximumResponseBytes) {
+    return new WatchStream(observer, scope, Runnable::run, timers, sessions,
+        CLUSTER_ID, MEMBER_ID, maximumResponseBytes, CompactedWatchIdBudget.processWide());
   }
 
   private static Rpc.WatchRequest createRequest(long id, byte[] key, byte[] rangeEnd,

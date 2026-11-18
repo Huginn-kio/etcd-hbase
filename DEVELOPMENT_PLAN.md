@@ -856,12 +856,15 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 完成标准：快照到订阅及回放到实时窗口不漏事件；整 revision、顺序、重连与 fragment 中断边界按原生协议验证。
   - 子任务 / 交付物（各项记录状态、负责人、日期、PR 与证据）：
     - [x] **J46.1** 历史回放与实时交接：水位、inclusive startRevision、重连以及快照→订阅窗口无遗漏。
-    - [ ] **J46.2** progress：进度水位及完整事件关系，单独记录原生对照结果。（显式全流请求屏障已实现并定向验证；周期 `progress_notify` 尚未实现。）
-    - [ ] **J46.3** fragment：大 revision 分片、顺序、断流恢复边界，独立验证；首版全部交付。
+    - [x] **J46.2** progress：进度水位及完整事件关系，单独记录原生对照结果；覆盖显式和周期 progress、过滤与历史回放屏障、raw `watch_id=-1`。
+    - [x] **J46.3** fragment：有界大 revision 分片、顺序、取消清理；固定 Go client 的分片重组和同一 Watch 调用在未完成 revision 中断后的自动重连。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=J46.1 实现及定向验证完成；J46.2 显式全流进度屏障已实现并定向验证，周期通知仍待实现；J46.3 未开始；负责人=Codex；完成日期=2026-11-18（J46.1 及 J46.2 显式屏障切片）；PR/commit=待建；验证报告=`j46-1-targeted-20261118-1`、`j46-2-targeted-20261118-2`（本地 artifact）；评审人/结论=待提交后请求 `Reidddddd` 评审。
+  - 跟踪：状态=J46.1–J46.3 代码与公开 MiniCluster 验证完成，待 PR 评审；负责人=Codex；完成日期=2026-11-18；PR/commit=待创建；正式 reviewer=`Reidddddd`，按前序 PR 顺序在 #52 合并后请求；目标身份与 M4 阶段验收=未完成。
   - J46.1 公开定向验证：Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J46 --artifact-root .artifacts/m4/j46-1-targeted-20261118-1` 通过。报告脚本 38 项、`WatchHistoryReplayTest` 2 项通过，失败/错误/跳过均为 0；artifact 标记为 `development-dirty`。证据仅覆盖 inclusive 历史回放、revision/ordinal 顺序和 captured barrier 交接，不代表 J46.2/J46.3、完整 J46、MiniCluster 或原生 Go client 验收。
   - J46.2 显式进度屏障公开定向验证：Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J46 --artifact-root .artifacts/m4/j46-2-targeted-20261118-2` 通过。固定 etcd v3.5.23 raw-proto Go 对照 1 项，Java 回放与进度测试 6 项，报告脚本 38 项；失败/错误/跳过均为 0，artifact 标记为 `development-dirty`。覆盖 synced 全流 `watch_id=-1` 响应、进度前的事件发送、过滤后空水位、任一历史回放未完成时不返回进度、未来起点门禁；不覆盖周期 progress、fragment、MiniCluster 或 Java 服务上的完整 Go client 互通。
+  - J46 完整公开验证：Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J46 --artifact-root .artifacts/m4/j46-fragment-fixtures-20261118-7` 通过。报告记录固定 etcd v3.5.23 raw-proto 对照 1 项、Java Surefire 64 项及 Failsafe `M4WatchRpcIT` 1 项，失败/错误/跳过均为 0；MiniCluster 的 HISTORY/NATIVE 两种布局均由 Go v3.5.23 client 验证历史 fragment 重组、首片/中片断流后的自动重连重放和 live handoff，以及完整 revision 后断流后续读下一 revision。断流通过 client-side interceptor 取消真实 RPC context 并注入 `UNAVAILABLE`；同一 `clientv3.Watcher.Watch` 持续交付完整 revision，测试同时验证重连。报告脚本 39 项、注册表验证和 artifact 复验通过；证据为 `development-dirty`，源码提交基线=`aa6bdd132195b50885205da7b46b905c58cbc9e9`，完整复核无 P1/P2；重跑后的干净提交验证另行记录。
+  - Review 边界：raw proto `watch_id=-1` 的 progress 已修复并由定向 Java 测试和完整 J46 验证覆盖。Created 后回放遇到 Compact 时携带 `compact_revision`，以及开流回放期间取消、deadline、断连后等待 producer drain，按 M4 设计 §9 和 J47 完成标准归 J47；J46 不宣称这些 J47 生命周期已验收。
+  - 作者自审=完成；独立复核=完成（冻结快照无 P1/P2，也无影响协议或资源安全的 P3）；维护者正式 review=待 PR 建立，并按 #52 合并顺序请求。
 
 - [ ] **J47｜gRPC readiness、慢消费、取消与 compaction 错误**
   - 依赖：J26/J46。

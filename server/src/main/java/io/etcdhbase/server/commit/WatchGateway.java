@@ -142,8 +142,13 @@ final class WatchGateway {
         throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
       }
       long retainedStateBytes = retainedStateBytes(range);
+      long maximumPendingRevisionBytes = request.getFragment()
+          ? LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES
+          : Math.min(maximumResponseBytes, LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES);
+      // The tailer retains its subscription index in OUTPUT alongside the pending revision.
+      long outputReservationBytes = Math.addExact(maximumPendingRevisionBytes, retainedStateBytes);
       var reservation = new BudgetManager.Reservation(retainedStateBytes, 1, 1,
-          maximumResponseBytes, 0);
+          outputReservationBytes, 0);
       BudgetManager.Account account = budgets.admit(tableGroup, streamScope, reservation);
       BudgetManager.Lease stateMemory = null;
       SharedEventTailer.SubscriptionStart start;
@@ -151,7 +156,7 @@ final class WatchGateway {
         stateMemory = account.tryRetain(BudgetManager.Memory.HEAD, retainedStateBytes)
             .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
         start = tailer.subscribeWithCheckpoint(range, account,
-            WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH, maximumResponseBytes,
+            WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH, maximumPendingRevisionBytes,
             request.getStartRevision());
       } catch (BackendFailure | RuntimeException | Error failure) {
         closeAfterFailure(stateMemory, failure);
@@ -194,6 +199,13 @@ final class WatchGateway {
       if (revision < start.revision()) {
         throw unavailable();
       }
+      if (request.getStartRevision() > 0
+          && request.getStartRevision() < state.compactRevision()) {
+        return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
+            state.publishedSequence(), state.compactRevision(),
+            new TailerSubscription(subscription, account, stateMemory, null,
+                state.publishedSequence())));
+      }
       if (request.getStartRevision() <= 0) {
         subscription.requireRevisionAtLeast(nextRevision(revision));
         return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
@@ -214,11 +226,11 @@ final class WatchGateway {
         var barrierSnapshot = snapshot.orElseThrow(WatchGateway::unavailable);
         return WatchHistoryReplay.open(tableGroup, range, request.getStartRevision(),
             barrierSnapshot, state.publishedSequence(), authorization, historyPins, selectedEvents,
-            budgets, account).thenApply(replay -> new WatchStream.OpenedWatch(revision,
-                state.publishedSequence(),
-                state.compactRevision() == 0 ? -1 : state.compactRevision(),
-                new TailerSubscription(subscription, account, stateMemory, replay,
-                    state.publishedSequence()), true));
+            budgets, account).thenApply(result -> new WatchStream.OpenedWatch(
+                result.revision(), result.sequence(),
+                result.compactRevision() == 0 ? -1 : result.compactRevision(),
+                new TailerSubscription(subscription, account, stateMemory,
+                    result.replay().orElse(null), result.sequence()), result.replay().isPresent()));
       }
       return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
           state.publishedSequence(),

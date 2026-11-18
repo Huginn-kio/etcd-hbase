@@ -100,7 +100,7 @@ import json
 import sys
 
 path, run_id, source, base, clean, started, task = sys.argv[1:]
-scope = "public-local-unit" if task in {"J45", "J46"} else "public-local-minicluster"
+scope = "public-local-unit" if task == "J45" else "public-local-minicluster"
 record = {
     "schema": "etcd-hbase-m4-run/v1",
     "run_id": run_id,
@@ -263,9 +263,9 @@ elif [[ "$task" == J45 ]]; then
   maven_command=maven-unit-tests
 elif [[ "$task" == J46 ]]; then
   maven_profile=m4-j46-public
-  maven_goal=test
-  maven_command=maven-unit-tests
-  maven_extra_args=(-Dtest=WatchHistoryReplayTest,WatchStreamTest#explicitProgressFollowsAllEligibleEventsAndUsesTheAuthoritativeRevision+explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch+progressRequestIsDroppedWhenAnyWatchHasNotFinishedHistoricalReplay+progressRequestIsDroppedUntilFutureStartRevisionIsReached -Dsurefire.failIfNoSpecifiedTests=false)
+  maven_goal=verify
+  maven_command=maven-verify
+  maven_extra_args=(-Dtest=WatchHistoryReplayTest,WatchStreamTest,WatchResponseFragmenterTest,WatchGatewayTest -Dit.test=M4WatchRpcIT -Dsurefire.failIfNoSpecifiedTests=false -Dfailsafe.failIfNoSpecifiedTests=false)
 fi
 run_logged "$maven_command" maven.log maven.stderr.log scripts/dev/mvn21.sh -B -ntp \
   -pl server -am clean "$maven_goal" -P"$maven_profile" "${maven_extra_args[@]}"

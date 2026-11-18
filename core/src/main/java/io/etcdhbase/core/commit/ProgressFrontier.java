@@ -33,14 +33,12 @@ public final class ProgressFrontier {
       boolean futureStartReached,
       boolean hasPendingMatchingEventsThroughFrontier) {
     public WatcherState {
-      if (watchId < 0) throw new IllegalArgumentException("watch ID must not be negative");
       Objects.requireNonNull(verifiedThrough, "verifiedThrough");
     }
   }
 
   /** Returns the watch's safe KV revision, or empty when its frontier is not ready. */
   public static OptionalLong forWatcher(Collection<WatcherState> watchers, long watchId) {
-    if (watchId < 0) throw new IllegalArgumentException("watch ID must not be negative");
     for (WatcherState watcher : snapshot(watchers)) {
       if (watcher.watchId() == watchId) return safeKvRevision(watcher);
     }

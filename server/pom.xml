@@ -192,8 +192,23 @@
     <profile>
       <id>m4-j46-public</id>
       <properties>
-        <j03.skipWire>true</j03.skipWire>
+        <j03.skipWire>false</j03.skipWire>
       </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <failIfNoTests>true</failIfNoTests>
+              <includes combine.self="override">
+                <include>**/M4WatchRpcIT.java</include>
+              </includes>
+              <forkedProcessTimeoutInSeconds>1800</forkedProcessTimeoutInSeconds>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
     </profile>
     <profile>
       <id>m3-j34-public</id>

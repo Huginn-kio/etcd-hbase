@@ -24,6 +24,16 @@ import java.util.concurrent.CompletionStage;
 
 /** Bounded, inclusive replay of selected Watch revisions behind one durable history pin. */
 final class WatchHistoryReplay implements AutoCloseable {
+  record OpenResult(long revision, long sequence, long compactRevision,
+      Optional<WatchHistoryReplay> replay) {
+    OpenResult {
+      if (revision < 0 || sequence < 0 || compactRevision < 0) {
+        throw new IllegalArgumentException("invalid Watch replay open result");
+      }
+      Objects.requireNonNull(replay, "replay");
+    }
+  }
+
   private static final int MAX_PAGES_PER_REVISION = 512;
   private static final long MAX_BYTES_PER_REVISION = 64L << 20;
   private static final int MAX_TOTAL_REVISIONS = 4096;
@@ -81,7 +91,7 @@ final class WatchHistoryReplay implements AutoCloseable {
     this.nextRevision = nextRevision;
   }
 
-  static CompletableFuture<WatchHistoryReplay> open(String tableGroup, KeyRange range,
+  static CompletableFuture<OpenResult> open(String tableGroup, KeyRange range,
       long startRevision, ControlSnapshot barrier, long barrierSequence, ByteKey authorization,
       EventHistoryPinManager pins, SelectedSequenceReader selected,
       BudgetManager budgets,
@@ -101,7 +111,9 @@ final class WatchHistoryReplay implements AutoCloseable {
           pins, selected, budgets, watchAccount);
       replay.complete = true;
       replay.settled.complete(null);
-      return CompletableFuture.completedFuture(replay);
+      return CompletableFuture.completedFuture(new OpenResult(
+          barrier.state().publishedRevision(), barrierSequence, barrier.state().compactRevision(),
+          Optional.of(replay)));
     }
 
     RequestScope lookupScope = RequestScope.withoutDeadline();
@@ -124,7 +136,7 @@ final class WatchHistoryReplay implements AutoCloseable {
     located.whenComplete((ignored, failure) -> {
       try { lookupAccount.close(); } finally { lookupScope.close(); }
     });
-    CompletableFuture<WatchHistoryReplay> opened = located.thenCompose(sequence -> {
+    CompletableFuture<OpenResult> opened = located.thenCompose(sequence -> {
       var requirement = new EventHistoryPinManager.Requirement(firstEventRevision, sequence,
           authorization, Optional.empty(), Optional.empty());
       return pins.register(requirement, replay.pinScope).thenCompose(registered -> {
@@ -133,10 +145,15 @@ final class WatchHistoryReplay implements AutoCloseable {
             .thenCompose(ignored -> replay.withReadScope(
                 (scope, budget) -> replay.readControl(scope, budget)))
             .thenCompose(current -> {
-              if (current.compactRevision() > startRevision
-                  || current.publishedRevision() < barrier.state().publishedRevision()) {
+              if (current.publishedRevision() < barrier.state().publishedRevision()) {
                 return CompletableFuture.failedFuture(
                     new BackendFailure(BackendFailure.Category.CANCELLED));
+              }
+              if (current.compactRevision() > startRevision) {
+                replay.completeCompactedOpen();
+                return CompletableFuture.completedFuture(new OpenResult(
+                    current.publishedRevision(), current.publishedSequence(),
+                    current.compactRevision(), Optional.empty()));
               }
               return replay.withReadScope((scope, budget) -> replay.readSequence(
                   firstEventRevision, current, scope, budget)).thenApply(verified -> {
@@ -144,7 +161,8 @@ final class WatchHistoryReplay implements AutoCloseable {
                       throw new CompletionException(new IllegalStateException(
                           "Watch replay sequence changed while registering its history pin"));
                     }
-                    return replay;
+                    return new OpenResult(barrier.state().publishedRevision(), barrierSequence,
+                        barrier.state().compactRevision(), Optional.of(replay));
                   });
             });
       });
@@ -401,6 +419,12 @@ final class WatchHistoryReplay implements AutoCloseable {
     pin = null;
     if (current != null) current.close();
     pinScope.close();
+  }
+
+  private void completeCompactedOpen() {
+    synchronized (this) { complete = true; }
+    releasePin();
+    settled.complete(null);
   }
 
   private static String reason(Throwable failure) {

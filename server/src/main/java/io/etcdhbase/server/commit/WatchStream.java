@@ -126,12 +126,16 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private static final class ActiveFragment implements AutoCloseable {
     private final WatchResponseFragmenter.Cursor cursor;
     private final WatchEventBatchEncoder.Output output;
+    private final long watchId;
     private boolean closed;
 
     private ActiveFragment(WatchResponseFragmenter.Cursor cursor, WatchEventBatchEncoder.Output output) {
       this.cursor = Objects.requireNonNull(cursor, "cursor");
       this.output = Objects.requireNonNull(output, "output");
+      this.watchId = output.response().getWatchId();
     }
+
+    private long watchId() { return watchId; }
 
     private synchronized FragmentResponse next() {
       if (closed) throw new IllegalStateException("watch fragments are closed");
@@ -342,6 +346,22 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private void drainLoop() {
     int filteredRevisions = 0;
     for (;;) {
+      ActiveFragment cancelledFragment = null;
+      synchronized (lock) {
+        if (activeFragment != null && isCancelRequest(pendingRequest)
+            && activeFragment.watchId() == pendingRequest.getCancelRequest().getWatchId()) {
+          cancelledFragment = activeFragment;
+          activeFragment = null;
+        }
+      }
+      if (cancelledFragment != null) {
+        try { cancelledFragment.close(); }
+        catch (RuntimeException | Error failure) {
+          fail(failure);
+          if (failure instanceof Error fatal) throw fatal;
+          return;
+        }
+      }
       DrainAction action = nextDrainAction();
       switch (action.kind()) {
         case STOP -> { return; }
@@ -394,6 +414,12 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       }
       if (terminal) return new DrainAction(DrainKind.STOP, null, null, null);
       if (pendingTerminationResponses > 0) return new DrainAction(DrainKind.STOP, null, null, null);
+      if (activeFragment != null && isCancelRequest(pendingRequest) && !processingRequest) {
+        Rpc.WatchRequest request = pendingRequest;
+        pendingRequest = null;
+        processingRequest = true;
+        return new DrainAction(DrainKind.PROCESS_REQUEST, null, request, null);
+      }
       if (activeFragment != null) {
         if (!isReady()) return new DrainAction(DrainKind.STOP, null, null, null);
         ActiveFragment fragments = activeFragment;
@@ -928,7 +954,10 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   }
 
   private void finishFragmentResponse(ActiveFragment fragments, boolean finalFragment) {
-    if (!finalFragment) return;
+    if (!finalFragment) {
+      requestNext();
+      return;
+    }
     synchronized (lock) {
       if (activeFragment != fragments) return;
       activeFragment = null;
@@ -1188,7 +1217,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     if (serverObserver == null) {
       synchronized (lock) {
         if (!terminal && !peerCancelled && !inboundClosed && !processingRequest
-            && pendingRequest == null && responses.isEmpty() && activeFragment == null) {
+            && pendingRequest == null && responses.isEmpty()) {
           requestOutstanding = true;
         }
       }
@@ -1197,7 +1226,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     boolean request;
     synchronized (lock) {
       request = !terminal && !peerCancelled && !inboundClosed && !processingRequest
-          && pendingRequest == null && responses.isEmpty() && activeFragment == null
+          && pendingRequest == null && responses.isEmpty()
           && !requestOutstanding;
       if (request) requestOutstanding = true;
     }
@@ -1381,6 +1410,11 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   private boolean terminalOrPeerCancelled() {
     synchronized (lock) { return terminal || peerCancelled; }
+  }
+
+  private static boolean isCancelRequest(Rpc.WatchRequest request) {
+    return request != null
+        && request.getRequestUnionCase() == Rpc.WatchRequest.RequestUnionCase.CANCEL_REQUEST;
   }
 
   private static Throwable unwrap(Throwable failure) {

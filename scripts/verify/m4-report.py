@@ -38,15 +38,13 @@ J45_REQUIRED_COMMANDS = {
     "maven-unit-tests", "collect-maven-reports",
 }
 J46_REQUIRED_COMMANDS = {
-    "registry-check", "report-tests", "go-tests", "maven-unit-tests", "collect-maven-reports",
+    "registry-check", "report-tests", "go-tests", "maven-verify", "collect-maven-reports",
 }
 J46_MAVEN_TEST_SELECTOR = (
-    "-Dtest=WatchHistoryReplayTest,WatchStreamTest#"
-    "explicitProgressFollowsAllEligibleEventsAndUsesTheAuthoritativeRevision+"
-    "explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch+"
-    "progressRequestIsDroppedWhenAnyWatchHasNotFinishedHistoricalReplay+"
-    "progressRequestIsDroppedUntilFutureStartRevisionIsReached"
+    "-Dtest=WatchHistoryReplayTest,WatchStreamTest,WatchResponseFragmenterTest,WatchGatewayTest"
 )
+J46_MAVEN_IT_SELECTOR = "-Dit.test=M4WatchRpcIT"
+J46_FAILSAFE_EMPTY_MODULES = "-Dfailsafe.failIfNoSpecifiedTests=false"
 J45_VERIFICATION_BOUNDARY = (
     "J45 public protocol evidence covers negative/zero startRevision cases, negative watch ID "
     "Create/Cancel, future startRevision Create/Cancel, and the Compact-boundary lifecycle. Future-event "
@@ -216,27 +214,64 @@ J45_GO_TESTS = {
     "internal/trace": {"TestTraceAcceptsLocalServiceEvidenceScope"},
 }
 J46_VERIFICATION_BOUNDARY = (
-    "J46.1 unit evidence covers inclusive positive historical start revisions, complete per-revision "
-    "ordinal ordering, and deterministic replay-to-live handoff at the captured (sequence, ordinal) "
-    "barrier. J46.2 covers explicit stream-wide ProgressRequest barriers, event-before-progress ordering, "
+    "J46.1 validates inclusive positive historical replay, per-revision ordinal ordering, compaction "
+    "registration races, and deterministic replay-to-live handoff at the captured (sequence, ordinal) "
+    "barrier. J46.2 validates explicit and periodic progress barriers, event-before-progress ordering, "
     "filtered revisions, incomplete history, future starts, and the pinned etcd v3.5.23 raw-proto oracle. "
-    "It does not claim periodic progress notifications, fragment delivery, MiniCluster persistence, or Go "
-    "client interoperability against the Java service; those remain separate J46.2/J46.3 or integration evidence"
+    "J46.3 validates bounded revision fragmentation, ordering and cancellation cleanup, plus the pinned Go "
+    "client's fragment reassembly, automatic reconnection after first- and middle-fragment interruptions, "
+    "and resumption at the next revision after a disconnect following a complete fragmented revision. "
+    "Both recovery boundaries use the same Watch channel and verify replay-to-live handoff against Java "
+    "WatchService on HBase MiniCluster with HISTORY and NATIVE layouts."
 )
 J46_JAVA_CLASS_MODULES = {
     "io.etcdhbase.server.commit.WatchHistoryReplayTest": "server",
     "io.etcdhbase.server.commit.WatchStreamTest": "server",
+    "io.etcdhbase.server.commit.WatchResponseFragmenterTest": "server",
+    "io.etcdhbase.server.commit.WatchGatewayTest": "server",
+    "io.etcdhbase.server.M4WatchRpcIT": "server",
+}
+J46_JAVA_CLASS_KINDS = {
+    "io.etcdhbase.server.commit.WatchHistoryReplayTest": "surefire",
+    "io.etcdhbase.server.commit.WatchStreamTest": "surefire",
+    "io.etcdhbase.server.commit.WatchResponseFragmenterTest": "surefire",
+    "io.etcdhbase.server.commit.WatchGatewayTest": "surefire",
+    "io.etcdhbase.server.M4WatchRpcIT": "failsafe",
 }
 J46_CRITICAL_JAVA_TESTS = {
     "io.etcdhbase.server.commit.WatchHistoryReplayTest": {
         "replaysInclusiveStartInRevisionAndOrdinalOrder",
         "replayToLiveHandoffDropsTheWholeBarrierSequenceWithoutGapsOrDuplicates",
+        "compactAdvancingDuringReplayRegistrationReturnsPerWatchCancellationBoundary",
     },
     "io.etcdhbase.server.commit.WatchStreamTest": {
         "explicitProgressFollowsAllEligibleEventsAndUsesTheAuthoritativeRevision",
         "explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch",
         "progressRequestIsDroppedWhenAnyWatchHasNotFinishedHistoricalReplay",
         "progressRequestIsDroppedUntilFutureStartRevisionIsReached",
+        "periodicProgressNotifySupportsRawNegativeIdAndDrainsEventsBeforeItsWatermark",
+        "periodicProgressNotifySkipsFutureAndUnsyncedWatchersIndependently",
+        "fragmentsKeepTheRevisionContiguousAheadOfProgressAndOtherWatches",
+        "closingDuringAFragmentSequenceReleasesTheUnfinishedRevision",
+        "matchingCancelStopsTheRemainingFragmentsAndReleasesTheirDeliveries",
+    },
+    "io.etcdhbase.server.commit.WatchResponseFragmenterTest": {
+        "leavesACompleteRevisionAsOneUnfragmentedResponseWhenItFits",
+        "splitsLargeRevisionInOrderAndMarksOnlyNonFinalFragments",
+        "packsMultipleEventsIntoEachFragmentWithoutChangingTheirOrder",
+        "allowsTheFinalFragmentToUseItsSmallerFalseFlagEncoding",
+        "includesPrevKvAndProtoOverheadWhenRejectingAnOversizedEvent",
+        "passesControlResponsesWithoutFragmentingThem",
+        "rejectsControlResponseThatExceedsTheMessageBudget",
+        "rejectsEventsFromDifferentRevisions",
+        "rejectsAlreadyFragmentedInputAndNonPositiveBudget",
+    },
+    "io.etcdhbase.server.commit.WatchGatewayTest": {
+        "initiallyCompactedPositiveStartSkipsHistoryRegistrationAndKeepsPerWatchBoundary",
+        "pollCancellationHandoffClosesTheDetachedDeliveryBeforeReleasingItsAccount",
+    },
+    "io.etcdhbase.server.M4WatchRpcIT": {
+        "pinnedGoClientVerifiesFragmentAutoResumeAndLiveHandoffOnBothLayouts",
     },
 }
 J46_GO_TESTS = {
@@ -1274,8 +1309,11 @@ def _validate_j46_registration(task: dict[str, object]) -> None:
         module, kind, class_name, tests = (
             suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
         )
-        if module not in JAVA_MODULES or kind != "surefire" or not isinstance(class_name, str):
-            raise ReportError("J46 Maven suites must be JVM unit tests in known modules")
+        if not isinstance(class_name, str):
+            raise ReportError("J46 Maven test class name is malformed")
+        expected_kind = J46_JAVA_CLASS_KINDS.get(class_name)
+        if module not in JAVA_MODULES or kind != expected_kind:
+            raise ReportError("J46 Maven suites must match the registered unit/integration suites")
         if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
             raise ReportError("J46 Maven suite has no named required tests")
         previous_module = java_modules.setdefault(class_name, module)
@@ -1283,7 +1321,7 @@ def _validate_j46_registration(task: dict[str, object]) -> None:
             raise ReportError("J46 Maven suite is registered in multiple modules")
         java_methods.setdefault(class_name, set()).update(tests)
     if set(java_modules) != set(J46_JAVA_CLASS_MODULES):
-        raise ReportError("J46 replay, handoff, and progress suites are incomplete")
+        raise ReportError("J46 replay, progress, fragment, or Go-client integration suites are incomplete")
     if any(java_modules.get(class_name) != module
            for class_name, module in J46_JAVA_CLASS_MODULES.items()):
         raise ReportError("J46 Java suites must be collected from their declared modules")
@@ -1378,10 +1416,11 @@ def _validate_commands(artifact: Path, run: dict[str, object], task: dict[str, o
         "J45": J45_REQUIRED_COMMANDS,
         "J46": J46_REQUIRED_COMMANDS,
     }.get(task.get("id"), REQUIRED_COMMANDS)
+    task_command_names = names - {"validate-artifact"}
     if not required.issubset(names):
         raise ReportError("M4 run is missing a required task verification command")
     if task.get("id") == "J45":
-        if names != J45_REQUIRED_COMMANDS:
+        if task_command_names != J45_REQUIRED_COMMANDS:
             raise ReportError("J45 verification must run its native Go oracle and JVM unit profile only")
         maven = next(command for command in commands if command["name"] == "maven-unit-tests")
         if ("-Pm4-j45-public" not in maven["argv"] or "test" not in maven["argv"]
@@ -1414,8 +1453,8 @@ def _validate_commands(artifact: Path, run: dict[str, object], task: dict[str, o
             if flag != "--native-data-dir" and (not resolved.is_file() or resolved.is_symlink()):
                 raise ReportError("J45 native oracle trace or metadata is missing or unsafe")
     if task.get("id") == "J46":
-        if names != J46_REQUIRED_COMMANDS:
-            raise ReportError("J46 verification must run its pinned Go oracle and JVM unit profile")
+        if task_command_names != J46_REQUIRED_COMMANDS:
+            raise ReportError("J46 verification must run its pinned Go oracle and MiniCluster profile")
         go_tests = next(command for command in commands if command["name"] == "go-tests")
         go_test_pattern = (
             go_tests["argv"][go_tests["argv"].index("-run") + 1]
@@ -1428,12 +1467,13 @@ def _validate_commands(artifact: Path, run: dict[str, object], task: dict[str, o
                 or any(test_name not in go_test_pattern
                        for tests in J46_GO_TESTS.values() for test_name in tests)):
             raise ReportError("J46 Go tests must run the registered etcd v3.5.23 raw-proto progress oracle")
-        maven = next(command for command in commands if command["name"] == "maven-unit-tests")
-        if ("-Pm4-j46-public" not in maven["argv"] or "test" not in maven["argv"]
-                or "verify" in maven["argv"]
+        maven = next(command for command in commands if command["name"] == "maven-verify")
+        if ("-Pm4-j46-public" not in maven["argv"] or "verify" not in maven["argv"]
                 or J46_MAVEN_TEST_SELECTOR not in maven["argv"]
+                or J46_MAVEN_IT_SELECTOR not in maven["argv"]
+                or J46_FAILSAFE_EMPTY_MODULES not in maven["argv"]
                 or "-Dsurefire.failIfNoSpecifiedTests=false" not in maven["argv"]):
-            raise ReportError("J46 Maven verification must run only the registered Surefire suite")
+            raise ReportError("J46 Maven verification must run registered Surefire and Failsafe suites")
 
 
 def _validate_go_tests(artifact: Path, task: dict[str, object]) -> int:
@@ -2322,7 +2362,7 @@ def _load_run_and_task(
     task = next((item for item in registry["tasks"] if item["id"] == task_id), None)
     if task is None:
         raise ReportError("M4 run task is not registered")
-    expected_scope = "public-local-unit" if task_id in {"J45", "J46"} else "public-local-minicluster"
+    expected_scope = "public-local-unit" if task_id == "J45" else "public-local-minicluster"
     if run.get("scope") != expected_scope:
         raise ReportError("M4 run scope does not match its task verification profile")
     _validate_run_identity(artifact, run)
@@ -2737,8 +2777,19 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
     if task.get("id") == "J45":
         return _validate_j45_artifact(repository, artifact, run, task, java_test_count)
     if task.get("id") == "J46":
-        if any(kind != "surefire" for _, kind, _ in _java_test_report_paths(artifact)):
-            raise ReportError("J46 evidence must contain JVM unit reports only")
+        report_kinds: set[str] = set()
+        report_classes: set[str] = set()
+        for module, kind, path in _java_test_report_paths(artifact):
+            report_kinds.add(kind)
+            for suite in _testsuite_elements(path):
+                class_name = suite.get("name")
+                if class_name:
+                    report_classes.add(class_name)
+        if (report_kinds != {"surefire", "failsafe"}
+                or report_classes != set(J46_JAVA_CLASS_MODULES)):
+            raise ReportError(
+                "J46 evidence must contain only the registered unit and MiniCluster integration reports"
+            )
         go_test_count = _validate_go_tests(artifact, task)
         return {
             "task": run["tasks"][0],
@@ -2748,8 +2799,8 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
             "evidence_class": "official-clean" if run["worktree_clean"] else "development-dirty",
             "go_test_count": go_test_count,
             "java_test_count": java_test_count,
-            "evidence": "J46.1-replay-J46.2-progress-barrier-and-pinned-native-oracle",
-            "scope": "public-local-unit",
+            "evidence": "J46.1-replay-J46.2-progress-J46.3-fragment-Go-client-MiniCluster-HISTORY-NATIVE",
+            "scope": "public-local-minicluster",
         }
     evidence_root = _task_artifact_root(artifact, task)
     go_test_count = _validate_go_tests(artifact, task)

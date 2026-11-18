@@ -523,7 +523,12 @@ func checkM4WatchStreamCloseAndRecreate(ctx context.Context,
 
 func openM4WatchStream(ctx context.Context, client etcdserverpb.WatchClient) (
 	etcdserverpb.Watch_WatchClient, context.CancelFunc, error) {
-	streamCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	return openM4WatchStreamWithTimeout(ctx, client, 10*time.Second)
+}
+
+func openM4WatchStreamWithTimeout(ctx context.Context, client etcdserverpb.WatchClient,
+	timeout time.Duration) (etcdserverpb.Watch_WatchClient, context.CancelFunc, error) {
+	streamCtx, cancel := context.WithTimeout(ctx, timeout)
 	stream, err := client.Watch(streamCtx)
 	if err != nil {
 		cancel()
