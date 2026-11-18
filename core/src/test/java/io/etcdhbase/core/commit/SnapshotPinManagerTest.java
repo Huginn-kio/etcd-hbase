@@ -31,6 +31,30 @@ class SnapshotPinManagerTest {
   private static final ByteKey AUTHORIZATION = digest(9);
 
   @Test
+  void onlyEventPinsExposeEventPromotionCapability() {
+    var records = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 3, Duration.ofMinutes(1));
+    try (RequestScope scope = scope()) {
+      var snapshots = SnapshotPinManager.initializeFresh(records, configuration, scope).join();
+      var events = EventHistoryPinManager.initializeFresh(records, configuration, Clock.systemUTC(), scope).join();
+      ReadViewPinRegistry.Pin ordinary = snapshots.register(stableView(5), scope).join();
+      ReadViewPinRegistry.Pin auxiliary = snapshots.registerAuxiliary(stableView(5), scope).join();
+      var requirement = new EventHistoryPinManager.Requirement(5, 3, AUTHORIZATION,
+          Optional.empty(), Optional.empty());
+      ReadViewPinRegistry.Pin event = events.register(requirement, scope).join();
+      assertFalse(ordinary instanceof EventHistoryPinManager.Pin);
+      assertFalse(auxiliary instanceof EventHistoryPinManager.Pin);
+      assertInstanceOf(EventHistoryPinManager.Pin.class, event);
+      ordinary.close();
+      auxiliary.close();
+      event.close();
+      ordinary.releaseCompletion().toCompletableFuture().join();
+      auxiliary.releaseCompletion().toCompletableFuture().join();
+      event.releaseCompletion().toCompletableFuture().join();
+    }
+  }
+
+  @Test
   void eventHistoryUsesAnIndependentDurableBoundaryAndRetainsItsExactRoot() {
     var records = new MemoryRecords();
     var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));

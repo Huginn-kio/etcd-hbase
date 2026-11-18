@@ -7,6 +7,7 @@ import java.time.Clock;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 
 /** Separate durable protection domain for event, index and decision history. */
 public final class EventHistoryPinManager {
@@ -76,9 +77,36 @@ public final class EventHistoryPinManager {
    */
   public CompletableFuture<Pin> register(Requirement requirement, RequestScope scope) {
     Objects.requireNonNull(requirement, "requirement");
-    return registry.registerEventHistory(requirement.revision(), requirement.sequence(),
+    return registry.registerProtected(requirement.revision(), requirement.sequence(),
         requirement.digest(), requirement.transaction(), requirement.eventRoot().map(EventReference::identity),
-        requirement.eventRoot().map(EventReference::digest), scope);
+        requirement.eventRoot().map(EventReference::digest), scope).thenApply(EventPin::new);
+  }
+
+  private static SnapshotPinManager.PinRequirement pinRequirement(Requirement requirement) {
+    return new SnapshotPinManager.PinRequirement(requirement.revision(), requirement.sequence(),
+        requirement.digest(), requirement.transaction(), requirement.eventRoot().map(EventReference::identity),
+        requirement.eventRoot().map(EventReference::digest));
+  }
+
+  private record EventPin(SnapshotPinManager.PinLease delegate) implements Pin {
+    @Override public long generation() { return delegate.generation(); }
+    @Override public CompletableFuture<Void> renew(RequestScope scope) { return delegate.renew(scope); }
+    @Override public CompletableFuture<Void> complete(RequestScope scope) { return delegate.complete(scope); }
+    @Override public CompletionStage<Void> releaseCompletion() { return delegate.releaseCompletion(); }
+    @Override public void close() { delegate.close(); }
+
+    @Override public CompletableFuture<Void> promoteRoot(Requirement previous,
+        Requirement promoted, RequestScope scope) {
+      Objects.requireNonNull(previous, "previous");
+      Objects.requireNonNull(promoted, "promoted");
+      Objects.requireNonNull(scope, "scope");
+      try {
+        promoted.requirePromotionFrom(previous);
+      } catch (IllegalArgumentException failure) {
+        return CompletableFuture.failedFuture(failure);
+      }
+      return delegate.promoteRoot(pinRequirement(previous), pinRequirement(promoted), scope);
+    }
   }
 
   /** Candidate pin boundary only; use EventHistoryRetention before physical event collection. */

@@ -252,11 +252,6 @@ final class EventTailerCycle {
     return CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(false, false));
   }
 
-  private static BackendFailure inactive(RequestScope scope) {
-    return new BackendFailure(scope.isDeadlineExceeded()
-        ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
-  }
-
   /** The pin owns this child; closing it waits for its actual backend producers. */
   private static final class Child implements AutoCloseable {
     private final RequestScope scope;
