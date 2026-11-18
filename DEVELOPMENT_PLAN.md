@@ -74,7 +74,7 @@
 | M1 | HBase 存储、盐桶扫描与预算 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M2 | 提交、MVCC、恢复与热点可行性 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M3 | KV / Range / Txn | 7 | 0 | 7 | 未开始 | 待分配 | — / — | — |
-| M4 | Lease、注册监听与 Watch | 8 | 0 | 8 | 进行中 | Codex | — / — | J40/J41 已合并；J42/J43 等待维护者评审；J44 PR #51 开放、CI 验证中；J45–J47 未完成；M4 阶段验收未通过 |
+| M4 | Lease、注册监听与 Watch | 8 | 0 | 8 | 进行中 | Codex | — / — | J40–J44 已合并；J45 PR #52、J46 PR #53、J47 PR #54 开放；J45 等待维护者复查；M4 阶段验收未完成 |
 | M5 | Auth、GC、运维与生命周期 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M6 | Milvus 新集群接入 | 8 | 0 | 8 | 未开始 | 待分配 | — / — | — |
 | M7 | HBase 压力、故障与长期运行 | 8 | 0 | 8 | 未开始 | 待分配 | — / — | — |
@@ -848,9 +848,8 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 完成标准：多 watchId、精确 key/区间、inclusive startRevision、Created、PrevKV 及过滤正确；内存随活跃订阅增长，不维护全部 KV 树。
   - 范围说明：J45 对照零、负数及未来 startRevision 的创建行为，并按 raw proto 契约接受 `watch_id=-1` 的 Create/Cancel；`startRevision > 0` 且目标不晚于当前 revision 的历史回放与 inclusive 交接由 J46.1 实现，J45 不宣称已支持历史回放。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=实现完成，PR #52 已开放；review 修复代码提交=`c82d560e5d35cd1332337203254dd3790492297c`；依赖 PR #51（J44）；负责人=Codex；完成日期=2026-11-18；PR=[PR #52](https://github.com/Reidddddd/etcd-hbase/pull/52)；当前 head 的 GitHub CI 运行中。正式 reviewer=`Reidddddd`，待 PR #51 合并后请求；目标环境与 M4 阶段验收=未完成。
-  - Review 修复：压缩取消后只保留 watch ID，不再让 tombstone 引用范围与订阅预算对象；进程最多保留 65,536 个 ID、每流最多 1,024 个。容量耗尽时返回创建拒绝；显式 Cancel、流关闭和故障清理释放配额。作者自审=完成；独立复核=完成（对象图保留与进程级预算问题均已处理，未发现 P1/P2）。
-  - Review 修复定向验证：Temurin JDK 21 下运行 `scripts/dev/mvn21.sh -pl server -am -Dtest=WatchStreamTest,WatchGatewayTest,WatchGoInteropTest -Dsurefire.failIfNoSpecifiedTests=false test`，40 项通过（WatchStream 28、WatchGateway 11、WatchGoInterop 1），失败/错误/跳过均为 0；`git diff --check` 通过。原完整公开验证报告对应较早的 J45 head，不作为本轮修复的完整验证；本轮新 head 的 GitHub CI 完成后再记录整体验证结论。
+  - 跟踪：PR [#52](https://github.com/Reidddddd/etcd-hbase/pull/52) 开放、非 Draft，base 为上游 `main`（`c11c0dfd2dde72f8bdccd8ba503e02bc767eea17`）；依赖 PR #51（J44）已合并。F1–F4 review 修订已完成作者自审和独立复核，未发现未解决的 P1/P2；当前修订等待维护者复查，完整正确性 review 尚未完成。正式 reviewer=`Reidddddd`。目标环境与 M4 阶段验收未完成。
+  - 验证：review 修订的代码版本=`cb34ba19433edffa437b20d354173dced4b8e8a7`；已通过 Python 报告校验/必需用例清单校验及 Watch Stream/Gateway/Go 互通定向测试（Temurin JDK `21.0.12.1+1`）。该版本代码随 PR #52 修订提交；新 PR head 的 GitHub CI 以 PR checks 为准，旧 head 结果不作为本轮修订证据。完整公开验证、目标环境与 M4 阶段验收未完成。
 
 - [ ] **J46｜历史回放、实时交接、progress 与 fragment**
   - 依赖：J45。

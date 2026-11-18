@@ -177,7 +177,7 @@ class WatchGatewayTest {
 
       assertEquals(12, opened.revision());
       verify(tailer).subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
-          eq(WatchStream.MAX_PENDING_EVENTS_PER_WATCH), eq((long) RESPONSE_BYTES), eq(15L));
+          eq(WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH), eq((long) RESPONSE_BYTES), eq(15L));
       opened.subscription().close();
     }
   }
@@ -212,7 +212,7 @@ class WatchGatewayTest {
   }
 
   @Test
-  void passesNegativeStartRevisionAndCompactBoundaryWithoutDroppingRpcStateBudget() throws Exception {
+  void passesNegativeStartRevisionAndCompactBoundaryAndReleasesBudgetsOnClose() throws Exception {
     try (var startup = RequestScope.withoutDeadline();
          var scope = RequestScope.withoutDeadline()) {
       var tailer = openTailer();
@@ -230,14 +230,37 @@ class WatchGatewayTest {
       assertEquals(2, opened.compactRevision());
       assertEquals(512, budgets.snapshot().allocatedBytes());
       verify(tailer).subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
-          eq(WatchStream.MAX_PENDING_EVENTS_PER_WATCH), eq(1L), eq(-2L));
-
-      opened.subscription().closeLiveDelivery();
-      verify(subscription).close();
-      assertEquals(512, budgets.snapshot().allocatedBytes(),
-          "the inactive watch ID retains one RPC-state reservation until client cancellation");
+          eq(WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH), eq(1L), eq(-2L));
 
       opened.subscription().close();
+      assertReleased(budgets);
+      opened.subscription().close();
+      verify(subscription).close();
+      assertReleased(budgets);
+    }
+  }
+
+  @Test
+  void subscriptionCloseErrorStillReleasesBudgetsAndIsPropagated() throws Exception {
+    try (var startup = RequestScope.withoutDeadline();
+         var scope = RequestScope.withoutDeadline()) {
+      var tailer = openTailer();
+      var subscription = mock(SharedEventTailer.Subscription.class);
+      when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
+          anyInt(), anyLong(), anyLong()))
+          .thenReturn(new SharedEventTailer.SubscriptionStart(subscription, 0, 0));
+      var budgets = budgets();
+      var gateway = gateway(startup, budgets);
+      var opened = subscribe(gateway, tailer, scope);
+      var closeFailure = new AssertionError("subscription cleanup failed");
+      doThrow(closeFailure).when(subscription).close();
+
+      assertSame(closeFailure,
+          assertThrows(AssertionError.class, opened.subscription()::close));
+      assertReleased(budgets);
+
+      opened.subscription().close();
+      verify(subscription).close();
       assertReleased(budgets);
     }
   }
@@ -291,7 +314,7 @@ class WatchGatewayTest {
           "the create cannot publish before the authoritative barrier read completes");
       var order = inOrder(tailer, control);
       order.verify(tailer).subscribeWithCheckpoint(any(KeyRange.class),
-          any(BudgetManager.Account.class), eq(WatchStream.MAX_PENDING_EVENTS_PER_WATCH),
+          any(BudgetManager.Account.class), eq(WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH),
           eq((long) RESPONSE_BYTES), eq(startRevision));
       order.verify(control).read(scope);
 

@@ -119,7 +119,7 @@ final class WatchGateway {
         stateMemory = account.tryRetain(BudgetManager.Memory.HEAD, retainedStateBytes)
             .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
         start = tailer.subscribeWithCheckpoint(range, account,
-            WatchStream.MAX_PENDING_EVENTS_PER_WATCH, maximumResponseBytes,
+            WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH, maximumResponseBytes,
             request.getStartRevision());
       } catch (BackendFailure | RuntimeException | Error failure) {
         closeAfterFailure(stateMemory, failure);
@@ -195,11 +195,25 @@ final class WatchGateway {
     }
   }
 
+  private static Throwable closeAndCollect(Runnable close, Throwable failure) {
+    try {
+      close.run();
+    } catch (RuntimeException | Error cleanupFailure) {
+      if (failure == null) return cleanupFailure;
+      if (failure == cleanupFailure) return failure;
+      if (cleanupFailure instanceof Error && !(failure instanceof Error)) {
+        cleanupFailure.addSuppressed(failure);
+        return cleanupFailure;
+      }
+      failure.addSuppressed(cleanupFailure);
+    }
+    return failure;
+  }
+
   private static final class TailerSubscription implements WatchStream.Subscription {
     private final SharedEventTailer.Subscription subscription;
     private final BudgetManager.Account account;
     private final BudgetManager.Lease stateMemory;
-    private boolean liveDeliveryClosed;
     private boolean closed;
 
     private TailerSubscription(SharedEventTailer.Subscription subscription,
@@ -211,9 +225,9 @@ final class WatchGateway {
 
     @Override
     public synchronized Optional<WatchStream.Delivery> poll() {
-      if (closed || liveDeliveryClosed) return Optional.empty();
+      if (closed) return Optional.empty();
       Optional<SharedEventTailer.Delivery> polled = subscription.poll();
-      if (closed || liveDeliveryClosed) {
+      if (closed) {
         polled.ifPresent(SharedEventTailer.Delivery::close);
         return Optional.empty();
       }
@@ -223,7 +237,7 @@ final class WatchGateway {
 
     @Override
     public synchronized Optional<String> terminationReason() {
-      if (liveDeliveryClosed) return Optional.empty();
+      if (closed) return Optional.empty();
       return subscription.termination().map(reason -> switch (reason) {
         case RESOURCE_LIMIT -> "etcd-hbase: Watch subscription resource limit exceeded";
         case TAILER_CLOSED -> "etcd-hbase: Watch event source is unavailable";
@@ -232,35 +246,14 @@ final class WatchGateway {
     }
 
     @Override
-    public synchronized void closeLiveDelivery() {
-      if (closed || liveDeliveryClosed) return;
-      liveDeliveryClosed = true;
-      subscription.close();
-    }
-
-    @Override
     public synchronized void close() {
       if (closed) return;
-      RuntimeException failure = null;
-      try {
-        closeLiveDelivery();
-      } catch (RuntimeException cleanup) {
-        failure = cleanup;
-      }
       closed = true;
-      try {
-        stateMemory.close();
-      } catch (RuntimeException cleanup) {
-        if (failure == null) failure = cleanup;
-        else if (cleanup != failure) failure.addSuppressed(cleanup);
-      }
-      try {
-        account.close();
-      } catch (RuntimeException cleanup) {
-        if (failure == null) failure = cleanup;
-        else if (cleanup != failure) failure.addSuppressed(cleanup);
-      }
-      if (failure != null) throw failure;
+      Throwable failure = closeAndCollect(subscription::close, null);
+      failure = closeAndCollect(stateMemory::close, failure);
+      failure = closeAndCollect(account::close, failure);
+      if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+      if (failure instanceof Error fatal) throw fatal;
     }
   }
 }

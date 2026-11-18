@@ -1034,8 +1034,9 @@
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchGatewayTest", "tests": [
           "gatewayChargesRetainedRangeBytesAndReleasesThemOnClose",
+          "subscriptionCloseErrorStillReleasesBudgetsAndIsPropagated",
           "tailerShutdownRacePreservesUnavailableAndReleasesWatchReservation",
-          "passesNegativeStartRevisionAndCompactBoundaryWithoutDroppingRpcStateBudget",
+          "passesNegativeStartRevisionAndCompactBoundaryAndReleasesBudgetsOnClose",
           "currentRevisionReadsTheAuthoritativeControlSnapshotInsteadOfTheTailerCheckpoint",
           "pollCancellationHandoffClosesTheDetachedDeliveryBeforeReleasingItsAccount"
         ]},

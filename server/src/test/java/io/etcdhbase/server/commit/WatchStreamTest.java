@@ -540,7 +540,7 @@ class WatchStreamTest {
       assertEquals(2, live.getHeader().getRevision());
       assertEquals(2, live.getEvents(0).getKv().getModRevision());
       assertEquals(1, session.subscriptions.size());
-      assertEquals(0, subscription.liveCloseCount.get());
+      assertEquals(0, subscription.closeCount.get());
       stream.close();
       assertEquals(1, subscription.closeCount.get());
     }
@@ -600,7 +600,6 @@ class WatchStreamTest {
       assertEquals(0, cancelled.getHeader().getRevision());
       assertEquals(-1, cancelled.getCompactRevision());
       assertEquals("", cancelled.getCancelReason());
-      assertEquals(1, compacted.liveCloseCount.get(), "compaction removes the range subscription");
       assertEquals(1, compacted.closeCount.get(),
           "compaction releases subscription resources while retaining the RPC watch ID");
 
@@ -649,7 +648,6 @@ class WatchStreamTest {
         assertEquals(9, observer.responses.get(1).getWatchId());
         assertEquals(2, observer.responses.get(1).getCompactRevision());
         assertEquals(0, observer.responses.get(1).getHeader().getRevision());
-        assertEquals(1, subscription.liveCloseCount.get());
         assertEquals(1, subscription.closeCount.get(),
             "compaction releases per-watch resources before waiting for client cancellation");
         stream.close();
@@ -1076,10 +1074,8 @@ class WatchStreamTest {
     private final ArrayDeque<WatchStream.Delivery> deliveries = new ArrayDeque<>();
     private final AtomicInteger releases = new AtomicInteger();
     private final AtomicInteger closeCount = new AtomicInteger();
-    private final AtomicInteger liveCloseCount = new AtomicInteger();
     private RuntimeException closeFailure;
     private Runnable afterPoll;
-    private boolean liveDeliveryClosed;
     private boolean closed;
 
     private void add(PreparedEvent event) {
@@ -1088,7 +1084,7 @@ class WatchStreamTest {
     }
 
     @Override public Optional<WatchStream.Delivery> poll() {
-      if (closed || liveDeliveryClosed) return Optional.empty();
+      if (closed) return Optional.empty();
       WatchStream.Delivery delivery = deliveries.pollFirst();
       Runnable hook = afterPoll;
       afterPoll = null;
@@ -1098,19 +1094,12 @@ class WatchStreamTest {
 
     @Override public Optional<String> terminationReason() { return Optional.empty(); }
 
-    @Override public void closeLiveDelivery() {
-      if (liveDeliveryClosed) return;
-      liveDeliveryClosed = true;
-      liveCloseCount.incrementAndGet();
-      while (!deliveries.isEmpty()) deliveries.removeFirst().close();
-      if (closeFailure != null) throw closeFailure;
-    }
-
     @Override public void close() {
       if (closed) return;
       closed = true;
       closeCount.incrementAndGet();
-      closeLiveDelivery();
+      while (!deliveries.isEmpty()) deliveries.removeFirst().close();
+      if (closeFailure != null) throw closeFailure;
     }
   }
 

@@ -7,20 +7,15 @@ import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.commit.PreparedEvent;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
-import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.grpc.protocol.ErrorProjection;
 import io.etcdhbase.grpc.protocol.ResponseHeaderFactory;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
@@ -28,7 +23,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import mvccpb.Kv;
 
 /** One stream-scoped watch registry and single writer for control responses and event batches. */
 final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseable {
@@ -37,9 +31,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private static final long REJECTED_CREATE_RESPONSE_WATCH_ID = -1;
   private static final String HISTORICAL_REPLAY_UNSUPPORTED_REASON =
       "etcd-hbase: historical Watch replay is not implemented";
-  private static final int MAX_WATCHES_PER_STREAM = 1024;
-  static final int MAX_PENDING_EVENTS_PER_WATCH = 4096;
-
   interface SessionProvider {
     CompletionStage<Session> open();
   }
@@ -65,7 +56,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   interface Subscription extends AutoCloseable {
     Optional<Delivery> poll();
     Optional<String> terminationReason();
-    void closeLiveDelivery();
     @Override void close();
   }
 
@@ -97,16 +87,10 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     }
   }
 
-  private record EventOutput(Rpc.WatchResponse response, List<Delivery> deliveries) {
-    private EventOutput {
-      Objects.requireNonNull(response, "response");
-      deliveries = List.copyOf(deliveries);
-    }
+  private enum DrainKind { STOP, SEND_FAILURE, COMPLETE, SEND_RESPONSE, PROCESS_REQUEST, PUMP }
 
-    private void release() { deliveries.forEach(Delivery::close); }
-  }
-
-  private record EventPoll(EventOutput output, boolean consumed) {}
+  private record DrainAction(
+      DrainKind kind, PendingResponse response, Rpc.WatchRequest request, Throwable failure) {}
 
   private enum PumpResult { RESPONSE_SENT, ADVANCED, IDLE }
 
@@ -119,10 +103,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private final SessionProvider sessions;
   private final long clusterId;
   private final long memberId;
-  private final int maximumResponseBytes;
-  private final CompactedWatchIdBudget compactedWatchIdBudget;
-  private final LinkedHashMap<Long, Watcher> watchers = new LinkedHashMap<>();
-  private final Set<Long> compactedWatchIds = new HashSet<>();
+  private final WatchRegistry watchRegistry;
+  private final WatchEventBatchEncoder eventBatchEncoder;
   private final ArrayDeque<PendingResponse> responses = new ArrayDeque<>();
   private final AtomicBoolean draining = new AtomicBoolean();
   private final AtomicBoolean drainRequested = new AtomicBoolean();
@@ -132,7 +114,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private Rpc.WatchRequest pendingRequest;
   private ScheduledFuture<?> pollTask;
   private int nextWatchIndex;
-  private long nextAutoId;
   private boolean processingRequest;
   private boolean requestOutstanding;
   private boolean inboundClosed;
@@ -156,14 +137,14 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     this.worker = Objects.requireNonNull(worker, "worker");
     this.timers = Objects.requireNonNull(timers, "timers");
     this.sessions = Objects.requireNonNull(sessions, "sessions");
-    this.compactedWatchIdBudget = Objects.requireNonNull(
-        compactedWatchIdBudget, "compactedWatchIdBudget");
     if (clusterId == 0 || memberId == 0 || maximumResponseBytes < 1) {
       throw new IllegalArgumentException("invalid Watch stream identity or response budget");
     }
     this.clusterId = clusterId;
     this.memberId = memberId;
-    this.maximumResponseBytes = maximumResponseBytes;
+    this.watchRegistry = new WatchRegistry(Objects.requireNonNull(
+        compactedWatchIdBudget, "compactedWatchIdBudget"));
+    this.eventBatchEncoder = new WatchEventBatchEncoder(clusterId, memberId, maximumResponseBytes);
     if (responseObserver instanceof ServerCallStreamObserver<?> serverCall) {
       @SuppressWarnings("unchecked")
       ServerCallStreamObserver<Rpc.WatchResponse> typed =
@@ -272,89 +253,26 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private void drainLoop() {
     int filteredRevisions = 0;
     for (;;) {
-      PendingResponse response;
-      Rpc.WatchRequest request;
-      boolean complete;
-      Throwable failureToSend;
-      synchronized (lock) {
-        if (peerCancelled) return;
-        if (terminalFailure != null) {
-          failureToSend = terminalFailure;
-          terminalFailure = null;
-          response = null;
-          request = null;
-          complete = false;
-        } else if (terminal) {
-          return;
-        } else if (!responses.isEmpty()) {
-          failureToSend = null;
-          if (!isReady()) return;
-          response = responses.removeFirst();
-          request = null;
-          complete = false;
-        } else if (pendingRequest != null && !processingRequest) {
-          failureToSend = null;
-          request = pendingRequest;
-          pendingRequest = null;
-          processingRequest = true;
-          response = null;
-          complete = false;
-        } else if (inboundClosed && pendingRequest == null && !processingRequest) {
-          failureToSend = null;
-          response = null;
-          request = null;
-          complete = true;
-        } else if (!isReady()) {
-          return;
-        } else {
-          failureToSend = null;
-          response = null;
-          request = null;
-          complete = false;
-        }
-      }
-
-      if (failureToSend != null) {
-        Throwable cause = unwrap(failureToSend);
-        try {
-          responseObserver.onError(cause instanceof StatusRuntimeException statusFailure
-              ? statusFailure : ErrorProjection.project(cause));
-        } finally {
-          streamScope.cancel();
-        }
-        return;
-      }
-
-      if (complete) {
-        try {
-          closeWatchers();
-        } catch (RuntimeException | Error failure) {
-          fail(failure);
-          if (failure instanceof Error fatal) throw fatal;
+      DrainAction action = nextDrainAction();
+      switch (action.kind()) {
+        case STOP -> { return; }
+        case SEND_FAILURE -> {
+          sendTerminalFailure(action.failure());
           return;
         }
-        synchronized (lock) {
-          if (terminal || peerCancelled) return;
-          terminal = true;
-        }
-        cancelPoll();
-        responseObserver.onCompleted();
-        return;
-      }
-      if (response != null) {
-        try {
-          responseObserver.onNext(response.response());
-          response.afterSend().run();
-        } catch (RuntimeException | Error failure) {
-          fail(failure);
-          if (failure instanceof Error fatal) throw fatal;
+        case COMPLETE -> {
+          completeInboundStream();
           return;
         }
-        continue;
-      }
-      if (request != null) {
-        processRequest(request);
-        continue;
+        case SEND_RESPONSE -> {
+          sendResponse(action.response());
+          continue;
+        }
+        case PROCESS_REQUEST -> {
+          processRequest(action.request());
+          continue;
+        }
+        case PUMP -> { }
       }
 
       PumpResult pumpResult = pumpOneWatcher();
@@ -374,6 +292,69 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       requestNext();
       if (hasCreatedWatcher()) schedulePoll(EVENT_POLL_DELAY_MILLIS);
       return;
+    }
+  }
+
+  private DrainAction nextDrainAction() {
+    synchronized (lock) {
+      if (peerCancelled) return new DrainAction(DrainKind.STOP, null, null, null);
+      if (terminalFailure != null) {
+        Throwable failure = terminalFailure;
+        terminalFailure = null;
+        return new DrainAction(DrainKind.SEND_FAILURE, null, null, failure);
+      }
+      if (terminal) return new DrainAction(DrainKind.STOP, null, null, null);
+      if (!responses.isEmpty()) {
+        if (!isReady()) return new DrainAction(DrainKind.STOP, null, null, null);
+        return new DrainAction(DrainKind.SEND_RESPONSE, responses.removeFirst(), null, null);
+      }
+      if (pendingRequest != null && !processingRequest) {
+        Rpc.WatchRequest request = pendingRequest;
+        pendingRequest = null;
+        processingRequest = true;
+        return new DrainAction(DrainKind.PROCESS_REQUEST, null, request, null);
+      }
+      if (inboundClosed && pendingRequest == null && !processingRequest) {
+        return new DrainAction(DrainKind.COMPLETE, null, null, null);
+      }
+      if (!isReady()) return new DrainAction(DrainKind.STOP, null, null, null);
+      return new DrainAction(DrainKind.PUMP, null, null, null);
+    }
+  }
+
+  private void sendTerminalFailure(Throwable failure) {
+    Throwable cause = unwrap(failure);
+    try {
+      responseObserver.onError(cause instanceof StatusRuntimeException statusFailure
+          ? statusFailure : ErrorProjection.project(cause));
+    } finally {
+      streamScope.cancel();
+    }
+  }
+
+  private void completeInboundStream() {
+    try {
+      closeWatchers();
+    } catch (RuntimeException | Error failure) {
+      fail(failure);
+      if (failure instanceof Error fatal) throw fatal;
+      return;
+    }
+    synchronized (lock) {
+      if (terminal || peerCancelled) return;
+      terminal = true;
+    }
+    cancelPoll();
+    responseObserver.onCompleted();
+  }
+
+  private void sendResponse(PendingResponse response) {
+    try {
+      responseObserver.onNext(response.response());
+      response.afterSend().run();
+    } catch (RuntimeException | Error failure) {
+      fail(failure);
+      if (failure instanceof Error fatal) throw fatal;
     }
   }
 
@@ -424,61 +405,52 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         rejectCreateAtCurrentRevision(openedSession, invalidRange.getMessage());
         return;
       }
-      boolean stopped;
-      boolean duplicate;
-      boolean atLimit;
-      synchronized (lock) {
-        stopped = terminal || peerCancelled || inboundClosed;
-        duplicate = !stopped && request.getWatchId() != 0
-            && containsWatchIdLocked(request.getWatchId());
-        atLimit = !stopped && !duplicate && watchIdCountLocked() >= MAX_WATCHES_PER_STREAM;
-        if (stopped) processingRequest = false;
-      }
-      if (stopped) {
-        scheduleDrain();
-        return;
-      }
-      if (duplicate) {
-        rejectCreateAtCurrentRevision(openedSession,
-            "mvcc: duplicate watch ID provided on the WatchStream");
-        return;
-      }
-      if (atLimit) {
-        rejectCreateAtCurrentRevision(openedSession,
-            "etcd-hbase: Watch stream subscription limit exceeded");
-        return;
-      }
-
-      CompletionStage<OpenedWatch> opening;
-      try {
-        opening = Objects.requireNonNull(
-            openedSession.subscribe(range, request), "opened Watch subscription");
-      } catch (BackendFailure failure) {
-        if (failure.category() == BackendFailure.Category.RESOURCE_LIMIT) {
-          rejectCreateAtCurrentRevision(openedSession, "etcd-hbase: Watch resource limit exceeded");
-        } else {
-          fail(failure);
-        }
-        return;
-      }
-      opening.whenComplete((opened, failure) -> executeCompletion(() ->
-          completeSubscribedCreate(openedSession, request, opened, failure)));
+      if (rejectUnadmittedCreate(openedSession, request)) return;
+      subscribe(openedSession, request, range);
     } catch (RuntimeException | Error failure) {
       fail(failure);
       if (failure instanceof Error fatal) throw fatal;
     }
   }
 
+  private boolean rejectUnadmittedCreate(Session openedSession, Rpc.WatchCreateRequest request) {
+    boolean stopped;
+    WatchRegistry.Rejection rejection = WatchRegistry.Rejection.NONE;
+    synchronized (lock) {
+      stopped = terminal || peerCancelled || inboundClosed;
+      if (!stopped) rejection = watchRegistry.checkCreate(request.getWatchId());
+      if (stopped) processingRequest = false;
+    }
+    if (stopped) {
+      scheduleDrain();
+      return true;
+    }
+    if (rejection == WatchRegistry.Rejection.NONE) return false;
+    rejectCreateAtCurrentRevision(openedSession, rejectionReason(rejection));
+    return true;
+  }
+
+  private void subscribe(Session openedSession, Rpc.WatchCreateRequest request, KeyRange range) {
+    CompletionStage<OpenedWatch> opening;
+    try {
+      opening = Objects.requireNonNull(
+          openedSession.subscribe(range, request), "opened Watch subscription");
+    } catch (BackendFailure failure) {
+      if (failure.category() == BackendFailure.Category.RESOURCE_LIMIT) {
+        rejectCreateAtCurrentRevision(openedSession, "etcd-hbase: Watch resource limit exceeded");
+      } else {
+        fail(failure);
+      }
+      return;
+    }
+    opening.whenComplete((opened, failure) -> executeCompletion(() ->
+        completeSubscribedCreate(openedSession, request, opened, failure)));
+  }
+
   private void completeSubscribedCreate(Session openedSession, Rpc.WatchCreateRequest request,
       OpenedWatch opened, Throwable subscriptionFailure) {
     if (subscriptionFailure != null) {
-      Throwable cause = unwrap(subscriptionFailure);
-      if (cause instanceof BackendFailure backendFailure
-          && backendFailure.category() == BackendFailure.Category.RESOURCE_LIMIT) {
-        rejectCreateAtCurrentRevision(openedSession, "etcd-hbase: Watch resource limit exceeded");
-      } else {
-        fail(cause);
-      }
+      handleSubscriptionFailure(openedSession, subscriptionFailure);
       return;
     }
     try {
@@ -488,56 +460,66 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         completeCompactedCreate(opened, request);
         return;
       }
-
       if (request.getStartRevision() > 0 && request.getStartRevision() <= opened.revision()) {
-        opened.subscription().close();
-        rejectCreate(opened.revision(), HISTORICAL_REPLAY_UNSUPPORTED_REASON);
+        rejectUnsupportedHistoricalReplay(opened);
         return;
       }
-
-      Watcher watcher = null;
-      boolean stopped;
-      boolean duplicate;
-      boolean atLimit;
-      synchronized (lock) {
-        stopped = terminal || peerCancelled || inboundClosed;
-        duplicate = !stopped && request.getWatchId() != 0
-            && containsWatchIdLocked(request.getWatchId());
-        atLimit = !stopped && !duplicate && watchIdCountLocked() >= MAX_WATCHES_PER_STREAM;
-        if (!stopped && !duplicate && !atLimit) {
-          long id = request.getWatchId() == 0 ? allocateWatchIdLocked() : request.getWatchId();
-          long minimumEventRevision = request.getStartRevision() <= 0
-              ? nextRevision(opened.revision()) : request.getStartRevision();
-          Watcher createdWatcher = new Watcher(id, minimumEventRevision,
-              request.getPrevKv(),
-              request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NOPUT),
-              request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NODELETE),
-              opened.subscription());
-          watchers.put(id, createdWatcher);
-          watcher = createdWatcher;
-          enqueueResponse(createdResponse(id, opened.revision()), () -> {
-            createdWatcher.createdSent = true;
-            requestNext();
-          });
-        }
-        processingRequest = false;
-      }
-      if (watcher == null) {
-        opened.subscription().close();
-        if (stopped) {
-          scheduleDrain();
-        } else if (duplicate) {
-          rejectCreate(opened.revision(), "mvcc: duplicate watch ID provided on the WatchStream");
-        } else if (atLimit) {
-          rejectCreate(opened.revision(), "etcd-hbase: Watch stream subscription limit exceeded");
-        }
-        return;
-      }
-      scheduleDrain();
+      registerSubscribedWatch(opened, request);
     } catch (RuntimeException | Error failure) {
       fail(failure);
       if (failure instanceof Error fatal) throw fatal;
     }
+  }
+
+  private void handleSubscriptionFailure(Session openedSession, Throwable failure) {
+    Throwable cause = unwrap(failure);
+    if (cause instanceof BackendFailure backendFailure
+        && backendFailure.category() == BackendFailure.Category.RESOURCE_LIMIT) {
+      rejectCreateAtCurrentRevision(openedSession, "etcd-hbase: Watch resource limit exceeded");
+    } else {
+      fail(cause);
+    }
+  }
+
+  private void rejectUnsupportedHistoricalReplay(OpenedWatch opened) {
+    opened.subscription().close();
+    rejectCreate(opened.revision(), HISTORICAL_REPLAY_UNSUPPORTED_REASON);
+  }
+
+  private void registerSubscribedWatch(OpenedWatch opened, Rpc.WatchCreateRequest request) {
+    WatchRegistry.Registration registration = null;
+    boolean stopped;
+    synchronized (lock) {
+      stopped = terminal || peerCancelled || inboundClosed;
+      if (!stopped) {
+        long minimumEventRevision = request.getStartRevision() <= 0
+            ? nextRevision(opened.revision()) : request.getStartRevision();
+        registration = watchRegistry.registerActive(request.getWatchId(), minimumEventRevision,
+            request.getPrevKv(),
+            request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NOPUT),
+            request.getFiltersList().contains(Rpc.WatchCreateRequest.FilterType.NODELETE),
+            opened.subscription());
+        if (registration.rejection() == WatchRegistry.Rejection.NONE) {
+          WatchRegistry.Watcher watcher = registration.watcher();
+          enqueueResponse(createdResponse(registration.watchId(), opened.revision()), () -> {
+            watcher.markCreatedSent();
+            requestNext();
+          });
+        }
+      }
+      processingRequest = false;
+    }
+    if (stopped || registration == null
+        || registration.rejection() != WatchRegistry.Rejection.NONE) {
+      opened.subscription().close();
+      if (stopped) {
+        scheduleDrain();
+      } else {
+        rejectCreate(opened.revision(), rejectionReason(registration.rejection()));
+      }
+      return;
+    }
+    scheduleDrain();
   }
 
   private void rejectCreateAtCurrentRevision(Session openedSession, String reason) {
@@ -571,48 +553,40 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     }
 
     boolean stopped;
-    boolean duplicate;
-    boolean atLimit;
-    boolean retentionLimit;
+    WatchRegistry.Registration registration = null;
     synchronized (lock) {
       stopped = terminal || peerCancelled || inboundClosed;
-      duplicate = !stopped && request.getWatchId() != 0
-          && containsWatchIdLocked(request.getWatchId());
-      atLimit = !stopped && !duplicate && watchIdCountLocked() >= MAX_WATCHES_PER_STREAM;
-      retentionLimit = false;
-      if (!stopped && !duplicate && !atLimit) {
-        long id = request.getWatchId() == 0 ? allocateWatchIdLocked() : request.getWatchId();
-        if (compactedWatchIdBudget.tryAcquire()) {
+      if (!stopped) {
+        registration = watchRegistry.retainCompacted(request.getWatchId());
+        if (registration.rejection() == WatchRegistry.Rejection.NONE) {
           try {
-            // The subscription's object graph contains its range and budget state; retain only
-            // the protocol ID so those per-watch objects are no longer reachable from this stream.
-            compactedWatchIds.add(id);
-            enqueueResponse(createdResponse(id, opened.revision()), () -> {});
-            enqueueResponse(compactedResponse(id, 0, opened.compactRevision()), this::requestNext);
+            enqueueResponse(createdResponse(registration.watchId(), opened.revision()), () -> {});
+            enqueueResponse(compactedResponse(
+                registration.watchId(), 0, opened.compactRevision()), this::requestNext);
           } catch (RuntimeException | Error failure) {
-            compactedWatchIds.remove(id);
-            compactedWatchIdBudget.release(1);
+            watchRegistry.removeCompacted(registration.watchId());
             throw failure;
           }
-        } else {
-          retentionLimit = true;
         }
       }
       processingRequest = false;
     }
-    if (stopped || duplicate || atLimit || retentionLimit) {
-      if (stopped) {
-        scheduleDrain();
-      } else if (duplicate) {
-        rejectCreate(opened.revision(), "mvcc: duplicate watch ID provided on the WatchStream");
-      } else if (atLimit) {
-        rejectCreate(opened.revision(), "etcd-hbase: Watch stream subscription limit exceeded");
-      } else if (retentionLimit) {
-        rejectCreate(opened.revision(), "etcd-hbase: compacted Watch ID retention limit exceeded");
-      }
-      return;
+    if (stopped) {
+      scheduleDrain();
+    } else if (registration.rejection() != WatchRegistry.Rejection.NONE) {
+      rejectCreate(opened.revision(), rejectionReason(registration.rejection()));
+    } else {
+      scheduleDrain();
     }
-    scheduleDrain();
+  }
+
+  private static String rejectionReason(WatchRegistry.Rejection rejection) {
+    return switch (rejection) {
+      case DUPLICATE_ID -> "mvcc: duplicate watch ID provided on the WatchStream";
+      case STREAM_LIMIT -> "etcd-hbase: Watch stream subscription limit exceeded";
+      case RETENTION_LIMIT -> "etcd-hbase: compacted Watch ID retention limit exceeded";
+      case NONE -> throw new IllegalArgumentException("successful Watch registration has no rejection");
+    };
   }
 
   private void processCancel(Rpc.WatchCancelRequest request) {
@@ -620,13 +594,12 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       finishRequestWithoutResponse();
       return;
     }
-    Watcher watcher;
+    WatchRegistry.Watcher watcher;
     boolean compactedTombstone;
     Session currentSession;
     synchronized (lock) {
-      watcher = watchers.remove(request.getWatchId());
-      compactedTombstone = watcher == null && compactedWatchIds.remove(request.getWatchId());
-      if (compactedTombstone) compactedWatchIdBudget.release(1);
+      watcher = watchRegistry.removeActive(request.getWatchId());
+      compactedTombstone = watcher == null && watchRegistry.removeCompacted(request.getWatchId());
       currentSession = session;
       if (watcher == null) processingRequest = false;
     }
@@ -701,19 +674,25 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   }
 
   private PumpResult pumpOneWatcher() {
-    List<Watcher> snapshot;
+    List<WatchRegistry.Watcher> snapshot;
     int first;
     synchronized (lock) {
-      snapshot = List.copyOf(watchers.values());
+      snapshot = watchRegistry.activeSnapshot();
       if (snapshot.isEmpty()) return PumpResult.IDLE;
       first = Math.floorMod(nextWatchIndex, snapshot.size());
     }
     for (int offset = 0; offset < snapshot.size(); offset++) {
       int index = (first + offset) % snapshot.size();
-      Watcher watcher = snapshot.get(index);
-      if (!watcher.createdSent) continue;
-      EventPoll poll = nextEventResponse(watcher);
-      EventOutput output = poll.output();
+      WatchRegistry.Watcher watcher = snapshot.get(index);
+      if (!watcher.createdSent()) continue;
+      WatchEventBatchEncoder.Poll poll;
+      synchronized (watcher) { poll = eventBatchEncoder.nextBatch(watcher); }
+      if (poll.terminationReason() != null) {
+        terminateWatcher(watcher, poll.terminationReason());
+        advanceWatchIndex(index);
+        return PumpResult.ADVANCED;
+      }
+      WatchEventBatchEncoder.Output output = poll.output();
       if (output != null) {
         advanceWatchIndex(index);
         try {
@@ -737,70 +716,17 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   }
 
   private void advanceWatchIndex(int index) {
-    synchronized (lock) { nextWatchIndex = (index + 1) % Math.max(1, watchers.size()); }
-  }
-
-  private EventPoll nextEventResponse(Watcher watcher) {
-    synchronized (watcher) {
-      return nextEventResponseLocked(watcher);
-    }
-  }
-
-  private EventPoll nextEventResponseLocked(Watcher watcher) {
-    List<Delivery> deliveries = new ArrayList<>();
-    boolean transferred = false;
-    try {
-      Delivery first = watcher.takeNext();
-      if (first == null) {
-        Optional<String> termination = watcher.subscription.terminationReason();
-        termination.ifPresent(reason -> terminateWatcher(watcher, reason));
-        return new EventPoll(null, termination.isPresent());
-      }
-      long revision = first.revision();
-      deliveries.add(first);
-      while (deliveries.size() < MAX_PENDING_EVENTS_PER_WATCH) {
-        Delivery next = watcher.pollNext();
-        if (next == null) break;
-        if (next.revision() != revision) {
-          watcher.defer(next);
-          break;
-        }
-        deliveries.add(next);
-      }
-
-      var response = Rpc.WatchResponse.newBuilder()
-          .setHeader(header(revision))
-          .setWatchId(watcher.id);
-      for (Delivery delivery : deliveries) {
-        PreparedEvent event = delivery.event();
-        if (delivery.revision() < watcher.minimumEventRevision
-            || event.kind() == PreparedEvent.Kind.PUT && watcher.filterPut
-            || event.kind() == PreparedEvent.Kind.DELETE && watcher.filterDelete) continue;
-        if (event.current().metadata().modificationRevision() != revision) {
-          throw new IllegalStateException("Watch event revision differs from its selected revision");
-        }
-        response.addEvents(project(event, watcher.previousKv));
-      }
-      if (response.getEventsCount() == 0) return new EventPoll(null, true);
-      Rpc.WatchResponse built = response.build();
-      if (built.getSerializedSize() > maximumResponseBytes) {
-        terminateWatcher(watcher, "etcd-hbase: Watch response exceeds the configured message budget");
-        return new EventPoll(null, true);
-      }
-      EventOutput output = new EventOutput(built, deliveries);
-      transferred = true;
-      return new EventPoll(output, true);
-    } finally {
-      if (!transferred) deliveries.forEach(Delivery::close);
-    }
-  }
-
-  private void terminateWatcher(Watcher watcher, String reason) {
     synchronized (lock) {
-      if (watchers.remove(watcher.id) != watcher) return;
+      nextWatchIndex = (index + 1) % Math.max(1, watchRegistry.activeCount());
+    }
+  }
+
+  private void terminateWatcher(WatchRegistry.Watcher watcher, String reason) {
+    synchronized (lock) {
+      if (!watchRegistry.removeActive(watcher.id(), watcher)) return;
       watcher.close();
       enqueueResponse(cancelledResponse(
-          watcher.id, session == null ? 0 : session.completedRevision(), reason),
+          watcher.id(), session == null ? 0 : session.completedRevision(), reason),
           this::requestNext);
     }
   }
@@ -860,7 +786,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   }
 
   private boolean hasCreatedWatcherLocked() {
-    return watchers.values().stream().anyMatch(watcher -> watcher.createdSent);
+    return watchRegistry.hasCreatedWatcher();
   }
 
   private boolean hasRunnableWork() {
@@ -880,21 +806,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       fail(fatal);
       throw fatal;
     }
-  }
-
-  private long allocateWatchIdLocked() {
-    long id = nextAutoId;
-    while (containsWatchIdLocked(id)) id = Math.addExact(id, 1);
-    nextAutoId = Math.addExact(id, 1);
-    return id;
-  }
-
-  private boolean containsWatchIdLocked(long id) {
-    return watchers.containsKey(id) || compactedWatchIds.contains(id);
-  }
-
-  private int watchIdCountLocked() {
-    return watchers.size() + compactedWatchIds.size();
   }
 
   private static long nextRevision(long revision) {
@@ -939,23 +850,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   private Rpc.ResponseHeader header(long revision) {
     return ResponseHeaderFactory.create(clusterId, memberId, revision, 0);
-  }
-
-  private static Kv.Event project(PreparedEvent event, boolean previousKv) {
-    var builder = Kv.Event.newBuilder()
-        .setType(event.kind() == PreparedEvent.Kind.PUT ? Kv.Event.EventType.PUT : Kv.Event.EventType.DELETE)
-        .setKv(project(event.current()));
-    if (previousKv) event.previous().ifPresent(previous -> builder.setPrevKv(project(previous)));
-    return builder.build();
-  }
-
-  private static Kv.KeyValue project(StoredRecord record) {
-    var metadata = record.metadata();
-    var builder = Kv.KeyValue.newBuilder().setKey(ByteString.copyFrom(record.key().bytes()))
-        .setCreateRevision(metadata.createRevision()).setModRevision(metadata.modificationRevision())
-        .setVersion(metadata.version()).setLease(metadata.leaseId());
-    record.value().ifPresent(value -> builder.setValue(ByteString.copyFrom(value)));
-    return builder.build();
   }
 
   private void cancelFromPeer() {
@@ -1012,35 +906,25 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   @Override
   public void close() {
-    List<Watcher> closing;
+    List<WatchRegistry.Watcher> closing;
     synchronized (lock) {
-      if (terminal && watchers.isEmpty() && compactedWatchIds.isEmpty()) return;
+      if (terminal && watchRegistry.isEmpty()) return;
       terminal = true;
       requestOutstanding = false;
       pendingRequest = null;
       responses.clear();
-      closing = new ArrayList<>(watchers.values());
-      watchers.clear();
-      releaseCompactedWatchIdsLocked();
+      closing = watchRegistry.detachAll();
     }
     cancelPoll();
     closeWatchers(closing);
   }
 
   private Throwable closeWatchersCollecting() {
-    List<Watcher> closing;
+    List<WatchRegistry.Watcher> closing;
     synchronized (lock) {
-      closing = new ArrayList<>(watchers.values());
-      watchers.clear();
-      releaseCompactedWatchIdsLocked();
+      closing = watchRegistry.detachAll();
     }
     return closeWatchersCollecting(closing);
-  }
-
-  private void releaseCompactedWatchIdsLocked() {
-    int releasedIds = compactedWatchIds.size();
-    compactedWatchIds.clear();
-    compactedWatchIdBudget.release(releasedIds);
   }
 
   private void closeWatchers() {
@@ -1049,15 +933,15 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     if (failure instanceof RuntimeException cleanup) throw cleanup;
   }
 
-  private static void closeWatchers(List<Watcher> closing) {
+  private static void closeWatchers(List<WatchRegistry.Watcher> closing) {
     Throwable failure = closeWatchersCollecting(closing);
     if (failure instanceof Error fatal) throw fatal;
     if (failure instanceof RuntimeException cleanup) throw cleanup;
   }
 
-  private static Throwable closeWatchersCollecting(List<Watcher> closing) {
+  private static Throwable closeWatchersCollecting(List<WatchRegistry.Watcher> closing) {
     Throwable failure = null;
-    for (Watcher watcher : closing) {
+    for (WatchRegistry.Watcher watcher : closing) {
       try {
         watcher.close();
       } catch (RuntimeException | Error cleanup) {
@@ -1077,76 +961,5 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   private static final class InvalidRange extends RuntimeException {
     private InvalidRange() { super("mvcc: watcher range is empty"); }
-  }
-
-  private final class Watcher implements AutoCloseable {
-    private final long id;
-    private final long minimumEventRevision;
-    private final boolean previousKv;
-    private final boolean filterPut;
-    private final boolean filterDelete;
-    private final Subscription subscription;
-    private Delivery pendingDelivery;
-    private boolean createdSent;
-    private boolean closed;
-
-    private Watcher(long id, long minimumEventRevision,
-        boolean previousKv, boolean filterPut, boolean filterDelete, Subscription subscription) {
-      this.id = id;
-      this.minimumEventRevision = minimumEventRevision;
-      this.previousKv = previousKv;
-      this.filterPut = filterPut;
-      this.filterDelete = filterDelete;
-      this.subscription = Objects.requireNonNull(subscription, "subscription");
-    }
-
-    private synchronized Delivery takeNext() {
-      if (closed) return null;
-      if (pendingDelivery != null) {
-        Delivery delivery = pendingDelivery;
-        pendingDelivery = null;
-        return delivery;
-      }
-      Delivery delivery = subscription.poll().orElse(null);
-      if (closed && delivery != null) {
-        delivery.close();
-        return null;
-      }
-      return delivery;
-    }
-
-    private synchronized Delivery pollNext() {
-      if (closed) return null;
-      Delivery delivery = subscription.poll().orElse(null);
-      if (closed && delivery != null) {
-        delivery.close();
-        return null;
-      }
-      return delivery;
-    }
-
-    private synchronized void defer(Delivery delivery) {
-      if (closed) delivery.close();
-      else pendingDelivery = delivery;
-    }
-
-    private synchronized boolean isClosed() { return closed; }
-
-    @Override public synchronized void close() {
-      if (closed) return;
-      closed = true;
-      RuntimeException failure = null;
-      if (pendingDelivery != null) {
-        try { pendingDelivery.close(); }
-        catch (RuntimeException cleanup) { failure = cleanup; }
-        pendingDelivery = null;
-      }
-      try { subscription.close(); }
-      catch (RuntimeException cleanup) {
-        if (failure == null) failure = cleanup;
-        else if (cleanup != failure) failure.addSuppressed(cleanup);
-      }
-      if (failure != null) throw failure;
-    }
   }
 }

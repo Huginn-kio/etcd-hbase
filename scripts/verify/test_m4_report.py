@@ -1138,161 +1138,201 @@ class M4ReportTest(unittest.TestCase):
         return records
 
     @classmethod
-    def _valid_j45_trace_records(
-        cls, task: dict[str, object], descriptor: dict[str, object],
-    ) -> list[dict[str, object]]:
+    def _j45_header(cls, revision: int) -> dict[str, object]:
+        return cls._snapshot({
+            "clusterId": "11", "memberId": "22", "raftTerm": "1",
+            "revision": str(revision),
+        })
+
+    @classmethod
+    def _j45_watch_response(
+        cls, watch_id: int, revision: int, *, created: bool, canceled: bool,
+        compact_revision: int = 0, reason: str = "",
+    ) -> dict[str, object]:
+        return cls._snapshot({
+            "header": cls._j45_header(revision), "watchId": str(watch_id),
+            "created": created, "canceled": canceled,
+            "compactRevision": str(compact_revision), "cancelReason": reason, "events": [],
+        })
+
+    @classmethod
+    def _j45_create_request(
+        cls, watch_id: int, start_revision: int, key: str = "aW5pdGlhbC1taW51cy1vbmU=",
+    ) -> dict[str, object]:
+        return {
+            "fields": {"createRequest": cls._snapshot({
+                "key": key, "watchId": str(watch_id),
+                "startRevision": str(start_revision),
+            })},
+            "oneofs": {"request_union": "create_request"},
+        }
+
+    @classmethod
+    def _j45_cancel_request(cls, watch_id: int) -> dict[str, object]:
+        return {
+            "fields": {"cancelRequest": cls._snapshot({"watchId": str(watch_id)})},
+            "oneofs": {"request_union": "cancel_request"},
+        }
+
+    @classmethod
+    def _j45_fixed_fixture_cases(cls) -> dict[str, tuple[dict[str, object], dict[str, object]]]:
         initial_revision = 2
         compact_revision = 3
-        fixture_key = "am00"
         history_key = "aW5pdGlhbC1taW51cy1vbmU="
         history_value = "ajQ1LWhpc3Rvcnk="
-        live_value = "ajQ1LXdhdGNoLWxpdmU="
-
-        def header(revision: int) -> dict[str, object]:
-            return cls._snapshot({
-                "clusterId": "11", "memberId": "22", "raftTerm": "1",
-                "revision": str(revision),
-            })
-
-        def watch_response(watch_id: int, revision: int, *, created: bool,
-                           canceled: bool, compact: int = 0, reason: str = "") -> dict[str, object]:
-            return cls._snapshot({
-                "header": header(revision), "watchId": str(watch_id), "created": created,
-                "canceled": canceled, "compactRevision": str(compact),
-                "cancelReason": reason, "events": [],
-            })
-
-        def create_request(watch_id: int, start_revision: int, key: str = history_key) -> dict[str, object]:
-            return {
-                "fields": {"createRequest": cls._snapshot({
-                    "key": key, "watchId": str(watch_id),
-                    "startRevision": str(start_revision),
-                })},
-                "oneofs": {"request_union": "create_request"},
-            }
-
-        def cancel_request(watch_id: int) -> dict[str, object]:
-            return {
-                "fields": {"cancelRequest": cls._snapshot({"watchId": str(watch_id)})},
-                "oneofs": {"request_union": "cancel_request"},
-            }
-
+        fixture_key = "am00"
         fixture_value = "ajQ1LXdhdGNoLWNvbXBhY3Q="
-        setup = {
+        initial_header = {"header": cls._j45_header(initial_revision)}
+        compact_header = {"header": cls._j45_header(compact_revision)}
+        return {
             "watch-start-history-put": (
                 cls._snapshot({"key": history_key, "value": history_value}),
-                cls._snapshot({"header": header(initial_revision)}),
+                cls._snapshot(initial_header),
             ),
             "watch-negative-live-put": (
-                cls._snapshot({"key": history_key, "value": live_value}),
-                cls._snapshot({"header": header(initial_revision + 1)}),
+                cls._snapshot({"key": history_key, "value": "ajQ1LXdhdGNoLWxpdmU="}),
+                cls._snapshot({"header": cls._j45_header(initial_revision + 1)}),
             ),
             "watch-compact-fixture-put": (
                 cls._snapshot({"key": fixture_key, "value": fixture_value}),
-                cls._snapshot({"header": header(compact_revision)}),
+                cls._snapshot(compact_header),
             ),
             "watch-compact-fixture-range": (
                 cls._snapshot({"key": fixture_key}),
                 cls._snapshot({
-                    "header": header(compact_revision),
+                    "header": cls._j45_header(compact_revision),
                     "kvs": [cls._snapshot({"key": fixture_key, "value": fixture_value})],
                 }),
             ),
             "watch-compact-fixture-compact": (
                 cls._snapshot({"revision": str(compact_revision)}),
-                cls._snapshot({"header": header(compact_revision)}),
+                cls._snapshot(compact_header),
             ),
         }
 
+    @classmethod
+    def _j45_negative_live_case(
+        cls, case_id: str,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        initial_revision = 2
+        live_revision = initial_revision + 1
+        history_key = "aW5pdGlhbC1taW51cy1vbmU="
+        live_value = "ajQ1LXdhdGNoLWxpdmU="
+        if case_id.endswith("-created"):
+            return (cls._j45_create_request(45, -1),
+                    cls._j45_watch_response(45, initial_revision, created=True, canceled=False))
+        if case_id.endswith("-progress"):
+            return ({
+                "fields": {"progressRequest": cls._snapshot({})},
+                "oneofs": {"request_union": "progress_request"},
+            }, cls._snapshot({
+                "header": cls._j45_header(initial_revision), "watchId": "-1",
+                "created": False, "canceled": False, "compactRevision": "0",
+                "cancelReason": "", "events": [],
+            }))
+        if case_id.endswith("-event"):
+            return (cls._j45_create_request(45, -1), cls._snapshot({
+                "header": cls._j45_header(live_revision), "watchId": "45",
+                "created": False, "canceled": False, "compactRevision": "0",
+                "cancelReason": "", "events": [cls._snapshot({
+                    "type": 0,
+                    "kv": cls._snapshot({
+                        "key": history_key, "createRevision": str(initial_revision),
+                        "modRevision": str(live_revision), "version": "2",
+                        "value": live_value, "lease": "0",
+                    }),
+                })],
+            }))
+        if case_id.endswith("-cancelled"):
+            return (cls._j45_cancel_request(45),
+                    cls._j45_watch_response(45, live_revision, created=False, canceled=True))
+        raise AssertionError(f"unregistered J45 negative-live trace case {case_id}")
+
+    @classmethod
+    def _j45_start_matrix_case(
+        cls, case_id: str,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if case_id.startswith("initial-"):
+            phase = "initial"
+            response_revision = 2
+            compact_boundary = -1
+        elif case_id.startswith("compacted-"):
+            phase = "compacted"
+            response_revision = 3
+            compact_boundary = 3
+        else:
+            raise AssertionError(f"unregistered J45 Watch matrix phase in {case_id}")
+
+        if case_id.startswith(f"{phase}-watch-id-minus-one-"):
+            base_id = f"{phase}-watch-id-minus-one"
+            start_revision = 0
+            watch_id = -1
+        else:
+            start_revisions = {"minus-two": -2, "minus-one": -1, "zero": 0, "future": 3}
+            start_name = next(
+                (name for name in start_revisions if case_id.startswith(f"{phase}-{name}-")),
+                None,
+            )
+            if start_name is None:
+                raise AssertionError(f"unregistered J45 Watch start case {case_id}")
+            start_revision = start_revisions[start_name]
+            base_id = f"{phase}-{start_name}"
+            watch_id = {-2: 41, -1: 42, 0: 43, 3: 44}[start_revision]
+
+        suffix = case_id[len(base_id) + 1:]
+        if suffix == "created":
+            return (cls._j45_create_request(watch_id, start_revision),
+                    cls._j45_watch_response(watch_id, response_revision,
+                                            created=True, canceled=False))
+        if suffix == "compacted":
+            return (cls._j45_create_request(watch_id, start_revision),
+                    cls._j45_watch_response(watch_id, 0, created=False, canceled=True,
+                                            compact_revision=compact_boundary))
+        if suffix == "duplicate-id":
+            return (cls._j45_create_request(watch_id, 0), cls._j45_watch_response(
+                -1, response_revision, created=True, canceled=True,
+                reason="mvcc: duplicate watch ID provided on the WatchStream",
+            ))
+        if suffix in {"cancel-id", "cancelled", "reused-cancelled"}:
+            return (cls._j45_cancel_request(watch_id),
+                    cls._j45_watch_response(watch_id, response_revision,
+                                            created=False, canceled=True))
+        if suffix == "reused-created":
+            return (cls._j45_create_request(watch_id, 0),
+                    cls._j45_watch_response(watch_id, response_revision,
+                                            created=True, canceled=False))
+        raise AssertionError(f"unregistered J45 Watch matrix suffix in {case_id}")
+
+    @staticmethod
+    def _j45_trace_record(
+        case_id: str, method: str, request: dict[str, object], response: dict[str, object],
+        evidence_scope: str,
+    ) -> dict[str, object]:
+        return {
+            "schema": "etcd-hbase-trace/v1", "case_id": case_id, "ordinal": 1,
+            "method": method, "request": request, "response": response,
+            "error": None, "stream_terminal": None, "evidence_scope": evidence_scope,
+            "elapsed_ns": "1",
+        }
+
+    @classmethod
+    def _valid_j45_trace_records(
+        cls, task: dict[str, object], descriptor: dict[str, object],
+    ) -> list[dict[str, object]]:
+        fixed_cases = cls._j45_fixed_fixture_cases()
         records = []
         for expected in task["trace_cases"]:
             case_id = expected["id"]
-            request, reply = setup.get(case_id, (None, None))
-            if request is None:
+            setup = fixed_cases.get(case_id)
+            if setup is None:
                 if case_id.startswith("watch-negative-live-"):
-                    if case_id.endswith("-created"):
-                        request = create_request(45, -1)
-                        reply = watch_response(45, initial_revision, created=True, canceled=False)
-                    elif case_id.endswith("-progress"):
-                        request = {
-                            "fields": {"progressRequest": cls._snapshot({})},
-                            "oneofs": {"request_union": "progress_request"},
-                        }
-                        reply = cls._snapshot({
-                            "header": header(initial_revision), "watchId": "-1", "created": False,
-                            "canceled": False, "compactRevision": "0", "cancelReason": "",
-                            "events": [],
-                        })
-                    elif case_id.endswith("-event"):
-                        request = create_request(45, -1)
-                        reply = cls._snapshot({
-                            "header": header(initial_revision + 1), "watchId": "45", "created": False,
-                            "canceled": False, "compactRevision": "0", "cancelReason": "",
-                            "events": [cls._snapshot({
-                                "type": 0,
-                                "kv": cls._snapshot({
-                                    "key": history_key, "createRevision": str(initial_revision),
-                                    "modRevision": str(initial_revision + 1), "version": "2",
-                                    "value": live_value, "lease": "0",
-                                }),
-                            })],
-                        })
-                    elif case_id.endswith("-cancelled"):
-                        request = cancel_request(45)
-                        reply = watch_response(
-                            45, initial_revision + 1, created=False, canceled=True,
-                        )
-                    else:
-                        raise AssertionError(f"unregistered J45 trace case {case_id}")
-                    records.append({
-                        "schema": "etcd-hbase-trace/v1", "case_id": case_id, "ordinal": 1,
-                        "method": expected["method"], "request": request, "response": reply,
-                        "error": None, "stream_terminal": None, "evidence_scope": descriptor["scope"],
-                        "elapsed_ns": "1",
-                    })
-                    continue
-
-                phase = "initial" if case_id.startswith("initial-") else "compacted"
-                if case_id.startswith(f"{phase}-watch-id-minus-one-"):
-                    base_id = f"{phase}-watch-id-minus-one"
-                    start_revision = 0
-                    watch_id = -1
+                    setup = cls._j45_negative_live_case(case_id)
                 else:
-                    start_name = next(name for name in ("minus-two", "minus-one", "zero", "future")
-                                      if case_id.startswith(f"{phase}-{name}-"))
-                    base_id = f"{phase}-{start_name}"
-                    start_revision = {"minus-two": -2, "minus-one": -1, "zero": 0, "future": 3}[start_name]
-                    watch_id = {-2: 41, -1: 42, 0: 43, 3: 44}[start_revision]
-                suffix = case_id[len(base_id) + 1:]
-                header_revision = initial_revision if phase == "initial" else compact_revision
-                compact_boundary = -1 if phase == "initial" else compact_revision
-                if suffix in {"created", "compacted"}:
-                    request = create_request(watch_id, start_revision)
-                    if suffix == "created":
-                        reply = watch_response(watch_id, header_revision, created=True, canceled=False)
-                    else:
-                        reply = watch_response(watch_id, 0, created=False, canceled=True,
-                                               compact=compact_boundary)
-                elif suffix == "duplicate-id":
-                    request = create_request(watch_id, 0)
-                    reply = watch_response(
-                        -1, header_revision, created=True, canceled=True,
-                        reason="mvcc: duplicate watch ID provided on the WatchStream",
-                    )
-                elif suffix in {"cancel-id", "cancelled", "reused-cancelled"}:
-                    request = cancel_request(watch_id)
-                    reply = watch_response(watch_id, header_revision, created=False, canceled=True)
-                elif suffix == "reused-created":
-                    request = create_request(watch_id, 0)
-                    reply = watch_response(watch_id, header_revision, created=True, canceled=False)
-                else:
-                    raise AssertionError(f"unregistered J45 trace case {case_id}")
-            records.append({
-                "schema": "etcd-hbase-trace/v1", "case_id": case_id, "ordinal": 1,
-                "method": expected["method"], "request": request, "response": reply,
-                "error": None, "stream_terminal": None, "evidence_scope": descriptor["scope"],
-                "elapsed_ns": "1",
-            })
+                    setup = cls._j45_start_matrix_case(case_id)
+            request, response = setup
+            records.append(cls._j45_trace_record(
+                case_id, expected["method"], request, response, descriptor["scope"]
+            ))
         return records
 
     @staticmethod
