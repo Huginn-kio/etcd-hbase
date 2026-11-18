@@ -41,6 +41,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -185,6 +186,88 @@ class EventTailerCycleTest {
     } finally {
       fixture.physical.complete(null);
       fixture.released.complete(null);
+    }
+  }
+
+  @Test
+  void successfulReadReportsPinReleaseFailure() throws Exception {
+    var fixture = new AsyncCheckpointFixture();
+    var releaseFailure = new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    try (var scope = RequestScope.withoutDeadline()) {
+      var result = fixture.cycle.run(Optional.empty(), scope);
+      assertTrue(fixture.started.await(5, TimeUnit.SECONDS));
+      CompletableFuture.runAsync(() -> fixture.request.complete(Optional.empty())).get(5, TimeUnit.SECONDS);
+      fixture.physical.complete(null);
+      fixture.pinClosed.get(5, TimeUnit.SECONDS);
+      assertFalse(result.isDone());
+
+      fixture.released.completeExceptionally(releaseFailure);
+
+      var observed = assertThrows(CompletionException.class, result::join);
+      assertSame(releaseFailure, io.etcdhbase.core.error.CompletionFailures.unwrapCompletion(observed));
+      assertEquals(0, fixture.budgets.snapshot().reservedBytes());
+    } finally {
+      fixture.physical.complete(null);
+      fixture.released.complete(null);
+    }
+  }
+
+  @Test
+  void readFailureRemainsPrimaryWhenPinReleaseAlsoFails() throws Exception {
+    var fixture = new AsyncCheckpointFixture();
+    var readFailure = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    var releaseFailure = new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    try (var scope = RequestScope.withoutDeadline()) {
+      var result = fixture.cycle.run(Optional.empty(), scope);
+      assertTrue(fixture.started.await(5, TimeUnit.SECONDS));
+      CompletableFuture.runAsync(() -> fixture.request.completeExceptionally(readFailure))
+          .get(5, TimeUnit.SECONDS);
+      fixture.physical.complete(null);
+      fixture.pinClosed.get(5, TimeUnit.SECONDS);
+      assertFalse(result.isDone());
+
+      fixture.released.completeExceptionally(releaseFailure);
+
+      var observed = assertThrows(CompletionException.class, result::join);
+      assertSame(readFailure, io.etcdhbase.core.error.CompletionFailures.unwrapCompletion(observed));
+      assertEquals(1, readFailure.getSuppressed().length);
+      assertSame(releaseFailure, readFailure.getSuppressed()[0]);
+      assertEquals(0, fixture.budgets.snapshot().reservedBytes());
+    } finally {
+      fixture.physical.complete(null);
+      fixture.released.complete(null);
+    }
+  }
+
+  @Test
+  void workerStopReportsChildPinReleaseFailureAfterDrain() throws Exception {
+    var fixture = new AsyncCheckpointFixture();
+    var timer = new ScheduledThreadPoolExecutor(1);
+    var worker = new EventHistoryWorker(timer, Optional::empty, fixture.cycle::run, mock(RequestMetrics.class));
+    var releaseFailure = new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    try {
+      worker.start();
+      assertTrue(fixture.started.await(5, TimeUnit.SECONDS));
+      worker.stop();
+      assertFalse(worker.drained().isDone());
+      verify(fixture.pin, never()).close();
+
+      fixture.physical.complete(null);
+      fixture.pinClosed.get(5, TimeUnit.SECONDS);
+      assertFalse(worker.drained().isDone());
+      fixture.released.completeExceptionally(releaseFailure);
+
+      var observed = assertThrows(ExecutionException.class,
+          () -> worker.drained().get(5, TimeUnit.SECONDS));
+      assertSame(releaseFailure,
+          io.etcdhbase.core.error.CompletionFailures.unwrapCompletion(observed.getCause()));
+      assertEquals(0, fixture.budgets.snapshot().reservedBytes());
+    } finally {
+      fixture.physical.complete(null);
+      fixture.released.complete(null);
+      worker.stop();
+      timer.shutdownNow();
+      timer.awaitTermination(5, TimeUnit.SECONDS);
     }
   }
 

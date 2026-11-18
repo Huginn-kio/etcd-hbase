@@ -87,7 +87,7 @@ final class EventBackfillCycle {
         try {
           result.complete(execute(owner, scope));
         } catch (Throwable failure) {
-          result.completeExceptionally(failure);
+          result.completeExceptionally(CompletionFailures.unwrapCompletionPreservingSuppressed(failure));
           if (failure instanceof Error fatal) throw fatal;
         } finally {
           drained.complete(null);
@@ -281,7 +281,8 @@ final class EventBackfillCycle {
       CompletableFuture<T> operation) {
     var result = new CompletableFuture<T>();
     operation.whenComplete((value, operationFailure) -> {
-      Throwable failure = operationFailure == null ? null : CompletionFailures.unwrapCompletion(operationFailure);
+      Throwable failure = operationFailure == null ? null
+          : CompletionFailures.unwrapCompletionPreservingSuppressed(operationFailure);
       try {
         window.close();
       } catch (RuntimeException | Error cleanup) {
@@ -292,7 +293,7 @@ final class EventBackfillCycle {
       window.releaseCompletion().whenComplete((ignored, releaseFailure) -> {
         Throwable settledFailure = primary;
         if (releaseFailure != null) {
-          Throwable cause = CompletionFailures.unwrapCompletion(releaseFailure);
+          Throwable cause = CompletionFailures.unwrapCompletionPreservingSuppressed(releaseFailure);
           if (settledFailure == null) settledFailure = cause;
           else if (settledFailure != cause) settledFailure.addSuppressed(cause);
         }
@@ -339,7 +340,7 @@ final class EventBackfillCycle {
 
     private Child(RequestScope parent) {
       scope = parent.childWithTimeoutNanos(parent.remainingDeadlineNanos());
-      drained = CompletableFuture.allOf(scope.cleanupCompletion().toCompletableFuture(),
+      drained = CompletableFuture.allOf(scope.cleanupOutcomeCompletion().toCompletableFuture(),
           scope.physicalProducersCompletion().toCompletableFuture());
       registration = parent.registerScopedCleanup(scope, drained);
     }

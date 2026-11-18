@@ -156,22 +156,36 @@ final class EventHistoryWorker {
       else if (failure != cleanup) failure.addSuppressed(cleanup);
     }
     Throwable primaryFailure = failure;
-    CompletableFuture.allOf(request.cleanupCompletion().toCompletableFuture(),
-        request.physicalProducersCompletion().toCompletableFuture()).whenComplete((ignored, drainProblem) -> {
-          Throwable settledFailure = primaryFailure;
-          if (drainProblem != null) {
-            Throwable cause = CompletionFailures.unwrapCompletion(drainProblem);
-            if (settledFailure == null) settledFailure = cause;
-            else if (settledFailure != cause) settledFailure.addSuppressed(cause);
-          }
-          if (request.cleanupFailureCount() != 0 && settledFailure == null) {
-            settledFailure = new IllegalStateException("event history cycle cleanup failed");
-          }
-          finish(request, result, settledFailure);
-        });
+    var cleanupFailure = request.cleanupOutcomeCompletion().handle((ignored, cleanupProblem) ->
+        cleanupProblem == null ? null
+            : CompletionFailures.unwrapCompletionPreservingSuppressed(cleanupProblem)).toCompletableFuture();
+    var producerFailure = request.physicalProducersCompletion().handle((ignored, producerProblem) ->
+        producerProblem == null ? null
+            : CompletionFailures.unwrapCompletionPreservingSuppressed(producerProblem)).toCompletableFuture();
+    CompletableFuture.allOf(cleanupFailure, producerFailure).whenComplete((ignored, outcomeFailure) -> {
+      Throwable settledFailure = primaryFailure == null
+          ? null : CompletionFailures.unwrapCompletionPreservingSuppressed(primaryFailure);
+      Throwable cleanupCause = cleanupFailure.join();
+      Throwable producerCause = producerFailure.join();
+      settledFailure = appendFailure(settledFailure, cleanupCause);
+      settledFailure = appendFailure(settledFailure, producerCause);
+
+      Throwable drainFailure = appendFailure(cleanupCause, producerCause);
+      if (request.cleanupFailureCount() != 0 && cleanupCause == null) {
+        Throwable unreportedFailure = new IllegalStateException("event history cycle cleanup failed");
+        settledFailure = appendFailure(settledFailure, unreportedFailure);
+        drainFailure = appendFailure(drainFailure, unreportedFailure);
+      }
+      if (outcomeFailure != null) {
+        Throwable cause = CompletionFailures.unwrapCompletionPreservingSuppressed(outcomeFailure);
+        settledFailure = appendFailure(settledFailure, cause);
+        drainFailure = appendFailure(drainFailure, cause);
+      }
+      finish(request, result, settledFailure, drainFailure);
+    });
   }
 
-  private void finish(RequestScope request, CycleResult result, Throwable failure) {
+  private void finish(RequestScope request, CycleResult result, Throwable failure, Throwable drainFailure) {
     boolean stopped = false;
     boolean finished = false;
     synchronized (lock) {
@@ -180,8 +194,9 @@ final class EventHistoryWorker {
       outstanding = false;
       if (!running) {
         stopped = true;
+        this.drainFailure = appendFailure(this.drainFailure, drainFailure);
       } else if (failure != null) {
-        Throwable cause = CompletionFailures.unwrapCompletion(failure);
+        Throwable cause = CompletionFailures.unwrapCompletionPreservingSuppressed(failure);
         lastFailure = Optional.of(cause instanceof BackendFailure backend
             ? backend.category() : BackendFailure.Category.UNKNOWN);
         metrics.recordEventHistoryFailure(lastFailure.orElseThrow());
@@ -199,6 +214,13 @@ final class EventHistoryWorker {
     }
     if (stopped) drainAfterExecutorStops();
     if (finished) complete.complete(null);
+  }
+
+  private static Throwable appendFailure(Throwable primary, Throwable additional) {
+    if (additional == null) return primary;
+    if (primary == null) return additional;
+    if (primary != additional) primary.addSuppressed(additional);
+    return primary;
   }
 
   private void drainAfterExecutorStops() {

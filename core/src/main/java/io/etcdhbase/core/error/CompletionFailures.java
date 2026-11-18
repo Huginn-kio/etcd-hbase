@@ -20,4 +20,30 @@ public final class CompletionFailures {
     }
     return current;
   }
+
+  /** Unwraps completion wrappers while moving their suppressed cleanup failures to the cause. */
+  public static Throwable unwrapCompletionPreservingSuppressed(Throwable failure) {
+    Throwable current = Objects.requireNonNull(failure, "failure");
+    Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+    while (current instanceof CompletionException && current.getCause() != null
+        && seen.add(current)) {
+      Throwable cause = current.getCause();
+      for (Throwable suppressed : current.getSuppressed()) {
+        if (suppressed == cause || seen.contains(suppressed)
+            || containsIdentity(cause.getSuppressed(), suppressed)) {
+          continue;
+        }
+        cause.addSuppressed(suppressed);
+      }
+      current = cause;
+    }
+    return current;
+  }
+
+  private static boolean containsIdentity(Throwable[] failures, Throwable target) {
+    for (Throwable failure : failures) {
+      if (failure == target) return true;
+    }
+    return false;
+  }
 }

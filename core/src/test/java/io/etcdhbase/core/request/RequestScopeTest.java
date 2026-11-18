@@ -97,6 +97,31 @@ class RequestScopeTest {
   }
 
   @Test
+  void exposesCleanupFailureOutcomeWithoutChangingCompletionContract() {
+    var scope = RequestScope.withoutDeadline();
+    var firstCompletion = new CompletableFuture<Void>();
+    var secondCompletion = new CompletableFuture<Void>();
+    var firstFailure = new IOException("first cleanup failed");
+    var secondFailure = new IOException("second cleanup failed");
+    scope.registerScopedCleanup(() -> {}, firstCompletion);
+    scope.registerScopedCleanup(() -> {}, secondCompletion);
+
+    scope.close();
+    firstCompletion.completeExceptionally(firstFailure);
+    assertFalse(scope.cleanupCompletion().toCompletableFuture().isDone());
+    assertFalse(scope.cleanupOutcomeCompletion().toCompletableFuture().isDone());
+    secondCompletion.completeExceptionally(secondFailure);
+
+    assertTrue(scope.cleanupCompletion().toCompletableFuture().isDone());
+    assertEquals(2, scope.cleanupFailureCount());
+    var observed = assertThrows(CompletionException.class,
+        () -> scope.cleanupOutcomeCompletion().toCompletableFuture().join());
+    assertSame(firstFailure, io.etcdhbase.core.error.CompletionFailures.unwrapCompletion(observed));
+    assertEquals(1, firstFailure.getSuppressed().length);
+    assertSame(secondFailure, firstFailure.getSuppressed()[0]);
+  }
+
+  @Test
   void rejectedCleanupExecutorRetainsTheCallersCleanupResponsibility() {
     var scope = RequestScope.withoutDeadline();
     var closes = new AtomicLong();

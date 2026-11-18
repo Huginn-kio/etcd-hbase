@@ -14,6 +14,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongSupplier;
 
@@ -60,8 +61,10 @@ public final class RequestScope implements AutoCloseable {
   private final Set<AutoCloseable> registrations =
       Collections.newSetFromMap(new IdentityHashMap<>());
   private final AtomicInteger cleanupFailureCount = new AtomicInteger();
+  private final AtomicReference<Throwable> firstCleanupFailure = new AtomicReference<>();
   private final StorageCostLedger storageCostLedger;
   private final CompletableFuture<Void> cleanupCompletion = new CompletableFuture<>();
+  private final CompletableFuture<Void> cleanupOutcomeCompletion = new CompletableFuture<>();
   private final CompletableFuture<Void> physicalProducersCompletion = new CompletableFuture<>();
   private boolean cancelled;
   private boolean closed;
@@ -196,6 +199,15 @@ public final class RequestScope implements AutoCloseable {
   /** Read-only completion of all resources registered before or during the closing batch. */
   public CompletionStage<Void> cleanupCompletion() {
     return cleanupCompletion.minimalCompletionStage();
+  }
+
+  /**
+   * Completes with the cleanup batch and exposes its failure outcome without changing
+   * {@link #cleanupCompletion()}'s always-successful completion contract. The first failure is
+   * primary and later cleanup failures are suppressed on it.
+   */
+  public CompletionStage<Void> cleanupOutcomeCompletion() {
+    return cleanupOutcomeCompletion.minimalCompletionStage();
   }
 
   /**
@@ -399,9 +411,9 @@ public final class RequestScope implements AutoCloseable {
     try {
       resource.close();
     } catch (Exception failure) {
-      if (actualCloseCompletion == null) cleanupFailureCount.incrementAndGet();
+      if (actualCloseCompletion == null) recordCleanupFailure(failure);
     } catch (Error failure) {
-      if (actualCloseCompletion == null) cleanupFailureCount.incrementAndGet();
+      if (actualCloseCompletion == null) recordCleanupFailure(failure);
       throw failure;
     } finally {
       if (actualCloseCompletion == null) {
@@ -410,7 +422,7 @@ public final class RequestScope implements AutoCloseable {
         // Another caller may own a still-running close. The closing batch observes that
         // attempt's outcome rather than treating the duplicate close's return as completion.
         actualCloseCompletion.whenComplete((ignored, failure) -> {
-          if (failure != null) cleanupFailureCount.incrementAndGet();
+          if (failure != null) recordCleanupFailure(failure);
           if (joinsClosingBatch) resourceClosed();
         });
       }
@@ -425,7 +437,20 @@ public final class RequestScope implements AutoCloseable {
       if (complete) cleanupFinished = true;
     }
     // Completion callbacks can re-enter this scope; never run them under its state lock.
-    if (complete) cleanupCompletion.complete(null);
+    if (complete) {
+      cleanupCompletion.complete(null);
+      Throwable failure = firstCleanupFailure.get();
+      if (failure == null) cleanupOutcomeCompletion.complete(null);
+      else cleanupOutcomeCompletion.completeExceptionally(failure);
+    }
+  }
+
+  private void recordCleanupFailure(Throwable failure) {
+    cleanupFailureCount.incrementAndGet();
+    Throwable primary = firstCleanupFailure.get();
+    if (primary == null && firstCleanupFailure.compareAndSet(null, failure)) return;
+    primary = firstCleanupFailure.get();
+    if (primary != failure) primary.addSuppressed(failure);
   }
 
   private static long deadline(long timeoutNanos, LongSupplier nanoTime) {

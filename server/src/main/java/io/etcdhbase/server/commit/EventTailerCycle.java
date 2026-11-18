@@ -180,9 +180,10 @@ final class EventTailerCycle {
       CompletableFuture<Void> drained = account == null ? child.drained : CompletableFuture.allOf(
           child.drained, account.termination().toCompletableFuture());
       return drained.handle((ignored, drainFailure) -> {
-        Throwable problem = primary;
+        Throwable problem = primary == null
+            ? null : CompletionFailures.unwrapCompletionPreservingSuppressed(primary);
         if (drainFailure != null) {
-          Throwable cause = CompletionFailures.unwrapCompletion(drainFailure);
+          Throwable cause = CompletionFailures.unwrapCompletionPreservingSuppressed(drainFailure);
           if (problem == null) problem = cause;
           else if (problem != cause) problem.addSuppressed(cause);
         }
@@ -215,7 +216,7 @@ final class EventTailerCycle {
           tailer.subscriptionCount());
       return result;
     }).exceptionallyCompose(failure -> {
-      Throwable cause = CompletionFailures.unwrapCompletion(failure);
+      Throwable cause = CompletionFailures.unwrapCompletionPreservingSuppressed(failure);
       if (tailer.isClosed()) pending.detachClosedEventTailer(tailer);
       metrics.recordEventTailerFailure(cause instanceof BackendFailure backend
           ? backend.category() : BackendFailure.Category.UNKNOWN);
@@ -277,7 +278,7 @@ final class EventTailerCycle {
 
     private Child(RequestScope parent) {
       scope = parent.childWithTimeoutNanos(parent.remainingDeadlineNanos());
-      drained = CompletableFuture.allOf(scope.cleanupCompletion().toCompletableFuture(),
+      drained = CompletableFuture.allOf(scope.cleanupOutcomeCompletion().toCompletableFuture(),
           scope.physicalProducersCompletion().toCompletableFuture());
       registration = parent.registerScopedCleanup(scope, drained);
     }
