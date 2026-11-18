@@ -23,7 +23,6 @@ public final class HBaseCommitDecisionRepository implements CommitDecisionReposi
 
   @Override
   public CompletableFuture<Optional<CommitDecision>> read(long sequence, RequestScope scope) {
-    ByteKey identity = identity(sequence);
     return readWithSize(sequence, scope).thenApply(SystemRecordRead::value);
   }
 
