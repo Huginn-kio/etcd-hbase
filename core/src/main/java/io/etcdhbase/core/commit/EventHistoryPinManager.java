@@ -16,6 +16,31 @@ public final class EventHistoryPinManager {
     CompletableFuture<Void> promoteRoot(Requirement previous, Requirement promoted, RequestScope scope);
   }
 
+  /** Couples a durable registration to the boundary it was created to protect. */
+  public static final class Protection implements AutoCloseable {
+    private final Pin pin;
+    private final Requirement requirement;
+    private final ByteKey registryIdentity;
+
+    private Protection(Pin pin, Requirement requirement, ByteKey registryIdentity) {
+      this.pin = Objects.requireNonNull(pin, "pin");
+      this.requirement = Objects.requireNonNull(requirement, "requirement");
+      this.registryIdentity = Objects.requireNonNull(registryIdentity, "registryIdentity");
+    }
+
+    Pin pin() { return pin; }
+    Requirement requirement() { return requirement; }
+    ByteKey registryIdentity() { return registryIdentity; }
+
+    public long generation() { return pin.generation(); }
+
+    public CompletableFuture<Void> renew(RequestScope scope) { return pin.renew(scope); }
+
+    public CompletionStage<Void> releaseCompletion() { return pin.releaseCompletion(); }
+
+    @Override public void close() { pin.close(); }
+  }
+
   private final SnapshotPinManager registry;
   private final Optional<ByteKey> namespace;
 
@@ -80,6 +105,15 @@ public final class EventHistoryPinManager {
     return registry.registerProtected(requirement.revision(), requirement.sequence(),
         requirement.digest(), requirement.transaction(), requirement.eventRoot().map(EventReference::identity),
         requirement.eventRoot().map(EventReference::digest), scope).thenApply(EventPin::new);
+  }
+
+  /** Registers a history floor and retains the proof that identifies what the returned pin covers. */
+  public CompletableFuture<Protection> registerProtection(
+      Requirement requirement, RequestScope scope) {
+    Objects.requireNonNull(requirement, "requirement");
+    ByteKey registeredIdentity = registryIdentity();
+    return register(requirement, scope).thenApply(pin ->
+        new Protection(pin, requirement, registeredIdentity));
   }
 
   private static SnapshotPinManager.PinRequirement pinRequirement(Requirement requirement) {

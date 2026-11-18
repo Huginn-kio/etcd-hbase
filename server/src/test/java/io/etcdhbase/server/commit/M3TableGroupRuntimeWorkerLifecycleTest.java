@@ -42,20 +42,49 @@ class M3TableGroupRuntimeWorkerLifecycleTest {
   }
 
   @Test
-  void eventHistoryWorkerStartsOnlyWhenTailerReadinessIsRequested() {
+  void eventHistoryWorkerStartsImmediatelyAndStartupReadinessWaitsForTailer() throws Exception {
     try (var scope = RequestScope.withoutDeadline()) {
       var pending = new M3TableGroupRuntime.Pending(scope, null, true);
+      var expiry = mock(LeaseExpiryWorker.class);
+      var expiryReady = new java.util.concurrent.CompletableFuture<Void>();
+      when(expiry.initialReadiness()).thenReturn(expiryReady);
+      pending.startExpiryWorker(expiry);
+
       var history = mock(EventHistoryWorker.class);
+      var historyReady = new java.util.concurrent.CompletableFuture<Void>();
+      when(history.initialReadiness()).thenReturn(historyReady);
       pending.installEventHistoryWorker(history);
 
-      verify(history, never()).start();
-      assertFalse(pending.eventTailerReady().isDone());
-      assertFalse(pending.eventTailerReady().isDone());
-
       verify(history, times(1)).start();
+      var ready = pending.initialReadiness();
+      assertFalse(ready.isDone(), "startup readiness waits for expiry, backfill and tailer readiness");
+      expiryReady.complete(null);
+      historyReady.complete(null);
+      assertFalse(ready.isDone(), "a healthy worker without an installed tailer is not ready");
+
+      var tailer = mock(SharedEventTailer.class);
+      when(tailer.isClosed()).thenReturn(false);
+      pending.installEventTailer(tailer);
+      ready.get(5, java.util.concurrent.TimeUnit.SECONDS);
       pending.ownerLost();
       verify(history).stop();
     }
+  }
+
+  @Test
+  void readinessRequiresEventPinsAHealthyWorkerAndAnOpenTailer() {
+    var history = mock(EventHistoryWorker.class);
+    var tailer = mock(SharedEventTailer.class);
+    when(tailer.isClosed()).thenReturn(false, true);
+
+    assertFalse(M3TableGroupRuntime.eventHistoryReady(false, history, tailer));
+    assertFalse(M3TableGroupRuntime.eventHistoryReady(true, history, tailer),
+        "a worker that has not completed its initial cycle cannot make the runtime ready");
+
+    when(history.isReady()).thenReturn(true);
+    assertTrue(M3TableGroupRuntime.eventHistoryReady(true, history, tailer));
+    assertFalse(M3TableGroupRuntime.eventHistoryReady(true, history, tailer),
+        "a closed tailer revokes runtime readiness");
   }
 
   @Test

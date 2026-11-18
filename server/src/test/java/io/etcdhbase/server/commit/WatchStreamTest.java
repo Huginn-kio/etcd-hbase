@@ -27,6 +27,8 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.etcdhbase.grpc.protocol.ResponseHeaderFactory;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.ServerCallStreamObserver;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -1097,6 +1099,30 @@ class WatchStreamTest {
   }
 
   @Test
+  void compactionDuringHistoricalReplaySendsCompactRevisionAfterCreated() {
+    var subscription = new RecordingSubscription();
+    subscription.termination = Optional.of(WatchTermination.compacted(4));
+    var session = new RecordingSession(6, true, subscription);
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(17, new byte[] {1}, new byte[0], 3, false));
+
+      assertEquals(2, observer.responses.size());
+      assertTrue(observer.responses.get(0).getCreated());
+      Rpc.WatchResponse cancelled = observer.responses.get(1);
+      assertTrue(cancelled.getCanceled());
+      assertEquals(17, cancelled.getWatchId());
+      assertEquals(6, cancelled.getHeader().getRevision());
+      assertEquals(4, cancelled.getCompactRevision());
+      assertEquals("", cancelled.getCancelReason());
+      assertEquals(1, subscription.closeCount.get());
+      stream.close();
+    }
+  }
+
+  @Test
   void negativeStartsBelowAnAdvancedCompactBoundaryReportTheNativeBoundary() {
     for (long startRevision : new long[] {-2, -1}) {
       var subscription = new RecordingSubscription();
@@ -1245,6 +1271,46 @@ class WatchStreamTest {
 
       stream.close();
       assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
+  void slowWatchResourceLimitDoesNotBlockReadyWatcherAfterBackpressure() {
+    var slow = new RecordingSubscription();
+    var fast = new RecordingSubscription();
+    var session = new RecordingSession(8, slow, fast);
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(31, new byte[] {1}, new byte[0], 0, false));
+      stream.onNext(createRequest(32, new byte[] {2}, new byte[0], 0, false));
+      int slowPollsBeforeBackpressure = slow.pollCalls;
+      int fastPollsBeforeBackpressure = fast.pollCalls;
+
+      observer.ready = false;
+      observer.readyHandler.run();
+      assertEquals(slowPollsBeforeBackpressure, slow.pollCalls,
+          "an unready transport stops requesting pages from the slow watch");
+      assertEquals(fastPollsBeforeBackpressure, fast.pollCalls,
+          "an unready transport stops requesting pages from the fast watch");
+
+      slow.termination = Optional.of(WatchTermination.resourceLimit(
+          "etcd-hbase: Watch subscription resource limit exceeded"));
+      fast.add(event(9, PreparedEvent.Kind.PUT, new byte[] {2}, new byte[] {9}, Optional.empty()));
+      observer.ready = true;
+      observer.readyHandler.run();
+
+      assertTrue(observer.responses.stream().anyMatch(response ->
+          response.getWatchId() == 31 && response.getCanceled()
+              && response.getCancelReason().contains("resource limit")));
+      assertTrue(observer.responses.stream().anyMatch(response ->
+          response.getWatchId() == 32 && response.getEventsCount() == 1
+              && response.getHeader().getRevision() == 9));
+      assertEquals(1, slow.closeCount.get());
+      assertEquals(0, fast.closeCount.get(), "one exhausted subscription leaves the fast watch active");
+      stream.close();
+      assertEquals(1, fast.closeCount.get());
     }
   }
 
@@ -1398,6 +1464,210 @@ class WatchStreamTest {
       assertFalse(observer.concurrentTerminalWrite,
           "onError must be delivered by the same serialized writer as onNext");
       stream.close();
+    }
+  }
+
+  @Test
+  void clientHalfCloseKeepsActiveWatchOpenUntilTheRpcContextIsCancelled() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(18, new byte[] {1}, new byte[0], 0, false));
+      stream.onCompleted();
+
+      assertFalse(observer.completed, "a client half-close must not terminate the response side");
+      assertEquals(0, subscription.closeCount.get(), "the active watch remains subscribed");
+      subscription.add(event(5, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {5}, Optional.empty()));
+      observer.readyHandler.run();
+
+      assertEquals(2, observer.responses.size());
+      assertTrue(observer.responses.get(0).getCreated());
+      assertEquals(1, observer.responses.get(1).getEventsCount());
+      assertEquals(5, observer.responses.get(1).getHeader().getRevision());
+      assertFalse(observer.completed);
+      assertEquals(0, subscription.closeCount.get());
+
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+      assertFalse(observer.completed,
+          "server cancellation cleans resources without claiming normal stream completion");
+    }
+  }
+
+  @Test
+  void emptyClientHalfCloseLeavesWatchRpcOpenLikeEtcd() {
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> {
+        throw new AssertionError("an empty half-close must not open a backend session");
+      });
+      stream.onCompleted();
+
+      assertTrue(observer.responses.isEmpty(), "an empty Watch stream has no response to send");
+      assertEquals(null, observer.failure);
+      assertFalse(observer.completed,
+          "etcd v3.5.23 keeps the Watch RPC open after request half-close, even without active watches");
+
+      stream.close();
+      assertFalse(observer.completed,
+          "peer cancellation cleans the stream without reporting normal completion");
+    }
+  }
+
+  @Test
+  void halfClosedRpcRemainsOpenAfterItsLastWatchIsCompacted() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(23, new byte[] {1}, new byte[0], 0, false));
+      stream.onCompleted();
+
+      subscription.termination = Optional.of(WatchTermination.compacted(4));
+      observer.readyHandler.run();
+
+      assertEquals(2, observer.responses.size());
+      assertTrue(observer.responses.get(0).getCreated());
+      Rpc.WatchResponse compacted = observer.responses.get(1);
+      assertTrue(compacted.getCanceled());
+      assertEquals(23, compacted.getWatchId());
+      assertEquals(4, compacted.getCompactRevision());
+      assertEquals(1, subscription.closeCount.get(), "compaction releases the final watch resources");
+      assertFalse(observer.completed,
+          "etcd v3.5.23 keeps the bidirectional RPC open after its final watch is canceled");
+
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+      assertFalse(observer.completed);
+    }
+  }
+
+  @Test
+  void clientHalfCloseAllowsAnAcceptedCreateToFinishAsynchronously() {
+    var subscription = new RecordingSubscription();
+    var observer = new RecordingObserver();
+    var opening = new CompletableFuture<WatchStream.Session>();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> opening);
+      stream.onNext(createRequest(19, new byte[] {1}, new byte[0], 0, false));
+      assertTrue(observer.responses.isEmpty(), "the session gate keeps the accepted create pending");
+
+      stream.onCompleted();
+      opening.complete(new RecordingSession(4, subscription));
+
+      assertEquals(1, observer.responses.size());
+      assertTrue(observer.responses.getFirst().getCreated(),
+          "a half-close does not discard an already accepted Create request");
+      assertFalse(observer.completed);
+      assertEquals(0, subscription.closeCount.get());
+
+      subscription.add(event(5, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {5}, Optional.empty()));
+      observer.readyHandler.run();
+
+      assertEquals(2, observer.responses.size());
+      assertEquals(5, observer.responses.getLast().getHeader().getRevision());
+      assertEquals(1, observer.responses.getLast().getEventsCount());
+      assertFalse(observer.completed);
+
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
+  void clientHalfCloseAllowsAnAcceptedSubscriptionToFinishAsynchronously() {
+    var subscription = new RecordingSubscription();
+    var observer = new RecordingObserver();
+    var opening = new CompletableFuture<WatchStream.OpenedWatch>();
+    WatchStream.Session session = new WatchStream.Session() {
+      @Override public long completedRevision() { return 4; }
+      @Override public CompletableFuture<Long> currentRevision() {
+        return CompletableFuture.completedFuture(4L);
+      }
+      @Override public CompletableFuture<WatchStream.OpenedWatch> subscribe(
+          KeyRange range, Rpc.WatchCreateRequest request) {
+        return opening;
+      }
+    };
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(),
+          () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(22, new byte[] {1}, new byte[0], 0, false));
+      assertTrue(observer.responses.isEmpty(), "the subscription gate keeps Create pending");
+
+      stream.onCompleted();
+      opening.complete(new WatchStream.OpenedWatch(4, 0, -1, subscription, false));
+
+      assertEquals(1, observer.responses.size());
+      assertTrue(observer.responses.getFirst().getCreated(),
+          "a half-close does not discard an accepted asynchronous subscription");
+      assertEquals(0, subscription.closeCount.get());
+      subscription.add(event(5, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {5}, Optional.empty()));
+      observer.readyHandler.run();
+
+      assertEquals(2, observer.responses.size());
+      assertEquals(5, observer.responses.getLast().getHeader().getRevision());
+      assertEquals(1, observer.responses.getLast().getEventsCount());
+      assertFalse(observer.completed);
+
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
+  void requestStreamErrorDuringPollClosesTheDetachedDelivery() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    var streamHolder = new AtomicReference<WatchStream>();
+    subscription.afterPoll = () -> streamHolder.get().onError(
+        new StatusRuntimeException(io.grpc.Status.CANCELLED));
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      streamHolder.set(stream);
+      subscription.add(event(5, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {5}, Optional.empty()));
+      stream.onNext(createRequest(20, new byte[] {1}, new byte[0], 0, false));
+
+      assertEquals(1, observer.responses.size(), "peer termination emits no further response");
+      assertTrue(observer.responses.getFirst().getCreated());
+      assertEquals(1, subscription.closeCount.get());
+      assertEquals(1, subscription.releases.get(), "a polled delivery is released after onError");
+      assertEquals(null, observer.failure, "the already failed request transport is not written again");
+    }
+  }
+
+  @Test
+  void replayAuthenticationAndPermissionFailuresUseTheirRpcStatus() {
+    for (BackendFailure.Category category : List.of(
+        BackendFailure.Category.AUTHENTICATION, BackendFailure.Category.PERMISSION)) {
+      var subscription = new RecordingSubscription();
+      subscription.termination = Optional.of(WatchTermination.failure(new BackendFailure(category)));
+      var session = new RecordingSession(4, subscription);
+      var observer = new RecordingObserver();
+
+      try (var scope = RequestScope.withoutDeadline()) {
+        var stream = stream(observer, scope, timers(),
+            () -> CompletableFuture.completedFuture(session));
+        stream.onNext(createRequest(21, new byte[] {1}, new byte[0], 0, false));
+
+        assertEquals(1, observer.responses.size());
+        assertTrue(observer.responses.getFirst().getCreated());
+        assertEquals(category == BackendFailure.Category.AUTHENTICATION
+            ? Status.Code.INVALID_ARGUMENT : Status.Code.PERMISSION_DENIED,
+            Status.fromThrowable(observer.failure).getCode());
+        assertEquals(1, subscription.closeCount.get());
+        stream.close();
+      }
     }
   }
 
@@ -1878,9 +2148,11 @@ class WatchStreamTest {
     private final AtomicInteger closeCount = new AtomicInteger();
     private RuntimeException closeFailure;
     private RuntimeException pollFailure;
+    private Optional<WatchTermination> termination = Optional.empty();
     private Runnable afterPoll;
     private Runnable wakeup;
-    private String terminationReason;
+    private int pollCalls;
+    private boolean liveDeliveryClosed;
     private boolean progressReady = true;
     private boolean closed;
 
@@ -1894,12 +2166,18 @@ class WatchStreamTest {
     }
 
     private void terminate(String reason) {
-      terminationReason = reason;
+      String normalized = reason.toLowerCase(java.util.Locale.ROOT);
+      termination = normalized.contains("resource limit") || normalized.contains("budget")
+          ? Optional.of(WatchTermination.resourceLimit(reason))
+          : normalized.contains("unavailable") || normalized.contains("closed")
+              ? Optional.of(WatchTermination.unavailable(reason))
+              : Optional.of(WatchTermination.cancelled(reason));
       if (wakeup != null) wakeup.run();
     }
 
     @Override public Optional<WatchStream.Delivery> poll() {
-      if (closed || terminationReason != null) return Optional.empty();
+      pollCalls++;
+      if (closed || liveDeliveryClosed || termination.isPresent()) return Optional.empty();
       if (pollFailure != null) throw pollFailure;
       WatchStream.Delivery delivery = deliveries.pollFirst();
       Runnable hook = afterPoll;
@@ -1908,21 +2186,27 @@ class WatchStreamTest {
       return Optional.ofNullable(delivery);
     }
 
-    @Override
-    public Optional<String> terminationReason() { return Optional.ofNullable(terminationReason); }
+    @Override public Optional<WatchTermination> termination() { return termination; }
 
     @Override public boolean progressReady(long revision) { return progressReady; }
 
     @Override
     public void setWakeup(Runnable wakeup) {
       this.wakeup = wakeup;
-      if (wakeup != null && (terminationReason != null || !deliveries.isEmpty())) wakeup.run();
+      if (wakeup != null && (termination.isPresent() || !deliveries.isEmpty())) wakeup.run();
+    }
+
+    @Override public void closeLiveDelivery() {
+      if (liveDeliveryClosed) return;
+      liveDeliveryClosed = true;
+      wakeup = null;
+      while (!deliveries.isEmpty()) deliveries.removeFirst().close();
     }
 
     @Override public void close() {
       if (closed) return;
       closed = true;
-      wakeup = null;
+      closeLiveDelivery();
       closeCount.incrementAndGet();
       while (!deliveries.isEmpty()) deliveries.removeFirst().close();
       if (closeFailure != null) throw closeFailure;
@@ -1935,6 +2219,7 @@ class WatchStreamTest {
     private Runnable cancelHandler;
     private boolean ready = true;
     private boolean cancelled;
+    private boolean completed;
     private int requests;
     private Throwable failure;
     private Runnable onNextHook;
@@ -1962,6 +2247,6 @@ class WatchStreamTest {
       concurrentTerminalWrite |= writingResponse;
       failure = cause;
     }
-    @Override public void onCompleted() {}
+    @Override public void onCompleted() { completed = true; }
   }
 }

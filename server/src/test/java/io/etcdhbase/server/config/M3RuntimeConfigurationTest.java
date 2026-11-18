@@ -35,8 +35,10 @@ class M3RuntimeConfigurationTest {
   void m4ExampleUsesExplicitLeaseTimingInputs() throws Exception {
     Path example = Path.of("..", "config", "examples", "m4", "activation.json");
     try (var input = Files.newInputStream(example)) {
-      var activation = new M3RuntimeConfigurationLoader().load(input);
+      var activation = new M3RuntimeConfigurationLoader(
+          M3RuntimeConfiguration.ActivationProfile.PUBLIC_TEST).load(input);
       assertTrue(activation.m4LeaseApiEnabled());
+      assertEquals(M3RuntimeConfiguration.ActivationProfile.PUBLIC_TEST, activation.activationProfile());
       assertEquals(5, activation.leaseMinTtlSeconds());
       assertEquals(1_000, activation.leaseClockUncertaintyMs());
       assertEquals(1_000, activation.leaseClockMaxDriftPpm());
@@ -44,6 +46,28 @@ class M3RuntimeConfigurationTest {
       assertEquals(4L << 20, activation.leaseCostLimits().maximumKeyBytes());
       assertEquals(32L << 20, activation.leaseCostLimits().maximumRevokeCostBytes());
       assertFalse(activation.readCacheEnabled());
+    }
+  }
+
+  @Test
+  void productionLoaderRejectsM4AndCannotBeOverriddenByJson() throws Exception {
+    Path example = Path.of("..", "config", "examples", "m4", "activation.json");
+    String enabled = Files.readString(example);
+    assertThrows(M3RuntimeConfiguration.LeaseActivationUnavailable.class,
+        () -> load(enabled));
+    String selfDeclaredProfile = enabled.replace("\"m4_lease_api_enabled\": true,",
+        "\"activation_profile\": \"PUBLIC_TEST\",\n  \"m4_lease_api_enabled\": true,");
+    assertThrows(IllegalArgumentException.class, () -> load(selfDeclaredProfile));
+  }
+
+  @Test
+  void publicTestProfileDoesNotChangeOrdinaryM3RuntimeConfiguration() throws Exception {
+    Path example = Path.of("..", "config", "examples", "m3", "activation.json");
+    try (var input = Files.newInputStream(example)) {
+      var activation = new M3RuntimeConfigurationLoader(
+          M3RuntimeConfiguration.ActivationProfile.PUBLIC_TEST).load(input);
+      assertFalse(activation.m4LeaseApiEnabled());
+      assertEquals(M3RuntimeConfiguration.ActivationProfile.PRODUCTION, activation.activationProfile());
     }
   }
 
@@ -66,7 +90,7 @@ class M3RuntimeConfigurationTest {
     var enabled = assertThrows(M3RuntimeConfiguration.CacheActivationUnavailable.class, () -> load(valid().replace(
         "\"pin_lease_ms\":60000", "\"pin_lease_ms\":60000,\"read_cache_enabled\":true")));
     assertTrue(enabled.getMessage().contains("identity lifecycle"));
-    assertThrows(IllegalArgumentException.class, () -> load(valid().replace(
+    assertThrows(IllegalArgumentException.class, () -> loadPublicTest(valid().replace(
         "\"pin_lease_ms\":60000", "\"pin_lease_ms\":60000,\"read_cache_enabled\":null")));
     assertThrows(IllegalArgumentException.class, () -> load(valid().replace(
         "\"pin_lease_ms\":60000", "\"pin_lease_ms\":60000,\"read_cache_enabled\":\"true\"")));
@@ -80,10 +104,10 @@ class M3RuntimeConfigurationTest {
   void m4ActivationRequiresExplicitMinimumTtlAndClockBounds() {
     String enabled = valid().replace("\"pin_lease_ms\":60000",
         "\"pin_lease_ms\":60000,\"m4_lease_api_enabled\":true");
-    assertThrows(IllegalArgumentException.class, () -> load(enabled));
-    assertThrows(IllegalArgumentException.class, () -> load(enabled.replace(
+    assertThrows(IllegalArgumentException.class, () -> loadPublicTest(enabled));
+    assertThrows(IllegalArgumentException.class, () -> loadPublicTest(enabled.replace(
         "\"m4_lease_api_enabled\":true", "\"m4_lease_api_enabled\":true,\"lease_min_ttl_seconds\":5")));
-    assertThrows(IllegalArgumentException.class, () -> load(valid().replace(
+    assertThrows(IllegalArgumentException.class, () -> loadPublicTest(valid().replace(
         "\"pin_lease_ms\":60000", "\"pin_lease_ms\":60000,\"m4_lease_api_enabled\":true,"
             + "\"lease_min_ttl_seconds\":5,\"lease_clock_uncertainty_ms\":1,"
             + "\"lease_clock_max_drift_ppm\":0")));
@@ -98,9 +122,10 @@ class M3RuntimeConfigurationTest {
             + "\"lease_min_ttl_seconds\":5,\"lease_clock_uncertainty_ms\":1000,"
             + "\"lease_clock_max_drift_ppm\":1000,\"lease_maximum_bindings\":1024,"
             + "\"lease_maximum_key_bytes\":4194304,\"lease_maximum_revoke_cost_bytes\":33554432");
-    assertThrows(IllegalArgumentException.class, () -> load(enabled.replace("536870912", "268435456")));
-    assertThrows(IllegalArgumentException.class, () -> load(enabled.replace("536870912", Long.toString(minimum - 1))));
-    assertEquals(minimum, load(enabled.replace("536870912", Long.toString(minimum))).memoryBytes());
+    assertThrows(IllegalArgumentException.class, () -> loadPublicTest(enabled.replace("536870912", "268435456")));
+    assertThrows(IllegalArgumentException.class,
+        () -> loadPublicTest(enabled.replace("536870912", Long.toString(minimum - 1))));
+    assertEquals(minimum, loadPublicTest(enabled.replace("536870912", Long.toString(minimum))).memoryBytes());
     assertEquals(268_435_456L, load(valid().replace("536870912", "268435456")).memoryBytes());
   }
 
@@ -109,17 +134,17 @@ class M3RuntimeConfigurationTest {
     String enabled = valid().replace("\"pin_lease_ms\":60000",
         "\"pin_lease_ms\":60000,\"m4_lease_api_enabled\":true,"
             + "\"lease_min_ttl_seconds\":5,\"lease_clock_uncertainty_ms\":1000");
-    assertThrows(IllegalArgumentException.class, () -> load(enabled));
+    assertThrows(IllegalArgumentException.class, () -> loadPublicTest(enabled));
     String withClockRate = enabled.replace("\"lease_clock_uncertainty_ms\":1000",
         "\"lease_clock_uncertainty_ms\":1000,\"lease_clock_max_drift_ppm\":1000");
-    assertThrows(IllegalArgumentException.class, () -> load(withClockRate));
+    assertThrows(IllegalArgumentException.class, () -> loadPublicTest(withClockRate));
     for (String field : new String[] {"lease_maximum_bindings", "lease_maximum_key_bytes",
         "lease_maximum_revoke_cost_bytes"}) {
       String withOneLimit = withClockRate.replace("\"lease_clock_max_drift_ppm\":1000",
           "\"lease_clock_max_drift_ppm\":1000,\"" + field + "\":1");
-      assertThrows(IllegalArgumentException.class, () -> load(withOneLimit));
+      assertThrows(IllegalArgumentException.class, () -> loadPublicTest(withOneLimit));
     }
-    assertThrows(IllegalArgumentException.class, () -> load(withClockRate.replace(
+    assertThrows(IllegalArgumentException.class, () -> loadPublicTest(withClockRate.replace(
         "\"lease_clock_max_drift_ppm\":1000",
         "\"lease_clock_max_drift_ppm\":1000,\"lease_maximum_bindings\":1025,"
             + "\"lease_maximum_key_bytes\":4194304,\"lease_maximum_revoke_cost_bytes\":33554432")));
@@ -140,6 +165,11 @@ class M3RuntimeConfigurationTest {
 
   private static M3RuntimeConfiguration load(String json) {
     return new M3RuntimeConfigurationLoader()
+        .load(new ByteArrayInputStream(json.getBytes(StandardCharsets.UTF_8)));
+  }
+
+  private static M3RuntimeConfiguration loadPublicTest(String json) {
+    return new M3RuntimeConfigurationLoader(M3RuntimeConfiguration.ActivationProfile.PUBLIC_TEST)
         .load(new ByteArrayInputStream(json.getBytes(StandardCharsets.UTF_8)));
   }
 

@@ -467,6 +467,76 @@ class M4ReportTest(unittest.TestCase):
 
             self.assertEqual("J46", summary["task"])
 
+    def test_j47_registry_requires_backpressure_compaction_and_cleanup_coverage(self) -> None:
+        for class_name, methods in m4_report.J47_CRITICAL_JAVA_TESTS.items():
+            for method_name in methods:
+                with self.subTest(class_name=class_name, method_name=method_name):
+                    changed = copy.deepcopy(self.registry)
+                    task = next(item for item in changed["tasks"] if item["id"] == "J47")
+                    suite = next(item for item in task["maven_tests"]
+                                 if item["class"] == class_name)
+                    suite["tests"].remove(method_name)
+                    expected = (
+                        "no named required tests" if len(suite["tests"]) == 0
+                        else "coverage is incomplete"
+                    )
+                    with self.assertRaisesRegex(m4_report.ReportError, expected):
+                        m4_report.validate_registry_document(changed)
+
+        changed = copy.deepcopy(self.registry)
+        task = next(item for item in changed["tasks"] if item["id"] == "J47")
+        task["go_tests"][0]["tests"].clear()
+        with self.assertRaisesRegex(m4_report.ReportError, "Go package has no named required tests"):
+            m4_report.validate_registry_document(changed)
+
+        missing_integration = copy.deepcopy(self.registry)
+        task = next(item for item in missing_integration["tasks"] if item["id"] == "J47")
+        task["maven_tests"] = [
+            suite for suite in task["maven_tests"]
+            if suite["class"] != "io.etcdhbase.server.M4WatchRpcIT"
+        ]
+        with self.assertRaisesRegex(m4_report.ReportError, "suites are incomplete"):
+            m4_report.validate_registry_document(missing_integration)
+
+    def test_complete_j47_artifact_requires_unit_native_and_minicluster_suites(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            self._write_valid_artifact(artifact, "J47")
+
+            summary = m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+            self.assertEqual("J47", summary["task"])
+            self.assertEqual("public-local-minicluster", summary["scope"])
+            self.assertEqual(2, summary["go_test_count"])
+            self.assertEqual(
+                sum(len(methods) for methods in m4_report.J47_CRITICAL_JAVA_TESTS.values()),
+                summary["java_test_count"],
+            )
+            self.assertEqual(
+                "J47-flow-control-compaction-cleanup-MiniCluster-HISTORY-NATIVE",
+                summary["evidence"],
+            )
+
+            run_path = artifact / "run.json"
+            original_run = run_path.read_bytes()
+            run = json.loads(original_run)
+            maven = next(command for command in run["commands"]
+                         if command["name"] == "maven-verify")
+            maven["argv"].remove(m4_report.J47_MAVEN_IT_SELECTOR)
+            run_path.write_text(json.dumps(run) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(m4_report.ReportError, "registered unit and MiniCluster"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+            run_path.write_bytes(original_run)
+
+            report = artifact / "server/target/failsafe-reports/TEST-unexpected.xml"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(
+                '<testsuite name="unexpected" tests="1" failures="0" errors="0" skipped="0">'
+                '<testcase name="unexpected"/></testsuite>', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(m4_report.ReportError, "only the registered unit and MiniCluster"):
+                m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
     def test_complete_j44_minicluster_artifact_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary)
@@ -928,7 +998,7 @@ class M4ReportTest(unittest.TestCase):
         self._write_run_manifest(artifact, task["id"], run_id, source_commit, base_commit, commands)
         self._write_go_test_events(artifact, task)
         self._write_maven_test_reports(artifact, task)
-        if task_id == "J46":
+        if task_id in {"J46", "J47"}:
             return
         suite_hash, prefix_hash = m4_report._scenario_hashes(m4_report.REPO, task, run_id)
         self._write_trace_artifacts(
@@ -953,6 +1023,26 @@ class M4ReportTest(unittest.TestCase):
     @staticmethod
     def _write_command_logs(artifact: Path, task_id: str, run_id: str) -> dict[str, str]:
         if task_id == "J46":
+            command_logs = {
+                "registry-check": "registry-check.log",
+                "report-tests": "report-tests.log",
+                "go-tests": "go-test.jsonl",
+                "maven-verify": "maven.log",
+                "collect-maven-reports": "maven-reports.log",
+            }
+            stderr_logs = {
+                "registry-check": "registry-check.stderr",
+                "report-tests": "report-tests.stderr",
+                "go-tests": "go-test.stderr",
+                "maven-verify": "maven.stderr.log",
+                "collect-maven-reports": "maven-reports.stderr",
+            }
+            for path in [*command_logs.values(), *stderr_logs.values()]:
+                target = artifact / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("completed\n", encoding="utf-8")
+            return command_logs
+        if task_id == "J47":
             command_logs = {
                 "registry-check": "registry-check.log",
                 "report-tests": "report-tests.log",
@@ -1016,8 +1106,8 @@ class M4ReportTest(unittest.TestCase):
             argv_by_name = {
                 "registry-check": ["python3", "scripts/verify/m4-report.py", "--validate-registry"],
                 "report-tests": ["python3", "scripts/verify/test_m4_report.py"],
-                "go-tests": ["scripts/dev/go-m0.sh", "test", "-json", "-count=1", "-run",
-                             go_test_pattern, "./internal/scenario"],
+                "go-tests": ["scripts/dev/go-m0.sh", "test", "-json", "-count=1",
+                             "-run", go_test_pattern, "./internal/scenario"],
                 "maven-verify": ["scripts/dev/mvn21.sh", "-B", "-ntp", "-pl", "server", "-am",
                                      "clean", "verify", "-Pm4-j46-public",
                                      m4_report.J46_MAVEN_TEST_SELECTOR,
@@ -1030,6 +1120,42 @@ class M4ReportTest(unittest.TestCase):
                 "registry-check": "registry-check.stderr", "report-tests": "report-tests.stderr",
                 "go-tests": "go-test.stderr",
                 "maven-verify": "maven.stderr.log",
+                "collect-maven-reports": "maven-reports.stderr",
+            }
+            return [
+                {
+                    "name": name,
+                    "argv": argv_by_name[name],
+                    "exit_code": 0,
+                    "started_at": "2026-11-18T00:00:00Z",
+                    "finished_at": "2026-11-18T00:00:01Z",
+                    "stdout_log": path,
+                    "stderr_log": stderr_by_name[name],
+                }
+                for name, path in command_logs.items()
+            ]
+        if task_id == "J47":
+            go_test_pattern = (
+                "^(TestM4WatchHalfCloseMatchesPinnedNativeOracle|"
+                "TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages)$"
+            )
+            argv_by_name = {
+                "registry-check": ["python3", "scripts/verify/m4-report.py", "--validate-registry"],
+                "report-tests": ["python3", "scripts/verify/test_m4_report.py"],
+                "go-tests": ["scripts/dev/go-m0.sh", "test", "-json", "-count=1",
+                             "-tags=m4watchintegration", "-run", go_test_pattern,
+                             "./internal/scenario"],
+                "maven-verify": ["scripts/dev/mvn21.sh", "-B", "-ntp", "-pl", "server", "-am",
+                                 "clean", "verify", "-Pm4-j47-public",
+                                 m4_report.J47_MAVEN_TEST_SELECTOR,
+                                 m4_report.J47_MAVEN_IT_SELECTOR,
+                                 "-Dsurefire.failIfNoSpecifiedTests=false",
+                                 m4_report.J47_FAILSAFE_EMPTY_MODULES],
+                "collect-maven-reports": ["collect-maven-reports"],
+            }
+            stderr_by_name = {
+                "registry-check": "registry-check.stderr", "report-tests": "report-tests.stderr",
+                "go-tests": "go-test.stderr", "maven-verify": "maven.stderr.log",
                 "collect-maven-reports": "maven-reports.stderr",
             }
             return [
@@ -1088,6 +1214,32 @@ class M4ReportTest(unittest.TestCase):
                     "finished_at": "2026-11-17T00:00:01Z",
                     "stdout_log": path,
                     "stderr_log": stderr_by_name[name],
+                }
+                for name, path in command_logs.items()
+            ]
+        if task_id in {"J40", "J41", "J42", "J43"}:
+            task = next(item for item in m4_report.load_registry()["tasks"]
+                        if item["id"] == task_id)
+            packages = sorted({f"./{item['package']}" for item in task["go_tests"]})
+            tests = sorted({name for item in task["go_tests"] for name in item["tests"]})
+            go_test_pattern = "^(?:" + "|".join(re.escape(name) for name in tests) + ")$"
+            argv_by_name = {
+                "go-module-lock": ["python3", "scripts/verify/go-module-lock.py"],
+                "go-tests": ["scripts/dev/go-m0.sh", "test", "-json", "-count=1", "-run",
+                             go_test_pattern, *packages],
+                "maven-verify": ["scripts/dev/mvn21.sh", "-B", "-ntp", "-pl", "server", "-am",
+                                 "clean", "verify", f"-Pm4-{task_id.lower()}-public"],
+                "collect-maven-reports": ["collect-maven-reports"],
+            }
+            return [
+                {
+                    "name": name,
+                    "argv": argv_by_name[name],
+                    "exit_code": 0,
+                    "started_at": "2026-11-14T00:00:00Z",
+                    "finished_at": "2026-11-14T00:00:01Z",
+                    "stdout_log": path,
+                    "stderr_log": "go-test.stderr" if name == "go-tests" else None,
                 }
                 for name, path in command_logs.items()
             ]

@@ -25,15 +25,16 @@ import (
 )
 
 const (
-	m4WatchJavaEndpointEnv = "ETCD_HBASE_M4_WATCH_ENDPOINT"
-	m4WatchJavaPrefixEnv   = "ETCD_HBASE_M4_WATCH_PREFIX"
-	m4WatchJavaEventCount  = 32
-	m4WatchJavaValueBytes  = 1536
-	m4WatchJavaUpdateBytes = 32
-	m4WatchJavaSeedBatch   = 8
-	m4WatchJavaRPCTimeout  = 10 * time.Second
-	m4WatchJavaTestTimeout = 90 * time.Second
-	m4WatchJavaRawWatchID  = int64(4601)
+	m4WatchJavaEndpointEnv       = "ETCD_HBASE_M4_WATCH_ENDPOINT"
+	m4WatchJavaPrefixEnv         = "ETCD_HBASE_M4_WATCH_PREFIX"
+	m4WatchJavaShutdownSignalEnv = "ETCD_HBASE_M4_WATCH_SHUTDOWN_SIGNAL"
+	m4WatchJavaEventCount        = 32
+	m4WatchJavaValueBytes        = 1536
+	m4WatchJavaUpdateBytes       = 32
+	m4WatchJavaSeedBatch         = 8
+	m4WatchJavaRPCTimeout        = 10 * time.Second
+	m4WatchJavaTestTimeout       = 90 * time.Second
+	m4WatchJavaRawWatchID        = int64(4601)
 )
 
 type m4WatchJavaFixture struct {
@@ -150,6 +151,152 @@ func TestM4WatchJavaServiceFragmentReplayAutoResumeAndLiveHandoff(t *testing.T) 
 	assertM4WatchJavaClientReplayAndHandoff(
 		t, testContext, client, replayPrefix,
 		replayUpdateRevision, replayFixtures)
+}
+
+func TestM4WatchJavaServiceHalfCloseAndDeadlineLifecycle(t *testing.T) {
+	endpoint := strings.TrimSpace(os.Getenv(m4WatchJavaEndpointEnv))
+	if endpoint == "" {
+		t.Skipf("set %s to run the Java WatchService lifecycle test", m4WatchJavaEndpointEnv)
+	}
+	prefixBase := strings.TrimSpace(os.Getenv(m4WatchJavaPrefixEnv))
+	if prefixBase == "" {
+		t.Fatalf("%s is required when %s is set", m4WatchJavaPrefixEnv, m4WatchJavaEndpointEnv)
+	}
+
+	testContext, cancelTest := context.WithTimeout(context.Background(), m4WatchJavaTestTimeout)
+	defer cancelTest()
+	client := newM4WatchJavaClient(t, endpoint)
+	prefix := newM4WatchJavaTestPrefix(t, prefixBase)
+	registerM4WatchJavaCleanup(t, client, prefix)
+	watchClient := etcdserverpb.NewWatchClient(client.ActiveConnection())
+
+	stream, cancelStream := openM4WatchJavaRawPrefixWatch(t, testContext, client, prefix, 0)
+	key := []byte(prefix + "half-close")
+	value := []byte("event-after-half-close")
+	if err := stream.CloseSend(); err != nil {
+		cancelStream()
+		t.Fatalf("half-close Java Watch request stream: %v", err)
+	}
+	putContext, cancelPut := context.WithTimeout(testContext, m4WatchJavaRPCTimeout)
+	put, err := client.KV.Put(putContext, string(key), string(value))
+	cancelPut()
+	if err != nil {
+		cancelStream()
+		t.Fatalf("write Java Watch event after half-close: %v", err)
+	}
+	event, err := receiveM4Watch(stream, "Java event after half-close")
+	if err != nil {
+		cancelStream()
+		t.Fatal(err)
+	}
+	if event.Header == nil || event.WatchId != m4WatchJavaRawWatchID || event.Created ||
+		event.Canceled || len(event.Events) != 1 || event.Events[0].Type != mvccpb.PUT ||
+		event.Events[0].Kv == nil || !bytes.Equal(event.Events[0].Kv.Key, key) ||
+		!bytes.Equal(event.Events[0].Kv.Value, value) ||
+		event.Header.Revision != put.Header.Revision ||
+		event.Events[0].Kv.ModRevision != put.Header.Revision {
+		cancelStream()
+		t.Fatalf("Java Watch did not keep its response side open after half-close: %v", event)
+	}
+	requireM4WatchOpenUntilContextCancellation(t, stream, cancelStream, "Java active Watch")
+
+	emptyContext, cancelEmpty := context.WithCancel(testContext)
+	emptyStream, err := watchClient.Watch(emptyContext)
+	if err != nil {
+		cancelEmpty()
+		t.Fatalf("open Java Watch stream with no active watches: %v", err)
+	}
+	if err := emptyStream.CloseSend(); err != nil {
+		cancelEmpty()
+		t.Fatalf("half-close Java empty Watch stream: %v", err)
+	}
+	requireM4WatchOpenUntilContextCancellation(t, emptyStream, cancelEmpty, "Java empty Watch")
+
+	deadlineContext, cancelDeadline := context.WithTimeout(testContext, 500*time.Millisecond)
+	defer cancelDeadline()
+	deadlineStream, err := watchClient.Watch(deadlineContext)
+	if err != nil {
+		t.Fatalf("open Java Watch with a deadline: %v", err)
+	}
+	deadlineKey := []byte(prefix + "deadline")
+	if err := sendM4WatchCreate(deadlineStream, &etcdserverpb.WatchCreateRequest{
+		Key: deadlineKey, WatchId: m4WatchJavaRawWatchID + 1,
+	}); err != nil {
+		t.Fatalf("create deadline-bound Java Watch: %v", err)
+	}
+	if err := requireM4WatchCreated(deadlineStream, m4WatchJavaRawWatchID+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deadlineStream.Recv(); err == nil || status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("Java Watch did not terminate at the client deadline: %v", err)
+	}
+}
+
+func TestM4WatchJavaServiceRuntimeShutdownCancelsHalfClosedWatch(t *testing.T) {
+	endpoint := strings.TrimSpace(os.Getenv(m4WatchJavaEndpointEnv))
+	if endpoint == "" {
+		t.Skipf("set %s to run the Java WatchService shutdown test", m4WatchJavaEndpointEnv)
+	}
+	prefixBase := strings.TrimSpace(os.Getenv(m4WatchJavaPrefixEnv))
+	if prefixBase == "" {
+		t.Fatalf("%s is required when %s is set", m4WatchJavaPrefixEnv, m4WatchJavaEndpointEnv)
+	}
+	signalPath := strings.TrimSpace(os.Getenv(m4WatchJavaShutdownSignalEnv))
+	if signalPath == "" {
+		t.Fatalf("%s is required when %s is set", m4WatchJavaShutdownSignalEnv, m4WatchJavaEndpointEnv)
+	}
+
+	testContext, cancelTest := context.WithTimeout(context.Background(), m4WatchJavaTestTimeout)
+	defer cancelTest()
+	client := newM4WatchJavaClientConfigured(t, endpoint, false)
+	defer func() {
+		if err := client.Close(); err != nil && !errors.Is(err, context.Canceled) &&
+			status.Code(err) != codes.Canceled {
+			t.Errorf("close Java WatchService client after runtime shutdown: %v", err)
+		}
+	}()
+	prefix := newM4WatchJavaTestPrefix(t, prefixBase)
+	stream, cancelStream := openM4WatchJavaRawPrefixWatch(t, testContext, client, prefix, 0)
+	defer cancelStream()
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("half-close Java Watch request stream before runtime shutdown: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		response, err := stream.Recv()
+		if err == nil {
+			if response == nil {
+				result <- errors.New("Java Watch returned a nil response after client half-close")
+				return
+			}
+			result <- fmt.Errorf("Java Watch emitted response before runtime shutdown: watch_id=%d events=%d canceled=%t",
+				response.WatchId, len(response.Events), response.Canceled)
+			return
+		}
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("client half-close ended the Java Watch before runtime shutdown: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := os.WriteFile(signalPath, []byte("watch-created-and-half-closed\n"), 0o600); err != nil {
+		t.Fatalf("publish the active Watch shutdown barrier: %v", err)
+	}
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("Java Watch returned a response instead of ending after runtime shutdown")
+		}
+		if code := status.Code(err); code != codes.Canceled && code != codes.Unavailable {
+			t.Fatalf("runtime shutdown returned unexpected Watch status %s: %v", code, err)
+		}
+	case <-testContext.Done():
+		t.Fatalf("runtime shutdown did not terminate the active Watch: %v", testContext.Err())
+	}
 }
 
 func newM4WatchJavaClient(t *testing.T, endpoint string) *clientv3.Client {

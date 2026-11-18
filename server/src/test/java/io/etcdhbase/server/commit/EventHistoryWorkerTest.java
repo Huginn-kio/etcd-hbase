@@ -83,6 +83,39 @@ class EventHistoryWorkerTest {
   }
 
   @Test
+  void readinessRequiresSuccessfulCycleAndIsRevokedAfterWorkerFailure() throws Exception {
+    var timer = new ScheduledThreadPoolExecutor(1);
+    var attempts = new AtomicInteger();
+    var failureStarted = new CountDownLatch(1);
+    var worker = new EventHistoryWorker(timer, () -> Optional.of(OWNER), (owner, scope) -> {
+      if (attempts.incrementAndGet() == 1) {
+        return CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(false, false));
+      }
+      failureStarted.countDown();
+      return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }, new RequestMetrics());
+    try {
+      assertFalse(worker.isReady());
+      worker.start();
+      worker.initialReadiness().get(5, TimeUnit.SECONDS);
+      assertTrue(worker.isReady(), "the first successful event-history cycle establishes readiness");
+
+      assertTrue(failureStarted.await(5, TimeUnit.SECONDS));
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (worker.state() != EventHistoryWorker.State.RETRYING && System.nanoTime() < deadline) {
+        TimeUnit.MILLISECONDS.sleep(1);
+      }
+      assertEquals(EventHistoryWorker.State.RETRYING, worker.state());
+      assertFalse(worker.isReady(), "a failed background worker must revoke readiness while it retries");
+    } finally {
+      worker.stop();
+      worker.drained().get(10, TimeUnit.SECONDS);
+      timer.shutdownNow();
+      assertTrue(timer.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
   void stopCancelsActiveCycleAndWaitsForLaneCleanup() throws Exception {
     var timer = new ScheduledThreadPoolExecutor(1);
     var lane = new SerialMutationQueue(0, 1024, 1, 1024, Duration.ofSeconds(5));

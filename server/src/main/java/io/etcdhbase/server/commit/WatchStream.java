@@ -70,9 +70,10 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   interface Subscription extends AutoCloseable {
     Optional<Delivery> poll();
-    Optional<String> terminationReason();
+    Optional<WatchTermination> termination();
     void setWakeup(Runnable wakeup);
     default boolean progressReady(long revision) { return true; }
+    default void closeLiveDelivery() {}
     @Override void close();
   }
 
@@ -606,7 +607,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     boolean stopped;
     WatchRegistry.Rejection rejection = WatchRegistry.Rejection.NONE;
     synchronized (lock) {
-      stopped = terminal || peerCancelled || inboundClosed;
+      // Half-close stops new requests, but a create accepted before it still owns completion.
+      stopped = terminal || peerCancelled;
       if (!stopped) rejection = watchRegistry.checkCreate(request.getWatchId());
       if (stopped) processingRequest = false;
     }
@@ -681,7 +683,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     WatchRegistry.Registration registration = null;
     boolean stopped;
     synchronized (lock) {
-      stopped = terminal || peerCancelled || inboundClosed;
+      // Preserve an already accepted create across client half-close.
+      stopped = terminal || peerCancelled;
       if (!stopped) {
         long minimumEventRevision = request.getStartRevision() <= 0
             ? nextRevision(opened.revision()) : request.getStartRevision();
@@ -757,7 +760,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     boolean stopped;
     WatchRegistry.Registration registration = null;
     synchronized (lock) {
-      stopped = terminal || peerCancelled || inboundClosed;
+      // A compacted accepted create must still receive its Created/Canceled response.
+      stopped = terminal || peerCancelled;
       if (!stopped) {
         registration = watchRegistry.retainCompacted(request.getWatchId());
         if (registration.rejection() == WatchRegistry.Rejection.NONE) {
@@ -893,8 +897,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       ProgressBarrier limit = streamProgress != null ? streamProgress : watchProgress;
       WatchEventBatchEncoder.Poll poll;
       synchronized (watcher) { poll = eventBatchEncoder.nextBatch(watcher, limit == null ? null : limit.revision()); }
-      if (poll.terminationReason() != null) {
-        terminateWatcher(watcher, poll.terminationReason());
+      if (poll.termination() != null) {
+        terminateWatcher(watcher, poll.termination());
         advanceWatchIndex(index);
         return PumpResult.ADVANCED;
       }
@@ -946,8 +950,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       }
       return PumpResult.ADVANCED;
     } catch (BackendFailure oversizedEvent) {
-      terminateWatcher(watcher,
-          "etcd-hbase: Watch response exceeds the configured message budget");
+      terminateWatcher(watcher, WatchTermination.resourceLimit(
+          "etcd-hbase: Watch response exceeds the configured message budget"));
       return PumpResult.ADVANCED;
     } finally {
       if (!transferred) output.release();
@@ -1159,7 +1163,11 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     refreshProgressNotifySchedule();
   }
 
-  private void terminateWatcher(WatchRegistry.Watcher watcher, String reason) {
+  private void terminateWatcher(WatchRegistry.Watcher watcher, WatchTermination termination) {
+    if (termination.kind() == WatchTermination.Kind.FAILURE) {
+      fail(termination.failure());
+      return;
+    }
     Session currentSession;
     synchronized (lock) {
       if (!watchRegistry.removeActive(watcher.id(), watcher)) return;
@@ -1169,7 +1177,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     try {
       watcher.close();
     } catch (RuntimeException | Error failure) {
-      completeTerminationResponse(watcher.id(), reason, null, failure);
+      completeTerminationResponse(watcher.id(), termination, null, failure);
       if (failure instanceof Error fatal) throw fatal;
       return;
     }
@@ -1180,16 +1188,17 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
           ? java.util.concurrent.CompletableFuture.completedFuture(0L)
           : Objects.requireNonNull(currentSession.currentRevision(), "current Watch revision future");
     } catch (RuntimeException | Error failure) {
-      completeTerminationResponse(watcher.id(), reason, null, failure);
+      completeTerminationResponse(watcher.id(), termination, null, failure);
       if (failure instanceof Error fatal) throw fatal;
       return;
     }
     revision.whenComplete((currentRevision, failure) -> executeCompletion(
-        () -> completeTerminationResponse(watcher.id(), reason, currentRevision, failure),
+        () -> completeTerminationResponse(watcher.id(), termination, currentRevision, failure),
         ignored -> releasePendingTerminationResponse()));
   }
 
-  private void completeTerminationResponse(long watchId, String reason, Long revision, Throwable failure) {
+  private void completeTerminationResponse(
+      long watchId, WatchTermination termination, Long revision, Throwable failure) {
     Throwable cause = failure == null ? null : unwrap(failure);
     if (cause == null && (revision == null || revision < 0)) {
       cause = new IllegalStateException("Watch session revision is invalid");
@@ -1197,7 +1206,12 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     synchronized (lock) {
       releasePendingTerminationResponseLocked();
       if (terminal || peerCancelled) return;
-      if (cause == null) enqueueResponse(cancelledResponse(watchId, revision, reason), this::requestNext);
+      if (cause == null) {
+        Rpc.WatchResponse response = termination.kind() == WatchTermination.Kind.COMPACTED
+            ? compactedResponse(watchId, revision, termination.compactRevision())
+            : cancelledResponse(watchId, revision, termination.reason());
+        enqueueResponse(response, this::requestNext);
+      }
     }
     if (cause != null) {
       fail(cause);

@@ -41,7 +41,8 @@ public record M3RuntimeConfiguration(
     long leaseMaximumKeyBytes,
     long leaseMaximumRevokeCostBytes,
     @JsonProperty(required = false) String ownerInstanceId,
-    @JsonProperty(required = false) OwnerForwardingSettings ownerForwarding) {
+    @JsonProperty(required = false) OwnerForwardingSettings ownerForwarding,
+    @JsonProperty(value = "activation_profile", required = false) ActivationProfile activationProfile) {
   private static final long MIN_MEMORY = 256L << 20;
   private static final long MAX_MEMORY = 1L << 40;
 
@@ -49,6 +50,15 @@ public record M3RuntimeConfiguration(
     private static final long serialVersionUID = 1L;
     public CacheActivationUnavailable() {
       super("read cache requires verified identity lifecycle and coverage proofs");
+    }
+  }
+
+  public enum ActivationProfile { PRODUCTION, PUBLIC_TEST }
+
+  public static final class LeaseActivationUnavailable extends IllegalArgumentException {
+    private static final long serialVersionUID = 1L;
+    public LeaseActivationUnavailable() {
+      super("M4 Lease activation requires an explicit PUBLIC_TEST profile until J51 identity lifecycle is ready");
     }
   }
 
@@ -96,7 +106,23 @@ public record M3RuntimeConfiguration(
     this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
         maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
         m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs, leaseClockMaxDriftPpm,
-        leaseMaximumBindings, leaseMaximumKeyBytes, leaseMaximumRevokeCostBytes, null, null);
+        leaseMaximumBindings, leaseMaximumKeyBytes, leaseMaximumRevokeCostBytes, null, null,
+        ActivationProfile.PRODUCTION);
+  }
+
+  /** Preserve the full constructor while keeping its activation profile fail-closed. */
+  public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
+      int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
+      int pinShards, int pinSlotsPerShard, int pinLeaseMs, boolean readCacheEnabled,
+      boolean m4LeaseApiEnabled, long leaseMinTtlSeconds, long leaseClockUncertaintyMs,
+      int leaseClockMaxDriftPpm, int leaseMaximumBindings, long leaseMaximumKeyBytes,
+      long leaseMaximumRevokeCostBytes, String ownerInstanceId,
+      OwnerForwardingSettings ownerForwarding) {
+    this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
+        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
+        m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs, leaseClockMaxDriftPpm,
+        leaseMaximumBindings, leaseMaximumKeyBytes, leaseMaximumRevokeCostBytes, ownerInstanceId,
+        ownerForwarding, ActivationProfile.PRODUCTION);
   }
 
   /** Existing callers retain the disabled-cache behavior. */
@@ -108,7 +134,8 @@ public record M3RuntimeConfiguration(
         0,
         LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
-        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null);
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null,
+        ActivationProfile.PRODUCTION);
   }
 
   /** Preserve callers that explicitly set the disabled-cache state. */
@@ -119,7 +146,8 @@ public record M3RuntimeConfiguration(
         maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
         false, 1, 1_000, 0, LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
-        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null);
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null,
+        ActivationProfile.PRODUCTION);
   }
 
   /** Preserve callers that predate the explicit J41 Lease revocation limits. */
@@ -132,12 +160,17 @@ public record M3RuntimeConfiguration(
         m4LeaseApiEnabled, leaseMinTtlSeconds, leaseClockUncertaintyMs, 0,
         LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
-        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null);
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null,
+        ActivationProfile.PRODUCTION);
   }
 
   public M3RuntimeConfiguration {
     if (readCacheEnabled) {
       throw new CacheActivationUnavailable();
+    }
+    if (activationProfile == null) activationProfile = ActivationProfile.PRODUCTION;
+    if (m4LeaseApiEnabled && activationProfile != ActivationProfile.PUBLIC_TEST) {
+      throw new LeaseActivationUnavailable();
     }
     if (memberId == null || !memberId.matches("[1-9][0-9]{0,19}")) {
       throw new IllegalArgumentException("member ID must be an explicit nonzero uint64");

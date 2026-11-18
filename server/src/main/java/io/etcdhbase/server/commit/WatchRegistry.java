@@ -118,8 +118,8 @@ final class WatchRegistry {
 
     synchronized boolean isClosed() { return closed; }
 
-    synchronized Optional<String> terminationReason() {
-      return closed ? Optional.empty() : subscription.terminationReason();
+    synchronized Optional<WatchTermination> termination() {
+      return closed ? Optional.empty() : subscription.termination();
     }
 
     @Override
@@ -131,6 +131,7 @@ final class WatchRegistry {
       Throwable failure = null;
       if (delivery != null) failure = WatchCleanup.closeAndCollect(delivery::close, failure);
       failure = WatchCleanup.closeAndCollect(() -> subscription.setWakeup(null), failure);
+      failure = WatchCleanup.closeAndCollect(subscription::closeLiveDelivery, failure);
       failure = WatchCleanup.closeAndCollect(subscription::close, failure);
       WatchCleanup.throwIfPresent(failure);
     }

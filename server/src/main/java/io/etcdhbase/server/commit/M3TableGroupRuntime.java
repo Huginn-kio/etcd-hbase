@@ -831,6 +831,11 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     Objects.requireNonNull(leaseTime, "leaseTime");
     return ownerReady && leaseTime.map(source -> source.observe().healthy()).orElse(true);
   }
+  static boolean eventHistoryReady(boolean eventPinsReady, EventHistoryWorker history,
+      SharedEventTailer tailer) {
+    return eventPinsReady && history != null && history.isReady()
+        && tailer != null && !tailer.isClosed();
+  }
 
   public boolean isReady() { return runtimeReady(resources.isReady(), leaseTime); }
   public CompletableFuture<Void> drained() { return resources.drained.copy(); }
@@ -936,7 +941,6 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     private volatile LeaseExpiryWorker expiryWorker;
     private volatile EventHistoryWorker eventHistoryWorker;
     private volatile boolean leaseEnabled;
-    private boolean eventHistoryWorkerStarted;
     private boolean ownerLost;
 
     Pending(RequestScope startup, ScheduledExecutorService leaseTimers) {
@@ -1022,16 +1026,10 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         throw new IllegalStateException("event history worker cannot be installed now");
       }
       eventHistoryWorker = worker;
-    }
-
-    private void startEventHistoryWorkerOnDemand() {
-      if (closing.get() || ownerLost || eventTailer != null || eventHistoryWorkerStarted
-          || eventHistoryWorker == null) return;
-      eventHistoryWorkerStarted = true;
       try {
-        eventHistoryWorker.start();
+        worker.start();
       } catch (RuntimeException | Error failure) {
-        eventHistoryWorkerStarted = false;
+        eventHistoryWorker = null;
         throw failure;
       }
     }
@@ -1077,18 +1075,33 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     }
 
     synchronized CompletableFuture<SharedEventTailer> eventTailerReady() {
-      startEventHistoryWorkerOnDemand();
       return eventTailerReady.copy();
     }
 
-    private CompletableFuture<Void> initialReadiness() {
+    CompletableFuture<Void> initialReadiness() {
       if (!leaseEnabled) return CompletableFuture.completedFuture(null);
       LeaseExpiryWorker current = expiryWorker;
       if (current == null) {
         return CompletableFuture.failedFuture(
             new IllegalStateException("Lease expiry worker was not installed"));
       }
-      return current.initialReadiness();
+      EventHistoryWorker history = eventHistoryWorker;
+      if (history == null) {
+        return CompletableFuture.failedFuture(
+            new IllegalStateException("event history worker was not installed"));
+      }
+      CompletableFuture<Void> historyReady = history.initialReadiness();
+      historyReady.whenComplete((ignored, failure) -> {
+        if (failure != null) eventTailerReady.completeExceptionally(failure);
+      });
+      CompletableFuture<Void> tailerReady = eventTailerReady.thenApply(tailer -> {
+        if (tailer.isClosed()) {
+          throw new java.util.concurrent.CompletionException(
+              new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        }
+        return null;
+      });
+      return CompletableFuture.allOf(current.initialReadiness(), historyReady, tailerReady);
     }
 
     synchronized void ownerLost() {
@@ -1108,7 +1121,10 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       M3OwnerLease current = owner;
       if (closing.get() || current == null || !current.isReady()) return false;
       LeaseExpiryWorker expiry = expiryWorker;
-      return !leaseEnabled || eventPins != null && expiry != null && expiry.isReady();
+      if (!leaseEnabled) return true;
+      EventHistoryWorker history = eventHistoryWorker;
+      return expiry != null && expiry.isReady()
+          && eventHistoryReady(eventPins != null, history, eventTailer);
     }
 
     private void close() {

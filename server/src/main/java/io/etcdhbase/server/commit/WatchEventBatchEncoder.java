@@ -25,7 +25,7 @@ final class WatchEventBatchEncoder {
     void release() { WatchCleanup.throwIfPresent(releaseDeliveries(deliveries, null)); }
   }
 
-  record Poll(Output output, boolean consumed, String terminationReason) {}
+  record Poll(Output output, boolean consumed, WatchTermination termination) {}
 
   private final long clusterId;
   private final long memberId;
@@ -48,8 +48,8 @@ final class WatchEventBatchEncoder {
     try {
       WatchStream.Delivery first = watcher.takeNext();
       if (first == null) {
-        String terminationReason = watcher.terminationReason().orElse(null);
-        return new Poll(null, terminationReason != null, terminationReason);
+        WatchTermination termination = watcher.termination().orElse(null);
+        return new Poll(null, termination != null, termination);
       }
 
       if (maximumRevision != null && first.revision() > maximumRevision) {
@@ -73,7 +73,8 @@ final class WatchEventBatchEncoder {
         if (overflow != null) {
           if (overflow.revision() == revision) {
             overflow.close();
-            return new Poll(null, true, "etcd-hbase: Watch revision exceeds the configured aggregation budget");
+            return new Poll(null, true, WatchTermination.resourceLimit(
+                "etcd-hbase: Watch revision exceeds the configured aggregation budget"));
           }
           watcher.defer(overflow);
         }
@@ -95,7 +96,7 @@ final class WatchEventBatchEncoder {
 
       Rpc.WatchResponse built = response.build();
       if (built.getSerializedSize() > maximumResponseBytes && !watcher.fragment()) {
-        return new Poll(null, true, OVERSIZED_RESPONSE_REASON);
+        return new Poll(null, true, WatchTermination.resourceLimit(OVERSIZED_RESPONSE_REASON));
       }
       Output output = new Output(built, deliveries);
       transferred = true;

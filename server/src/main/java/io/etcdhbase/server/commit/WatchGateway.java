@@ -218,7 +218,7 @@ final class WatchGateway {
         return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
             state.publishedSequence(), state.compactRevision(),
             new TailerSubscription(subscription, subscriptionCleanup, account,
-                stateMemoryCleanup, null,
+                stateMemoryCleanup, null, null,
                 state.publishedSequence())));
       }
       if (request.getStartRevision() <= 0) {
@@ -227,7 +227,7 @@ final class WatchGateway {
             state.publishedSequence(),
             state.compactRevision() == 0 ? -1 : state.compactRevision(),
             new TailerSubscription(subscription, subscriptionCleanup, account,
-                stateMemoryCleanup, null,
+                stateMemoryCleanup, null, null,
                 state.publishedSequence())));
       }
       if (request.getStartRevision() <= revision) {
@@ -236,25 +236,35 @@ final class WatchGateway {
               state.publishedSequence(),
               state.compactRevision() == 0 ? -1 : state.compactRevision(),
               new TailerSubscription(subscription, subscriptionCleanup, account,
-                  stateMemoryCleanup, null,
+                  stateMemoryCleanup, null, null,
                   state.publishedSequence())));
         }
         subscription.requireRevisionAtLeast(nextRevision(revision));
         var barrierSnapshot = snapshot.orElseThrow(WatchGateway::unavailable);
         return WatchHistoryReplay.open(tableGroup, range, request.getStartRevision(),
             barrierSnapshot, state.publishedSequence(), authorization, historyPins, selectedEvents,
-            budgets, account).thenApply(result -> new WatchStream.OpenedWatch(
-                result.revision(), result.sequence(),
-                result.compactRevision() == 0 ? -1 : result.compactRevision(),
-                new TailerSubscription(subscription, subscriptionCleanup, account,
-                    stateMemoryCleanup,
-                    result.replay().orElse(null), result.sequence()), result.replay().isPresent()));
+            budgets, account, streamScope).thenApply(result -> {
+              var opened = new java.util.concurrent.atomic.AtomicReference<WatchStream.OpenedWatch>();
+              boolean active = streamScope.startIfOpen(() -> {
+                var tailerSubscription = new TailerSubscription(subscription,
+                    subscriptionCleanup, account, stateMemoryCleanup, result.replay().orElse(null),
+                    result.cleanup().orElse(null), result.sequence());
+                opened.set(new WatchStream.OpenedWatch(result.revision(), result.sequence(),
+                    result.compactRevision() == 0 ? -1 : result.compactRevision(),
+                    tailerSubscription, result.replay().isPresent()));
+              });
+              if (!active) {
+                result.closeUntransferredReplay();
+                throw unavailable();
+              }
+              return opened.get();
+            });
       }
       return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
           state.publishedSequence(),
           state.compactRevision() == 0 ? -1 : state.compactRevision(),
           new TailerSubscription(subscription, subscriptionCleanup, account,
-              stateMemoryCleanup, null,
+              stateMemoryCleanup, null, null,
               state.publishedSequence())));
     }
 
@@ -267,14 +277,6 @@ final class WatchGateway {
 
   private static long nextRevision(long revision) {
     return revision == Long.MAX_VALUE ? Long.MAX_VALUE : revision + 1;
-  }
-
-  static String cancelReason(SharedEventTailer.Termination reason) {
-    return switch (reason) {
-      case RESOURCE_LIMIT -> "etcd-hbase: Watch subscription resource limit exceeded";
-      case TAILER_CLOSED -> "etcd-hbase: Watch event source is unavailable";
-      case CANCELLED -> "etcd-hbase: Watch subscription was cancelled";
-    };
   }
 
   private static long retainedStateBytes(KeyRange range) {
@@ -309,28 +311,32 @@ final class WatchGateway {
     private final BudgetManager.Account account;
     private final RequestScope.ScopedCleanup stateMemoryCleanup;
     private final WatchHistoryReplay history;
+    private final RequestScope.ScopedCleanup historyCleanup;
     private final long barrierSequence;
+    private boolean liveDeliveryClosed;
     private boolean closed;
 
     private TailerSubscription(SharedEventTailer.Subscription subscription,
         RequestScope.ScopedCleanup subscriptionCleanup, BudgetManager.Account account,
         RequestScope.ScopedCleanup stateMemoryCleanup,
-        WatchHistoryReplay history, long barrierSequence) {
+        WatchHistoryReplay history, RequestScope.ScopedCleanup historyCleanup,
+        long barrierSequence) {
       this.subscription = subscription;
       this.subscriptionCleanup = subscriptionCleanup;
       this.account = account;
       this.stateMemoryCleanup = stateMemoryCleanup;
       this.history = history;
+      this.historyCleanup = historyCleanup;
       this.barrierSequence = barrierSequence;
     }
 
     @Override
     public synchronized Optional<WatchStream.Delivery> poll() {
-      if (closed) return Optional.empty();
+      if (closed || liveDeliveryClosed) return Optional.empty();
       if (history != null) {
         Optional<WatchStream.Delivery> replayed = history.poll();
         if (replayed.isPresent()) return replayed;
-        if (!history.complete() || history.terminationReason().isPresent()) return Optional.empty();
+        if (!history.complete() || history.termination().isPresent()) return Optional.empty();
       }
       Optional<SharedEventTailer.Delivery> polled;
       do {
@@ -344,8 +350,8 @@ final class WatchGateway {
           candidate.close();
           polled = Optional.empty();
         }
-      } while (polled.isEmpty() && !closed);
-      if (closed) {
+      } while (polled.isEmpty() && !closed && !liveDeliveryClosed);
+      if (closed || liveDeliveryClosed) {
         polled.ifPresent(SharedEventTailer.Delivery::close);
         return Optional.empty();
       }
@@ -354,14 +360,21 @@ final class WatchGateway {
     }
 
     @Override
-    public synchronized Optional<String> terminationReason() {
-      if (closed) return Optional.empty();
+    public synchronized Optional<WatchTermination> termination() {
+      if (liveDeliveryClosed) return Optional.empty();
       if (history != null) {
-        Optional<String> historyTermination = history.terminationReason();
+        Optional<WatchTermination> historyTermination = history.termination();
         if (historyTermination.isPresent()) return historyTermination;
         if (!history.complete()) return Optional.empty();
       }
-      return subscription.termination().map(WatchGateway::cancelReason);
+      return subscription.termination().map(reason -> switch (reason) {
+        case RESOURCE_LIMIT -> WatchTermination.resourceLimit(
+            "etcd-hbase: Watch subscription resource limit exceeded");
+        case TAILER_CLOSED -> WatchTermination.unavailable(
+            "etcd-hbase: Watch event source is unavailable");
+        case CANCELLED -> WatchTermination.cancelled(
+            "etcd-hbase: Watch subscription was cancelled");
+      });
     }
 
     @Override
@@ -370,27 +383,64 @@ final class WatchGateway {
     }
 
     @Override
-    public synchronized void setWakeup(Runnable wakeup) {
-      if (closed) return;
-      if (history != null) history.setWakeup(wakeup);
-      subscription.setWakeup(wakeup);
+    public void setWakeup(Runnable wakeup) {
+      synchronized (this) {
+        if (closed || liveDeliveryClosed) return;
+        if (history != null) history.setWakeup(wakeup);
+        subscription.setWakeup(wakeup);
+      }
+    }
+
+    @Override
+    public synchronized void closeLiveDelivery() {
+      if (closed || liveDeliveryClosed) return;
+      liveDeliveryClosed = true;
+      Throwable failure = WatchCleanup.closeAndCollect(() -> subscription.setWakeup(null), null);
+      failure = WatchCleanup.closeAndCollect(
+          () -> closeScopedCleanup(subscriptionCleanup, "Watch subscription cleanup failed"), failure);
+      WatchCleanup.throwIfPresent(failure);
     }
 
     @Override
     public synchronized void close() {
       if (closed) return;
-      closed = true;
-      Throwable failure = WatchCleanup.closeAndCollect(() -> subscription.setWakeup(null), null);
-      if (history != null) {
-        failure = WatchCleanup.closeAndCollect(() -> history.setWakeup(null), failure);
-        failure = WatchCleanup.closeAndCollect(history::close, failure);
+      RuntimeException failure = null;
+      try {
+        closeLiveDelivery();
+      } catch (RuntimeException cleanup) {
+        failure = cleanup;
       }
-      failure = WatchCleanup.closeAndCollect(
-          () -> closeScopedCleanup(subscriptionCleanup, "Watch subscription cleanup failed"), failure);
-      failure = WatchCleanup.closeAndCollect(
-          () -> closeScopedCleanup(stateMemoryCleanup, "Watch state memory cleanup failed"), failure);
-      failure = WatchCleanup.closeAndCollect(account::close, failure);
-      WatchCleanup.throwIfPresent(failure);
+      try {
+        subscriptionCleanup.close();
+      } catch (Exception cleanup) {
+        RuntimeException wrapped = new IllegalStateException(
+            "Watch subscription cleanup registration failed", cleanup);
+        if (failure == null) failure = wrapped;
+        else if (cleanup != failure) failure.addSuppressed(wrapped);
+      }
+      closed = true;
+      try {
+        if (historyCleanup != null) historyCleanup.close();
+        else if (history != null) history.close();
+      } catch (Exception cleanup) {
+        RuntimeException wrapped = new IllegalStateException(
+            "Watch history cleanup registration failed", cleanup);
+        if (failure == null) failure = wrapped;
+        else if (cleanup != failure) failure.addSuppressed(wrapped);
+      }
+      try {
+        closeScopedCleanup(stateMemoryCleanup, "Watch state memory cleanup failed");
+      } catch (RuntimeException cleanup) {
+        if (failure == null) failure = cleanup;
+        else if (cleanup != failure) failure.addSuppressed(cleanup);
+      }
+      try {
+        account.close();
+      } catch (RuntimeException cleanup) {
+        if (failure == null) failure = cleanup;
+        else if (cleanup != failure) failure.addSuppressed(cleanup);
+      }
+      if (failure != null) throw failure;
     }
   }
 }

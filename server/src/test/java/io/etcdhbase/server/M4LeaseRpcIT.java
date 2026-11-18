@@ -439,7 +439,8 @@ class M4LeaseRpcIT {
         2, 16, 60_000, false, true, 5, 1_000, 1_000,
         LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
-        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes(), null, null,
+        M3RuntimeConfiguration.ActivationProfile.PUBLIC_TEST);
   }
 
 
@@ -2676,7 +2677,8 @@ class M4LeaseRpcIT {
         base.maxEtcdRequestBytes(), base.pinShards(), base.pinSlotsPerShard(), base.pinLeaseMs(),
         base.readCacheEnabled(), base.m4LeaseApiEnabled(), base.leaseMinTtlSeconds(),
         base.leaseClockUncertaintyMs(), base.leaseClockMaxDriftPpm(), base.leaseMaximumBindings(),
-        base.leaseMaximumKeyBytes(), base.leaseMaximumRevokeCostBytes(), instanceId, forwarding);
+        base.leaseMaximumKeyBytes(), base.leaseMaximumRevokeCostBytes(), instanceId, forwarding,
+        base.activationProfile());
   }
 
   private static Rpc.PutResponse putThrough(RuntimeServer server, String key, long expectedMemberId)
@@ -3039,7 +3041,7 @@ class M4LeaseRpcIT {
     tree.put("member_id", memberId).put("owner_lease_ms", ownerLeaseMillis)
         .put("heartbeat_ms", heartbeatMillis)
         .put("m4_lease_api_enabled", enableLeaseApi);
-    return new M3RuntimeConfigurationLoader()
+    return new M3RuntimeConfigurationLoader(M3RuntimeConfiguration.ActivationProfile.PUBLIC_TEST)
         .load(new ByteArrayInputStream(mapper.writeValueAsBytes(tree)));
   }
 

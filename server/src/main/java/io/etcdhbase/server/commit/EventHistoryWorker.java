@@ -38,6 +38,7 @@ final class EventHistoryWorker {
   private final RequestMetrics metrics;
   private final CompletableFuture<Void> drained = new CompletableFuture<>();
   private final CompletableFuture<Void> complete = new CompletableFuture<>();
+  private final CompletableFuture<Void> initiallyReady = new CompletableFuture<>();
   private final AtomicBoolean drainStarted = new AtomicBoolean();
   private ScheduledFuture<?> scheduled;
   private RequestScope service;
@@ -76,6 +77,14 @@ final class EventHistoryWorker {
   Optional<BackendFailure.Category> lastFailure() { synchronized (lock) { return lastFailure; } }
   CompletableFuture<Void> drained() { return drained.copy(); }
   CompletableFuture<Void> completion() { return complete.copy(); }
+  CompletableFuture<Void> initialReadiness() { return initiallyReady.copy(); }
+
+  boolean isReady() {
+    synchronized (lock) {
+      return started && running && initiallyReady.isDone() && !initiallyReady.isCompletedExceptionally()
+          && lastFailure.isEmpty();
+    }
+  }
 
   void stop() {
     RequestScope cancel;
@@ -91,6 +100,8 @@ final class EventHistoryWorker {
       idle = !outstanding;
     }
     complete.completeExceptionally(new CancellationException("event history worker stopped"));
+    initiallyReady.completeExceptionally(
+        new CancellationException("event history worker stopped before becoming ready"));
     cycles.shutdown();
     if (cancel != null) cancel.cancelAsync(CLEANUP);
     if (idle) drainAfterExecutorStops();
@@ -107,6 +118,7 @@ final class EventHistoryWorker {
       lastFailure = Optional.of(BackendFailure.Category.UNAVAILABLE);
       metrics.recordEventHistoryFailure(BackendFailure.Category.UNAVAILABLE);
       complete.completeExceptionally(failure);
+      initiallyReady.completeExceptionally(failure);
       cycles.shutdown();
       drainAfterExecutorStops();
     }
@@ -205,10 +217,12 @@ final class EventHistoryWorker {
       } else if (result.finished()) {
         lastFailure = Optional.empty();
         state = State.COMPLETE;
+        initiallyReady.complete(null);
         finished = true;
       } else {
         lastFailure = Optional.empty();
         state = State.WAITING;
+        initiallyReady.complete(null);
         schedule(result.progressed() ? PROGRESS_DELAY_MILLIS : IDLE_DELAY_MILLIS);
       }
     }

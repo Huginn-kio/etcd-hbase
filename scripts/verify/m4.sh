@@ -29,7 +29,7 @@ while (($#)); do
       artifact_request="$2"; seen_artifact=true; shift 2 ;;
     --help)
       cat <<'USAGE'
-用法：scripts/verify/m4.sh --scope public --task J40|J41|J42|J43|J44|J45|J46 --artifact-root .artifacts/m4/<fresh-run-id>
+用法：scripts/verify/m4.sh --scope public --task J40|J41|J42|J43|J44|J45|J46|J47 --artifact-root .artifacts/m4/<fresh-run-id>
      或 scripts/verify/m4.sh --scope public --all --artifact-root .artifacts/m4/<fresh-run-id>
 USAGE
       exit 0 ;;
@@ -51,7 +51,7 @@ if [[ "$run_all" == true ]]; then
   exit 2
 fi
 if [[ "$task" != J40 && "$task" != J41 && "$task" != J42 && "$task" != J43 && \
-      "$task" != J44 && "$task" != J45 && "$task" != J46 ]]; then
+      "$task" != J44 && "$task" != J45 && "$task" != J46 && "$task" != J47 ]]; then
   echo "M4 task is not registered for public execution: $task" >&2
   exit 2
 fi
@@ -240,6 +240,10 @@ if [[ "$task" == J45 ]]; then
 elif [[ "$task" == J46 ]]; then
   run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
     -run '^TestM4WatchProgressRequestMatchesPinnedNativeOracle$' ./internal/scenario
+elif [[ "$task" == J47 ]]; then
+  run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
+    -tags=m4watchintegration \
+    -run '^(TestM4WatchHalfCloseMatchesPinnedNativeOracle|TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages)$' ./internal/scenario
 elif [[ "$task" != J44 ]]; then
   run_logged go-module-lock go-module-lock.log go-module-lock.stderr python3 scripts/verify/go-module-lock.py
   run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
@@ -266,6 +270,11 @@ elif [[ "$task" == J46 ]]; then
   maven_goal=verify
   maven_command=maven-verify
   maven_extra_args=(-Dtest=WatchHistoryReplayTest,WatchStreamTest,WatchResponseFragmenterTest,WatchGatewayTest -Dit.test=M4WatchRpcIT -Dsurefire.failIfNoSpecifiedTests=false -Dfailsafe.failIfNoSpecifiedTests=false)
+elif [[ "$task" == J47 ]]; then
+  maven_profile=m4-j47-public
+  maven_goal=verify
+  maven_command=maven-verify
+  maven_extra_args=(-Dtest=WatchHistoryReplayTest,WatchStreamTest,WatchGatewayTest,EventHistoryWorkerTest,M3TableGroupRuntimeWorkerLifecycleTest,SealedEventCursorTest,M3RuntimeConfigurationTest -Dit.test=J47WatchReplayGcIT,M4WatchRpcIT#pinnedGoClientVerifiesHalfCloseAndDeadlineLifecycleOnBothLayouts+pinnedGoClientVerifiesRuntimeShutdownCancelsHalfClosedWatchOnBothLayouts+pinnedGoClientVerifiesRegistrationDiscoveryLifecycleOnBothLayouts+pinnedGoClientVerifiesCombinedLeaseAndWatchReplayLoadOnBothLayouts -Dsurefire.failIfNoSpecifiedTests=false -Dfailsafe.failIfNoSpecifiedTests=false)
 fi
 run_logged "$maven_command" maven.log maven.stderr.log scripts/dev/mvn21.sh -B -ntp \
   -pl server -am clean "$maven_goal" -P"$maven_profile" "${maven_extra_args[@]}"

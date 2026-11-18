@@ -622,6 +622,39 @@ class SealedEventCursorTest {
   }
 
   @Test
+  void sequenceReaderRejectsProtectionFromAnotherEventRegistry() throws Exception {
+    Fixture fixture = new Fixture();
+    var localRecords = new MemoryRecords();
+    var foreignRecords = new MemoryRecords();
+    var configuration = new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1));
+    try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var localPins = EventHistoryPinManager.initializeFresh(
+          localRecords, configuration, Clock.systemUTC(), setup).join();
+      var foreignPins = EventHistoryPinManager.initializeFresh(
+          foreignRecords, configuration, Clock.systemUTC(), setup).join();
+      try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5));
+           BudgetManager.Account account = fixture.account(scope)) {
+        var requirement = new EventHistoryPinManager.Requirement(11, 3, fixture.digest,
+            Optional.empty(), Optional.empty());
+        var foreignProtection = foreignPins.registerProtection(requirement, scope).join();
+        try {
+          assertFalse(foreignProtection.registryIdentity().equals(localPins.registryIdentity()));
+          var reader = fixture.sequenceReader(localPins, fixture.finalizedState(), Optional.empty());
+          var budget = new ManifestCatalog.ProofReadBudget(scope, account, 5, 1024L << 20);
+          var failure = assertThrows(CompletionException.class,
+              () -> reader.openUnderProtection(3, 10, fixture.digest, foreignProtection, scope, budget).join());
+          assertTrue(failure.getCause() instanceof IllegalArgumentException);
+          assertEquals(0, fixture.controlReads.get(), "foreign protection must be rejected before storage reads");
+          assertEquals(0, fixture.decisionReads.get(), "foreign protection must not read local decisions");
+        } finally {
+          foreignProtection.close();
+          foreignProtection.releaseCompletion().toCompletableFuture().join();
+        }
+      }
+    }
+  }
+
+  @Test
   void sequenceReaderMayReadSelectedSlotBeforeItsIndexIsFinalized() throws Exception {
     Fixture fixture = new Fixture();
     var records = new MemoryRecords();

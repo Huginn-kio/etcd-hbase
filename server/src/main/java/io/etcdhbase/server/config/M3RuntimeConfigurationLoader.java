@@ -8,10 +8,23 @@ import java.io.InputStream;
 /** Loads the explicit M3 activation file without resolving credentials or contacting HBase. */
 public final class M3RuntimeConfigurationLoader {
   private final StrictConfigurationJson json = new StrictConfigurationJson();
+  private final M3RuntimeConfiguration.ActivationProfile activationProfile;
+
+  /** Production is the default; only trusted test wiring may select PUBLIC_TEST. */
+  public M3RuntimeConfigurationLoader() {
+    this(M3RuntimeConfiguration.ActivationProfile.PRODUCTION);
+  }
+
+  public M3RuntimeConfigurationLoader(M3RuntimeConfiguration.ActivationProfile activationProfile) {
+    this.activationProfile = java.util.Objects.requireNonNull(activationProfile, "activationProfile");
+  }
 
   public M3RuntimeConfiguration load(InputStream input) {
     var tree = json.read(input);
     if (tree instanceof ObjectNode object) {
+      if (object.has("activation_profile")) {
+        throw new IllegalArgumentException("activation_profile is controlled by trusted runtime code");
+      }
       if (!object.has("read_cache_enabled")) object.put("read_cache_enabled", false);
       else if (object.path("read_cache_enabled").isBoolean() && object.path("read_cache_enabled").booleanValue()) {
         throw new M3RuntimeConfiguration.CacheActivationUnavailable();
@@ -21,6 +34,12 @@ public final class M3RuntimeConfigurationLoader {
         throw new IllegalArgumentException("m4_lease_api_enabled must be a boolean");
       }
       boolean m4LeaseApiEnabled = object.path("m4_lease_api_enabled").booleanValue();
+      if (m4LeaseApiEnabled
+          && activationProfile != M3RuntimeConfiguration.ActivationProfile.PUBLIC_TEST) {
+        throw new M3RuntimeConfiguration.LeaseActivationUnavailable();
+      }
+      object.put("activation_profile", (m4LeaseApiEnabled
+          ? activationProfile : M3RuntimeConfiguration.ActivationProfile.PRODUCTION).name());
       if (!object.has("lease_min_ttl_seconds")) {
         if (m4LeaseApiEnabled) {
           throw new IllegalArgumentException("M4 Lease activation requires lease_min_ttl_seconds");

@@ -5,10 +5,20 @@ import io.etcdhbase.core.request.RequestScope;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.function.BiFunction;
 
 /** Reads the next selected sequence under a durable event-history pin. */
 public final class SelectedSequenceReader {
+  /** A finalized revision index disappeared; callers may recheck the authoritative compact row. */
+  public static final class MissingFinalizedRevisionIndex extends IllegalStateException {
+    private static final long serialVersionUID = 1L;
+
+    public MissingFinalizedRevisionIndex() {
+      super("finalized event revision index is missing");
+    }
+  }
+
   private final EventHistoryPinManager pins;
   private final CommitControlStore control;
   private final SelectedDecisionReader decisions;
@@ -74,6 +84,43 @@ public final class SelectedSequenceReader {
   }
 
   /**
+   * Reads an event under an existing replay pin whose sequence floor covers it. This avoids
+   * registering a child pin below a GC registration floor while the parent pin remains active.
+   */
+  public CompletableFuture<Optional<Selected>> openUnderProtection(long sequence, long baseRevision,
+      ByteKey authorizationDigest, EventHistoryPinManager.Protection protection,
+      RequestScope scope, ManifestCatalog.ProofReadBudget budget) {
+    Objects.requireNonNull(authorizationDigest, "authorizationDigest");
+    Objects.requireNonNull(protection, "protection");
+    Objects.requireNonNull(scope, "scope");
+    Objects.requireNonNull(budget, "budget");
+    EventHistoryPinManager.Requirement covering = protection.requirement();
+    long revision = nextRevision(baseRevision);
+    if (sequence <= 0 || baseRevision <= 0 || authorizationDigest.length() != 32
+        || covering.revision() > revision || covering.sequence() > sequence
+        || !protection.registryIdentity().equals(pins.registryIdentity())
+        || !covering.authorizationDigest().equals(authorizationDigest)
+        || !budget.belongsTo(scope)) {
+      return CompletableFuture.failedFuture(new IllegalArgumentException(
+          "selected event is outside its durable replay protection"));
+    }
+    BorrowedEventPin borrowedPin = new BorrowedEventPin(protection);
+    var protectedCursor = new ProtectedEventCursor(borrowedPin, scope);
+    CompletableFuture<Optional<Selected>> read;
+    try {
+      read = read(sequence, baseRevision, protectedCursor, borrowedPin, covering, scope, budget,
+          Optional.empty(), Optional.empty(), false);
+    } catch (RuntimeException | Error failure) {
+      protectedCursor.close();
+      if (failure instanceof Error fatal) throw fatal;
+      return CompletableFuture.failedFuture(failure);
+    }
+    read.whenComplete((ignored, failure) -> { if (failure != null) protectedCursor.close(); });
+    read.whenComplete((ignored, failure) -> { if (read.isCancelled()) scope.cancel(); });
+    return read;
+  }
+
+  /**
    * Finds the next event-bearing decision without reading every intervening metadata-only sequence.
    * An unchanged authoritative revision proves that the selected prefix contains no KV events;
    * otherwise the complete revision index must locate the next event before the prefix is skipped.
@@ -133,7 +180,7 @@ public final class SelectedSequenceReader {
       if (barrier.finalizedRevision() < revision) {
         return pendingEventSequence(barrier, revision - 1, revision);
       }
-      throw new IllegalStateException("finalized event revision index is missing");
+      throw new MissingFinalizedRevisionIndex();
     });
   }
 
@@ -181,7 +228,7 @@ public final class SelectedSequenceReader {
                   completedSequence, completedRevision, nextRevision)));
         })
         .thenCompose(located -> read(located.sequence(), completedRevision, protectedCursor,
-            pin, requirement, scope, budget, Optional.empty(), located.index()).thenApply(found -> {
+            pin, requirement, scope, budget, Optional.empty(), located.index(), true).thenApply(found -> {
               Selected selected = found.orElseThrow(
                   () -> new IllegalStateException("indexed event is not selected by the control barrier"));
               if (selected.decision().sequence() != located.sequence()
@@ -262,7 +309,7 @@ public final class SelectedSequenceReader {
         authorizationDigest, Optional.empty(), Optional.empty());
     return withPin(requirement, scope, (protectedCursor, pin) ->
         read(sequence, baseRevision, protectedCursor, pin, requirement, scope, budget, legacy,
-            Optional.empty()));
+            Optional.empty(), true));
   }
 
   private <T> CompletableFuture<T> withPin(EventHistoryPinManager.Requirement requirement,
@@ -305,7 +352,7 @@ public final class SelectedSequenceReader {
       ProtectedEventCursor protectedCursor, EventHistoryPinManager.Pin pin,
       EventHistoryPinManager.Requirement pinRequirement, RequestScope scope,
       ManifestCatalog.ProofReadBudget budget, Optional<EventIndexBackfillCheckpoint> legacy,
-      Optional<EventRevisionIndex> locatedIndex) {
+      Optional<EventRevisionIndex> locatedIndex, boolean promoteRoot) {
     return protectedCursor.renew().thenCompose(ignored -> readControl(scope, budget)).thenCompose(state -> {
       validateControl(state, baseRevision, legacy);
       if (sequence > state.publishedSequence()) return closeEmpty(protectedCursor);
@@ -320,7 +367,7 @@ public final class SelectedSequenceReader {
           ManifestRoot root = foundRoot.orElseThrow(
               () -> new IllegalStateException("selected manifest root is missing"));
           validateRoot(decision, root);
-          CompletableFuture<Void> rootProtection = decision.containsKeyChanges()
+          CompletableFuture<Void> rootProtection = decision.containsKeyChanges() && promoteRoot
               ? promoteEventRoot(decision, root, pin, pinRequirement, protectedCursor, scope)
               : CompletableFuture.completedFuture(null);
           return rootProtection.thenCompose(ignored -> readSelectedIndex(decision, root, scope, budget,
@@ -441,5 +488,36 @@ public final class SelectedSequenceReader {
   private static CompletableFuture<Optional<Selected>> closeEmpty(ProtectedEventCursor pin) {
     pin.close();
     return pin.releaseCompletion().thenApply(ignored -> Optional.<Selected>empty()).toCompletableFuture();
+  }
+
+  private static final class BorrowedEventPin implements EventHistoryPinManager.Pin {
+    private final EventHistoryPinManager.Protection protection;
+
+    private BorrowedEventPin(EventHistoryPinManager.Protection protection) {
+      this.protection = Objects.requireNonNull(protection, "protection");
+    }
+
+    @Override public long generation() { return protection.generation(); }
+
+    @Override public CompletableFuture<Void> renew(RequestScope scope) {
+      return protection.renew(scope);
+    }
+
+    @Override public CompletableFuture<Void> complete(RequestScope scope) {
+      return CompletableFuture.failedFuture(new IllegalStateException(
+          "a borrowed replay protection cannot be completed by an event reader"));
+    }
+
+    @Override public CompletionStage<Void> releaseCompletion() {
+      return CompletableFuture.completedFuture(null);
+    }
+
+    @Override public void close() { }
+
+    @Override public CompletableFuture<Void> promoteRoot(EventHistoryPinManager.Requirement previous,
+        EventHistoryPinManager.Requirement promoted, RequestScope scope) {
+      return CompletableFuture.failedFuture(new IllegalStateException(
+          "a borrowed replay protection does not own event root promotion"));
+    }
   }
 }

@@ -40,11 +40,27 @@ J45_REQUIRED_COMMANDS = {
 J46_REQUIRED_COMMANDS = {
     "registry-check", "report-tests", "go-tests", "maven-verify", "collect-maven-reports",
 }
+J47_REQUIRED_COMMANDS = {
+    "registry-check", "report-tests", "go-tests", "maven-verify", "collect-maven-reports",
+}
 J46_MAVEN_TEST_SELECTOR = (
     "-Dtest=WatchHistoryReplayTest,WatchStreamTest,WatchResponseFragmenterTest,WatchGatewayTest"
 )
 J46_MAVEN_IT_SELECTOR = "-Dit.test=M4WatchRpcIT"
 J46_FAILSAFE_EMPTY_MODULES = "-Dfailsafe.failIfNoSpecifiedTests=false"
+J47_MAVEN_TEST_SELECTOR = (
+    "-Dtest=WatchHistoryReplayTest,WatchStreamTest,WatchGatewayTest,"
+    "EventHistoryWorkerTest,M3TableGroupRuntimeWorkerLifecycleTest,"
+    "SealedEventCursorTest,M3RuntimeConfigurationTest"
+)
+J47_MAVEN_IT_SELECTOR = (
+    "-Dit.test=J47WatchReplayGcIT,M4WatchRpcIT#"
+    "pinnedGoClientVerifiesHalfCloseAndDeadlineLifecycleOnBothLayouts+"
+    "pinnedGoClientVerifiesRuntimeShutdownCancelsHalfClosedWatchOnBothLayouts+"
+    "pinnedGoClientVerifiesRegistrationDiscoveryLifecycleOnBothLayouts+"
+    "pinnedGoClientVerifiesCombinedLeaseAndWatchReplayLoadOnBothLayouts"
+)
+J47_FAILSAFE_EMPTY_MODULES = "-Dfailsafe.failIfNoSpecifiedTests=false"
 J45_VERIFICATION_BOUNDARY = (
     "J45 public protocol evidence covers negative/zero startRevision cases, negative watch ID "
     "Create/Cancel, future startRevision Create/Cancel, and the Compact-boundary lifecycle. Future-event "
@@ -124,7 +140,7 @@ J44_CRITICAL_JAVA_TESTS = {
         "slowBackfillReadDoesNotBlockHeartbeatAndPublicationUsesOwnerLane",
     },
     "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest": {
-        "eventHistoryWorkerStartsOnlyWhenTailerReadinessIsRequested",
+        "eventHistoryWorkerStartsImmediatelyAndStartupReadinessWaitsForTailer",
         "ownerLossBeforeEventHistoryWorkerInstallationRejectsLateWorker",
         "ownerLossBeforeInstallationRejectsBothWorkers",
     },
@@ -237,6 +253,106 @@ J46_JAVA_CLASS_KINDS = {
     "io.etcdhbase.server.commit.WatchResponseFragmenterTest": "surefire",
     "io.etcdhbase.server.commit.WatchGatewayTest": "surefire",
     "io.etcdhbase.server.M4WatchRpcIT": "failsafe",
+}
+J47_VERIFICATION_BOUNDARY = (
+    "J47 validates startup readiness after event-index backfill and tailer installation, revokes readiness "
+    "when the history worker fails or the tailer closes, and rejects event-history protection from another "
+    "registry before storage reads. Production Lease activation also remains fail-closed until J51 identity "
+    "lifecycle is ready; only trusted test wiring may select the public test profile. J47 then validates "
+    "per-watch budget isolation when a transport is not ready, accepted asynchronous "
+    "Watch creates across client half-close, Created-to-Canceled compact_revision delivery during "
+    "historical replay, and cleanup after request-stream errors, client cancellation, deadline, late "
+    "callbacks, physical producer drain and durable history-pin release. A real MiniCluster collector test "
+    "opens WatchHistoryReplay against a durable event-pin registry and proves that the required EVENT row "
+    "remains until replay settles, then becomes collectible after backfill and safe-watermark advancement. "
+    "A pinned Go client also keeps an active Watch open after request-side half-close, then verifies that "
+    "RuntimeServer shutdown terminates the RPC and that event-tailer HBase read counters remain stable "
+    "after runtime, background identity provider, and request cleanup drain on both HBase MiniCluster "
+    "layouts. This covers the existing shutdown lifecycle only; credential rotation/generation "
+    "invalidation and cross-replica propagation remain assigned to J51. A pinned Go etcd client exercises "
+    "the Milvus sessionutil registration shape against Java WatchService on both HBase MiniCluster layouts: "
+    "one atomic multi-role registration binds expiring service keys, leaves the coordinator version key "
+    "unleased, lists services at revision R, watches from R+1, renews at TTL/3, applies PrevKV deletes to "
+    "local service lists, and preserves a role rebound to another Lease. A combined load case interleaves "
+    "periodic KeepAlive between business writes while a Watch client is not reading, then replays the "
+    "committed history through "
+    "a bounded watcher burst. This is an isolated consumer fixture, "
+    "not complete Milvus deployment acceptance. This evidence does not claim target credential rotation, "
+    "production fanout capacity, or target-cluster acceptance."
+)
+J47_JAVA_CLASS_MODULES = {
+    "io.etcdhbase.core.commit.SealedEventCursorTest": "core",
+    "io.etcdhbase.server.commit.WatchHistoryReplayTest": "server",
+    "io.etcdhbase.server.commit.WatchStreamTest": "server",
+    "io.etcdhbase.server.commit.WatchGatewayTest": "server",
+    "io.etcdhbase.server.commit.EventHistoryWorkerTest": "server",
+    "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest": "server",
+    "io.etcdhbase.server.commit.J47WatchReplayGcIT": "server",
+    "io.etcdhbase.server.M4WatchRpcIT": "server",
+    "io.etcdhbase.server.config.M3RuntimeConfigurationTest": "server",
+}
+J47_JAVA_CLASS_KINDS = {
+    "io.etcdhbase.core.commit.SealedEventCursorTest": "surefire",
+    "io.etcdhbase.server.commit.WatchHistoryReplayTest": "surefire",
+    "io.etcdhbase.server.commit.WatchStreamTest": "surefire",
+    "io.etcdhbase.server.commit.WatchGatewayTest": "surefire",
+    "io.etcdhbase.server.commit.EventHistoryWorkerTest": "surefire",
+    "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest": "surefire",
+    "io.etcdhbase.server.commit.J47WatchReplayGcIT": "failsafe",
+    "io.etcdhbase.server.M4WatchRpcIT": "failsafe",
+    "io.etcdhbase.server.config.M3RuntimeConfigurationTest": "surefire",
+}
+J47_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.core.commit.SealedEventCursorTest": {
+        "sequenceReaderRejectsProtectionFromAnotherEventRegistry",
+    },
+    "io.etcdhbase.server.commit.WatchHistoryReplayTest": {
+        "compactAdvancingAfterReplayRegistrationPreservesTheBoundary",
+        "compactDuringGatewayReplaySendsCreatedThenCanceledWithTheBoundary",
+        "closingReplayWaitsForPhysicalProducerBeforeReleasingItsHistoryPin",
+        "cancellingDuringProtectedEventOpenDrainsProducerBeforeReleasingReplayProtection",
+        "authenticationAndPermissionFailuresRemainTypedDuringReplay",
+    },
+    "io.etcdhbase.server.commit.WatchStreamTest": {
+        "compactionDuringHistoricalReplaySendsCompactRevisionAfterCreated",
+        "slowWatchResourceLimitDoesNotBlockReadyWatcherAfterBackpressure",
+        "clientHalfCloseKeepsActiveWatchOpenUntilTheRpcContextIsCancelled",
+        "clientHalfCloseAllowsAnAcceptedCreateToFinishAsynchronously",
+        "clientHalfCloseAllowsAnAcceptedSubscriptionToFinishAsynchronously",
+        "emptyClientHalfCloseLeavesWatchRpcOpenLikeEtcd",
+        "halfClosedRpcRemainsOpenAfterItsLastWatchIsCompacted",
+        "requestStreamErrorDuringPollClosesTheDetachedDelivery",
+        "replayAuthenticationAndPermissionFailuresUseTheirRpcStatus",
+    },
+    "io.etcdhbase.server.commit.WatchGatewayTest": {
+        "pollCancellationHandoffClosesTheDetachedDeliveryBeforeReleasingItsAccount",
+    },
+    "io.etcdhbase.server.commit.EventHistoryWorkerTest": {
+        "readinessRequiresSuccessfulCycleAndIsRevokedAfterWorkerFailure",
+    },
+    "io.etcdhbase.server.commit.M3TableGroupRuntimeWorkerLifecycleTest": {
+        "eventHistoryWorkerStartsImmediatelyAndStartupReadinessWaitsForTailer",
+        "readinessRequiresEventPinsAHealthyWorkerAndAnOpenTailer",
+    },
+    "io.etcdhbase.server.config.M3RuntimeConfigurationTest": {
+        "productionLoaderRejectsM4AndCannotBeOverriddenByJson",
+        "publicTestProfileDoesNotChangeOrdinaryM3RuntimeConfiguration",
+    },
+    "io.etcdhbase.server.commit.J47WatchReplayGcIT": {
+        "watchReplayPinPreventsPhysicalEventCollectionUntilReplaySettles",
+    },
+    "io.etcdhbase.server.M4WatchRpcIT": {
+        "pinnedGoClientVerifiesHalfCloseAndDeadlineLifecycleOnBothLayouts",
+        "pinnedGoClientVerifiesRuntimeShutdownCancelsHalfClosedWatchOnBothLayouts",
+        "pinnedGoClientVerifiesRegistrationDiscoveryLifecycleOnBothLayouts",
+        "pinnedGoClientVerifiesCombinedLeaseAndWatchReplayLoadOnBothLayouts",
+    },
+}
+J47_GO_TESTS = {
+    "internal/scenario": {
+        "TestM4WatchHalfCloseMatchesPinnedNativeOracle",
+        "TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages",
+    },
 }
 J46_CRITICAL_JAVA_TESTS = {
     "io.etcdhbase.server.commit.WatchHistoryReplayTest": {
@@ -869,6 +985,9 @@ def validate_registry_document(document: object) -> dict[str, object]:
     j46 = task_map.get("J46")
     if j46 is not None:
         _validate_j46_registration(j46)
+    j47 = task_map.get("J47")
+    if j47 is not None:
+        _validate_j47_registration(j47)
     return document
 
 
@@ -897,6 +1016,14 @@ def _validate_task_shape(task: dict[str, object]) -> None:
                 or not task["go_tests"]
                 or task.get("verification_boundary") != J46_VERIFICATION_BOUNDARY):
             raise ReportError("J46 must register replay/progress suites and its verification boundary")
+        return
+    if task.get("id") == "J47":
+        if (task.get("kind") != "watch-readiness"
+                or not isinstance(task.get("maven_tests"), list)
+                or not task["maven_tests"]
+                or not isinstance(task.get("go_tests"), list)
+                or task.get("verification_boundary") != J47_VERIFICATION_BOUNDARY):
+            raise ReportError("J47 must register Watch readiness suites and its verification boundary")
         return
     if not isinstance(task.get("api_ids"), list) or not task["api_ids"]:
         raise ReportError("registered M4 task must identify API coverage")
@@ -1330,6 +1457,45 @@ def _validate_j46_registration(task: dict[str, object]) -> None:
         raise ReportError("J46 replay ordering, handoff, or progress barrier coverage is incomplete")
 
 
+def _validate_j47_registration(task: dict[str, object]) -> None:
+    if (task.get("kind") != "watch-readiness" or task.get("id") != "J47"
+            or task.get("api_ids") != ["C19"]
+            or task.get("verification_boundary") != J47_VERIFICATION_BOUNDARY):
+        raise ReportError("J47 Watch readiness scope or verification boundary changed")
+    go_tests = _registered_go_tests(task["go_tests"], "J47")
+    if any(not expected.issubset(go_tests.get(package, set()))
+           for package, expected in J47_GO_TESTS.items()):
+        raise ReportError("J47 pinned etcd v3.5.23 half-close oracle is incomplete")
+
+    java_methods: dict[str, set[str]] = {}
+    java_modules: dict[str, str] = {}
+    for suite in task["maven_tests"]:
+        if not isinstance(suite, dict):
+            raise ReportError("J47 Maven test registration is malformed")
+        module, kind, class_name, tests = (
+            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
+        )
+        if not isinstance(class_name, str):
+            raise ReportError("J47 Maven test class name is malformed")
+        expected_kind = J47_JAVA_CLASS_KINDS.get(class_name)
+        if module not in JAVA_MODULES or kind != expected_kind:
+            raise ReportError("J47 Maven suites must match registered unit/integration suites")
+        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
+            raise ReportError("J47 Maven suite has no named required tests")
+        previous_module = java_modules.setdefault(class_name, module)
+        if previous_module != module:
+            raise ReportError("J47 Maven suite is registered in multiple modules")
+        java_methods.setdefault(class_name, set()).update(tests)
+    if set(java_modules) != set(J47_JAVA_CLASS_MODULES):
+        raise ReportError("J47 stream cleanup or MiniCluster integration suites are incomplete")
+    if any(java_modules.get(class_name) != module
+           for class_name, module in J47_JAVA_CLASS_MODULES.items()):
+        raise ReportError("J47 Java suites must be collected from their declared modules")
+    if any(not methods.issubset(java_methods.get(class_name, set()))
+           for class_name, methods in J47_CRITICAL_JAVA_TESTS.items()):
+        raise ReportError("J47 cancellation, backpressure, compaction, or cleanup coverage is incomplete")
+
+
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, object]:
     return validate_registry_document(read_json(path))
 
@@ -1415,6 +1581,7 @@ def _validate_commands(artifact: Path, run: dict[str, object], task: dict[str, o
         "J44": J44_REQUIRED_COMMANDS,
         "J45": J45_REQUIRED_COMMANDS,
         "J46": J46_REQUIRED_COMMANDS,
+        "J47": J47_REQUIRED_COMMANDS,
     }.get(task.get("id"), REQUIRED_COMMANDS)
     task_command_names = names - {"validate-artifact"}
     if not required.issubset(names):
@@ -1474,6 +1641,29 @@ def _validate_commands(artifact: Path, run: dict[str, object], task: dict[str, o
                 or J46_FAILSAFE_EMPTY_MODULES not in maven["argv"]
                 or "-Dsurefire.failIfNoSpecifiedTests=false" not in maven["argv"]):
             raise ReportError("J46 Maven verification must run registered Surefire and Failsafe suites")
+    if task.get("id") == "J47":
+        if task_command_names != J47_REQUIRED_COMMANDS:
+            raise ReportError("J47 verification must run its half-close oracle and MiniCluster profile")
+        go_tests = next(command for command in commands if command["name"] == "go-tests")
+        go_test_pattern = (
+            go_tests["argv"][go_tests["argv"].index("-run") + 1]
+            if "-run" in go_tests["argv"]
+            and go_tests["argv"].index("-run") + 1 < len(go_tests["argv"])
+            else ""
+        )
+        if ("scripts/dev/go-m0.sh" not in go_tests["argv"] or "test" not in go_tests["argv"]
+                or "-json" not in go_tests["argv"] or "-run" not in go_tests["argv"]
+                or "./internal/scenario" not in go_tests["argv"]
+                or any(test_name not in go_test_pattern
+                       for tests in J47_GO_TESTS.values() for test_name in tests)):
+            raise ReportError("J47 Go tests must run the pinned etcd v3.5.23 half-close oracle")
+        maven = next(command for command in commands if command["name"] == "maven-verify")
+        if ("-Pm4-j47-public" not in maven["argv"] or "verify" not in maven["argv"]
+                or J47_MAVEN_TEST_SELECTOR not in maven["argv"]
+                or J47_MAVEN_IT_SELECTOR not in maven["argv"]
+                or J47_FAILSAFE_EMPTY_MODULES not in maven["argv"]
+                or "-Dsurefire.failIfNoSpecifiedTests=false" not in maven["argv"]):
+            raise ReportError("J47 Maven verification must run registered unit and MiniCluster suites")
 
 
 def _validate_go_tests(artifact: Path, task: dict[str, object]) -> int:
@@ -2800,6 +2990,32 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
             "go_test_count": go_test_count,
             "java_test_count": java_test_count,
             "evidence": "J46.1-replay-J46.2-progress-J46.3-fragment-Go-client-MiniCluster-HISTORY-NATIVE",
+            "scope": "public-local-minicluster",
+        }
+    if task.get("id") == "J47":
+        report_kinds: set[str] = set()
+        report_classes: set[str] = set()
+        for _, kind, path in _java_test_report_paths(artifact):
+            report_kinds.add(kind)
+            for suite in _testsuite_elements(path):
+                class_name = suite.get("name")
+                if class_name:
+                    report_classes.add(class_name)
+        if (report_kinds != {"surefire", "failsafe"}
+                or report_classes != set(J47_JAVA_CLASS_MODULES)):
+            raise ReportError(
+                "J47 evidence must contain only the registered unit and MiniCluster lifecycle reports"
+            )
+        go_test_count = _validate_go_tests(artifact, task)
+        return {
+            "task": run["tasks"][0],
+            "run_id": run["run_id"],
+            "source_commit": run["source_commit"],
+            "base_commit": run["base_commit"],
+            "evidence_class": "official-clean" if run["worktree_clean"] else "development-dirty",
+            "go_test_count": go_test_count,
+            "java_test_count": java_test_count,
+            "evidence": "J47-flow-control-compaction-cleanup-MiniCluster-HISTORY-NATIVE",
             "scope": "public-local-minicluster",
         }
     evidence_root = _task_artifact_root(artifact, task)

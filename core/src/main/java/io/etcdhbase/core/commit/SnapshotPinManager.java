@@ -19,6 +19,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Durable, bounded, cross-replica read protection with independent GC revision and sequence floors. */
 public final class SnapshotPinManager implements ReadViewPinRegistry {
+  /** A requested history floor can no longer be protected by a newly registered pin. */
+  public static final class RegistrationFloorExceeded extends IllegalStateException {
+    private static final long serialVersionUID = 1L;
+
+    public RegistrationFloorExceeded() {
+      super("read view is below the durable snapshot registration floor");
+    }
+  }
+
   private static final int MAX_CAS_ATTEMPTS = 32;
   private static final int MAX_INITIALIZATION_ATTEMPTS = 32;
   private static final int INITIALIZATION_BATCH = 8;
@@ -490,8 +499,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
       PinRequirement requirement, RequestScope scope, int attempt) {
     SnapshotPinShard current = stored.shard();
     if (belowRegistrationFloor(current, requirement)) {
-      return failed(new IllegalStateException(
-          "read view is below the durable snapshot registration floor"));
+      return failed(new RegistrationFloorExceeded());
     }
     long now = clock.millis();
     int existing = activePinSlot(current, pinId);
