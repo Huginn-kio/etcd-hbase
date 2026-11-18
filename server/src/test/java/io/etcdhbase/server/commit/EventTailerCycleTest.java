@@ -201,6 +201,7 @@ class EventTailerCycleTest {
       verify(fixture.pin, never()).close();
       assertTrue(fixture.budgets.snapshot().reservedBytes() > 0);
       fixture.physical.complete(null);
+      fixture.pinClosed.get(5, TimeUnit.SECONDS);
       verify(fixture.pin).close();
       assertFalse(worker.drained().isDone());
       fixture.released.complete(null);
@@ -220,6 +221,7 @@ class EventTailerCycleTest {
     final CompletableFuture<Optional<SystemRecordEntry>> request = new CompletableFuture<>();
     final CompletableFuture<Void> physical = new CompletableFuture<>();
     final CompletableFuture<Void> released = new CompletableFuture<>();
+    final CompletableFuture<Void> pinClosed = new CompletableFuture<>();
     final CountDownLatch started = new CountDownLatch(1);
     final ReadViewPinRegistry.Pin pin = mock(ReadViewPinRegistry.Pin.class);
     final BudgetManager budgets;
@@ -232,6 +234,7 @@ class EventTailerCycleTest {
       when(pin.generation()).thenReturn(1L);
       when(pin.renew(any(RequestScope.class))).thenReturn(CompletableFuture.completedFuture(null));
       when(pin.releaseCompletion()).thenReturn(released);
+      doAnswer(invocation -> { pinClosed.complete(null); return null; }).when(pin).close();
       var viewPins = mock(ReadViewPinRegistry.class);
       when(viewPins.registerAuxiliary(any(ReadView.class), any(RequestScope.class)))
           .thenReturn(CompletableFuture.completedFuture(pin));
