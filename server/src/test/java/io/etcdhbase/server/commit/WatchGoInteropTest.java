@@ -172,6 +172,8 @@ class WatchGoInteropTest {
 
     private static SharedEventTailer.Delivery delivery(PreparedEvent event) {
       var delivery = mock(SharedEventTailer.Delivery.class);
+      // A default Mockito sequence of zero would be filtered as being behind J46's barrier.
+      when(delivery.sequence()).thenReturn(Math.addExact(event.baseSequence(), 1));
       when(delivery.revision()).thenReturn(event.current().metadata().modificationRevision());
       when(delivery.event()).thenReturn(event);
       return delivery;
@@ -207,11 +209,12 @@ class WatchGoInteropTest {
     String filter = base + "filter/";
     var events = new ArrayList<PreparedEvent>();
     if (includeWatchHistory) {
-      events.add(watchPut(2, (prefix + "initial/minus-one").getBytes(),
+      events.add(watchPut(2, 0, (prefix + "initial/minus-one").getBytes(),
           "before-negative-watch".getBytes(), null));
     }
     events.addAll(List.of(
-        watchPut(2, (base + "multi/a").getBytes(), "multi-a".getBytes(), null),
+        watchPut(2, includeWatchHistory ? 1 : 0,
+            (base + "multi/a").getBytes(), "multi-a".getBytes(), null),
         watchPut(3, (base + "multi/b").getBytes(), "multi-b".getBytes(), null),
         watchPut(4, new byte[] {0, (byte) 0xff, 0x0f}, "binary-before".getBytes(), null),
         watchPut(5, new byte[] {0, (byte) 0xff, 0x10}, "binary-key".getBytes(), null),
@@ -226,6 +229,11 @@ class WatchGoInteropTest {
   }
 
   private static PreparedEvent watchPut(long revision, byte[] key, byte[] value, byte[] previous) {
+    return watchPut(revision, 0, key, value, previous);
+  }
+
+  private static PreparedEvent watchPut(long revision, long ordinal, byte[] key, byte[] value,
+      byte[] previous) {
     long createRevision = previous == null ? revision : 1;
     long version = previous == null ? 1 : 2;
     var metadata = new StorageMetadata(createRevision, revision, version, 0,
@@ -237,8 +245,9 @@ class WatchGoInteropTest {
           new StorageMetadata(1, revision - 1, 1, 0, StorageMetadata.State.LIVE, previous.length),
           previous));
     }
-    return new PreparedEvent(new TransactionId(new UUID(0, revision)), 1, revision - 1,
-        revision - 1, 0, PreparedEvent.Kind.PUT, current, previousRecord);
+    // This fixture starts from initialized revision 1 and advances one selected sequence per KV revision.
+    return new PreparedEvent(new TransactionId(new UUID(0, revision)), 1, revision - 2,
+        revision - 1, ordinal, PreparedEvent.Kind.PUT, current, previousRecord);
   }
 
   private static PreparedEvent watchDelete(long revision, byte[] key, byte[] previous) {
@@ -246,7 +255,7 @@ class WatchGoInteropTest {
         1, 0, StorageMetadata.State.TOMBSTONE, 0));
     var previousRecord = StoredRecord.live(ByteKey.copyOf(key), new StorageMetadata(1,
         revision - 1, 1, 0, StorageMetadata.State.LIVE, previous.length), previous);
-    return new PreparedEvent(new TransactionId(new UUID(0, revision)), 1, revision - 1,
+    return new PreparedEvent(new TransactionId(new UUID(0, revision)), 1, revision - 2,
         revision - 1, 0, PreparedEvent.Kind.DELETE, current, Optional.of(previousRecord));
   }
 
