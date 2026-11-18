@@ -212,6 +212,48 @@ class WatchGatewayTest {
   }
 
   @Test
+  void cancellingStreamRemovesInstalledTailerSubscriptionBeforeBarrierReadCompletes()
+      throws Exception {
+    try (var startup = RequestScope.withoutDeadline();
+         var tailerScope = RequestScope.withoutDeadline();
+         var streamScope = RequestScope.withoutDeadline()) {
+      var budgets = budgets();
+      var tailerMemory = budgets.admit(TABLE_GROUP, tailerScope,
+          new BudgetManager.Reservation(0, 1, 1, 1));
+      BudgetManager.Snapshot tailerBaseline = budgets.snapshot();
+      try (var tailer = new SharedEventTailer(mock(SelectedSequenceReader.class),
+          ByteKey.copyOf(new byte[32]), tailerMemory, 0, 1, 4,
+          WatchStream.MAX_PENDING_EVENTS_PER_WATCH,
+          LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES)) {
+        var control = mock(CommitControlStore.class);
+        var barrierRead = new CompletableFuture<Optional<ControlSnapshot>>();
+        when(control.read(streamScope)).thenReturn(barrierRead);
+        var gateway = gateway(startup, budgets, RESPONSE_BYTES, control);
+
+        CompletableFuture<WatchStream.OpenedWatch> opening = session(gateway, tailer, streamScope)
+            .subscribe(KeyRange.all(), Rpc.WatchCreateRequest.getDefaultInstance())
+            .toCompletableFuture();
+        assertEquals(1, tailer.subscriptionCount());
+
+        streamScope.cancel();
+
+        assertEquals(0, tailer.subscriptionCount(),
+            "cancellation releases the shared range index without waiting for the barrier read");
+        assertEquals(0, budgets.snapshot().allocatedBytes(),
+            "cancellation also releases the watch state memory before the barrier read completes");
+        assertEquals(tailerBaseline.requests(), budgets.snapshot().requests(),
+            "cancellation releases the watch admission before the barrier read completes");
+        assertEquals(tailerBaseline.reservedBytes(), budgets.snapshot().reservedBytes(),
+            "cancellation releases the watch reservation before the barrier read completes");
+        barrierRead.complete(Optional.of(snapshot(12, 0)));
+        assertThrows(CompletionException.class, opening::join);
+      }
+      tailerScope.close();
+      assertReleased(budgets);
+    }
+  }
+
+  @Test
   void cleanupFailuresAreSuppressedAndDoNotPreventOtherResourcesFromReleasing() throws Exception {
     try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
       var tailer = openTailer();

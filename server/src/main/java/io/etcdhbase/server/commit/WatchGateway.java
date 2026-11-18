@@ -151,37 +151,50 @@ final class WatchGateway {
           outputReservationBytes, 0);
       BudgetManager.Account account = budgets.admit(tableGroup, streamScope, reservation);
       BudgetManager.Lease stateMemory = null;
+      RequestScope.ScopedCleanup stateMemoryCleanup = null;
       SharedEventTailer.SubscriptionStart start;
       try {
         stateMemory = account.tryRetain(BudgetManager.Memory.HEAD, retainedStateBytes)
             .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
+        stateMemoryCleanup = streamScope.registerScopedCleanup(stateMemory);
+        if (streamScope.isClosed()) {
+          throw new BackendFailure(BackendFailure.Category.CANCELLED);
+        }
         start = tailer.subscribeWithCheckpoint(range, account,
             WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH, maximumPendingRevisionBytes,
             request.getStartRevision());
       } catch (BackendFailure | RuntimeException | Error failure) {
-        closeAfterFailure(stateMemory, failure);
+        closeAfterFailure(stateMemoryCleanup == null ? stateMemory : stateMemoryCleanup, failure);
         closeAfterFailure(account, failure);
         throw failure;
       }
 
       SharedEventTailer.Subscription subscription = start.subscription();
-      BudgetManager.Lease retainedStateMemory = stateMemory;
+      RequestScope.ScopedCleanup subscriptionCleanup = streamScope.registerScopedCleanup(subscription);
+      if (streamScope.isClosed()) {
+        BackendFailure cancelled = new BackendFailure(BackendFailure.Category.CANCELLED);
+        closeAfterFailure(subscriptionCleanup, cancelled);
+        closeAfterFailure(stateMemoryCleanup, cancelled);
+        closeAfterFailure(account, cancelled);
+        throw cancelled;
+      }
+      RequestScope.ScopedCleanup retainedStateMemoryCleanup = stateMemoryCleanup;
       CompletionStage<Optional<ControlSnapshot>> barrier;
       try {
         barrier = Objects.requireNonNull(control.read(streamScope), "Watch control snapshot future");
       } catch (RuntimeException | Error failure) {
-        closeAfterFailure(subscription, failure);
-        closeAfterFailure(retainedStateMemory, failure);
+        closeAfterFailure(subscriptionCleanup, failure);
+        closeAfterFailure(retainedStateMemoryCleanup, failure);
         closeAfterFailure(account, failure);
         throw failure;
       }
       return barrier
-          .thenCompose(snapshot -> openedWatch(range, snapshot, start, subscription, account,
-              retainedStateMemory, request))
+          .thenCompose(snapshot -> openedWatch(range, snapshot, start, subscription,
+              subscriptionCleanup, account, retainedStateMemoryCleanup, request))
           .whenComplete((opened, failure) -> {
             if (failure == null) return;
-            closeAfterFailure(subscription, failure);
-            closeAfterFailure(retainedStateMemory, failure);
+            closeAfterFailure(subscriptionCleanup, failure);
+            closeAfterFailure(retainedStateMemoryCleanup, failure);
             closeAfterFailure(account, failure);
           });
     }
@@ -189,7 +202,8 @@ final class WatchGateway {
     private CompletionStage<WatchStream.OpenedWatch> openedWatch(KeyRange range,
         Optional<ControlSnapshot> snapshot,
         SharedEventTailer.SubscriptionStart start, SharedEventTailer.Subscription subscription,
-        BudgetManager.Account account, BudgetManager.Lease stateMemory,
+        RequestScope.ScopedCleanup subscriptionCleanup, BudgetManager.Account account,
+        RequestScope.ScopedCleanup stateMemoryCleanup,
         Rpc.WatchCreateRequest request) {
       if (streamScope.isCancelled() || tailer.isClosed()) {
         throw unavailable();
@@ -203,7 +217,8 @@ final class WatchGateway {
           && request.getStartRevision() < state.compactRevision()) {
         return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
             state.publishedSequence(), state.compactRevision(),
-            new TailerSubscription(subscription, account, stateMemory, null,
+            new TailerSubscription(subscription, subscriptionCleanup, account,
+                stateMemoryCleanup, null,
                 state.publishedSequence())));
       }
       if (request.getStartRevision() <= 0) {
@@ -211,7 +226,8 @@ final class WatchGateway {
         return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
             state.publishedSequence(),
             state.compactRevision() == 0 ? -1 : state.compactRevision(),
-            new TailerSubscription(subscription, account, stateMemory, null,
+            new TailerSubscription(subscription, subscriptionCleanup, account,
+                stateMemoryCleanup, null,
                 state.publishedSequence())));
       }
       if (request.getStartRevision() <= revision) {
@@ -219,7 +235,8 @@ final class WatchGateway {
           return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
               state.publishedSequence(),
               state.compactRevision() == 0 ? -1 : state.compactRevision(),
-              new TailerSubscription(subscription, account, stateMemory, null,
+              new TailerSubscription(subscription, subscriptionCleanup, account,
+                  stateMemoryCleanup, null,
                   state.publishedSequence())));
         }
         subscription.requireRevisionAtLeast(nextRevision(revision));
@@ -229,13 +246,15 @@ final class WatchGateway {
             budgets, account).thenApply(result -> new WatchStream.OpenedWatch(
                 result.revision(), result.sequence(),
                 result.compactRevision() == 0 ? -1 : result.compactRevision(),
-                new TailerSubscription(subscription, account, stateMemory,
+                new TailerSubscription(subscription, subscriptionCleanup, account,
+                    stateMemoryCleanup,
                     result.replay().orElse(null), result.sequence()), result.replay().isPresent()));
       }
       return CompletableFuture.completedFuture(new WatchStream.OpenedWatch(revision,
           state.publishedSequence(),
           state.compactRevision() == 0 ? -1 : state.compactRevision(),
-          new TailerSubscription(subscription, account, stateMemory, null,
+          new TailerSubscription(subscription, subscriptionCleanup, account,
+              stateMemoryCleanup, null,
               state.publishedSequence())));
     }
 
@@ -274,20 +293,33 @@ final class WatchGateway {
     }
   }
 
+  private static void closeScopedCleanup(RequestScope.ScopedCleanup cleanup, String description) {
+    try {
+      cleanup.close();
+    } catch (RuntimeException | Error failure) {
+      throw failure;
+    } catch (Exception failure) {
+      throw new IllegalStateException(description, failure);
+    }
+  }
+
   private static final class TailerSubscription implements WatchStream.Subscription {
     private final SharedEventTailer.Subscription subscription;
+    private final RequestScope.ScopedCleanup subscriptionCleanup;
     private final BudgetManager.Account account;
-    private final BudgetManager.Lease stateMemory;
+    private final RequestScope.ScopedCleanup stateMemoryCleanup;
     private final WatchHistoryReplay history;
     private final long barrierSequence;
     private boolean closed;
 
     private TailerSubscription(SharedEventTailer.Subscription subscription,
-        BudgetManager.Account account, BudgetManager.Lease stateMemory,
+        RequestScope.ScopedCleanup subscriptionCleanup, BudgetManager.Account account,
+        RequestScope.ScopedCleanup stateMemoryCleanup,
         WatchHistoryReplay history, long barrierSequence) {
       this.subscription = subscription;
+      this.subscriptionCleanup = subscriptionCleanup;
       this.account = account;
-      this.stateMemory = stateMemory;
+      this.stateMemoryCleanup = stateMemoryCleanup;
       this.history = history;
       this.barrierSequence = barrierSequence;
     }
@@ -353,8 +385,10 @@ final class WatchGateway {
         failure = WatchCleanup.closeAndCollect(() -> history.setWakeup(null), failure);
         failure = WatchCleanup.closeAndCollect(history::close, failure);
       }
-      failure = WatchCleanup.closeAndCollect(subscription::close, failure);
-      failure = WatchCleanup.closeAndCollect(stateMemory::close, failure);
+      failure = WatchCleanup.closeAndCollect(
+          () -> closeScopedCleanup(subscriptionCleanup, "Watch subscription cleanup failed"), failure);
+      failure = WatchCleanup.closeAndCollect(
+          () -> closeScopedCleanup(stateMemoryCleanup, "Watch state memory cleanup failed"), failure);
       failure = WatchCleanup.closeAndCollect(account::close, failure);
       WatchCleanup.throwIfPresent(failure);
     }
