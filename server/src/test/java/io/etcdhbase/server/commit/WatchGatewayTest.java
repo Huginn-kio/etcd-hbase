@@ -27,6 +27,7 @@ import io.etcdhbase.core.commit.CommitDecision;
 import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.commit.EventHistoryPinManager;
 import io.etcdhbase.core.commit.EventReference;
 import io.etcdhbase.core.commit.EventRevisionIndex;
 import io.etcdhbase.core.commit.InvocationId;
@@ -42,6 +43,7 @@ import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import io.grpc.Status;
+import io.etcdhbase.server.observability.RequestMetrics;
 import io.grpc.stub.StreamObserver;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
@@ -83,13 +85,152 @@ class WatchGatewayTest {
     try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
       var tailer = openTailer();
       var budgets = budgets();
-      var gateway = gateway(startup, budgets);
+      var metrics = new RequestMetrics();
+      var gateway = gateway(startup, budgets, RESPONSE_BYTES, control(12, 0), metrics);
       var failure = new IllegalStateException("tailer rejected subscription");
       doThrow(failure).when(tailer).subscribeWithCheckpoint(
           any(KeyRange.class), any(BudgetManager.Account.class), anyInt(), anyLong(), anyLong());
 
       assertSame(failure, assertThrows(IllegalStateException.class,
           () -> subscribe(gateway, tailer, scope)));
+      assertEquals(0, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.TAILER_SUBSCRIPTION),
+          "non-resource failures are not counted as resource refusals");
+      assertReleased(budgets);
+    }
+  }
+
+  @Test
+  void requestAdmissionResourceFailureIsCountedAtItsBoundedStage() throws Exception {
+    try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
+      var tailer = openTailer();
+      var budgets = budgetsWithMemory(1_024);
+      var metrics = new RequestMetrics();
+      var gateway = gateway(startup, budgets, RESPONSE_BYTES, control(12, 0), metrics);
+
+      BackendFailure failure = assertThrows(BackendFailure.class,
+          () -> subscribe(gateway, tailer, scope));
+
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT, failure.category());
+      assertEquals(1, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.REQUEST_ACCOUNT_ADMISSION));
+      assertEquals(0, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.TAILER_SUBSCRIPTION));
+      assertReleased(budgets);
+    }
+  }
+
+  @Test
+  void stateMemoryRetentionResourceFailureIsCountedSeparatelyFromAdmission() throws Exception {
+    try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
+      BudgetManager budgets = mock(BudgetManager.class);
+      BudgetManager.Account account = mock(BudgetManager.Account.class);
+      when(budgets.admit(eq(TABLE_GROUP), eq(scope), any(BudgetManager.Reservation.class)))
+          .thenReturn(account);
+      when(account.tryRetain(eq(BudgetManager.Memory.HEAD), anyLong()))
+          .thenReturn(Optional.empty());
+      var metrics = new RequestMetrics();
+      var gateway = gateway(startup, budgets, RESPONSE_BYTES, control(12, 0), metrics);
+
+      BackendFailure failure = assertThrows(BackendFailure.class,
+          () -> subscribe(gateway, openTailer(), scope));
+
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT, failure.category());
+      assertEquals(1, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.STATE_MEMORY_RETENTION));
+      assertEquals(0, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.REQUEST_ACCOUNT_ADMISSION));
+      verify(account).close();
+    }
+  }
+
+  @Test
+  void tailerSubscriptionResourceFailureIsCountedAndReleasesAdmission() throws Exception {
+    try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
+      var tailer = openTailer();
+      var budgets = budgets();
+      var metrics = new RequestMetrics();
+      var gateway = gateway(startup, budgets, RESPONSE_BYTES, control(12, 0), metrics);
+      var failure = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+      doThrow(failure).when(tailer).subscribeWithCheckpoint(
+          any(KeyRange.class), any(BudgetManager.Account.class), anyInt(), anyLong(), anyLong());
+
+      assertSame(failure, assertThrows(BackendFailure.class,
+          () -> subscribe(gateway, tailer, scope)));
+
+      assertEquals(1, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.TAILER_SUBSCRIPTION));
+      assertEquals(0, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.REQUEST_ACCOUNT_ADMISSION));
+      assertReleased(budgets);
+    }
+  }
+
+  @Test
+  void barrierReadResourceFailureIsCountedAndReleasesWatchSubscription() throws Exception {
+    try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
+      var tailer = openTailer();
+      var subscription = mock(SharedEventTailer.Subscription.class);
+      when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
+          anyInt(), anyLong(), anyLong()))
+          .thenReturn(new SharedEventTailer.SubscriptionStart(subscription, 0, 1));
+      var budgets = budgets();
+      var control = mock(CommitControlStore.class);
+      var failure = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+      when(control.read(scope)).thenReturn(CompletableFuture.failedFuture(failure));
+      var metrics = new RequestMetrics();
+      var gateway = gateway(startup, budgets, RESPONSE_BYTES, control, metrics);
+
+      CompletionException openingFailure = assertThrows(CompletionException.class,
+          () -> subscribe(gateway, tailer, scope));
+
+      assertTrue(openingFailure.getCause() instanceof BackendFailure);
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT,
+          ((BackendFailure) openingFailure.getCause()).category());
+      assertEquals(1, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.BARRIER_READ));
+      assertEquals(0, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.HISTORY_REPLAY_OPEN));
+      verify(subscription).close();
+      assertReleased(budgets);
+    }
+  }
+
+  @Test
+  void historyReplayResourceFailureIsCountedAtReplayOpenStage() throws Exception {
+    try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
+      var limits = new BudgetManager.Limits(8, 8, 8, 8, 8, 1L << 20, 128L << 20);
+      var reserved = new BudgetManager.ReservedCapacity(2, 2, 2, 2, 2, 1L << 20, 64L << 20);
+      var budgets = new BudgetManager(limits, Map.of(TABLE_GROUP, limits), limits,
+          reserved, Map.of(TABLE_GROUP, reserved));
+      var tailer = openTailer();
+      var subscription = mock(SharedEventTailer.Subscription.class);
+      when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
+          anyInt(), anyLong(), anyLong()))
+          .thenReturn(new SharedEventTailer.SubscriptionStart(subscription, 0, 1));
+      var selected = mock(SelectedSequenceReader.class);
+      var failure = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+      when(selected.sequenceForRevision(anyLong(), any(CommitState.class),
+          any(RequestScope.class), any(ManifestCatalog.ProofReadBudget.class)))
+          .thenReturn(CompletableFuture.failedFuture(failure));
+      var metrics = new RequestMetrics();
+      var gateway = new WatchGateway(TABLE_GROUP,
+          new M3TableGroupRuntime.Pending(startup, null, true), control(12, 0), budgets,
+          Runnable::run, mock(ScheduledExecutorService.class), 11, 12, RESPONSE_BYTES,
+          mock(EventHistoryPinManager.class), selected, ByteKey.copyOf(new byte[32]), metrics);
+      var request = Rpc.WatchCreateRequest.newBuilder().setStartRevision(3).build();
+
+      CompletionException openingFailure = assertThrows(CompletionException.class,
+          () -> subscribe(gateway, tailer, scope, KeyRange.all(), request));
+
+      assertTrue(openingFailure.getCause() instanceof BackendFailure);
+      assertEquals(BackendFailure.Category.RESOURCE_LIMIT,
+          ((BackendFailure) openingFailure.getCause()).category());
+      assertEquals(1, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.HISTORY_REPLAY_OPEN));
+      assertEquals(0, metrics.watchCreateResourceFailures().get(
+          RequestMetrics.WatchCreateResourceFailureStage.TAILER_SUBSCRIPTION));
+      verify(subscription).close();
       assertReleased(budgets);
     }
   }
@@ -785,9 +926,15 @@ class WatchGatewayTest {
 
   private static WatchGateway gateway(RequestScope startup, BudgetManager budgets,
       int maximumResponseBytes, CommitControlStore control) {
+    return gateway(startup, budgets, maximumResponseBytes, control, new RequestMetrics());
+  }
+
+  private static WatchGateway gateway(RequestScope startup, BudgetManager budgets,
+      int maximumResponseBytes, CommitControlStore control, RequestMetrics metrics) {
     var pending = new M3TableGroupRuntime.Pending(startup, null, true);
     return new WatchGateway(TABLE_GROUP, pending, control, budgets, Runnable::run,
-        mock(ScheduledExecutorService.class), 11, 12, maximumResponseBytes);
+        mock(ScheduledExecutorService.class), 11, 12, maximumResponseBytes,
+        null, null, null, metrics);
   }
 
   private static CommitControlStore control(long revision, long compactRevision) {

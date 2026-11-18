@@ -167,7 +167,9 @@ class M4WatchRpcIT {
         } catch (AssertionError failure) {
           var metrics = server.metrics().getFirst();
           throw new AssertionError(failure.getMessage() + "\nserver request metrics: "
-              + metrics.snapshot() + "\nPut stages: " + metrics.putStages(), failure);
+              + metrics.snapshot() + "\nPut stages: " + metrics.putStages()
+              + "\nWatch create resource failure stages: "
+              + metrics.watchCreateResourceFailures(), failure);
         }
       }
     }

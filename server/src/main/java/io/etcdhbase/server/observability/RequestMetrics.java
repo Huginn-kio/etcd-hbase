@@ -30,6 +30,7 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   private final Map<TxnStage, StageCounter> txnStages;
   private final Map<LeaseRenewalStage, StageCounter> leaseRenewalStages;
   private final Map<LeaseRevocationStage, StageCounter> leaseRevocationStages;
+  private final Map<WatchCreateResourceFailureStage, LongAdder> watchCreateResourceFailures;
   private final LongAdder putOutputBytes = new LongAdder();
   private final LongAdder txnOutputBytes = new LongAdder();
   private final LongAdder leaseRenewalRequests = new LongAdder();
@@ -106,6 +107,12 @@ public final class RequestMetrics implements RequestCompletionRecorder {
       revocations.put(stage, new StageCounter());
     }
     leaseRevocationStages = Map.copyOf(revocations);
+    Map<WatchCreateResourceFailureStage, LongAdder> watchFailures =
+        new EnumMap<>(WatchCreateResourceFailureStage.class);
+    for (WatchCreateResourceFailureStage stage : WatchCreateResourceFailureStage.values()) {
+      watchFailures.put(stage, new LongAdder());
+    }
+    watchCreateResourceFailures = Map.copyOf(watchFailures);
   }
 
   /** Bounded stages that J30 actually observes; publication includes M2 finalization. */
@@ -121,6 +128,30 @@ public final class RequestMetrics implements RequestCompletionRecorder {
 
   /** Bounded stages measured while preparing and publishing a Lease revocation. */
   public enum LeaseRevocationStage { QUEUE, PREPARE, PUBLISH_AND_FINALIZE }
+
+  /**
+   * Coarse, bounded stages for Watch-create resource failures. These counters locate the processing
+   * stage that rejected a request; they do not identify the specific budget dimension or limit.
+   */
+  public enum WatchCreateResourceFailureStage {
+    REQUEST_ACCOUNT_ADMISSION,
+    STATE_MEMORY_RETENTION,
+    TAILER_SUBSCRIPTION,
+    BARRIER_READ,
+    HISTORY_REPLAY_OPEN
+  }
+
+  public void recordWatchCreateResourceFailure(WatchCreateResourceFailureStage stage) {
+    Objects.requireNonNull(stage, "stage");
+    watchCreateResourceFailures.get(stage).increment();
+  }
+
+  public Map<WatchCreateResourceFailureStage, Long> watchCreateResourceFailures() {
+    Map<WatchCreateResourceFailureStage, Long> snapshot =
+        new EnumMap<>(WatchCreateResourceFailureStage.class);
+    watchCreateResourceFailures.forEach((stage, count) -> snapshot.put(stage, count.sum()));
+    return Map.copyOf(snapshot);
+  }
 
   public void recordTxnStage(TxnStage stage, long elapsedNanos) {
     Objects.requireNonNull(stage, "stage");

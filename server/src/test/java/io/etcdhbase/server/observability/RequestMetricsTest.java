@@ -75,6 +75,26 @@ class RequestMetricsTest {
   }
 
   @Test
+  void countsWatchCreateResourceFailuresByBoundedStage() {
+    var metrics = new RequestMetrics();
+    metrics.recordWatchCreateResourceFailure(
+        RequestMetrics.WatchCreateResourceFailureStage.REQUEST_ACCOUNT_ADMISSION);
+    metrics.recordWatchCreateResourceFailure(
+        RequestMetrics.WatchCreateResourceFailureStage.TAILER_SUBSCRIPTION);
+    metrics.recordWatchCreateResourceFailure(
+        RequestMetrics.WatchCreateResourceFailureStage.TAILER_SUBSCRIPTION);
+
+    var snapshot = metrics.watchCreateResourceFailures();
+    assertEquals(5, snapshot.size());
+    assertEquals(1, snapshot.get(
+        RequestMetrics.WatchCreateResourceFailureStage.REQUEST_ACCOUNT_ADMISSION));
+    assertEquals(2, snapshot.get(
+        RequestMetrics.WatchCreateResourceFailureStage.TAILER_SUBSCRIPTION));
+    assertEquals(0, snapshot.get(
+        RequestMetrics.WatchCreateResourceFailureStage.HISTORY_REPLAY_OPEN));
+  }
+
+  @Test
   void countsCommittedExpiryWithoutInventingAnUnavailableDelaySample() {
     var metrics = new RequestMetrics();
     metrics.recordLeaseExpiryRevocation(250);

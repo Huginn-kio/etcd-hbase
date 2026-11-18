@@ -11,11 +11,14 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.RequestScopeInterceptor;
+import io.etcdhbase.server.observability.RequestMetrics;
 import io.grpc.stub.StreamObserver;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Function;
@@ -46,13 +49,14 @@ final class WatchGateway {
   private final long clusterId;
   private final long memberId;
   private final int maximumResponseBytes;
+  private final RequestMetrics metrics;
 
   WatchGateway(String tableGroup, M3TableGroupRuntime.Pending pending, CommitControlStore control,
       BudgetManager budgets,
       Executor worker, ScheduledExecutorService timers, long clusterId, long memberId,
       int maximumResponseBytes) {
     this(tableGroup, pending, control, budgets, worker, timers, clusterId, memberId,
-        maximumResponseBytes, null, null, null);
+        maximumResponseBytes, null, null, null, new RequestMetrics());
   }
 
   WatchGateway(String tableGroup, M3TableGroupRuntime.Pending pending, CommitControlStore control,
@@ -60,6 +64,15 @@ final class WatchGateway {
       long clusterId, long memberId, int maximumResponseBytes,
       EventHistoryPinManager historyPins, SelectedSequenceReader selectedEvents,
       io.etcdhbase.core.bytes.ByteKey authorization) {
+    this(tableGroup, pending, control, budgets, worker, timers, clusterId, memberId,
+        maximumResponseBytes, historyPins, selectedEvents, authorization, new RequestMetrics());
+  }
+
+  WatchGateway(String tableGroup, M3TableGroupRuntime.Pending pending, CommitControlStore control,
+      BudgetManager budgets, Executor worker, ScheduledExecutorService timers,
+      long clusterId, long memberId, int maximumResponseBytes,
+      EventHistoryPinManager historyPins, SelectedSequenceReader selectedEvents,
+      io.etcdhbase.core.bytes.ByteKey authorization, RequestMetrics metrics) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
     this.pending = Objects.requireNonNull(pending, "pending");
     this.control = Objects.requireNonNull(control, "control");
@@ -71,6 +84,7 @@ final class WatchGateway {
       throw new IllegalArgumentException("Watch replay dependencies must be provided together");
     }
     this.budgets = Objects.requireNonNull(budgets, "budgets");
+    this.metrics = Objects.requireNonNull(metrics, "metrics");
     this.worker = Objects.requireNonNull(worker, "worker");
     this.timers = Objects.requireNonNull(timers, "timers");
     if (tableGroup.isBlank() || clusterId == 0 || memberId == 0 || maximumResponseBytes < 1) {
@@ -149,7 +163,14 @@ final class WatchGateway {
       long outputReservationBytes = Math.addExact(maximumPendingRevisionBytes, retainedStateBytes);
       var reservation = new BudgetManager.Reservation(retainedStateBytes, 1, 1,
           outputReservationBytes, 0);
-      BudgetManager.Account account = budgets.admit(tableGroup, streamScope, reservation);
+      BudgetManager.Account account;
+      try {
+        account = budgets.admit(tableGroup, streamScope, reservation);
+      } catch (BackendFailure failure) {
+        recordResourceFailure(
+            RequestMetrics.WatchCreateResourceFailureStage.REQUEST_ACCOUNT_ADMISSION, failure);
+        throw failure;
+      }
       BudgetManager.Lease stateMemory = null;
       RequestScope.ScopedCleanup stateMemoryCleanup = null;
       SharedEventTailer.SubscriptionStart start;
@@ -160,11 +181,22 @@ final class WatchGateway {
         if (streamScope.isClosed()) {
           throw new BackendFailure(BackendFailure.Category.CANCELLED);
         }
+      } catch (BackendFailure | RuntimeException | Error failure) {
+        recordResourceFailure(
+            RequestMetrics.WatchCreateResourceFailureStage.STATE_MEMORY_RETENTION, failure);
+        closeAfterFailure(stateMemoryCleanup == null ? stateMemory : stateMemoryCleanup, failure);
+        closeAfterFailure(account, failure);
+        throw failure;
+      }
+
+      try {
         start = tailer.subscribeWithCheckpoint(range, account,
             WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH, maximumPendingRevisionBytes,
             request.getStartRevision());
       } catch (BackendFailure | RuntimeException | Error failure) {
-        closeAfterFailure(stateMemoryCleanup == null ? stateMemory : stateMemoryCleanup, failure);
+        recordResourceFailure(
+            RequestMetrics.WatchCreateResourceFailureStage.TAILER_SUBSCRIPTION, failure);
+        closeAfterFailure(stateMemoryCleanup, failure);
         closeAfterFailure(account, failure);
         throw failure;
       }
@@ -183,11 +215,15 @@ final class WatchGateway {
       try {
         barrier = Objects.requireNonNull(control.read(streamScope), "Watch control snapshot future");
       } catch (RuntimeException | Error failure) {
+        recordResourceFailure(
+            RequestMetrics.WatchCreateResourceFailureStage.BARRIER_READ, failure);
         closeAfterFailure(subscriptionCleanup, failure);
         closeAfterFailure(retainedStateMemoryCleanup, failure);
         closeAfterFailure(account, failure);
         throw failure;
       }
+      barrier = barrier.whenComplete((snapshot, failure) -> recordResourceFailure(
+          RequestMetrics.WatchCreateResourceFailureStage.BARRIER_READ, failure));
       return barrier
           .thenCompose(snapshot -> openedWatch(range, snapshot, start, subscription,
               subscriptionCleanup, account, retainedStateMemoryCleanup, request))
@@ -241,9 +277,19 @@ final class WatchGateway {
         }
         subscription.requireRevisionAtLeast(nextRevision(revision));
         var barrierSnapshot = snapshot.orElseThrow(WatchGateway::unavailable);
-        return WatchHistoryReplay.open(tableGroup, range, request.getStartRevision(),
-            barrierSnapshot, state.publishedSequence(), authorization, historyPins, selectedEvents,
-            budgets, account, streamScope).thenApply(result -> {
+        CompletionStage<WatchHistoryReplay.OpenResult> replayOpen;
+        try {
+          replayOpen = WatchHistoryReplay.open(tableGroup, range, request.getStartRevision(),
+              barrierSnapshot, state.publishedSequence(), authorization, historyPins, selectedEvents,
+              budgets, account, streamScope);
+        } catch (RuntimeException | Error failure) {
+          recordResourceFailure(
+              RequestMetrics.WatchCreateResourceFailureStage.HISTORY_REPLAY_OPEN, failure);
+          throw failure;
+        }
+        return replayOpen.whenComplete((result, failure) -> recordResourceFailure(
+            RequestMetrics.WatchCreateResourceFailureStage.HISTORY_REPLAY_OPEN, failure))
+            .thenApply(result -> {
               var opened = new java.util.concurrent.atomic.AtomicReference<WatchStream.OpenedWatch>();
               boolean active = streamScope.startIfOpen(() -> {
                 var tailerSubscription = new TailerSubscription(subscription,
@@ -268,6 +314,19 @@ final class WatchGateway {
               state.publishedSequence())));
     }
 
+  }
+
+  private void recordResourceFailure(
+      RequestMetrics.WatchCreateResourceFailureStage stage, Throwable failure) {
+    Throwable cause = failure;
+    while ((cause instanceof CompletionException || cause instanceof ExecutionException)
+        && cause.getCause() != null) {
+      cause = cause.getCause();
+    }
+    if (cause instanceof BackendFailure backendFailure
+        && backendFailure.category() == BackendFailure.Category.RESOURCE_LIMIT) {
+      metrics.recordWatchCreateResourceFailure(stage);
+    }
   }
 
   private static java.util.concurrent.CompletionException unavailable() {

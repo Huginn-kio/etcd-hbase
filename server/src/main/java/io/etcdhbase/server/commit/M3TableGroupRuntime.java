@@ -792,7 +792,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       var watchGateway = new WatchGateway(plan.source().tableGroupId(), pending,
           stores.control(), budgets, pending.worker, pending.leaseTimers,
           stores.clusterId(), activation.memberIdBits(), limits.maxRpcBytes(), pending.eventPins,
-          selectedEvents, authorization);
+          selectedEvents, authorization, business.metrics());
       watchService = new WatchService(watchGateway.handler());
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
