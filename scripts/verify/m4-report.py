@@ -308,10 +308,11 @@ J47_CRITICAL_JAVA_TESTS = {
     },
     "io.etcdhbase.server.commit.WatchHistoryReplayTest": {
         "compactAdvancingAfterReplayRegistrationPreservesTheBoundary",
-        "compactDuringGatewayReplaySendsCreatedThenCanceledWithTheBoundary",
+        "compactDuringInitialIndexLookupSendsCreatedThenCanceledWithTheBoundary",
         "closingReplayWaitsForPhysicalProducerBeforeReleasingItsHistoryPin",
         "cancellingDuringProtectedEventOpenDrainsProducerBeforeReleasingReplayProtection",
         "authenticationAndPermissionFailuresRemainTypedDuringReplay",
+        "authenticationAndPermissionFailuresDuringCompactRecheckRemainTyped",
     },
     "io.etcdhbase.server.commit.WatchStreamTest": {
         "compactionDuringHistoricalReplaySendsCompactRevisionAfterCreated",
