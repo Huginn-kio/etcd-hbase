@@ -1,3 +1,5 @@
+//go:build m4watchintegration
+
 package scenario
 
 import (

@@ -144,7 +144,8 @@ class M4WatchRpcIT {
   private static void runGoWatchTest(Path root, String endpoint, String prefix, Path log,
       String layoutName) throws Exception {
     List<String> command = List.of(root.resolve("scripts/dev/go-m0.sh").toString(),
-        "test", "-v", "-count=1", "-run", "^" + GO_WATCH_TEST + "$", "./internal/scenario");
+        "test", "-tags", "m4watchintegration", "-v", "-count=1", "-run",
+        "^" + GO_WATCH_TEST + "$", "./internal/scenario");
     ProcessBuilder builder = new ProcessBuilder(command).directory(root.toFile());
     builder.environment().put(WATCH_ENDPOINT_ENV, endpoint);
     builder.environment().put(WATCH_PREFIX_ENV, prefix);
