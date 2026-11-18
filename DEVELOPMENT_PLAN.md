@@ -74,12 +74,12 @@
 | M1 | HBase 存储、盐桶扫描与预算 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M2 | 提交、MVCC、恢复与热点可行性 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M3 | KV / Range / Txn | 7 | 0 | 7 | 未开始 | 待分配 | — / — | — |
-| M4 | Lease、注册监听与 Watch | 8 | 0 | 8 | 进行中 | Codex | — / — | J40–J44 已合并；J45 PR #52、J46 PR #53、J47 PR #54 开放；J45 等待维护者复查；M4 阶段验收未完成 |
+| M4 | Lease、注册监听与 Watch | 8 | 5 | 3 | 进行中 | Codex | — / — | J40–J44（PR #47–#51）已完成并合并；J45 PR #52 开放、40 项 CI 通过且已请求 reviewer；J46 PR #53 开放、41 项 CI 通过，按顺序等待 #52 合并后评审；J47 PR #54 head=`330d19e`，42 项 CI 通过，等待 #53 合并后评审；目标环境与 M4 阶段验收未完成 |
 | M5 | Auth、GC、运维与生命周期 | 10 | 0 | 10 | 未开始 | 待分配 | — / — | — |
 | M6 | Milvus 新集群接入 | 8 | 0 | 8 | 未开始 | 待分配 | — / — | — |
 | M7 | HBase 压力、故障与长期运行 | 8 | 0 | 8 | 未开始 | 待分配 | — / — | — |
 | M8 | 新集群灰度与交付 | 7 | 0 | 7 | 未开始 | 待分配 | — / — | — |
-| **合计** | | **78** | **3** | **75** | **进行中** | | | |
+| **合计** | | **78** | **8** | **70** | **进行中** | | | |
 
 ### 2.3 已完成 / 未完成记录
 
@@ -835,21 +835,22 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 后续检查点断言验证：在 J43 head=`6e467042aef8142c451276c85bdd3cb2eb231394` 上执行 `ETCD_HBASE_JDK21_HOME=<pinned Temurin 21> scripts/dev/mvn21.sh -B -ntp -pl server -am -Dtest=LeaseRevocationPreparerTest -Dsurefire.failIfNoSpecifiedTests=false test`，10 项通过，失败、错误、跳过为 0；该定向检查覆盖检查点 target identity 与 sequence 的新增断言。
   - 作者自审=完成；独立复核=已完成（1 项 P1 已修复并定向验证）；维护者正式 review=待处理。
 
-- [ ] **J44｜已提交事件页、共享 EventTailer 与事件读取预算**
+- [x] **J44｜已提交事件页、共享 EventTailer 与事件读取预算**
   - 依赖：J23/J24。
   - 完成标准：事件和 KV 同一逻辑提交；每实例/表组共享实时读取，通过已选择决定定位事件页，不为每个 watch 重扫 latest；记录副本读放大。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=待评审；负责人=Codex；完成日期=2026-11-17（实现与公开验证）；PR/commit=[PR #51](https://github.com/Reidddddd/etcd-hbase/pull/51) / `39ef6d692e56f7833519e2ab67375bc1cfe91c29`；验证报告=`j44-final-20261117-on-demand-retry2`（本地 artifact）；评审人/结论=`Reidddddd` / 待 #50 合并后请求正式 review。目标环境与 M4 阶段验收=未完成。
+  - 跟踪：状态=实现、公开验证、维护者评审完成并已合并；负责人=Codex；完成日期=2026-11-18；PR/commit=[PR #51](https://github.com/Reidddddd/etcd-hbase/pull/51) / `f34d9138f63a63fec48010df44a291ec808e9ac6`；验证报告=`j44-final-20261117-on-demand-retry2`（本地 artifact）；正式 reviewer=`Reidddddd`，已批准；GitHub CI 39 项通过。目标环境与 M4 阶段验收=未完成。
   - 公开验证：Temurin JDK 21 下 `scripts/verify/m4.sh --scope public --task J44` 对应 Maven `clean verify -Pm4-j44-public`；1130 项 Java 测试、192 份 Maven XML 报告，失败/错误/跳过均为 0；HBase MiniCluster 的 HISTORY/NATIVE 两种布局事件与持久化用例通过，原生 Lease 回归 trace 对照通过。完整原始报告留在本地；Go Watch 对照归 J45/J46。
-  - 作者自审=完成；独立复核=完成（未发现 P1/P2；固定控制行发布基准读取的预算归属在 PR 说明中披露）；维护者正式 review=待处理。
+  - 作者自审=完成；独立复核=完成（未发现 P1/P2；固定控制行发布基准读取的预算归属在 PR 说明中披露）；维护者正式 review=`Reidddddd` 已批准。
 
 - [ ] **J45｜Watch 双向流 create/cancel、范围订阅索引**
   - 依赖：J44。
   - 完成标准：多 watchId、精确 key/区间、inclusive startRevision、Created、PrevKV 及过滤正确；内存随活跃订阅增长，不维护全部 KV 树。
   - 范围说明：J45 对照零、负数及未来 startRevision 的创建行为，并按 raw proto 契约接受 `watch_id=-1` 的 Create/Cancel；`startRevision > 0` 且目标不晚于当前 revision 的历史回放与 inclusive 交接由 J46.1 实现，J45 不宣称已支持历史回放。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：PR [#52](https://github.com/Reidddddd/etcd-hbase/pull/52) 开放、非 Draft，base 为上游 `main`（`c11c0dfd2dde72f8bdccd8ba503e02bc767eea17`）；依赖 PR #51（J44）已合并。F1–F4 及后续三项资源清理 review 修订均已完成；作者自审和独立复核未发现未解决的 P1/P2，等待维护者复查。完整正确性 review 尚未完成。正式 reviewer=`Reidddddd`。目标环境与 M4 阶段验收未完成。
-  - 验证：代码提交=`6c7cb7ca85518fde02b04845fbfbf99d807a1486`；Temurin JDK `21.0.12.1+1` 下运行 `scripts/verify/m4.sh --scope public --task J45`，run ID=`j45-pr52-resource-cleanup-20261119`，状态=passed；8 项 Go 测试、1,168 项 Java 测试、39 条原生 trace；失败、错误、跳过均为 0。报告范围是公开 JVM 单测、Go/native Watch 起点对照及本地服务生命周期矩阵，不含 MiniCluster 或真实目标环境。原始报告留在本地 `.artifacts/m4/j45-pr52-resource-cleanup-20261119`；run 标记 `development-dirty`，因为保留了已有未跟踪 `scripts/verify/__pycache__/`，验证源码与提交 SHA 一致。新 PR head 的 GitHub CI 以 PR checks 为准。目标环境与 M4 阶段验收未完成。
+  - 跟踪：状态=实现与公开验证完成，正式评审等待中；PR #52 已开放，review 修复代码提交=`c82d560e5d35cd1332337203254dd3790492297c`；依赖 PR #51（J44）；负责人=Codex；完成日期=2026-11-18；PR=[PR #52](https://github.com/Reidddddd/etcd-hbase/pull/52)；当前 head GitHub CI 40 项通过；正式 reviewer=`Reidddddd` 已请求。目标环境与 M4 阶段验收=未完成。
+  - Review 修复：压缩取消后只保留 watch ID，不再让 tombstone 引用范围与订阅预算对象；进程最多保留 65,536 个 ID、每流最多 1,024 个。容量耗尽时返回创建拒绝；显式 Cancel、流关闭和故障清理释放配额。作者自审=完成；独立复核=完成（对象图保留与进程级预算问题均已处理，未发现 P1/P2）。
+  - Review 修复定向验证：Temurin JDK 21 下运行 `scripts/dev/mvn21.sh -pl server -am -Dtest=WatchStreamTest,WatchGatewayTest,WatchGoInteropTest -Dsurefire.failIfNoSpecifiedTests=false test`，40 项通过（WatchStream 28、WatchGateway 11、WatchGoInterop 1），失败/错误/跳过均为 0；`git diff --check` 通过。原完整公开验证报告对应较早的 J45 head，不作为本轮修复的完整验证；本轮新 head 的 GitHub CI 完成后再记录整体验证结论。
 
 - [ ] **J46｜历史回放、实时交接、progress 与 fragment**
   - 依赖：J45。
@@ -859,7 +860,7 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
     - [x] **J46.2** progress：进度水位及完整事件关系，单独记录原生对照结果；覆盖显式和周期 progress、过滤与历史回放屏障、raw `watch_id=-1`。
     - [x] **J46.3** fragment：有界大 revision 分片、顺序、取消清理；固定 Go client 的分片重组和同一 Watch 调用在未完成 revision 中断后的自动重连。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：J46.1–J46.3 实现及原 head 的公开 MiniCluster 验证完成，PR #53 已开放；CI 首轮发现 Watch 测试夹具缺少有效事件序号，head `4c028a7b654653a0270ea97551cf60f01ccbd610` 的跨任务检查又发现 opt-in Go→Java 集成测试被常规 Go 套件计为 skip；两项均已形成局部修复，后者的常规 Go 全套复验通过，完整新 head CI 待运行；负责人=Codex；完成日期=2026-11-18；实现 commit=`f8b498020aebe5265161a2a77bb30fd4167e067f`；Base=上游 `main` `5c3298e5014255dc16f6a85347b2309f0f7aec16`；Head=`Huginn-kio:codex/j46-watch-replay-progress`；正式 reviewer=`Reidddddd`，按前序 PR 顺序在 #52 合并后请求；目标身份与 M4 阶段验收=未完成。
+  - 跟踪：J46.1–J46.3 实现及公开 MiniCluster 验证完成，PR #53 已开放并已 rebase 到最新上游 `main`；当前 base=`c11c0dfd2dde72f8bdccd8ba503e02bc767eea17`，当前 head=`911526d5957c8643035431d9829c7169374b78fd`。CI 首轮发现 Watch 测试夹具缺少有效事件序号，后续跨任务检查又发现 opt-in Go→Java 集成测试被常规 Go 套件计为 skip；两项均已形成局部修复，后者的常规 Go 全套复验通过。当前 head 的 GitHub CI 41 项全部成功；负责人=Codex；完成日期=2026-11-18；原完整验证提交=`f8b498020aebe5265161a2a77bb30fd4167e067f`；正式 reviewer=`Reidddddd`，按前序 PR 顺序等待 #52 合并后请求；目标身份与 M4 阶段验收=未完成。
   - J46.1 公开定向验证：Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J46 --artifact-root .artifacts/m4/j46-1-targeted-20261118-1` 通过。报告脚本 38 项、`WatchHistoryReplayTest` 2 项通过，失败/错误/跳过均为 0；artifact 标记为 `development-dirty`。证据仅覆盖 inclusive 历史回放、revision/ordinal 顺序和 captured barrier 交接，不代表 J46.2/J46.3、完整 J46、MiniCluster 或原生 Go client 验收。
   - J46.2 显式进度屏障公开定向验证：Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J46 --artifact-root .artifacts/m4/j46-2-targeted-20261118-2` 通过。固定 etcd v3.5.23 raw-proto Go 对照 1 项，Java 回放与进度测试 6 项，报告脚本 38 项；失败/错误/跳过均为 0，artifact 标记为 `development-dirty`。覆盖 synced 全流 `watch_id=-1` 响应、进度前的事件发送、过滤后空水位、任一历史回放未完成时不返回进度、未来起点门禁；不覆盖周期 progress、fragment、MiniCluster 或 Java 服务上的完整 Go client 互通。
   - J46 完整公开验证：Temurin JDK 21；artifact `j46-final-clean-20261118-1` 标记为 `official-clean`，scope=`public-local-minicluster`，source/checkout SHA=`f8b498020aebe5265161a2a77bb30fd4167e067f`，base SHA=`5c3298e5014255dc16f6a85347b2309f0f7aec16`，`worktree_clean=true`。报告记录固定 etcd v3.5.23 raw-proto Go 对照 1 项、Java 测试 65 项，失败/错误/跳过均为 0；HISTORY/NATIVE 两种 MiniCluster 布局均由 Go v3.5.23 client 验证历史 fragment 重组、首片/中片断流后的自动重连重放和 live handoff，以及完整 revision 后断流恢复。断流通过 client-side interceptor 取消真实 RPC context 并注入 `UNAVAILABLE`；同一 `clientv3.Watcher.Watch` 持续交付完整 revision。报告注册表、报告测试和 artifact 校验均通过。
@@ -874,12 +875,12 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 完成标准：订阅/连接/表组缓冲均有界；取消释放资源；历史不足返回原生可识别错误，客户端重新读取列表，不能丢事件后继续伪装正常。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
   - CI 报告注册表修复（2026-11-19）：PR #54 原 head=`14e96762f4c147f6401109f3cc55b0a689323e81` 的 M4 检查未进入 Maven，J45/J47 日志显示共享 `report-tests` 因 J47 `WatchHistoryReplayTest` 登记了已改名方法而失败。已同步 `m4-cases.json` 与报告守卫中的关键测试集合，并登记新增的认证/权限重查回归；`PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify/test_m4_report.py` 41 项通过，`python3 scripts/verify/m4-report.py --validate-registry`、JSON 解析和 `git diff --check` 通过。新 head 的 MiniCluster 与 Maven CI 仍待验证，旧 run 未到该阶段。
-  - 跟踪：状态=实现与本地定向验证完成，PR #54 已开放；分支=`codex/j47-watch-readiness`，基于最新上游 `main`；由于 #52/#53 尚未合并，PR #54 相对 main 的累计 diff 包含 J45/J46/J47，描述中分别标注依赖与比较范围；当前 head 的 GitHub 完整 CI 待完成；负责人=Codex；完成日期=2026-11-19；完整验证基线报告=`j47-final-gated-r2-20261119`（本地 artifact）；正式 reviewer=`Reidddddd`（按前序 PR 顺序在 #53 合并后请求）；目标环境与 M4 阶段验收=未完成。
+  - 跟踪：状态=实现、公开验证与独立复核完成，等待正式评审；PR #54 已开放；分支=`codex/j47-watch-readiness`，base=`c11c0dfd2dde72f8bdccd8ba503e02bc767eea17`，head=`330d19e4533f2cdf00509e0ec820622206db6d27`；由于 #52/#53 尚未合并，PR #54 相对 main 的累计 diff 包含 J45/J46/J47，描述中分别标注依赖与比较范围；GitHub run [44390833495](https://github.com/Reidddddd/etcd-hbase/actions/runs/44390833495) 的 42 项检查全部通过（J41 首次启动失败仅在单 job 重跑后成功）；负责人=Codex；完成日期=2026-11-19；完整验证基线报告=`j47-final-gated-r2-20261119`（本地 artifact）；正式 reviewer=`Reidddddd`，按顺序等待 #53 合并后请求；目标环境与 M4 阶段验收=未完成。
   - 完整公开验证基线：Temurin JDK 21，`scripts/verify/m4.sh --scope public --task J47 --artifact-root .artifacts/m4/j47-final-gated-r2-20261119` 通过；140 项 Surefire、5 项 Failsafe、2 项 Go 用例通过，失败/错误/跳过均为 0；报告注册表与 41 项报告测试通过，artifact 校验成功。覆盖固定 etcd v3.5.23 Go Watch half-close/压缩边界对照、registry-bound 历史保护、production Lease fail-closed、错误状态脱敏、HISTORY/NATIVE MiniCluster 的 runtime shutdown 取消、历史回放/GC 保护，以及 J29.4 Lease 与 Watch 组合负载。该 artifact 在本轮 review 修复前生成，标记为 `development-dirty`，只作为完整套件基线，不作为下述新修复的全量验证证据。
   - 新 head CI 失败复核与测试入口修复（2026-11-19）：run `44369533155` 中 J42/J43 在双进程 `M4LeaseKeepAliveRpcIT.dualProcessKeepAliveSurvivesOwnerFailureAndFencesStaleEpoch` 失败；根因是生产 CLI 默认 `PRODUCTION` 并按设计拒绝 Lease activation，而测试子进程错误地经该 CLI 启动。新增测试专用 `M4LeaseRuntimeProcess`，只由可信测试代码注入 `PUBLIC_TEST`；`RuntimeServer.run(String[])` 仍固定使用 `PRODUCTION`，并新增生产入口拒绝断言。Temurin JDK 21 下 `scripts/dev/mvn21.sh -B -ntp -pl server -am -Pm4-j42-public -Dtest=RuntimeServerTest#productionRuntimeCliRejectsLeaseActivationBeforeStartingTheBackend -Dsurefire.failIfNoSpecifiedTests=false -Dit.test=M4LeaseKeepAliveRpcIT#dualProcessKeepAliveSurvivesOwnerFailureAndFencesStaleEpoch -Dfailsafe.failIfNoSpecifiedTests=false verify` 通过：单测与双进程 MiniCluster 用例各 1 项，失败/错误/跳过均为 0。
-  - J46 CI 资源拒绝诊断（2026-11-19）：run `44369533155` 的 `M4WatchRpcIT` 5 项中 1 项失败；Go client 在完整 revision 后断流场景收到 `Watch resource limit exceeded`。本机 Temurin JDK 21 单方法复现通过；随后按 CI 顺序运行完整 `scripts/verify/m4.sh --scope public --task J46 --artifact-root .artifacts/m4/j47-ci-repro-20261119` 通过：86 项 Surefire、5 项 Go client/MiniCluster Failsafe、固定 etcd Go oracle 与 artifact 校验均通过，失败/错误/跳过均为 0。当前证据未确认预算或 cleanup 缺陷，不扩大预算、不改测试预期；该 Linux CI 失败仍待修复后新 head 的 CI 重跑确认。
+  - J46 CI 资源拒绝诊断（2026-11-19）：GitHub run `44378084888` 的 `M4WatchRpcIT` 在 Go client 收到 fragment 1 后自动重连时返回 `Watch resource limit exceeded`，同一 run 的 J47 job 通过；该拒绝发生在 Watch 创建阶段，具体预算来源未确认。新增五个固定 Watch 创建阶段计数（请求准入、state memory 保留、tailer 订阅、barrier 读取、历史 replay 打开），只定位阶段族、不声称具体预算维度/阈值；测试失败时输出阶段计数，不记录 key、身份或请求值。本地 Temurin JDK 21 对当前增量运行 `scripts/verify/m4.sh --scope public --task J46 --artifact-root .artifacts/m4/j47-watch-create-diagnostics-20261119-1` 通过：86 项 Surefire、5 项 Go client/MiniCluster Failsafe、固定 etcd Go oracle 与 artifact 校验均通过，失败/错误/跳过均为 0。新 head `330d19e` 的 run `44390833495` 中 J46 与 J47 job 均通过，42 项检查最终全绿；J41 首次出现的 MiniCluster startup `UNAVAILABLE` 在单 job rerun 后成功。没有扩大预算或放宽断言；此次未重现先前 J46 拒绝，不能据此宣称其根因已确认。
   - 本轮 review 修复与定向验证（2026-11-19）：独立复核首轮发现两项 P2；后续针对复核又确认一项错误映射 P2，三项均已修复。对 Watch 初始 revision-index lookup 缺失或 pin 注册 floor 拒绝，仅重读权威 control；只有 `compactRevision > startRevision` 才走既有 Created→Canceled 路径，未越界保留原故障，普通权限失败不触发额外重读，取消中的 stream 不启动查验。若 control 重读失败，则传播该认证/权限/后端错误，并将初始错误作为 suppressed 诊断信息。确定性单测覆盖两种竞态起因、未压缩缺页、索引查询权限失败，以及缺索引/注册 floor 后认证与权限重读失败；注册 floor 组合实际经过 `registerProtection`。gateway 回归断言 Compact 竞争时按顺序返回 Created、Canceled 和 `compact_revision`，并保留 pin 已注册后 Compact 的独立覆盖。drift=0 配置测试改用 `PUBLIC_TEST` loader，确保命中零漂移校验，而非被 production Lease fail-closed 提前拒绝。最终矩阵调整后的 Temurin JDK 21 reactor 定向验证：`./mvnw -pl server -am -Dtest=WatchHistoryReplayTest -Dsurefire.failIfNoSpecifiedTests=false test`，全 8 个 Maven 模块编译成功，15 项通过（0 失败、0 错误、0 跳过）；同一生产代码版本的先前定向运行 `WatchHistoryReplayTest,WatchStreamTest` 为 62/62。此前 `SnapshotPinManagerTest`、`SelectedDecisionReaderTest`、`NotSelectedProofTest`、`M3RuntimeConfigurationTest` 及 `J47WatchReplayGcIT` 的结果对应前一候选；本次未重跑 MiniCluster 或完整 J47 套件，不能替代新 head 验证。
-  - Review 状态：作者多维度自审=完成；独立复核已通过三项 P2 修复增量，未发现其他可操作的 P0/P1/P2/P3；主 agent 最终复核=完成。正式 reviewer `Reidddddd` 按顺序等待 #53 合并后请求；目标身份与 M4 阶段验收=未完成。生产 Lease 默认拒绝启用，直到 J51 身份生命周期完成；凭据轮换与跨副本授权代次失效仍归 J51，不在此处宣称完成。
+  - Review 状态：作者多维度自审=完成；独立复核=完成，未发现 P0/P1/P2；订阅关闭 P3 建议已补断言并通过定向测试；主 agent 最终复核=完成。正式 reviewer `Reidddddd` 按顺序等待 #53 合并后请求；目标身份与 M4 阶段验收=未完成。生产 Lease 默认拒绝启用，直到 J51 身份生命周期完成；凭据轮换与跨副本授权代次失效仍归 J51，不在此处宣称完成。
 
 **退出条件：** Grant→注册事务→KeepAlive→到期删除→Watch 完整链路及所有管理/选项通过；固定版本默认 session、主备、多角色、PrevKV、回放与慢消费通过，J29.4 真实 Lease 混合负载有报告。15 秒为当前参考值，随固定集成版本复核。
 
