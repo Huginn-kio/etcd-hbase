@@ -2,6 +2,12 @@ package io.etcdhbase.server.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
@@ -22,6 +28,7 @@ import io.etcdhbase.core.commit.SharedEventTailer;
 import io.etcdhbase.core.commit.SystemRecordEntry;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
 import io.etcdhbase.hbase.storage.HBaseCommitDecisionRepository;
@@ -32,6 +39,10 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -125,6 +136,129 @@ class EventTailerCycleTest {
       tailer.close();
     } finally {
       memoryScope.close();
+    }
+  }
+
+  @Test
+  void absentCheckpointWaitsForPhysicalReadWithoutBlockingItsCompletionThread() throws Exception {
+    var fixture = new AsyncCheckpointFixture();
+    try (var scope = RequestScope.withoutDeadline()) {
+      var result = fixture.cycle.run(Optional.empty(), scope);
+      assertTrue(fixture.started.await(5, TimeUnit.SECONDS));
+      CompletableFuture.runAsync(() -> fixture.request.complete(Optional.empty())).get(5, TimeUnit.SECONDS);
+      assertFalse(result.isDone());
+      verify(fixture.pin, never()).close();
+      assertTrue(fixture.budgets.snapshot().reservedBytes() > 0);
+      fixture.physical.complete(null);
+      verify(fixture.pin).close();
+      assertFalse(result.isDone());
+      fixture.released.complete(null);
+      var value = result.get(5, TimeUnit.SECONDS);
+      assertFalse(value.progressed());
+      verify(fixture.pin).close();
+      assertEquals(0, fixture.budgets.snapshot().reservedBytes());
+    } finally {
+      fixture.physical.complete(null);
+      fixture.released.complete(null);
+    }
+  }
+
+  @Test
+  void asyncReadFailurePreservesCauseAndWaitsForPhysicalRead() throws Exception {
+    var fixture = new AsyncCheckpointFixture();
+    var failure = new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    try (var scope = RequestScope.withoutDeadline()) {
+      var result = fixture.cycle.run(Optional.empty(), scope);
+      assertTrue(fixture.started.await(5, TimeUnit.SECONDS));
+      CompletableFuture.runAsync(() -> fixture.request.completeExceptionally(failure)).get(5, TimeUnit.SECONDS);
+      assertFalse(result.isDone());
+      verify(fixture.pin, never()).close();
+      assertTrue(fixture.budgets.snapshot().reservedBytes() > 0);
+      fixture.physical.complete(null);
+      verify(fixture.pin).close();
+      assertFalse(result.isDone());
+      fixture.released.complete(null);
+      var observed = assertThrows(CompletionException.class, result::join);
+      assertSame(failure, io.etcdhbase.core.error.CompletionFailures.unwrapCompletion(observed));
+      verify(fixture.pin).close();
+      assertEquals(0, fixture.budgets.snapshot().reservedBytes());
+    } finally {
+      fixture.physical.complete(null);
+      fixture.released.complete(null);
+    }
+  }
+
+  @Test
+  void workerStopWaitsForPhysicalReadAndPinRelease() throws Exception {
+    var fixture = new AsyncCheckpointFixture();
+    var timer = new ScheduledThreadPoolExecutor(1);
+    var worker = new EventHistoryWorker(timer, Optional::empty, fixture.cycle::run, mock(RequestMetrics.class));
+    try {
+      worker.start();
+      assertTrue(fixture.started.await(5, TimeUnit.SECONDS));
+      worker.stop();
+      assertFalse(worker.drained().isDone());
+      verify(fixture.pin, never()).close();
+      assertTrue(fixture.budgets.snapshot().reservedBytes() > 0);
+      fixture.physical.complete(null);
+      verify(fixture.pin).close();
+      assertFalse(worker.drained().isDone());
+      fixture.released.complete(null);
+      worker.drained().get(5, TimeUnit.SECONDS);
+      verify(fixture.pin).close();
+      assertEquals(0, fixture.budgets.snapshot().reservedBytes());
+    } finally {
+      fixture.physical.complete(null);
+      fixture.released.complete(null);
+      worker.stop();
+      timer.shutdownNow();
+      timer.awaitTermination(5, TimeUnit.SECONDS);
+    }
+  }
+
+  private static final class AsyncCheckpointFixture {
+    final CompletableFuture<Optional<SystemRecordEntry>> request = new CompletableFuture<>();
+    final CompletableFuture<Void> physical = new CompletableFuture<>();
+    final CompletableFuture<Void> released = new CompletableFuture<>();
+    final CountDownLatch started = new CountDownLatch(1);
+    final ReadViewPinRegistry.Pin pin = mock(ReadViewPinRegistry.Pin.class);
+    final BudgetManager budgets;
+    final EventTailerCycle cycle;
+
+    AsyncCheckpointFixture() {
+      var control = mock(HBaseCommitControlStore.class);
+      when(control.read(any(RequestScope.class)))
+          .thenReturn(CompletableFuture.completedFuture(Optional.of(snapshot(state(40, 30)))));
+      when(pin.generation()).thenReturn(1L);
+      when(pin.renew(any(RequestScope.class))).thenReturn(CompletableFuture.completedFuture(null));
+      when(pin.releaseCompletion()).thenReturn(released);
+      var viewPins = mock(ReadViewPinRegistry.class);
+      when(viewPins.registerAuxiliary(any(ReadView.class), any(RequestScope.class)))
+          .thenReturn(CompletableFuture.completedFuture(pin));
+      var manifests = mock(ManifestCatalog.class);
+      var records = mock(HBaseSystemRecordStore.class);
+      when(records.latestAtOrBefore(eq(SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT),
+          eq(EventIndexBackfillCheckpoint.routePrefix()), eq(40L), any(RequestScope.class)))
+          .thenAnswer(invocation -> {
+            RequestScope child = invocation.getArgument(3);
+            child.trackPhysicalProducer(physical);
+            child.registerCleanup(() -> request.completeExceptionally(
+                new BackendFailure(BackendFailure.Category.CANCELLED)));
+            started.countDown();
+            return request;
+          });
+      var stores = mock(TableGroupStores.class);
+      when(stores.views()).thenReturn(new ReadViewService(control, manifests, viewPins, FINGERPRINT));
+      when(stores.records()).thenReturn(records);
+      when(stores.manifests()).thenReturn(manifests);
+      var limits = new BudgetManager.Limits(8, 8, 8, 8, 8, 64L << 20, 1L << 30);
+      var reserved = new BudgetManager.ReservedCapacity(4, 4, 4, 4, 4, 1L << 20, 128L << 20);
+      budgets = new BudgetManager(limits, Map.of(TABLE_GROUP, limits), limits,
+          reserved, Map.of(TABLE_GROUP, reserved));
+      var pending = mock(M3TableGroupRuntime.Pending.class);
+      when(pending.eventTailer()).thenReturn(Optional.empty());
+      cycle = new EventTailerCycle(TABLE_GROUP, mock(SerialMutationQueue.class), Optional::empty,
+          stores, mock(EventHistoryPinManager.class), budgets, AUTHORIZATION, pending, mock(RequestMetrics.class));
     }
   }
 

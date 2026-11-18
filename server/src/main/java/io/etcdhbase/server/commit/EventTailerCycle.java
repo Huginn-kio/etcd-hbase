@@ -80,9 +80,13 @@ final class EventTailerCycle {
       readAccount = budgets.admitReserved(tableGroup, pinScope.scope,
           LeaseBudgetProfile.EVENT_TAILER_READ_MEMORY,
           LeaseBudgetProfile.EVENT_TAILER_READ_LIMITS);
-    } catch (BackendFailure failure) {
-      close(pinScope, failure);
-      return CompletableFuture.failedFuture(failure);
+      // Keep admission reserved until the last physical producer stops, even when its
+      // request future completes before the producer's completion callback returns.
+      var hold = readAccount.tryRetain(BudgetManager.Memory.HEAD, 1)
+          .orElseThrow(() -> new IllegalStateException("tailer admission hold unavailable"));
+      pinScope.scope.physicalProducersCompletion().whenComplete((ignored, failure) -> hold.close());
+    } catch (BackendFailure | RuntimeException failure) {
+      return closeAfter(CompletableFuture.failedFuture(failure), pinScope, null);
     }
     var proof = new ManifestCatalog.ProofReadBudget(pinScope.scope, readAccount,
         MAX_PROOF_PAGES, MAX_PROOF_BYTES);
@@ -112,7 +116,7 @@ final class EventTailerCycle {
         });
       }).whenComplete((ignored, failure) -> pinned.close());
     });
-    return creation.whenComplete((ignored, failure) -> close(pinScope, failure));
+    return closeAfter(creation, pinScope, readAccount);
   }
 
   private CompletableFuture<SharedEventTailer> installOnOwnerLane(TailerSeed seed,
@@ -163,16 +167,29 @@ final class EventTailerCycle {
     return expectedOwner.equals(owner.get());
   }
 
-  private static void close(Child child, Throwable primary) {
-    try {
-      child.close();
-    } catch (Exception cleanup) {
-      if (primary != null) {
-        if (primary != cleanup) primary.addSuppressed(cleanup);
-      } else {
-        throw new java.util.concurrent.CompletionException(cleanup);
+  private static <T> CompletableFuture<T> closeAfter(CompletableFuture<T> operation, Child child,
+      BudgetManager.Account account) {
+    return operation.handle((result, failure) -> {
+      try {
+        child.close();
+      } catch (Exception cleanup) {
+        if (failure == null) failure = cleanup;
+        else if (failure != cleanup) failure.addSuppressed(cleanup);
       }
-    }
+      Throwable primary = failure;
+      CompletableFuture<Void> drained = account == null ? child.drained : CompletableFuture.allOf(
+          child.drained, account.termination().toCompletableFuture());
+      return drained.handle((ignored, drainFailure) -> {
+        Throwable problem = primary;
+        if (drainFailure != null) {
+          Throwable cause = CompletionFailures.unwrapCompletion(drainFailure);
+          if (problem == null) problem = cause;
+          else if (problem != cause) problem.addSuppressed(cause);
+        }
+        if (problem != null) throw new java.util.concurrent.CompletionException(problem);
+        return result;
+      });
+    }).thenCompose(completion -> completion);
   }
 
   private CompletableFuture<EventHistoryWorker.CycleResult> advance(SharedEventTailer tailer,
@@ -252,7 +269,7 @@ final class EventTailerCycle {
     return CompletableFuture.completedFuture(new EventHistoryWorker.CycleResult(false, false));
   }
 
-  /** The pin owns this child; closing it waits for its actual backend producers. */
+  /** The parent observes child cleanup and physical producers without blocking their callbacks. */
   private static final class Child implements AutoCloseable {
     private final RequestScope scope;
     private final CompletableFuture<Void> drained;
@@ -267,7 +284,6 @@ final class EventTailerCycle {
 
     @Override public void close() throws Exception {
       registration.close();
-      drained.join();
     }
   }
 }
