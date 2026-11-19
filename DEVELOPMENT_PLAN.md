@@ -848,8 +848,8 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 完成标准：多 watchId、精确 key/区间、inclusive startRevision、Created、PrevKV 及过滤正确；内存随活跃订阅增长，不维护全部 KV 树。
   - 范围说明：J45 对照零、负数及未来 startRevision 的创建行为，并按 raw proto 契约接受 `watch_id=-1` 的 Create/Cancel；`startRevision > 0` 且目标不晚于当前 revision 的历史回放与 inclusive 交接由 J46.1 实现，J45 不宣称已支持历史回放。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：PR [#52](https://github.com/Reidddddd/etcd-hbase/pull/52) 开放、非 Draft，base 为上游 `main`（`c11c0dfd2dde72f8bdccd8ba503e02bc767eea17`）；依赖 PR #51（J44）已合并。F1–F4 review 修订已完成作者自审和独立复核，未发现未解决的 P1/P2；当前修订等待维护者复查，完整正确性 review 尚未完成。正式 reviewer=`Reidddddd`。目标环境与 M4 阶段验收未完成。
-  - 验证：review 修订的代码版本=`cb34ba19433edffa437b20d354173dced4b8e8a7`；已通过 Python 报告校验/必需用例清单校验及 Watch Stream/Gateway/Go 互通定向测试（Temurin JDK `21.0.12.1+1`）。该版本代码随 PR #52 修订提交；新 PR head 的 GitHub CI 以 PR checks 为准，旧 head 结果不作为本轮修订证据。完整公开验证、目标环境与 M4 阶段验收未完成。
+  - 跟踪：PR [#52](https://github.com/Reidddddd/etcd-hbase/pull/52) 开放、非 Draft，base 为上游 `main`（`c11c0dfd2dde72f8bdccd8ba503e02bc767eea17`）；依赖 PR #51（J44）已合并。F1–F4 及后续三项资源清理 review 修订均已完成；作者自审和独立复核未发现未解决的 P1/P2，等待维护者复查。完整正确性 review 尚未完成。正式 reviewer=`Reidddddd`。目标环境与 M4 阶段验收未完成。
+  - 验证：代码提交=`6c7cb7ca85518fde02b04845fbfbf99d807a1486`；Temurin JDK `21.0.12.1+1` 下运行 `scripts/verify/m4.sh --scope public --task J45`，run ID=`j45-pr52-resource-cleanup-20261119`，状态=passed；8 项 Go 测试、1,168 项 Java 测试、39 条原生 trace；失败、错误、跳过均为 0。报告范围是公开 JVM 单测、Go/native Watch 起点对照及本地服务生命周期矩阵，不含 MiniCluster 或真实目标环境。原始报告留在本地 `.artifacts/m4/j45-pr52-resource-cleanup-20261119`；run 标记 `development-dirty`，因为保留了已有未跟踪 `scripts/verify/__pycache__/`，验证源码与提交 SHA 一致。新 PR head 的 GitHub CI 以 PR checks 为准。目标环境与 M4 阶段验收未完成。
 
 - [ ] **J46｜历史回放、实时交接、progress 与 fragment**
   - 依赖：J45。
