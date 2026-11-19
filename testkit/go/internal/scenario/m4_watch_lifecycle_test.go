@@ -353,6 +353,8 @@ func checkM4WatchFiltersAndPreviousValues(ctx context.Context, client etcdserver
 		}
 	}
 
+	var deleteKeyRevision int64
+	var deleteMarkerRevision int64
 	for _, change := range []struct {
 		key, value []byte
 		delete     bool
@@ -363,8 +365,14 @@ func checkM4WatchFiltersAndPreviousValues(ctx context.Context, client etcdserver
 		{key: deleteMarker, delete: true},
 	} {
 		if change.delete {
-			if err := deleteM4WatchKey(ctx, kv, change.key); err != nil {
+			revision, err := deleteM4WatchKeyAtRevision(ctx, kv, change.key)
+			if err != nil {
 				return err
+			}
+			if bytes.Equal(change.key, deleteKey) {
+				deleteKeyRevision = revision
+			} else if bytes.Equal(change.key, deleteMarker) {
+				deleteMarkerRevision = revision
 			}
 		} else if err := putM4WatchKey(ctx, kv, change.key, change.value); err != nil {
 			return err
@@ -374,13 +382,13 @@ func checkM4WatchFiltersAndPreviousValues(ctx context.Context, client etcdserver
 	expected := map[int64][]m4WatchEventExpectation{
 		301: {
 			{eventType: mvccpb.PUT, key: putKey, value: []byte("put-after"), previous: []byte("put-before")},
-			{eventType: mvccpb.DELETE, key: deleteKey, previous: []byte("delete-before")},
+			{eventType: mvccpb.DELETE, key: deleteKey, previous: []byte("delete-before"), modRevision: deleteKeyRevision},
 			{eventType: mvccpb.PUT, key: putMarker, value: []byte("put-marker")},
-			{eventType: mvccpb.DELETE, key: deleteMarker, previous: []byte("delete-marker-before")},
+			{eventType: mvccpb.DELETE, key: deleteMarker, previous: []byte("delete-marker-before"), modRevision: deleteMarkerRevision},
 		},
 		302: {
-			{eventType: mvccpb.DELETE, key: deleteKey, previous: []byte("delete-before")},
-			{eventType: mvccpb.DELETE, key: deleteMarker, previous: []byte("delete-marker-before")},
+			{eventType: mvccpb.DELETE, key: deleteKey, previous: []byte("delete-before"), modRevision: deleteKeyRevision},
+			{eventType: mvccpb.DELETE, key: deleteMarker, previous: []byte("delete-marker-before"), modRevision: deleteMarkerRevision},
 		},
 		303: {
 			{eventType: mvccpb.PUT, key: putKey, value: []byte("put-after"), previous: []byte("put-before")},
@@ -436,16 +444,21 @@ func checkM4WatchFiltersAndPreviousValues(ctx context.Context, client etcdserver
 }
 
 type m4WatchEventExpectation struct {
-	eventType mvccpb.Event_EventType
-	key       []byte
-	value     []byte
-	previous  []byte
+	eventType   mvccpb.Event_EventType
+	key         []byte
+	value       []byte
+	previous    []byte
+	modRevision int64
 }
 
 func requireM4WatchEvent(event *mvccpb.Event, want m4WatchEventExpectation) error {
 	if event == nil || event.Kv == nil || event.Type != want.eventType ||
 		!bytes.Equal(event.Kv.Key, want.key) || !bytes.Equal(event.Kv.Value, want.value) {
 		return errors.New("native Watch event key, type, or value differs from its expected revision")
+	}
+	if want.eventType == mvccpb.DELETE && (event.Kv.CreateRevision != 0 ||
+		event.Kv.ModRevision != want.modRevision || event.Kv.Version != 0 || event.Kv.Lease != 0) {
+		return errors.New("native DELETE Watch event metadata differs from the pinned etcd behavior")
 	}
 	if want.previous == nil {
 		if event.PrevKv != nil {
@@ -594,12 +607,17 @@ func putM4WatchKey(ctx context.Context, client etcdserverpb.KVClient, key, value
 }
 
 func deleteM4WatchKey(ctx context.Context, client etcdserverpb.KVClient, key []byte) error {
+	_, err := deleteM4WatchKeyAtRevision(ctx, client, key)
+	return err
+}
+
+func deleteM4WatchKeyAtRevision(ctx context.Context, client etcdserverpb.KVClient, key []byte) (int64, error) {
 	response, err := client.DeleteRange(ctx, &etcdserverpb.DeleteRangeRequest{Key: key})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if response == nil || response.Header == nil || response.Deleted != 1 {
-		return errors.New("native Watch fixture Delete did not remove exactly one key")
+		return 0, errors.New("native Watch fixture Delete did not remove exactly one key")
 	}
-	return nil
+	return response.Header.Revision, nil
 }

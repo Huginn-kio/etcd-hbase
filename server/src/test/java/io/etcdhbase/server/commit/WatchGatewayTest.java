@@ -56,6 +56,16 @@ class WatchGatewayTest {
   private static final int RESPONSE_BYTES = 64 * 1024;
 
   @Test
+  void mapsEveryTailerTerminationToItsWatchCancellationReason() {
+    assertEquals("etcd-hbase: Watch subscription was cancelled",
+        WatchGateway.cancelReason(SharedEventTailer.Termination.CANCELLED));
+    assertEquals("etcd-hbase: Watch subscription resource limit exceeded",
+        WatchGateway.cancelReason(SharedEventTailer.Termination.RESOURCE_LIMIT));
+    assertEquals("etcd-hbase: Watch event source is unavailable",
+        WatchGateway.cancelReason(SharedEventTailer.Termination.TAILER_CLOSED));
+  }
+
+  @Test
   void tailerSubscribeFailureReleasesWatchReservationAndStateMemory() throws Exception {
     try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
       var tailer = openTailer();

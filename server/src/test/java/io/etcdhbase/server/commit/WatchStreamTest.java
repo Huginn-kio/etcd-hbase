@@ -3,6 +3,7 @@ package io.etcdhbase.server.commit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -11,6 +12,8 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 import com.google.protobuf.ByteString;
 import etcdserverpb.Rpc;
@@ -80,10 +83,15 @@ class WatchStreamTest {
       assertEquals(1, events.getEventsCount(), "NOPUT filters only the PUT event");
       assertEquals(mvccpb.Kv.Event.EventType.DELETE, events.getEvents(0).getType());
       assertArrayEquals(start, events.getEvents(0).getKv().getKey().toByteArray());
+      assertEquals(0, events.getEvents(0).getKv().getCreateRevision());
+      assertEquals(5, events.getEvents(0).getKv().getModRevision());
+      assertEquals(0, events.getEvents(0).getKv().getVersion());
+      assertEquals(0, events.getEvents(0).getKv().getLease());
       assertTrue(events.getEvents(0).hasPrevKv());
       assertArrayEquals(new byte[] {6}, events.getEvents(0).getPrevKv().getValue().toByteArray());
       assertEquals(2, subscription.releases.get(), "all events in the delivered revision are released");
       assertEquals(2, observer.requests, "the next inbound request follows Created");
+      verify(timers, never()).schedule(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS));
       assertEquals(KeyRange.Kind.RANGE, session.range.kind());
       assertEquals(Optional.of(ByteKey.copyOf(start)), session.range.lowerInclusive());
       assertEquals(Optional.of(ByteKey.copyOf(end)), session.range.upperExclusive());
@@ -331,6 +339,70 @@ class WatchStreamTest {
   }
 
   @Test
+  void publishedSubscriptionWakeupDrainsWithoutPollingTimerAndCloseClearsListener() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(8, subscription);
+    var observer = new RecordingObserver();
+    var timers = timers();
+    byte[] key = {1};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers, () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(31, key, new byte[0], 0, false));
+      assertEquals(1, observer.responses.size());
+      assertTrue(observer.responses.getFirst().getCreated());
+
+      subscription.add(event(9, PreparedEvent.Kind.PUT, key, new byte[] {9}, Optional.empty()));
+      subscription.signalWakeup();
+
+      assertEquals(2, observer.responses.size(), "a published event wakes the stream without periodic polling");
+      assertEquals(1, observer.responses.get(1).getEventsCount());
+      verify(timers, never()).schedule(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS));
+
+      stream.close();
+      assertTrue(subscription.wakeup == null, "closing the watcher removes its callback reference");
+    }
+  }
+
+  @Test
+  void separateStreamsDrainPublishedEventsWithoutSchedulingPolls() {
+    var firstSubscription = new RecordingSubscription();
+    var secondSubscription = new RecordingSubscription();
+    var firstSession = new RecordingSession(8, firstSubscription);
+    var secondSession = new RecordingSession(8, secondSubscription);
+    var firstObserver = new RecordingObserver();
+    var secondObserver = new RecordingObserver();
+    var timers = timers();
+    byte[] firstKey = {1};
+    byte[] secondKey = {2};
+
+    try (var firstScope = RequestScope.withoutDeadline();
+         var secondScope = RequestScope.withoutDeadline();
+         var firstStream = stream(firstObserver, firstScope, timers,
+             () -> CompletableFuture.completedFuture(firstSession));
+         var secondStream = stream(secondObserver, secondScope, timers,
+             () -> CompletableFuture.completedFuture(secondSession))) {
+      firstStream.onNext(createRequest(41, firstKey, new byte[0], 0, false));
+      secondStream.onNext(createRequest(42, secondKey, new byte[0], 0, false));
+      assertTrue(firstObserver.responses.getFirst().getCreated());
+      assertTrue(secondObserver.responses.getFirst().getCreated());
+
+      firstSubscription.add(event(9, PreparedEvent.Kind.PUT, firstKey, new byte[] {9}, Optional.empty()));
+      secondSubscription.add(event(10, PreparedEvent.Kind.PUT, secondKey, new byte[] {10}, Optional.empty()));
+      firstSubscription.signalWakeup();
+      secondSubscription.signalWakeup();
+
+      assertEquals(2, firstObserver.responses.size(), "the first stream drains its published event");
+      assertEquals(2, secondObserver.responses.size(), "the second stream drains its published event");
+      assertEquals(41, firstObserver.responses.get(1).getWatchId());
+      assertEquals(42, secondObserver.responses.get(1).getWatchId());
+      verify(timers, never()).schedule(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS));
+    }
+    assertNull(firstSubscription.wakeup, "closing the first stream releases its callback");
+    assertNull(secondSubscription.wakeup, "closing the second stream releases its callback");
+  }
+
+  @Test
   void automaticIdsStartAtZeroAndSkipAnActiveExplicitId() {
     var session = new RecordingSession(8, new RecordingSubscription(),
         new RecordingSubscription(), new RecordingSubscription());
@@ -421,6 +493,61 @@ class WatchStreamTest {
       secondStream.close();
       assertEquals(0, budget.retainedIds(), "closing a stream releases retained IDs");
       assertEquals(1, retrySubscription.closeCount.get());
+    }
+  }
+
+  @Test
+  void processWideTombstonesFromOneStreamDoNotRejectAnotherStreamsActiveCreate() {
+    var budget = CompactedWatchIdBudget.processWide();
+    int baseline = budget.retainedIds();
+    assertTrue(baseline <= CompactedWatchIdBudget.MAX_PROCESS_IDS - WatchRegistry.MAX_WATCHES_PER_STREAM - 1,
+        "the process-wide budget must have room for this isolated multi-stream case");
+
+    var tombstones = new ArrayList<RecordingSubscription>(WatchRegistry.MAX_WATCHES_PER_STREAM);
+    for (int index = 0; index < WatchRegistry.MAX_WATCHES_PER_STREAM; index++) {
+      tombstones.add(new RecordingSubscription());
+    }
+    var firstSession = new RecordingSession(3, 2, tombstones.toArray(RecordingSubscription[]::new));
+    var firstObserver = new RecordingObserver();
+    var activeSubscription = new RecordingSubscription();
+    var secondCompactedSubscription = new RecordingSubscription();
+    var secondSession = new RecordingSession(3, 2, activeSubscription, secondCompactedSubscription);
+    var secondObserver = new RecordingObserver();
+
+    try (var firstScope = RequestScope.withoutDeadline();
+         var secondScope = RequestScope.withoutDeadline()) {
+      var firstStream = stream(firstObserver, firstScope, timers(),
+          () -> CompletableFuture.completedFuture(firstSession));
+      var secondStream = stream(secondObserver, secondScope, timers(),
+          () -> CompletableFuture.completedFuture(secondSession));
+
+      for (int index = 0; index < WatchRegistry.MAX_WATCHES_PER_STREAM; index++) {
+        long watchId = index + 1L;
+        firstStream.onNext(createRequest(watchId, new byte[] {1}, new byte[0], -1, false));
+      }
+      assertEquals(baseline + WatchRegistry.MAX_WATCHES_PER_STREAM, budget.retainedIds(),
+          "the first stream retains its bounded compacted IDs in the process-wide budget");
+
+      secondStream.onNext(createRequest(2001, new byte[] {2}, new byte[0], 0, false));
+      assertEquals(1, secondObserver.responses.size());
+      assertTrue(secondObserver.responses.getFirst().getCreated(),
+          "another stream can register a normal active watch while tombstones are retained");
+
+      secondStream.onNext(createRequest(2002, new byte[] {3}, new byte[0], -1, false));
+      assertEquals(baseline + WatchRegistry.MAX_WATCHES_PER_STREAM + 1, budget.retainedIds(),
+          "another stream can also retain a compacted ID below the process-wide cap");
+      assertTrue(secondObserver.responses.get(1).getCreated());
+      assertTrue(secondObserver.responses.get(2).getCanceled());
+
+      firstStream.onNext(Rpc.WatchRequest.newBuilder().setCancelRequest(
+          Rpc.WatchCancelRequest.newBuilder().setWatchId(1)).build());
+      assertEquals(baseline + WatchRegistry.MAX_WATCHES_PER_STREAM, budget.retainedIds(),
+          "cancelling one stream's tombstone releases exactly one process-wide slot");
+
+      firstStream.close();
+      secondStream.close();
+      assertEquals(baseline, budget.retainedIds(), "closing streams releases all of their retained IDs");
+      assertEquals(1, activeSubscription.closeCount.get());
     }
   }
 
@@ -1092,6 +1219,7 @@ class WatchStreamTest {
     var active = new RecordingSubscription();
     var replacement = new RecordingSubscription();
     var session = new RecordingSession(8, terminated, active, replacement);
+    session.currentRevision = CompletableFuture.completedFuture(9L);
     var observer = new RecordingObserver();
     byte[] firstKey = {1};
     byte[] secondKey = {2};
@@ -1105,6 +1233,7 @@ class WatchStreamTest {
 
       terminated.add(event(9, PreparedEvent.Kind.PUT, firstKey, new byte[] {9}, Optional.empty()));
       terminated.terminate(reason);
+      observer.ready = true;
       observer.readyHandler.run();
 
       assertEquals(3, observer.responses.size());
@@ -1113,6 +1242,8 @@ class WatchStreamTest {
       assertTrue(cancelled.getCanceled());
       assertEquals(51, cancelled.getWatchId());
       assertEquals(reason, cancelled.getCancelReason());
+      assertEquals(9, cancelled.getHeader().getRevision(),
+          "termination reports the current session revision when it exceeds the tailer checkpoint");
       assertEquals(1, terminated.closeCount.get());
       assertEquals(1, terminated.releases.get(),
           "closing a terminated watcher releases queued delivery");
@@ -1134,6 +1265,52 @@ class WatchStreamTest {
       assertEquals(1, terminated.closeCount.get());
       assertEquals(1, active.closeCount.get());
       assertEquals(1, replacement.closeCount.get());
+    }
+  }
+
+  @Test
+  void asynchronousTerminationRevisionFailureFailsStreamWithoutCanceledResponse() {
+    var terminated = new RecordingSubscription();
+    var session = new RecordingSession(8, terminated);
+    var revision = new CompletableFuture<Long>();
+    session.currentRevision = revision;
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(61, new byte[] {1}, new byte[0], 0, false));
+      terminated.terminate("watch source closed");
+      assertEquals(1, observer.responses.size(), "termination waits for the current revision lookup");
+
+      revision.completeExceptionally(new IllegalStateException("revision read failed"));
+
+      assertEquals(1, observer.responses.size(), "a failed revision lookup does not emit a stale cancel header");
+      assertTrue(observer.failure != null, "a revision lookup failure terminates the Watch stream");
+      assertEquals(1, terminated.closeCount.get());
+      stream.close();
+    }
+  }
+
+  @Test
+  void lateTerminationRevisionDoesNotWriteAfterStreamClose() {
+    var terminated = new RecordingSubscription();
+    var session = new RecordingSession(8, terminated);
+    var revision = new CompletableFuture<Long>();
+    session.currentRevision = revision;
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(62, new byte[] {1}, new byte[0], 0, false));
+      terminated.terminate("watch source closed");
+      assertEquals(1, observer.responses.size());
+
+      stream.close();
+      revision.complete(9L);
+
+      assertEquals(1, observer.responses.size(), "late completion after close is discarded");
+      assertEquals(1, terminated.closeCount.get());
+      assertTrue(observer.failure == null, "a late success does not write an error after close");
     }
   }
 
@@ -1252,6 +1429,7 @@ class WatchStreamTest {
     private final AtomicInteger closeCount = new AtomicInteger();
     private RuntimeException closeFailure;
     private Runnable afterPoll;
+    private Runnable wakeup;
     private String terminationReason;
     private boolean closed;
 
@@ -1260,7 +1438,14 @@ class WatchStreamTest {
           event, releases::incrementAndGet));
     }
 
-    private void terminate(String reason) { terminationReason = reason; }
+    private void signalWakeup() {
+      if (wakeup != null) wakeup.run();
+    }
+
+    private void terminate(String reason) {
+      terminationReason = reason;
+      if (wakeup != null) wakeup.run();
+    }
 
     @Override public Optional<WatchStream.Delivery> poll() {
       if (closed || terminationReason != null) return Optional.empty();
@@ -1274,9 +1459,16 @@ class WatchStreamTest {
     @Override
     public Optional<String> terminationReason() { return Optional.ofNullable(terminationReason); }
 
+    @Override
+    public void setWakeup(Runnable wakeup) {
+      this.wakeup = wakeup;
+      if (wakeup != null && (terminationReason != null || !deliveries.isEmpty())) wakeup.run();
+    }
+
     @Override public void close() {
       if (closed) return;
       closed = true;
+      wakeup = null;
       closeCount.incrementAndGet();
       while (!deliveries.isEmpty()) deliveries.removeFirst().close();
       if (closeFailure != null) throw closeFailure;

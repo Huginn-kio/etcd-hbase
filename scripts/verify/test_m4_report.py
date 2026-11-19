@@ -256,7 +256,8 @@ class M4ReportTest(unittest.TestCase):
             "does not claim Java progress-request support, which is assigned to J46.2. Native raw-proto and local-service "
             "Go traces compare the registered start/cancel matrix; a separate Go-client lifecycle run exercises multiple "
             "watch IDs, byte ranges, filters/PrevKV, and client-context cancellation cleanup against "
-            "Java WatchService. Normal server-side request half-close semantics remain assigned to J47. "
+            "Java WatchService, including two concurrently requested watchers sharing one pinned client stream. "
+            "Normal server-side request half-close semantics remain assigned to J47. "
             "MiniCluster acceptance remains outside this unit evidence"
         )
         self.assertEqual(m4_report.J45_VERIFICATION_BOUNDARY, expected_boundary)

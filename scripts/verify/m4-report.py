@@ -45,7 +45,8 @@ J45_VERIFICATION_BOUNDARY = (
     "does not claim Java progress-request support, which is assigned to J46.2. Native raw-proto and local-service "
     "Go traces compare the registered start/cancel matrix; a separate Go-client lifecycle run exercises multiple "
     "watch IDs, byte ranges, filters/PrevKV, and client-context cancellation cleanup against "
-    "Java WatchService. Normal server-side request half-close semantics remain assigned to J47. "
+    "Java WatchService, including two concurrently requested watchers sharing one pinned client stream. "
+    "Normal server-side request half-close semantics remain assigned to J47. "
     "MiniCluster acceptance remains outside this unit evidence"
 )
 
@@ -149,6 +150,7 @@ J45_CRITICAL_JAVA_TESTS = {
         "assembledWatchServiceDelegatesTheResponseObserverAndReturnsItsRequestHandler",
     },
     "io.etcdhbase.server.commit.WatchGatewayTest": {
+        "mapsEveryTailerTerminationToItsWatchCancellationReason",
         "gatewayChargesRetainedRangeBytesAndReleasesThemOnClose",
         "tailerShutdownRacePreservesUnavailableAndReleasesWatchReservation",
         "passesNegativeStartRevisionAndCompactBoundaryAndReleasesBudgetsOnClose",
@@ -162,6 +164,8 @@ J45_CRITICAL_JAVA_TESTS = {
         "resourceLimitedCreateLeavesExistingWatchActive",
         "duplicateIdDoesNotReplaceExistingWatchAndCancelClosesOnlyItsSubscription",
         "emptyRequestAndUnknownCancelHaveNoResponseAndKeepActiveWatch",
+        "publishedSubscriptionWakeupDrainsWithoutPollingTimerAndCloseClearsListener",
+        "separateStreamsDrainPublishedEventsWithoutSchedulingPolls",
         "zeroStartWaitsForCreatedBarrierAndExcludesEarlierEvents",
         "initialNegativeStartWithNoHistoryUsesTheLiveBarrier",
         "negativeStartWithUncompactedHistorySkipsOldEventsAndDeliversNewEvents",
@@ -176,6 +180,9 @@ J45_CRITICAL_JAVA_TESTS = {
         "cancellingOneWatchKeepsOtherByteRangeSubscriptionActive",
         "resourceLimitTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries",
         "closedTailerTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries",
+        "asynchronousTerminationRevisionFailureFailsStreamWithoutCanceledResponse",
+        "lateTerminationRevisionDoesNotWriteAfterStreamClose",
+        "processWideTombstonesFromOneStreamDoNotRejectAnotherStreamsActiveCreate",
         "oversizedCompleteRevisionCancelsWatchWithoutSendingPartialEvents",
         "watcherCloseStillClosesSubscriptionWhenPendingDeliveryCleanupThrowsError",
         "outputReleaseAttemptsEveryDeliveryAndPrioritizesFatalCleanupFailure",

@@ -53,59 +53,106 @@ func RunM4WatchLifecycleInterop(ctx context.Context, client *clientv3.Client, pr
 
 func checkClientV3Watch(ctx context.Context, client *clientv3.Client, prefix string) error {
 	watchContext, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
 	watchKey := string(interopMultiKey(prefix, 401))
-	responses := client.Watcher.Watch(watchContext, watchKey, clientv3.WithCreatedNotify())
+	const concurrentWatchCount = 2
+	start := make(chan struct{})
+	started := make(chan clientv3.WatchChan, concurrentWatchCount)
+	for range concurrentWatchCount {
+		go func() {
+			<-start
+			started <- client.Watcher.Watch(watchContext, watchKey, clientv3.WithCreatedNotify())
+		}()
+	}
+	close(start)
 
-	created := false
-	gotEvent := false
-	for !created || !gotEvent {
+	responses := make([]clientv3.WatchChan, 0, concurrentWatchCount)
+	for range concurrentWatchCount {
 		select {
-		case response, open := <-responses:
-			if !open {
-				cancelWatch()
-				return errors.New("clientv3 Watch channel closed before Created and event delivery")
-			}
-			if err := response.Err(); err != nil {
-				cancelWatch()
-				return fmt.Errorf("clientv3 Watch returned an error: %w", err)
-			}
-			if response.Created {
-				if created || len(response.Events) != 0 {
-					cancelWatch()
-					return errors.New("clientv3 Watch Created response was duplicated or included events")
-				}
-				created = true
-				continue
-			}
-			for _, event := range response.Events {
-				if event == nil || event.Kv == nil || string(event.Kv.Key) != watchKey {
-					cancelWatch()
-					return errors.New("clientv3 Watch returned an unexpected event")
-				}
-				if event.Type != mvccpb.PUT || string(event.Kv.Value) != "multi-a" ||
-					event.Kv.ModRevision != 2 {
-					cancelWatch()
-					return errors.New("clientv3 Watch event fields differ from the fixture")
-				}
-				gotEvent = true
+		case response := <-started:
+			responses = append(responses, response)
+		case <-ctx.Done():
+			return fmt.Errorf("clientv3 Watch calls did not return their channels: %w", ctx.Err())
+		}
+	}
+
+	results := make(chan error, concurrentWatchCount)
+	for _, responseChannel := range responses {
+		go func(responseChannel clientv3.WatchChan) {
+			results <- verifyClientV3WatchResponse(ctx, responseChannel, watchKey)
+		}(responseChannel)
+	}
+	for range concurrentWatchCount {
+		select {
+		case err := <-results:
+			if err != nil {
+				return err
 			}
 		case <-ctx.Done():
-			cancelWatch()
-			return fmt.Errorf("clientv3 Watch did not receive Created and its event: %w", ctx.Err())
+			return fmt.Errorf("concurrent clientv3 Watches did not receive Created and their events: %w", ctx.Err())
 		}
 	}
 
 	cancelWatch()
 	closeContext, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelClose()
-	select {
-	case _, open := <-responses:
-		if open {
-			return errors.New("clientv3 Watch channel remained open after context cancellation")
+	for _, responseChannel := range responses {
+		if err := waitClientV3WatchClosed(closeContext, responseChannel); err != nil {
+			return err
 		}
-		return nil
-	case <-closeContext.Done():
-		return errors.New("clientv3 Watch channel did not close after context cancellation")
+	}
+	return nil
+}
+
+func verifyClientV3WatchResponse(ctx context.Context, responses clientv3.WatchChan, watchKey string) error {
+	created := false
+	gotEvent := false
+	for !created || !gotEvent {
+		select {
+		case response, open := <-responses:
+			if !open {
+				return errors.New("clientv3 Watch channel closed before Created and event delivery")
+			}
+			if err := response.Err(); err != nil {
+				return fmt.Errorf("clientv3 Watch returned an error: %w", err)
+			}
+			if response.Created {
+				if created || len(response.Events) != 0 {
+					return errors.New("clientv3 Watch Created response was duplicated or included events")
+				}
+				created = true
+				continue
+			}
+			if !created {
+				return errors.New("clientv3 Watch delivered an event before Created")
+			}
+			for _, event := range response.Events {
+				if event == nil || event.Kv == nil || string(event.Kv.Key) != watchKey {
+					return errors.New("clientv3 Watch returned an unexpected event")
+				}
+				if event.Type != mvccpb.PUT || string(event.Kv.Value) != "multi-a" ||
+					event.Kv.ModRevision != 2 {
+					return errors.New("clientv3 Watch event fields differ from the fixture")
+				}
+				gotEvent = true
+			}
+		case <-ctx.Done():
+			return fmt.Errorf("clientv3 Watch did not receive Created and its event: %w", ctx.Err())
+		}
+	}
+	return nil
+}
+
+func waitClientV3WatchClosed(ctx context.Context, responses clientv3.WatchChan) error {
+	for {
+		select {
+		case _, open := <-responses:
+			if !open {
+				return nil
+			}
+		case <-ctx.Done():
+			return errors.New("clientv3 Watch channel did not close after context cancellation")
+		}
 	}
 }
 
@@ -556,6 +603,10 @@ func requireInteropEvent(reader *interopWatchReader, watchID int64, expected int
 	if event == nil || event.Kv == nil || event.Type != expected.typeID ||
 		!bytes.Equal(event.Kv.Key, expected.key) || !bytes.Equal(event.Kv.Value, expected.value) {
 		return errors.New("local Watch event key, value, or type differs from its selected revision")
+	}
+	if expected.typeID == mvccpb.DELETE && (event.Kv.CreateRevision != 0 ||
+		event.Kv.ModRevision != expected.revision || event.Kv.Version != 0 || event.Kv.Lease != 0) {
+		return errors.New("local DELETE Watch event metadata differs from the pinned etcd behavior")
 	}
 	if expected.previous == nil {
 		if event.PrevKv != nil {

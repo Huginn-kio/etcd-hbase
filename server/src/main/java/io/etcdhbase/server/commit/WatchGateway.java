@@ -179,6 +179,14 @@ final class WatchGateway {
     return revision == Long.MAX_VALUE ? Long.MAX_VALUE : revision + 1;
   }
 
+  static String cancelReason(SharedEventTailer.Termination reason) {
+    return switch (reason) {
+      case RESOURCE_LIMIT -> "etcd-hbase: Watch subscription resource limit exceeded";
+      case TAILER_CLOSED -> "etcd-hbase: Watch event source is unavailable";
+      case CANCELLED -> "etcd-hbase: Watch subscription was cancelled";
+    };
+  }
+
   private static long retainedStateBytes(KeyRange range) {
     Objects.requireNonNull(range, "range");
     long lowerBoundBytes = range.lowerInclusive().map(bound -> (long) bound.length()).orElse(0L);
@@ -223,17 +231,19 @@ final class WatchGateway {
     @Override
     public synchronized Optional<String> terminationReason() {
       if (closed) return Optional.empty();
-      return subscription.termination().map(reason -> switch (reason) {
-        case RESOURCE_LIMIT -> "etcd-hbase: Watch subscription resource limit exceeded";
-        case TAILER_CLOSED -> "etcd-hbase: Watch event source is unavailable";
-        case CANCELLED -> "etcd-hbase: Watch subscription was cancelled";
-      });
+      return subscription.termination().map(WatchGateway::cancelReason);
+    }
+
+    @Override
+    public synchronized void setWakeup(Runnable wakeup) {
+      if (!closed) subscription.setWakeup(wakeup);
     }
 
     @Override
     public synchronized void close() {
       if (closed) return;
       closed = true;
+      subscription.setWakeup(null);
       Throwable failure = WatchCleanup.closeAndCollect(subscription::close, null);
       failure = WatchCleanup.closeAndCollect(stateMemory::close, failure);
       failure = WatchCleanup.closeAndCollect(account::close, failure);

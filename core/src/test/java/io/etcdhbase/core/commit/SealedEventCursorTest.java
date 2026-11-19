@@ -1316,12 +1316,14 @@ class SealedEventCursorTest {
     try (RequestScope setup = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope tailScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope firstScope = RequestScope.withTimeout(Duration.ofSeconds(5));
+         RequestScope secondScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope zeroScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope futureScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope negativeScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          RequestScope readScope = RequestScope.withTimeout(Duration.ofSeconds(5));
          BudgetManager.Account tailMemory = fixture.account(tailScope);
          BudgetManager.Account firstMemory = fixture.account(firstScope);
+         BudgetManager.Account secondMemory = fixture.account(secondScope);
          BudgetManager.Account zeroMemory = fixture.account(zeroScope);
          BudgetManager.Account futureMemory = fixture.account(futureScope);
          BudgetManager.Account negativeMemory = fixture.account(negativeScope);
@@ -1330,8 +1332,20 @@ class SealedEventCursorTest {
           new SnapshotPinConfiguration(1, 2, Duration.ofMinutes(1)), Clock.systemUTC(), setup).join();
       var index = EventRevisionIndex.fromSelected(fixture.decision, fixture.root);
       var source = fixture.sequenceReader(pins, fixture.finalizedState(), Optional.of(index));
-      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 4, 4, 8192)) {
+      try (var tailer = new SharedEventTailer(source, fixture.digest, tailMemory, 2, 10, 5, 4, 8192)) {
         var first = tailer.subscribeWithCheckpoint(KeyRange.all(), firstMemory, 4, 8192, 11);
+        AtomicInteger wakeups = new AtomicInteger();
+        AtomicInteger callbacksUnderTailerLock = new AtomicInteger();
+        first.subscription().setWakeup(() -> {
+          if (Thread.holdsLock(tailer)) callbacksUnderTailerLock.incrementAndGet();
+          wakeups.incrementAndGet();
+        });
+        var matchingSubscription = tailer.subscribeWithCheckpoint(KeyRange.all(), secondMemory, 4, 8192, 11);
+        AtomicInteger secondWakeups = new AtomicInteger();
+        matchingSubscription.subscription().setWakeup(() -> {
+          if (Thread.holdsLock(tailer)) callbacksUnderTailerLock.incrementAndGet();
+          secondWakeups.incrementAndGet();
+        });
         var zero = tailer.subscribeWithCheckpoint(KeyRange.all(), zeroMemory, 4, 8192, 0);
         var future = tailer.subscribeWithCheckpoint(KeyRange.all(), futureMemory, 4, 8192, 12);
         var negative = tailer.subscribeWithCheckpoint(KeyRange.all(), negativeMemory, 4, 8192, -1);
@@ -1348,16 +1362,68 @@ class SealedEventCursorTest {
             new ManifestCatalog.ProofReadBudget(readScope, readMemory, 3, 512L << 20)).join();
         tailer.step(readScope,
             new ManifestCatalog.ProofReadBudget(readScope, readMemory, 1, 512L << 20)).join();
+        assertEquals(1, wakeups.get(),
+            "one completed revision wakes the subscription once after all matching events are queued");
+        assertEquals(1, secondWakeups.get(),
+            "one publication wakes every matching subscription without a shared polling timer");
+        assertEquals(0, callbacksUnderTailerLock.get(), "publication callbacks run outside the tailer lock");
+
+        AtomicInteger immediateWakeups = new AtomicInteger();
+        first.subscription().setWakeup(() -> {
+          if (Thread.holdsLock(tailer)) callbacksUnderTailerLock.incrementAndGet();
+          immediateWakeups.incrementAndGet();
+        });
+        assertEquals(1, immediateWakeups.get(),
+            "installing a listener after publication signals already queued work immediately");
+        assertEquals(0, callbacksUnderTailerLock.get(), "immediate callbacks also run outside the tailer lock");
 
         try (var inclusive = first.subscription().poll().orElseThrow()) {
           assertEquals(11, inclusive.revision(), "a positive start is inclusive at the live tailer layer");
+          assertEquals(0, inclusive.event().ordinal());
         }
+        try (var second = first.subscription().poll().orElseThrow()) {
+          assertEquals(11, second.revision());
+          assertEquals(1, second.event().ordinal(), "both events in the revision are delivered exactly once");
+        }
+        try (var firstDelivery = matchingSubscription.subscription().poll().orElseThrow();
+             var secondDelivery = matchingSubscription.subscription().poll().orElseThrow()) {
+          assertEquals(11, firstDelivery.revision());
+          assertEquals(11, secondDelivery.revision());
+          assertEquals(0, firstDelivery.event().ordinal());
+          assertEquals(1, secondDelivery.event().ordinal());
+        }
+        assertTrue(matchingSubscription.subscription().poll().isEmpty(),
+            "the second subscriber receives each event once");
+        assertTrue(first.subscription().poll().isEmpty(), "a notification does not duplicate a delivery");
         assertTrue(future.subscription().poll().isEmpty(), "a future start must not receive earlier revisions");
 
         zero.subscription().requireRevisionAtLeast(12);
         negative.subscription().requireRevisionAtLeast(12);
         assertTrue(zero.subscription().poll().isEmpty(), "zero start drops events at the creation barrier");
         assertTrue(negative.subscription().poll().isEmpty(), "negative start begins after the creation barrier");
+
+        AtomicInteger cancellationWakeups = new AtomicInteger();
+        zero.subscription().setWakeup(cancellationWakeups::incrementAndGet);
+        zero.subscription().close();
+        zero.subscription().close();
+        assertEquals(1, cancellationWakeups.get(), "subscription cancellation wakes its consumer only once");
+
+        AtomicInteger removedListenerWakeups = new AtomicInteger();
+        negative.subscription().setWakeup(removedListenerWakeups::incrementAndGet);
+        negative.subscription().setWakeup(null);
+        negative.subscription().close();
+        assertEquals(0, removedListenerWakeups.get(), "cleared listeners are not retained for cancellation");
+
+        tailer.close();
+        assertEquals(Optional.of(SharedEventTailer.Termination.TAILER_CLOSED), first.subscription().termination());
+        assertEquals(2, immediateWakeups.get(), "tailer close wakes a still-registered consumer");
+        assertEquals(Optional.of(SharedEventTailer.Termination.TAILER_CLOSED),
+            matchingSubscription.subscription().termination());
+        assertEquals(2, secondWakeups.get(), "tailer close also wakes the second active consumer");
+        tailer.close();
+        assertEquals(2, immediateWakeups.get(), "repeated tailer close does not duplicate notification");
+        assertEquals(2, secondWakeups.get(), "repeated tailer close does not duplicate the second notification");
+        assertEquals(0, callbacksUnderTailerLock.get(), "close callbacks run outside the tailer lock");
       }
     }
   }

@@ -27,7 +27,6 @@ import java.util.function.Consumer;
 
 /** One stream-scoped watch registry and single writer for control responses and event batches. */
 final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseable {
-  private static final long EVENT_POLL_DELAY_MILLIS = 25;
   private static final int MAX_FILTERED_REVISIONS_PER_DRAIN = 128;
   private static final long REJECTED_CREATE_RESPONSE_WATCH_ID = -1;
   private static final String HISTORICAL_REPLAY_UNSUPPORTED_REASON =
@@ -57,6 +56,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   interface Subscription extends AutoCloseable {
     Optional<Delivery> poll();
     Optional<String> terminationReason();
+    void setWakeup(Runnable wakeup);
     @Override void close();
   }
 
@@ -113,8 +113,9 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private CompletionStage<Session> sessionFuture;
   private Session session;
   private Rpc.WatchRequest pendingRequest;
-  private ScheduledFuture<?> pollTask;
+  private ScheduledFuture<?> drainYieldTask;
   private int nextWatchIndex;
+  private int pendingTerminationResponses;
   private boolean processingRequest;
   private boolean requestOutstanding;
   private boolean inboundClosed;
@@ -285,13 +286,12 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       if (pumpResult == PumpResult.ADVANCED) {
         requestNext();
         if (++filteredRevisions >= MAX_FILTERED_REVISIONS_PER_DRAIN) {
-          schedulePoll(0);
+          scheduleDrainYield();
           return;
         }
         continue;
       }
       requestNext();
-      if (hasCreatedWatcher()) schedulePoll(EVENT_POLL_DELAY_MILLIS);
       return;
     }
   }
@@ -305,6 +305,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         return new DrainAction(DrainKind.SEND_FAILURE, null, null, failure);
       }
       if (terminal) return new DrainAction(DrainKind.STOP, null, null, null);
+      if (pendingTerminationResponses > 0) return new DrainAction(DrainKind.STOP, null, null, null);
       if (!responses.isEmpty()) {
         if (!isReady()) return new DrainAction(DrainKind.STOP, null, null, null);
         return new DrainAction(DrainKind.SEND_RESPONSE, responses.removeFirst(), null, null);
@@ -345,7 +346,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       if (terminal || peerCancelled) return;
       terminal = true;
     }
-    cancelPoll();
+    cancelDrainYield();
     responseObserver.onCompleted();
   }
 
@@ -511,6 +512,16 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       }
       processingRequest = false;
     }
+    if (!stopped && registration != null
+        && registration.rejection() == WatchRegistry.Rejection.NONE) {
+      try {
+        registration.watcher().setWakeup(this::scheduleDrain);
+      } catch (RuntimeException | Error failure) {
+        fail(failure);
+        if (failure instanceof Error fatal) throw fatal;
+        return;
+      }
+    }
     if (stopped || registration == null
         || registration.rejection() != WatchRegistry.Rejection.NONE) {
       opened.subscription().close();
@@ -650,7 +661,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       enqueueResponse(cancelledResponse(watchId, revision), this::requestNext);
     }
     scheduleDrain();
-    if (!hasCreatedWatcher()) cancelPoll();
   }
 
   private void rejectCreate(long revision, String reason) {
@@ -724,13 +734,61 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   }
 
   private void terminateWatcher(WatchRegistry.Watcher watcher, String reason) {
+    Session currentSession;
     synchronized (lock) {
       if (!watchRegistry.removeActive(watcher.id(), watcher)) return;
-      watcher.close();
-      enqueueResponse(cancelledResponse(
-          watcher.id(), session == null ? 0 : session.completedRevision(), reason),
-          this::requestNext);
+      pendingTerminationResponses++;
+      currentSession = session;
     }
+    try {
+      watcher.close();
+    } catch (RuntimeException | Error failure) {
+      completeTerminationResponse(watcher.id(), reason, null, failure);
+      if (failure instanceof Error fatal) throw fatal;
+      return;
+    }
+
+    CompletionStage<Long> revision;
+    try {
+      revision = currentSession == null
+          ? java.util.concurrent.CompletableFuture.completedFuture(0L)
+          : Objects.requireNonNull(currentSession.currentRevision(), "current Watch revision future");
+    } catch (RuntimeException | Error failure) {
+      completeTerminationResponse(watcher.id(), reason, null, failure);
+      if (failure instanceof Error fatal) throw fatal;
+      return;
+    }
+    revision.whenComplete((currentRevision, failure) -> executeCompletion(
+        () -> completeTerminationResponse(watcher.id(), reason, currentRevision, failure),
+        ignored -> releasePendingTerminationResponse()));
+  }
+
+  private void completeTerminationResponse(long watchId, String reason, Long revision, Throwable failure) {
+    Throwable cause = failure == null ? null : unwrap(failure);
+    if (cause == null && (revision == null || revision < 0)) {
+      cause = new IllegalStateException("Watch session revision is invalid");
+    }
+    synchronized (lock) {
+      releasePendingTerminationResponseLocked();
+      if (terminal || peerCancelled) return;
+      if (cause == null) enqueueResponse(cancelledResponse(watchId, revision, reason), this::requestNext);
+    }
+    if (cause != null) {
+      fail(cause);
+      return;
+    }
+    scheduleDrain();
+  }
+
+  private void releasePendingTerminationResponse() {
+    synchronized (lock) { releasePendingTerminationResponseLocked(); }
+  }
+
+  private void releasePendingTerminationResponseLocked() {
+    if (pendingTerminationResponses <= 0) {
+      throw new IllegalStateException("Watch termination response count is unbalanced");
+    }
+    pendingTerminationResponses--;
   }
 
   private void requestNext() {
@@ -755,26 +813,26 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     }
   }
 
-  private void schedulePoll(long delayMillis) {
+  private void scheduleDrainYield() {
     synchronized (lock) {
-      if (terminal || peerCancelled || pollTask != null || !hasCreatedWatcherLocked()) return;
+      if (terminal || peerCancelled || drainYieldTask != null) return;
       try {
-        pollTask = timers.schedule(() -> {
-          synchronized (lock) { pollTask = null; }
+        drainYieldTask = timers.schedule(() -> {
+          synchronized (lock) { drainYieldTask = null; }
           scheduleDrain();
-        }, delayMillis, TimeUnit.MILLISECONDS);
+        }, 0, TimeUnit.MILLISECONDS);
       } catch (RejectedExecutionException rejected) {
-        // The stream cannot make progress without its scheduler, so fail and release all subscriptions.
+        // The bounded drain must yield to avoid monopolizing the worker on filtered revisions.
         fail(rejected);
       }
     }
   }
 
-  private void cancelPoll() {
+  private void cancelDrainYield() {
     ScheduledFuture<?> scheduled;
     synchronized (lock) {
-      scheduled = pollTask;
-      pollTask = null;
+      scheduled = drainYieldTask;
+      drainYieldTask = null;
     }
     if (scheduled != null) scheduled.cancel(false);
   }
@@ -783,18 +841,10 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     return serverObserver == null || serverObserver.isReady();
   }
 
-  private boolean hasCreatedWatcher() {
-    synchronized (lock) { return hasCreatedWatcherLocked(); }
-  }
-
-  private boolean hasCreatedWatcherLocked() {
-    return watchRegistry.hasCreatedWatcher();
-  }
-
   private boolean hasRunnableWork() {
     synchronized (lock) {
-      return !peerCancelled && (terminalFailure != null || !terminal && (pendingRequest != null
-          || !responses.isEmpty() && isReady()
+      return !peerCancelled && (terminalFailure != null || !terminal && pendingTerminationResponses == 0
+          && (pendingRequest != null || !responses.isEmpty() && isReady()
           || inboundClosed && pendingRequest == null && !processingRequest && responses.isEmpty()));
     }
   }
@@ -909,7 +959,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       pendingRequest = null;
       responses.clear();
     }
-    cancelPoll();
+    cancelDrainYield();
     Throwable cleanupFailure = closeWatchersCollecting();
     if (cleanupFailure != null && cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
     if (scheduleWriter) scheduleDrain();
@@ -940,7 +990,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       responses.clear();
       closing = watchRegistry.detachAll();
     }
-    cancelPoll();
+    cancelDrainYield();
     closeWatchers(closing);
   }
 

@@ -112,9 +112,17 @@ final class WatchEventBatchEncoder {
     var builder = Kv.Event.newBuilder()
         .setType(event.kind() == PreparedEvent.Kind.PUT
             ? Kv.Event.EventType.PUT : Kv.Event.EventType.DELETE)
-        .setKv(project(event.current()));
+        .setKv(event.kind() == PreparedEvent.Kind.PUT
+            ? project(event.current()) : projectDelete(event.current()));
     if (previousKv) event.previous().ifPresent(previous -> builder.setPrevKv(project(previous)));
     return builder.build();
+  }
+
+  private static Kv.KeyValue projectDelete(StoredRecord tombstone) {
+    return Kv.KeyValue.newBuilder()
+        .setKey(ByteString.copyFrom(tombstone.key().bytes()))
+        .setModRevision(tombstone.metadata().modificationRevision())
+        .build();
   }
 
   private static Kv.KeyValue project(StoredRecord record) {

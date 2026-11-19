@@ -56,6 +56,8 @@ final class WatchRegistry {
 
     void markCreatedSent() { createdSent = true; }
 
+    void setWakeup(Runnable wakeup) { subscription.setWakeup(wakeup); }
+
     synchronized WatchStream.Delivery takeNext() {
       if (closed) return null;
       if (pendingDelivery != null) {
@@ -100,6 +102,7 @@ final class WatchRegistry {
       pendingDelivery = null;
       Throwable failure = null;
       if (delivery != null) failure = WatchCleanup.closeAndCollect(delivery::close, failure);
+      failure = WatchCleanup.closeAndCollect(() -> subscription.setWakeup(null), failure);
       failure = WatchCleanup.closeAndCollect(subscription::close, failure);
       WatchCleanup.throwIfPresent(failure);
     }
@@ -162,10 +165,6 @@ final class WatchRegistry {
   }
 
   synchronized List<Watcher> activeSnapshot() { return List.copyOf(active.values()); }
-
-  synchronized boolean hasCreatedWatcher() {
-    return active.values().stream().anyMatch(Watcher::createdSent);
-  }
 
   synchronized int activeCount() { return active.size(); }
 
