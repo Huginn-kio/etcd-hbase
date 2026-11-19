@@ -1038,7 +1038,9 @@
           "tailerShutdownRacePreservesUnavailableAndReleasesWatchReservation",
           "passesNegativeStartRevisionAndCompactBoundaryAndReleasesBudgetsOnClose",
           "currentRevisionReadsTheAuthoritativeControlSnapshotInsteadOfTheTailerCheckpoint",
-          "pollCancellationHandoffClosesTheDetachedDeliveryBeforeReleasingItsAccount"
+          "pollCancellationHandoffClosesTheDetachedDeliveryBeforeReleasingItsAccount",
+          "workerRejectionAfterWatchSubscriptionOpensReleasesTailerAndBudgetResources",
+          "workerErrorAfterWatchSubscriptionOpensReleasesTailerAndBudgetResources"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchStreamTest", "tests": [
           "emitsCreatedBeforeInclusiveLiveEventsAndAppliesFilterAndPrevKv",
@@ -1056,7 +1058,9 @@
           "createsAndCancelsRawWatchIdMinusOne",
           "createRejectionUsesTheCurrentSessionRevision",
           "terminalFailureWaitsForTheCurrentResponseWriter",
-          "cancellingOneWatchKeepsOtherByteRangeSubscriptionActive"
+          "cancellingOneWatchKeepsOtherByteRangeSubscriptionActive",
+          "watcherCloseStillClosesSubscriptionWhenPendingDeliveryCleanupThrowsError",
+          "outputReleaseAttemptsEveryDeliveryAndPrioritizesFatalCleanupFailure"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchGoInteropTest", "tests": [
           "pinnedGoClientMatchesStartAndLifecycleCasesAgainstJavaWatchService"

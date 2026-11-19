@@ -153,6 +153,8 @@ J45_CRITICAL_JAVA_TESTS = {
         "passesNegativeStartRevisionAndCompactBoundaryAndReleasesBudgetsOnClose",
         "currentRevisionReadsTheAuthoritativeControlSnapshotInsteadOfTheTailerCheckpoint",
         "pollCancellationHandoffClosesTheDetachedDeliveryBeforeReleasingItsAccount",
+        "workerRejectionAfterWatchSubscriptionOpensReleasesTailerAndBudgetResources",
+        "workerErrorAfterWatchSubscriptionOpensReleasesTailerAndBudgetResources",
     },
     "io.etcdhbase.server.commit.WatchStreamTest": {
         "emitsCreatedBeforeInclusiveLiveEventsAndAppliesFilterAndPrevKv",
@@ -171,6 +173,8 @@ J45_CRITICAL_JAVA_TESTS = {
         "createRejectionUsesTheCurrentSessionRevision",
         "terminalFailureWaitsForTheCurrentResponseWriter",
         "cancellingOneWatchKeepsOtherByteRangeSubscriptionActive",
+        "watcherCloseStillClosesSubscriptionWhenPendingDeliveryCleanupThrowsError",
+        "outputReleaseAttemptsEveryDeliveryAndPrioritizesFatalCleanupFailure",
     },
     "io.etcdhbase.server.commit.WatchGoInteropTest": {
         "pinnedGoClientMatchesStartAndLifecycleCasesAgainstJavaWatchService",

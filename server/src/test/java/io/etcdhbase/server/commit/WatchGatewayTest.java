@@ -2,6 +2,7 @@ package io.etcdhbase.server.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -9,8 +10,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -18,27 +19,31 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import etcdserverpb.Rpc;
-import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
 import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
-import io.etcdhbase.core.commit.SharedEventTailer;
 import io.etcdhbase.core.commit.PreparedEvent;
+import io.etcdhbase.core.commit.SharedEventTailer;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
-import java.util.Optional;
-import java.util.UUID;
+import io.grpc.Status;
+import io.grpc.stub.StreamObserver;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -372,6 +377,63 @@ class WatchGatewayTest {
     }
   }
 
+  @Test
+  void workerRejectionAfterWatchSubscriptionOpensReleasesTailerAndBudgetResources()
+      throws Exception {
+    assertWorkerFailureAfterWatchOpensReleasesResources(
+        new RejectedExecutionException("completion worker rejected the Watch"),
+        Status.Code.RESOURCE_EXHAUSTED, "backend resource limit was reached");
+  }
+
+  @Test
+  void workerErrorAfterWatchSubscriptionOpensReleasesTailerAndBudgetResources() throws Exception {
+    assertWorkerFailureAfterWatchOpensReleasesResources(
+        new AssertionError("completion worker failed fatally"),
+        Status.Code.INTERNAL, "backend operation failed");
+  }
+
+  private static void assertWorkerFailureAfterWatchOpensReleasesResources(
+      Throwable workerFailure, Status.Code expectedCode, String expectedDescription)
+      throws Exception {
+    try (var startup = RequestScope.withoutDeadline();
+         var scope = RequestScope.withoutDeadline()) {
+      var tailer = openTailer();
+      var subscription = mock(SharedEventTailer.Subscription.class);
+      when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
+          anyInt(), anyLong(), anyLong()))
+          .thenReturn(new SharedEventTailer.SubscriptionStart(subscription, 0, 0));
+      var barrier = new CompletableFuture<Optional<ControlSnapshot>>();
+      var control = mock(CommitControlStore.class);
+      when(control.read(scope)).thenReturn(barrier);
+      var budgets = budgets();
+      var gateway = gateway(startup, budgets, RESPONSE_BYTES, control);
+      var worker = new ToggleRejectingExecutor();
+      var observer = new RecordingWatchObserver();
+      var stream = new WatchStream(observer, scope, worker, mock(ScheduledExecutorService.class),
+          () -> CompletableFuture.completedFuture(session(gateway, tailer, scope)),
+          11, 12, RESPONSE_BYTES, new CompactedWatchIdBudget(8));
+
+      stream.onNext(Rpc.WatchRequest.newBuilder().setCreateRequest(
+          Rpc.WatchCreateRequest.newBuilder().setWatchId(7)
+              .setKey(com.google.protobuf.ByteString.copyFromUtf8("key"))).build());
+
+      verify(control).read(scope);
+      assertTrue(budgets.snapshot().allocatedBytes() > 0,
+          "the delayed control barrier leaves the accepted subscription and state memory retained");
+      worker.rejection = workerFailure;
+      barrier.complete(Optional.of(snapshot(4, 0)));
+
+      verify(subscription).close();
+      assertReleased(budgets);
+      assertNotNull(observer.failure, "the worker failure is delivered through the RPC error path");
+      Status status = Status.fromThrowable(observer.failure);
+      assertEquals(expectedCode, status.getCode());
+      assertEquals(expectedDescription, status.getDescription());
+      assertFalse(status.getDescription().contains(workerFailure.getMessage()),
+          "the RPC error must not expose the executor failure details");
+    }
+  }
+
   private static SharedEventTailer openTailer() {
     SharedEventTailer tailer = mock(SharedEventTailer.class);
     when(tailer.isClosed()).thenReturn(false);
@@ -464,6 +526,26 @@ class WatchGatewayTest {
     assertEquals(0, snapshot.requests());
     assertEquals(0, snapshot.reservedBytes());
     assertEquals(0, snapshot.allocatedBytes());
+  }
+
+  private static final class ToggleRejectingExecutor implements Executor {
+    private Throwable rejection;
+
+    @Override public void execute(Runnable command) {
+      if (rejection instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+      if (rejection instanceof Error fatal) throw fatal;
+      command.run();
+    }
+  }
+
+  private static final class RecordingWatchObserver implements StreamObserver<Rpc.WatchResponse> {
+    private Throwable failure;
+
+    @Override public void onNext(Rpc.WatchResponse response) {}
+
+    @Override public void onError(Throwable cause) { failure = cause; }
+
+    @Override public void onCompleted() {}
   }
 
   private static PreparedEvent event() { return event(4); }

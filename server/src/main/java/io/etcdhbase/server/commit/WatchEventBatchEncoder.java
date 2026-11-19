@@ -22,7 +22,7 @@ final class WatchEventBatchEncoder {
       deliveries = List.copyOf(deliveries);
     }
 
-    void release() { deliveries.forEach(WatchStream.Delivery::close); }
+    void release() { WatchCleanup.throwIfPresent(releaseDeliveries(deliveries, null)); }
   }
 
   record Poll(Output output, boolean consumed, String terminationReason) {}
@@ -44,6 +44,7 @@ final class WatchEventBatchEncoder {
     Objects.requireNonNull(watcher, "watcher");
     List<WatchStream.Delivery> deliveries = new ArrayList<>();
     boolean transferred = false;
+    Throwable failure = null;
     try {
       WatchStream.Delivery first = watcher.takeNext();
       if (first == null) {
@@ -85,9 +86,22 @@ final class WatchEventBatchEncoder {
       Output output = new Output(built, deliveries);
       transferred = true;
       return new Poll(output, true, null);
+    } catch (RuntimeException | Error problem) {
+      failure = problem;
+      throw problem;
     } finally {
-      if (!transferred) deliveries.forEach(WatchStream.Delivery::close);
+      if (!transferred) {
+        WatchCleanup.throwIfPresent(releaseDeliveries(deliveries, failure));
+      }
     }
+  }
+
+  private static Throwable releaseDeliveries(List<WatchStream.Delivery> deliveries,
+      Throwable failure) {
+    for (WatchStream.Delivery delivery : deliveries) {
+      failure = WatchCleanup.closeAndCollect(delivery::close, failure);
+    }
+    return failure;
   }
 
   private Rpc.ResponseHeader header(long revision) {

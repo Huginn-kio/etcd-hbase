@@ -96,22 +96,12 @@ final class WatchRegistry {
     public synchronized void close() {
       if (closed) return;
       closed = true;
-      RuntimeException failure = null;
-      if (pendingDelivery != null) {
-        try {
-          pendingDelivery.close();
-        } catch (RuntimeException cleanup) {
-          failure = cleanup;
-        }
-        pendingDelivery = null;
-      }
-      try {
-        subscription.close();
-      } catch (RuntimeException cleanup) {
-        if (failure == null) failure = cleanup;
-        else if (cleanup != failure) failure.addSuppressed(cleanup);
-      }
-      if (failure != null) throw failure;
+      WatchStream.Delivery delivery = pendingDelivery;
+      pendingDelivery = null;
+      Throwable failure = null;
+      if (delivery != null) failure = WatchCleanup.closeAndCollect(delivery::close, failure);
+      failure = WatchCleanup.closeAndCollect(subscription::close, failure);
+      WatchCleanup.throwIfPresent(failure);
     }
   }
 

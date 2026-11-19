@@ -3,6 +3,8 @@ package io.etcdhbase.server.commit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -959,6 +961,62 @@ class WatchStreamTest {
       assertEquals(1, cancelled.closeCount.get());
       assertEquals(1, active.closeCount.get());
     }
+  }
+
+  @Test
+  void watcherCloseStillClosesSubscriptionWhenPendingDeliveryCleanupThrowsError() {
+    var subscription = new RecordingSubscription();
+    var subscriptionFailure = new IllegalStateException("subscription cleanup failed");
+    subscription.closeFailure = subscriptionFailure;
+    var watcher = new WatchRegistry(new CompactedWatchIdBudget(1))
+        .registerActive(1, 1, false, false, false, subscription).watcher();
+    var deliveryFailure = new AssertionError("pending delivery cleanup failed");
+    var pendingDelivery = new WatchStream.Delivery(2,
+        event(2, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {2}, Optional.empty()),
+        () -> { throw deliveryFailure; });
+    watcher.defer(pendingDelivery);
+
+    assertSame(deliveryFailure, assertThrows(AssertionError.class, watcher::close));
+
+    assertEquals(1, subscription.closeCount.get(),
+        "subscription cleanup runs even when pending delivery cleanup throws Error");
+    assertEquals(1, deliveryFailure.getSuppressed().length);
+    assertSame(subscriptionFailure, deliveryFailure.getSuppressed()[0]);
+  }
+
+  @Test
+  void outputReleaseAttemptsEveryDeliveryAndPrioritizesFatalCleanupFailure() {
+    var firstFailure = new IllegalStateException("first delivery cleanup failed");
+    var fatalFailure = new AssertionError("second delivery cleanup failed");
+    var lastFailure = new IllegalArgumentException("last delivery cleanup failed");
+    var firstAttempts = new AtomicInteger();
+    var secondAttempts = new AtomicInteger();
+    var lastAttempts = new AtomicInteger();
+    var first = deliveryWithCleanupFailure(firstAttempts, firstFailure);
+    var second = deliveryWithCleanupFailure(secondAttempts, fatalFailure);
+    var last = deliveryWithCleanupFailure(lastAttempts, lastFailure);
+    var output = new WatchEventBatchEncoder.Output(Rpc.WatchResponse.getDefaultInstance(),
+        List.of(first, second, last));
+
+    assertSame(fatalFailure, assertThrows(AssertionError.class, output::release));
+
+    assertEquals(1, firstAttempts.get());
+    assertEquals(1, secondAttempts.get());
+    assertEquals(1, lastAttempts.get(), "a cleanup failure does not skip later deliveries");
+    assertEquals(2, fatalFailure.getSuppressed().length);
+    assertSame(firstFailure, fatalFailure.getSuppressed()[0]);
+    assertSame(lastFailure, fatalFailure.getSuppressed()[1]);
+  }
+
+  private static WatchStream.Delivery deliveryWithCleanupFailure(
+      AtomicInteger attempts, Throwable failure) {
+    return new WatchStream.Delivery(2,
+        event(2, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {2}, Optional.empty()),
+        () -> {
+          attempts.incrementAndGet();
+          if (failure instanceof Error fatal) throw fatal;
+          throw (RuntimeException) failure;
+        });
   }
 
   private static WatchStream stream(RecordingObserver observer, RequestScope scope,

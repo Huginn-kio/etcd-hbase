@@ -23,6 +23,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /** One stream-scoped watch registry and single writer for control responses and event batches. */
 final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseable {
@@ -443,8 +444,9 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       }
       return;
     }
-    opening.whenComplete((opened, failure) -> executeCompletion(() ->
-        completeSubscribedCreate(openedSession, request, opened, failure)));
+    opening.whenComplete((opened, failure) -> executeCompletion(
+        () -> completeSubscribedCreate(openedSession, request, opened, failure),
+        schedulingFailure -> closeUnregisteredWatch(opened, failure, schedulingFailure)));
   }
 
   private void completeSubscribedCreate(Session openedSession, Rpc.WatchCreateRequest request,
@@ -798,13 +800,36 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   }
 
   private void executeCompletion(Runnable completion) {
+    executeCompletion(completion, ignored -> {});
+  }
+
+  private void executeCompletion(Runnable completion, Consumer<Throwable> schedulingFailureCleanup) {
     try {
       worker.execute(completion);
     } catch (RejectedExecutionException rejected) {
-      fail(rejected);
+      failCompletion(rejected, schedulingFailureCleanup);
     } catch (Error fatal) {
-      fail(fatal);
+      failCompletion(fatal, schedulingFailureCleanup);
       throw fatal;
+    }
+  }
+
+  private void failCompletion(Throwable failure, Consumer<Throwable> schedulingFailureCleanup) {
+    try {
+      schedulingFailureCleanup.accept(failure);
+    } catch (RuntimeException | Error cleanupFailure) {
+      if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+    }
+    fail(failure);
+  }
+
+  private static void closeUnregisteredWatch(OpenedWatch opened, Throwable openingFailure,
+      Throwable schedulingFailure) {
+    if (openingFailure != null || opened == null) return;
+    try {
+      opened.subscription().close();
+    } catch (RuntimeException | Error cleanupFailure) {
+      if (cleanupFailure != schedulingFailure) schedulingFailure.addSuppressed(cleanupFailure);
     }
   }
 

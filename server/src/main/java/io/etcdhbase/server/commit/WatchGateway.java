@@ -195,21 +195,6 @@ final class WatchGateway {
     }
   }
 
-  private static Throwable closeAndCollect(Runnable close, Throwable failure) {
-    try {
-      close.run();
-    } catch (RuntimeException | Error cleanupFailure) {
-      if (failure == null) return cleanupFailure;
-      if (failure == cleanupFailure) return failure;
-      if (cleanupFailure instanceof Error && !(failure instanceof Error)) {
-        cleanupFailure.addSuppressed(failure);
-        return cleanupFailure;
-      }
-      failure.addSuppressed(cleanupFailure);
-    }
-    return failure;
-  }
-
   private static final class TailerSubscription implements WatchStream.Subscription {
     private final SharedEventTailer.Subscription subscription;
     private final BudgetManager.Account account;
@@ -249,11 +234,10 @@ final class WatchGateway {
     public synchronized void close() {
       if (closed) return;
       closed = true;
-      Throwable failure = closeAndCollect(subscription::close, null);
-      failure = closeAndCollect(stateMemory::close, failure);
-      failure = closeAndCollect(account::close, failure);
-      if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
-      if (failure instanceof Error fatal) throw fatal;
+      Throwable failure = WatchCleanup.closeAndCollect(subscription::close, null);
+      failure = WatchCleanup.closeAndCollect(stateMemory::close, failure);
+      failure = WatchCleanup.closeAndCollect(account::close, failure);
+      WatchCleanup.throwIfPresent(failure);
     }
   }
 }
