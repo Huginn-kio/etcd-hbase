@@ -223,7 +223,7 @@ class WatchGatewayTest {
       BudgetManager.Snapshot tailerBaseline = budgets.snapshot();
       try (var tailer = new SharedEventTailer(mock(SelectedSequenceReader.class),
           ByteKey.copyOf(new byte[32]), tailerMemory, 0, 1, 4,
-          WatchStream.MAX_PENDING_EVENTS_PER_WATCH,
+          WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH,
           LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES)) {
         var control = mock(CommitControlStore.class);
         var barrierRead = new CompletableFuture<Optional<ControlSnapshot>>();
@@ -387,7 +387,7 @@ class WatchGatewayTest {
         when(cursor.releaseCompletion()).thenReturn(CompletableFuture.completedFuture(null));
 
         try (var tailer = new SharedEventTailer(source, authorizationDigest, tailerMemory,
-            3, 4, 4, WatchStream.MAX_PENDING_EVENTS_PER_WATCH,
+            3, 4, 4, WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH,
             LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES)) {
           var pending = new M3TableGroupRuntime.Pending(startup, null, true);
           pending.installEventTailer(tailer);

@@ -1278,9 +1278,14 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
 
   private boolean hasRunnableWork() {
     synchronized (lock) {
-      return !peerCancelled && (terminalFailure != null || !terminal && pendingTerminationResponses == 0
-          && (activeFragment != null && isReady() || pendingRequest != null || !responses.isEmpty() && isReady()
-          || inboundClosed && pendingRequest == null && !processingRequest && responses.isEmpty()));
+      if (peerCancelled) return false;
+      if (terminalFailure != null) return true;
+      if (terminal || pendingTerminationResponses > 0) return false;
+      if (activeFragment != null) {
+        return isReady() || isCancelRequest(pendingRequest) && !processingRequest;
+      }
+      return pendingRequest != null && !processingRequest || !responses.isEmpty() && isReady()
+          || inboundClosed && pendingRequest == null && !processingRequest && responses.isEmpty();
     }
   }
 

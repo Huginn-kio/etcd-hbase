@@ -172,7 +172,7 @@ final class WatchHistoryReplay implements AutoCloseable {
   }
 
   synchronized void setWakeup(Runnable wakeup) {
-    this.wakeup = Objects.requireNonNull(wakeup, "wakeup");
+    this.wakeup = wakeup == null ? () -> {} : wakeup;
   }
 
   synchronized Optional<WatchStream.Delivery> poll() {

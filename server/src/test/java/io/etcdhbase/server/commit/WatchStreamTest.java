@@ -832,7 +832,7 @@ class WatchStreamTest {
     var session = new RecordingSession(4, subscription);
     var observer = new RecordingObserver();
     byte[] key = {4};
-    for (int index = 0; index <= WatchStream.MAX_PENDING_EVENTS_PER_WATCH; index++) {
+    for (int index = 0; index <= WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH; index++) {
       subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {(byte) index}, Optional.empty()));
     }
 
@@ -846,7 +846,7 @@ class WatchStreamTest {
       assertTrue(cancelled.getCanceled());
       assertEquals(33, cancelled.getWatchId());
       assertTrue(cancelled.getCancelReason().contains("aggregation budget"));
-      assertEquals(WatchStream.MAX_PENDING_EVENTS_PER_WATCH + 1, subscription.releases.get());
+      assertEquals(WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH + 1, subscription.releases.get());
 
       stream.close();
       assertEquals(1, subscription.closeCount.get());
