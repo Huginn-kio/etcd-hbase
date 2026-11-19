@@ -2,6 +2,8 @@ package io.etcdhbase.server.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -33,6 +35,7 @@ import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -42,12 +45,43 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 
 class WatchHistoryReplayTest {
   private static final String TABLE_GROUP = "watch-history-test";
   private static final ByteKey AUTHORIZATION = ByteKey.copyOf(new byte[32]);
   private static final int RESPONSE_BYTES = 1 << 20;
+
+  @Test
+  void closeAttemptsRemainingDeliveryReleasesAndPropagatesAggregatedFailures() throws Exception {
+    var fixture = new ReplayFixture();
+    var firstFailure = new AssertionError("first delivery release failed");
+    var secondFailure = new IllegalStateException("second delivery release failed");
+    var thirdReleased = new AtomicBoolean();
+    var deliveries = List.of(
+        delivery(() -> { throw firstFailure; }),
+        delivery(() -> { throw secondFailure; }),
+        delivery(() -> thirdReleased.set(true)));
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      WatchHistoryReplay replay = fixture.openReplay(watchAccount, KeyRange.all(), 3);
+      ArrayDeque<WatchStream.Delivery> pending = pendingDeliveries(replay);
+      pending.addAll(deliveries);
+
+      AssertionError actual = assertThrows(AssertionError.class, replay::close);
+
+      assertSame(firstFailure, actual);
+      assertEquals(1, actual.getSuppressed().length);
+      assertSame(secondFailure, actual.getSuppressed()[0]);
+      assertTrue(thirdReleased.get(), "later delivery release must run after an Error");
+      assertTrue(pending.isEmpty(), "pending deliveries must be cleared after release attempts");
+      verify(fixture.pin).close();
+      watchAccount.close();
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
 
   @Test
   void replaysInclusiveStartInRevisionAndOrdinalOrder() throws Exception {
@@ -173,6 +207,19 @@ class WatchHistoryReplayTest {
     when(delivery.sequence()).thenReturn(sequence);
     when(delivery.revision()).thenReturn(event.current().metadata().modificationRevision());
     return delivery;
+  }
+
+  private static WatchStream.Delivery delivery(Runnable release) {
+    PreparedEvent event = event(2, 1, 0, 61);
+    return new WatchStream.Delivery(1, 2, event, release);
+  }
+
+  @SuppressWarnings("unchecked")
+  private static ArrayDeque<WatchStream.Delivery> pendingDeliveries(WatchHistoryReplay replay)
+      throws ReflectiveOperationException {
+    Field pendingField = WatchHistoryReplay.class.getDeclaredField("pending");
+    pendingField.setAccessible(true);
+    return (ArrayDeque<WatchStream.Delivery>) pendingField.get(replay);
   }
 
   private static WatchStream.Session tailerSession(WatchGateway gateway,

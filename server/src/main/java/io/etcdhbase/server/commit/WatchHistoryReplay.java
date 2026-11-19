@@ -195,7 +195,7 @@ final class WatchHistoryReplay implements AutoCloseable {
     }
     if (readRevisions >= MAX_TOTAL_REVISIONS || readPages >= MAX_TOTAL_PAGES
         || readBytes >= MAX_TOTAL_PROOF_BYTES) {
-      terminate(RESOURCE_LIMIT_REASON);
+      WatchCleanup.throwIfPresent(terminate(RESOURCE_LIMIT_REASON));
       return;
     }
     loading = true;
@@ -219,6 +219,7 @@ final class WatchHistoryReplay implements AutoCloseable {
   private void finishRevision(long revision, List<WatchStream.Delivery> events,
       Throwable failure, CompletableFuture<?> read) {
     Runnable signal;
+    Throwable cleanupFailure = null;
     synchronized (this) {
       if (inFlight == read) inFlight = null;
       loading = false;
@@ -227,7 +228,7 @@ final class WatchHistoryReplay implements AutoCloseable {
         return;
       }
       if (failure != null) {
-        terminate(reason(failure));
+        cleanupFailure = terminate(reason(failure));
         signal = wakeup;
       } else {
         pending.addAll(Objects.requireNonNull(events, "replayed events"));
@@ -236,7 +237,7 @@ final class WatchHistoryReplay implements AutoCloseable {
         signal = wakeup;
       }
     }
-    signal.run();
+    WatchCleanup.throwIfPresent(WatchCleanup.closeAndCollect(signal, cleanupFailure));
   }
 
   private CompletableFuture<Long> readSequence(long revision, CommitState state,
@@ -329,7 +330,7 @@ final class WatchHistoryReplay implements AutoCloseable {
             else if (problem != release) problem.addSuppressed(release);
           }
           if (problem != null) {
-            closeDeliveries(deliveries);
+            problem = collectDeliveryCloseFailures(deliveries, problem);
             result.completeExceptionally(problem);
           } else {
             result.complete(List.copyOf(deliveries));
@@ -401,19 +402,22 @@ final class WatchHistoryReplay implements AutoCloseable {
     return result;
   }
 
-  private void terminate(String reason) {
-    if (termination != null || closed) return;
+  private Throwable terminate(String reason) {
+    if (termination != null || closed) return null;
     termination = reason;
-    closeDeliveries(pending);
+    Throwable failure = collectDeliveryCloseFailures(pending, null);
     pending.clear();
-    releasePin();
+    failure = WatchCleanup.closeAndCollect(this::releasePin, failure);
+    return failure;
   }
 
   private void releasePin() {
     EventHistoryPinManager.Pin current = pin;
     pin = null;
-    if (current != null) current.close();
-    pinScope.close();
+    Throwable failure = null;
+    if (current != null) failure = WatchCleanup.closeAndCollect(current::close, failure);
+    failure = WatchCleanup.closeAndCollect(pinScope::close, failure);
+    WatchCleanup.throwIfPresent(failure);
   }
 
   private void completeCompactedOpen() {
@@ -440,26 +444,36 @@ final class WatchHistoryReplay implements AutoCloseable {
   }
 
   private static void closeDeliveries(Iterable<WatchStream.Delivery> deliveries) {
+    WatchCleanup.throwIfPresent(collectDeliveryCloseFailures(deliveries, null));
+  }
+
+  private static Throwable collectDeliveryCloseFailures(
+      Iterable<WatchStream.Delivery> deliveries, Throwable failure) {
     for (WatchStream.Delivery delivery : deliveries) {
-      try { delivery.close(); } catch (RuntimeException ignored) { /* release remaining leases */ }
+      failure = WatchCleanup.closeAndCollect(delivery::close, failure);
     }
+    return failure;
   }
 
   @Override
   public void close() {
     CompletableFuture<?> active;
+    Throwable failure = null;
     synchronized (this) {
       if (closed) return;
       closed = true;
-      closeDeliveries(pending);
+      failure = collectDeliveryCloseFailures(pending, failure);
       pending.clear();
       active = inFlight;
-      if (active == null) releasePin();
-      if (activeReadScope != null) activeReadScope.cancel();
+      if (active == null) failure = WatchCleanup.closeAndCollect(this::releasePin, failure);
+      if (activeReadScope != null) {
+        failure = WatchCleanup.closeAndCollect(activeReadScope::cancel, failure);
+      }
     }
     if (active != null) {
-      pinScope.cancel();
-      active.whenComplete((ignored, failure) -> releasePin());
+      failure = WatchCleanup.closeAndCollect(pinScope::cancel, failure);
+      active.whenComplete((ignored, completionFailure) -> releasePin());
     }
+    WatchCleanup.throwIfPresent(failure);
   }
 }
