@@ -3,6 +3,7 @@ package io.etcdhbase.server.commit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -18,13 +19,21 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.google.protobuf.ByteString;
 import etcdserverpb.Rpc;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.bytes.KeyRange;
+import io.etcdhbase.core.commit.CommitDecision;
 import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.commit.EventReference;
+import io.etcdhbase.core.commit.EventRevisionIndex;
+import io.etcdhbase.core.commit.InvocationId;
+import io.etcdhbase.core.commit.ManifestCatalog;
 import io.etcdhbase.core.commit.PreparedEvent;
+import io.etcdhbase.core.commit.ProtectedEventCursor;
+import io.etcdhbase.core.commit.SelectedSequenceReader;
 import io.etcdhbase.core.commit.SharedEventTailer;
 import io.etcdhbase.core.commit.TransactionId;
 import io.etcdhbase.core.error.BackendFailure;
@@ -36,7 +45,9 @@ import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -45,6 +56,8 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -95,6 +108,89 @@ class WatchGatewayTest {
           () -> subscribe(gateway, tailer, scope)));
       assertEquals(BackendFailure.Category.UNAVAILABLE, failure.category());
       assertReleased(budgets);
+    }
+  }
+
+  @Test
+  void realTailerResourceLimitWakesWatchAndReleasesDeliveryBudgetWithoutAnotherRequest() throws Exception {
+    var budgets = budgetsWithMemory(2L << 20);
+    try (var startup = RequestScope.withoutDeadline();
+         var tailerScope = RequestScope.withoutDeadline();
+         var readScope = RequestScope.withoutDeadline();
+         var streamScope = RequestScope.withoutDeadline();
+         var tailerMemory = budgets.admit(TABLE_GROUP, tailerScope,
+             new BudgetManager.Reservation(0, 1, 1, 8192));
+         var readMemory = budgets.admit(TABLE_GROUP, readScope,
+             new BudgetManager.Reservation(0, 1, 1, 1L << 20))) {
+      TransactionId transactionId = new TransactionId(new UUID(0, 11));
+      PreparedEvent firstEvent = preparedEvent(transactionId, 0, 11, new byte[] {1});
+      PreparedEvent secondEvent = preparedEvent(transactionId, 1, 11, new byte[] {1});
+      SharedEventTailer tailer = realTailer(tailerMemory, transactionId, firstEvent, secondEvent);
+      try (tailer) {
+        // Allow one event after index accounting, but leave the second same-sized event one byte over budget.
+        int subscriptionByteLimit = Math.subtractExact(Math.multiplyExact(firstEvent.retainedBytes(), 2), 1);
+        var control = mock(CommitControlStore.class);
+        AtomicInteger controlReads = new AtomicInteger();
+        when(control.read(any(RequestScope.class))).thenAnswer(ignored -> {
+          long revision = controlReads.getAndIncrement() == 0 ? 10 : 11;
+          return CompletableFuture.completedFuture(Optional.of(snapshot(revision, 0)));
+        });
+        WatchGateway gateway = gateway(startup, budgets, subscriptionByteLimit, control);
+        WatchStream.Session session = session(gateway, tailer, streamScope);
+        ScheduledExecutorService timers = mock(ScheduledExecutorService.class);
+        List<Rpc.WatchResponse> responses = new ArrayList<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        StreamObserver<Rpc.WatchResponse> observer = new StreamObserver<>() {
+          @Override public void onNext(Rpc.WatchResponse response) { responses.add(response); }
+          @Override public void onError(Throwable problem) { failure.set(problem); }
+          @Override public void onCompleted() {}
+        };
+        AtomicInteger workerExecutions = new AtomicInteger();
+        Executor worker = task -> {
+          workerExecutions.incrementAndGet();
+          task.run();
+        };
+        var stream = new WatchStream(observer, streamScope, worker, timers,
+            () -> CompletableFuture.completedFuture(session), 11, 12, subscriptionByteLimit,
+            new CompactedWatchIdBudget(8));
+        try (stream) {
+          BudgetManager.Snapshot baseline = budgets.snapshot();
+          stream.onNext(Rpc.WatchRequest.newBuilder()
+              .setCreateRequest(Rpc.WatchCreateRequest.newBuilder()
+                  .setWatchId(77).setKey(ByteString.copyFrom(new byte[] {1})))
+              .build());
+          assertEquals(1, responses.size());
+          assertTrue(responses.getFirst().getCreated());
+          assertEquals(77, responses.getFirst().getWatchId(),
+              "unexpected rejected Create: " + responses.getFirst().getCancelReason());
+          assertFalse(responses.getFirst().getCanceled());
+          assertEquals(1, tailer.subscriptionCount(), "the Created response must retain a live tailer subscription");
+
+          assertEquals(SharedEventTailer.Step.OPENED, advanceTailer(tailer, readScope, readMemory));
+          assertEquals(SharedEventTailer.Step.BUFFERED, advanceTailer(tailer, readScope, readMemory));
+          assertEquals(SharedEventTailer.Step.BUFFERED, advanceTailer(tailer, readScope, readMemory));
+          int workerExecutionsBeforePublish = workerExecutions.get();
+          assertEquals(SharedEventTailer.Step.PUBLISHED, advanceTailer(tailer, readScope, readMemory));
+
+          assertTrue(workerExecutions.get() > workerExecutionsBeforePublish,
+              "the tailer must invoke the installed Watch stream wakeup after terminating a subscriber");
+          assertEquals(0, tailer.subscriptionCount(),
+              "the real tailer must terminate a subscriber whose byte budget is exceeded");
+          assertEquals(2, responses.size(),
+              "the real tailer must wake the Watch stream without another client request");
+          Rpc.WatchResponse cancelled = responses.getLast();
+          assertTrue(cancelled.getCanceled());
+          assertEquals(77, cancelled.getWatchId());
+          assertEquals("etcd-hbase: Watch subscription resource limit exceeded",
+              cancelled.getCancelReason());
+          assertEquals(baseline.requests(), budgets.snapshot().requests());
+          assertEquals(baseline.reservedBytes(), budgets.snapshot().reservedBytes());
+          assertEquals(baseline.allocatedBytes(), budgets.snapshot().allocatedBytes(),
+              "queued delivery memory is released when RESOURCE_LIMIT is delivered");
+          assertNull(failure.get());
+          verify(timers, never()).schedule(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS));
+        }
+      }
     }
   }
 
@@ -448,6 +544,43 @@ class WatchGatewayTest {
     SharedEventTailer tailer = mock(SharedEventTailer.class);
     when(tailer.isClosed()).thenReturn(false);
     return tailer;
+  }
+
+  private static SharedEventTailer realTailer(BudgetManager.Account memory, TransactionId transactionId,
+      PreparedEvent firstEvent, PreparedEvent secondEvent) {
+    var decision = new CommitDecision(transactionId, InvocationId.create(), 1, 10, 11,
+        ByteKey.copyOf(new byte[] {1}), ByteKey.copyOf(new byte[32]), true);
+    var eventReference = new EventReference(ByteKey.copyOf(new byte[] {2}), ByteKey.copyOf(new byte[32]),
+        0, 1, 2, firstEvent.retainedBytes() + secondEvent.retainedBytes(), 1, 0);
+    var selected = new SelectedSequenceReader.Selected(decision, Optional.of(mock(ProtectedEventCursor.class)),
+        Optional.of(new EventRevisionIndex(decision, eventReference)));
+    ProtectedEventCursor cursor = selected.events().orElseThrow();
+    when(cursor.next(any(ManifestCatalog.ProofReadBudget.class))).thenReturn(
+        CompletableFuture.completedFuture(Optional.of(firstEvent)),
+        CompletableFuture.completedFuture(Optional.of(secondEvent)),
+        CompletableFuture.completedFuture(Optional.empty()));
+    when(cursor.releaseCompletion()).thenReturn(CompletableFuture.completedFuture(null));
+    var source = mock(SelectedSequenceReader.class);
+    when(source.openNext(anyLong(), anyLong(), any(ByteKey.class), any(RequestScope.class),
+        any(ManifestCatalog.ProofReadBudget.class))).thenReturn(CompletableFuture.completedFuture(
+            new SelectedSequenceReader.ReadAhead(0, Optional.of(selected))));
+    return new SharedEventTailer(source, ByteKey.copyOf(new byte[32]), memory,
+        0, 10, 4, 4, 1L << 20);
+  }
+
+  private static PreparedEvent preparedEvent(TransactionId transactionId, long ordinal,
+      long revision, byte[] key) {
+    byte[] value = new byte[1 << 10];
+    StoredRecord current = StoredRecord.live(ByteKey.copyOf(key),
+        new StorageMetadata(revision, revision, 1, 0, StorageMetadata.State.LIVE, value.length), value);
+    return new PreparedEvent(transactionId, 1, 0, revision - 1, ordinal,
+        PreparedEvent.Kind.PUT, current, Optional.empty());
+  }
+
+  private static SharedEventTailer.Step advanceTailer(SharedEventTailer tailer,
+      RequestScope scope, BudgetManager.Account memory) {
+    var budget = new ManifestCatalog.ProofReadBudget(scope, memory, 10, 1L << 20);
+    return tailer.step(scope, budget).join();
   }
 
   private static BudgetManager budgets() {

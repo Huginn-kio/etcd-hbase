@@ -421,7 +421,7 @@ public final class SharedEventTailer implements AutoCloseable {
         matches.clear();
         subscriptionIndex.forEachMatch(event.event().current().key(), matches::add);
         for (Subscription subscription : matches) {
-          if (subscription.offer(event, activeDecision)) changed.add(subscription);
+          if (subscription.offer(event, activeDecision, wakeups)) changed.add(subscription);
         }
       }
       for (Subscription subscription : changed) {
@@ -528,12 +528,12 @@ public final class SharedEventTailer implements AutoCloseable {
       this.minimumRevision = minimumRevision;
     }
 
-    private boolean offer(Buffered item, CommitDecision decision) {
+    private boolean offer(Buffered item, CommitDecision decision, List<Runnable> wakeups) {
       if (decision.revision() < minimumRevision) return false;
       PreparedEvent event = item.event();
       long eventBytes = event.retainedBytes();
       if (pending.size() >= maximumEvents || eventBytes > maximumBytes - pendingBytes) {
-        stop(Termination.RESOURCE_LIMIT);
+        stopForResourceLimit(wakeups);
         return true;
       }
       BudgetManager.Lease retained;
@@ -541,7 +541,7 @@ public final class SharedEventTailer implements AutoCloseable {
         retained = account.tryRetain(BudgetManager.Memory.OUTPUT, eventBytes)
             .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
       } catch (BackendFailure failure) {
-        stop(Termination.RESOURCE_LIMIT);
+        stopForResourceLimit(wakeups);
         return true;
       }
       try {
@@ -552,6 +552,11 @@ public final class SharedEventTailer implements AutoCloseable {
       }
       pendingBytes += eventBytes;
       return true;
+    }
+
+    private void stopForResourceLimit(List<Runnable> wakeups) {
+      Runnable listener = stop(Termination.RESOURCE_LIMIT);
+      if (listener != null) wakeups.add(listener);
     }
 
     /** Installs a bounded consumer wakeup and signals immediately if work is already available. */
