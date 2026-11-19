@@ -44,7 +44,8 @@ J45_VERIFICATION_BOUNDARY = (
     "The native raw-proto event probe waits for etcd's synced progress marker as a harness barrier; this "
     "does not claim Java progress-request support, which is assigned to J46.2. Native raw-proto and local-service "
     "Go traces compare the registered start/cancel matrix; a separate Go-client lifecycle run exercises multiple "
-    "watch IDs, byte ranges, filters/PrevKV, cancellation and stream close against Java WatchService. "
+    "watch IDs, byte ranges, filters/PrevKV, and client-context cancellation cleanup against "
+    "Java WatchService. Normal server-side request half-close semantics remain assigned to J47. "
     "MiniCluster acceptance remains outside this unit evidence"
 )
 
@@ -173,6 +174,9 @@ J45_CRITICAL_JAVA_TESTS = {
         "createRejectionUsesTheCurrentSessionRevision",
         "terminalFailureWaitsForTheCurrentResponseWriter",
         "cancellingOneWatchKeepsOtherByteRangeSubscriptionActive",
+        "resourceLimitTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries",
+        "closedTailerTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries",
+        "oversizedCompleteRevisionCancelsWatchWithoutSendingPartialEvents",
         "watcherCloseStillClosesSubscriptionWhenPendingDeliveryCleanupThrowsError",
         "outputReleaseAttemptsEveryDeliveryAndPrioritizesFatalCleanupFailure",
     },
@@ -1191,7 +1195,9 @@ def _validate_j45_java_registration(task: dict[str, object]) -> None:
         raise ReportError("J45 Java suites must be collected from their declared modules")
     if any(not methods.issubset(java_methods.get(class_name, set()))
            for class_name, methods in J45_CRITICAL_JAVA_TESTS.items()):
-        raise ReportError("J45 revision floors, cancellation ownership, or single-writer coverage is incomplete")
+        raise ReportError(
+            "J45 revision floors, termination/resource cleanup, or single-writer coverage is incomplete"
+        )
 
 
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, object]:

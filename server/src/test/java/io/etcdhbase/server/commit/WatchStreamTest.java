@@ -22,6 +22,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
+import io.etcdhbase.grpc.protocol.ResponseHeaderFactory;
 import io.grpc.stub.ServerCallStreamObserver;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -719,6 +720,72 @@ class WatchStreamTest {
   }
 
   @Test
+  void resourceLimitTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries() {
+    assertTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries(
+        "etcd-hbase: Watch subscription resource limit exceeded");
+  }
+
+  @Test
+  void closedTailerTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries() {
+    assertTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries(
+        "etcd-hbase: Watch event source is unavailable");
+  }
+
+  @Test
+  void oversizedCompleteRevisionCancelsWatchWithoutSendingPartialEvents() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] firstKey = {1};
+    byte[] firstValue = {5, 6};
+    byte[] secondKey = {2};
+    byte[] secondValue = {7, 8};
+    subscription.add(event(5, PreparedEvent.Kind.PUT, firstKey, firstValue, Optional.empty()));
+    subscription.add(event(5, PreparedEvent.Kind.PUT, secondKey, secondValue, Optional.empty()));
+    int maximumResponseBytes = 1;
+
+    Rpc.WatchResponse completeRevision = Rpc.WatchResponse.newBuilder()
+        .setHeader(ResponseHeaderFactory.create(CLUSTER_ID, MEMBER_ID, 5, 0))
+        .setWatchId(63)
+        .addEvents(mvccpb.Kv.Event.newBuilder().setType(mvccpb.Kv.Event.EventType.PUT)
+            .setKv(mvccpb.Kv.KeyValue.newBuilder().setKey(ByteString.copyFrom(firstKey))
+                .setValue(ByteString.copyFrom(firstValue)).setCreateRevision(1)
+                .setModRevision(5).setVersion(5)))
+        .addEvents(mvccpb.Kv.Event.newBuilder().setType(mvccpb.Kv.Event.EventType.PUT)
+            .setKv(mvccpb.Kv.KeyValue.newBuilder().setKey(ByteString.copyFrom(secondKey))
+                .setValue(ByteString.copyFrom(secondValue)).setCreateRevision(1)
+                .setModRevision(5).setVersion(5)))
+        .build();
+    assertTrue(completeRevision.getSerializedSize() > maximumResponseBytes);
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run, timers(),
+          () -> CompletableFuture.completedFuture(session), CLUSTER_ID, MEMBER_ID,
+          maximumResponseBytes);
+      stream.onNext(createRequest(63, firstKey, new byte[0], 0, false));
+
+      assertEquals(2, observer.responses.size(),
+          "an oversized revision is rejected as a whole after Created");
+      assertTrue(observer.responses.get(0).getCreated());
+      Rpc.WatchResponse cancelled = observer.responses.get(1);
+      assertFalse(cancelled.getCreated());
+      assertTrue(cancelled.getCanceled());
+      assertEquals(63, cancelled.getWatchId());
+      assertEquals("etcd-hbase: Watch response exceeds the configured message budget",
+          cancelled.getCancelReason());
+      assertEquals(0, observer.responses.stream()
+          .mapToInt(Rpc.WatchResponse::getEventsCount).sum(),
+          "no subset of the revision may be sent");
+      assertEquals(2, subscription.releases.get(),
+          "every delivery in the rejected revision releases its retained budget");
+      assertEquals(1, subscription.closeCount.get());
+
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
   void cancelAcknowledgementWaitsForAndUsesTheCurrentSessionRevision() {
     var subscription = new RecordingSubscription();
     var session = new RecordingSession(4, subscription);
@@ -1019,6 +1086,57 @@ class WatchStreamTest {
         });
   }
 
+  private static void assertTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries(
+      String reason) {
+    var terminated = new RecordingSubscription();
+    var active = new RecordingSubscription();
+    var replacement = new RecordingSubscription();
+    var session = new RecordingSession(8, terminated, active, replacement);
+    var observer = new RecordingObserver();
+    byte[] firstKey = {1};
+    byte[] secondKey = {2};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(),
+          () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(51, firstKey, new byte[0], 0, false));
+      stream.onNext(createRequest(52, secondKey, new byte[0], 0, false));
+      assertEquals(2, observer.responses.size());
+
+      terminated.add(event(9, PreparedEvent.Kind.PUT, firstKey, new byte[] {9}, Optional.empty()));
+      terminated.terminate(reason);
+      observer.readyHandler.run();
+
+      assertEquals(3, observer.responses.size());
+      Rpc.WatchResponse cancelled = observer.responses.get(2);
+      assertFalse(cancelled.getCreated());
+      assertTrue(cancelled.getCanceled());
+      assertEquals(51, cancelled.getWatchId());
+      assertEquals(reason, cancelled.getCancelReason());
+      assertEquals(1, terminated.closeCount.get());
+      assertEquals(1, terminated.releases.get(),
+          "closing a terminated watcher releases queued delivery");
+      assertEquals(0, active.closeCount.get(), "a sibling watcher remains registered");
+
+      stream.onNext(createRequest(51, firstKey, new byte[0], 0, false));
+      assertEquals(4, observer.responses.size(), "a terminated Watch ID is no longer reserved");
+      assertTrue(observer.responses.get(3).getCreated());
+      assertEquals(51, observer.responses.get(3).getWatchId());
+
+      active.add(event(10, PreparedEvent.Kind.PUT, secondKey, new byte[] {10}, Optional.empty()));
+      observer.readyHandler.run();
+      Rpc.WatchResponse siblingEvent = observer.responses.get(4);
+      assertEquals(52, siblingEvent.getWatchId());
+      assertEquals(1, siblingEvent.getEventsCount());
+      assertEquals(0, active.closeCount.get());
+
+      stream.close();
+      assertEquals(1, terminated.closeCount.get());
+      assertEquals(1, active.closeCount.get());
+      assertEquals(1, replacement.closeCount.get());
+    }
+  }
+
   private static WatchStream stream(RecordingObserver observer, RequestScope scope,
       ScheduledExecutorService timers, WatchStream.SessionProvider sessions) {
     return stream(observer, scope, timers, sessions, CompactedWatchIdBudget.processWide());
@@ -1134,6 +1252,7 @@ class WatchStreamTest {
     private final AtomicInteger closeCount = new AtomicInteger();
     private RuntimeException closeFailure;
     private Runnable afterPoll;
+    private String terminationReason;
     private boolean closed;
 
     private void add(PreparedEvent event) {
@@ -1141,8 +1260,10 @@ class WatchStreamTest {
           event, releases::incrementAndGet));
     }
 
+    private void terminate(String reason) { terminationReason = reason; }
+
     @Override public Optional<WatchStream.Delivery> poll() {
-      if (closed) return Optional.empty();
+      if (closed || terminationReason != null) return Optional.empty();
       WatchStream.Delivery delivery = deliveries.pollFirst();
       Runnable hook = afterPoll;
       afterPoll = null;
@@ -1150,7 +1271,8 @@ class WatchStreamTest {
       return Optional.ofNullable(delivery);
     }
 
-    @Override public Optional<String> terminationReason() { return Optional.empty(); }
+    @Override
+    public Optional<String> terminationReason() { return Optional.ofNullable(terminationReason); }
 
     @Override public void close() {
       if (closed) return;

@@ -1059,6 +1059,9 @@
           "createRejectionUsesTheCurrentSessionRevision",
           "terminalFailureWaitsForTheCurrentResponseWriter",
           "cancellingOneWatchKeepsOtherByteRangeSubscriptionActive",
+          "resourceLimitTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries",
+          "closedTailerTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries",
+          "oversizedCompleteRevisionCancelsWatchWithoutSendingPartialEvents",
           "watcherCloseStillClosesSubscriptionWhenPendingDeliveryCleanupThrowsError",
           "outputReleaseAttemptsEveryDeliveryAndPrioritizesFatalCleanupFailure"
         ]},
@@ -1070,7 +1073,7 @@
         "native": {"scope": "native-etcd", "layout": "", "embedded_native": true},
         "local_service": {"scope": "local-service", "layout": "", "embedded_native": false}
       },
-      "verification_boundary": "J45 public protocol evidence covers negative/zero startRevision cases, negative watch ID Create/Cancel, future startRevision Create/Cancel, and the Compact-boundary lifecycle. Future-event delivery, positive historical startRevision behavior, and replay/live handoff are assigned to J46.1. The native raw-proto event probe waits for etcd's synced progress marker as a harness barrier; this does not claim Java progress-request support, which is assigned to J46.2. Native raw-proto and local-service Go traces compare the registered start/cancel matrix; a separate Go-client lifecycle run exercises multiple watch IDs, byte ranges, filters/PrevKV, cancellation and stream close against Java WatchService. MiniCluster acceptance remains outside this unit evidence"
+      "verification_boundary": "J45 public protocol evidence covers negative/zero startRevision cases, negative watch ID Create/Cancel, future startRevision Create/Cancel, and the Compact-boundary lifecycle. Future-event delivery, positive historical startRevision behavior, and replay/live handoff are assigned to J46.1. The native raw-proto event probe waits for etcd's synced progress marker as a harness barrier; this does not claim Java progress-request support, which is assigned to J46.2. Native raw-proto and local-service Go traces compare the registered start/cancel matrix; a separate Go-client lifecycle run exercises multiple watch IDs, byte ranges, filters/PrevKV, and client-context cancellation cleanup against Java WatchService. Normal server-side request half-close semantics remain assigned to J47. MiniCluster acceptance remains outside this unit evidence"
     }
   ],
   "pending_tasks": ["J46","J47","J29.4"]
