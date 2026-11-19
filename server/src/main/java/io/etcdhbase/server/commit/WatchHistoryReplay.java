@@ -20,7 +20,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.CompletionStage;
 
 /** Bounded, inclusive replay of selected Watch revisions behind one durable history pin. */
 final class WatchHistoryReplay implements AutoCloseable {
@@ -58,7 +57,6 @@ final class WatchHistoryReplay implements AutoCloseable {
   private final BudgetManager.Account watchAccount;
   private final RequestScope pinScope = RequestScope.withoutDeadline();
   private final ArrayDeque<WatchStream.Delivery> pending = new ArrayDeque<>();
-  private final CompletableFuture<Void> settled = new CompletableFuture<>();
 
   private EventHistoryPinManager.Pin pin;
   private long nextRevision;
@@ -110,7 +108,6 @@ final class WatchHistoryReplay implements AutoCloseable {
           barrier.state().publishedRevision(), barrierSequence, startRevision, authorization,
           pins, selected, budgets, watchAccount);
       replay.complete = true;
-      replay.settled.complete(null);
       return CompletableFuture.completedFuture(new OpenResult(
           barrier.state().publishedRevision(), barrierSequence, barrier.state().compactRevision(),
           Optional.of(replay)));
@@ -194,7 +191,6 @@ final class WatchHistoryReplay implements AutoCloseable {
     if (nextRevision > barrierRevision) {
       complete = true;
       releasePin();
-      settled.complete(null);
       return;
     }
     if (readRevisions >= MAX_TOTAL_REVISIONS || readPages >= MAX_TOTAL_PAGES
@@ -411,7 +407,6 @@ final class WatchHistoryReplay implements AutoCloseable {
     closeDeliveries(pending);
     pending.clear();
     releasePin();
-    settled.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
   }
 
   private void releasePin() {
@@ -424,7 +419,6 @@ final class WatchHistoryReplay implements AutoCloseable {
   private void completeCompactedOpen() {
     synchronized (this) { complete = true; }
     releasePin();
-    settled.complete(null);
   }
 
   private static String reason(Throwable failure) {
@@ -460,20 +454,12 @@ final class WatchHistoryReplay implements AutoCloseable {
       closeDeliveries(pending);
       pending.clear();
       active = inFlight;
-      if (active == null) {
-        releasePin();
-        settled.complete(null);
-      }
+      if (active == null) releasePin();
       if (activeReadScope != null) activeReadScope.cancel();
     }
     if (active != null) {
       pinScope.cancel();
-      active.whenComplete((ignored, failure) -> {
-        releasePin();
-        settled.complete(null);
-      });
+      active.whenComplete((ignored, failure) -> releasePin());
     }
   }
-
-  CompletionStage<Void> settled() { return settled.minimalCompletionStage(); }
 }

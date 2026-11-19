@@ -937,6 +937,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       synchronized (lock) {
         if (terminal || peerCancelled || !watchRegistry.containsActive(watcher.id(), watcher)
             || watcher.isClosed()) return PumpResult.IDLE;
+        // Only the drain writer pumps events, and it sends an active fragment before pumping again.
         if (activeFragment != null) {
           throw new IllegalStateException("a Watch revision is already being fragmented");
         }
@@ -972,7 +973,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
           || !watchRegistry.containsActive(watcher.id(), watcher) || watcher.pendingNotifyProgress() != barrier) {
         return false;
       }
-      ProgressFrontier.WatcherState frontier = progressFrontier(watcher, barrier, false);
+      ProgressFrontier.WatcherState frontier = drainedProgressFrontier(watcher, barrier);
       long safeRevision = ProgressFrontier.forWatcher(List.of(frontier), watcher.id()).orElse(-1);
       if (safeRevision != barrier.revision()) {
         watcher.clearNotifyProgress(barrier);
@@ -1000,7 +1001,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       ProgressBarrier barrier = pendingProgress;
       List<ProgressFrontier.WatcherState> frontiers = watchRegistry.activeSnapshot().stream()
           .filter(watcher -> watcher.createdSent() && !watcher.isClosed())
-          .map(watcher -> progressFrontier(watcher, barrier, false))
+          .map(watcher -> drainedProgressFrontier(watcher, barrier))
           .toList();
       noActiveWatch = frontiers.isEmpty();
       verified = !noActiveWatch
@@ -1024,8 +1025,11 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     return true;
   }
 
-  private ProgressFrontier.WatcherState progressFrontier(
-      WatchRegistry.Watcher watcher, ProgressBarrier barrier, boolean hasPendingMatchingEvents) {
+  // Called only after the pump found no eligible event for this watcher (or every active watcher).
+  // Tailer publishes all deliveries before advancing completedRevision; later deliveries cannot
+  // belong to the verified prefix. Replay readiness also requires its historical prefix drained.
+  private ProgressFrontier.WatcherState drainedProgressFrontier(
+      WatchRegistry.Watcher watcher, ProgressBarrier barrier) {
     boolean active = watcher.createdSent() && !watcher.isClosed();
     boolean replayComplete = watcher.progressReady(barrier.revision());
     boolean futureStartReached = watcher.startRevision() <= 0
@@ -1036,7 +1040,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
             : Optional.of(new ProgressFrontier.VerifiedFrontier(
                 barrier.sequence(), barrier.revision()));
     return new ProgressFrontier.WatcherState(watcher.id(), verifiedThrough, active,
-        replayComplete, futureStartReached, hasPendingMatchingEvents);
+        replayComplete, futureStartReached, false);
   }
 
   private void refreshProgressNotifySchedule() {

@@ -611,6 +611,36 @@ class WatchStreamTest {
   }
 
   @Test
+  void explicitProgressWaitsForEveryWatchThroughItsBarrier() {
+    var future = new RecordingSubscription();
+    var pending = new RecordingSubscription();
+    var session = new RecordingSession(4, future, pending);
+    var observer = new RecordingObserver();
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(31, new byte[] {1}, new byte[0], 0, false));
+      stream.onNext(createRequest(32, new byte[] {2}, new byte[0], 0, false));
+      observer.ready = false;
+      session.revision = 5;
+      future.add(event(6, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {6}, Optional.empty()));
+      pending.add(event(5, PreparedEvent.Kind.PUT, new byte[] {2}, new byte[] {5}, Optional.empty()));
+      stream.onNext(progressRequest());
+      observer.ready = true;
+      observer.readyHandler.run();
+
+      int eventIndex = indexOfResponse(observer.responses,
+          response -> response.getWatchId() == 32 && response.getEventsCount() > 0);
+      int progressIndex = indexOfResponse(observer.responses, response -> response.getWatchId() == -1);
+      int futureIndex = indexOfResponse(observer.responses,
+          response -> response.getWatchId() == 31 && response.getEventsCount() > 0);
+      assertTrue(eventIndex >= 0 && eventIndex < progressIndex);
+      assertTrue(progressIndex < futureIndex);
+      assertEquals(5, observer.responses.get(progressIndex).getHeader().getRevision());
+      stream.close();
+    }
+  }
+
+  @Test
   void explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch() {
     var subscription = new RecordingSubscription();
     var session = new RecordingSession(4, subscription);

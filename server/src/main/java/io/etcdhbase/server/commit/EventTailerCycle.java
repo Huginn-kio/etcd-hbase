@@ -14,7 +14,6 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
-import io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepository;
 import io.etcdhbase.server.observability.RequestMetrics;
 import java.util.Objects;
 import java.util.Optional;
@@ -110,7 +109,7 @@ final class EventTailerCycle {
                 new BackendFailure(BackendFailure.Category.UNAVAILABLE));
           }
           var source = new SelectedSequenceReader(pins, stores.control(), stores.decisions(),
-              stores.manifestRepository(), new HBaseEventRevisionIndexRepository(stores.records()));
+              stores.manifestRepository(), stores.eventIndexes());
           source.observePublishedSequence(state.publishedSequence());
           return Optional.of(new TailerSeed(source, view, state));
         });

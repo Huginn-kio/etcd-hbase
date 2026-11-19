@@ -32,6 +32,7 @@ import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
 import io.etcdhbase.hbase.storage.HBaseCommitDecisionRepository;
+import io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepository;
 import io.etcdhbase.hbase.storage.HBaseManifestRepository;
 import io.etcdhbase.hbase.storage.HBaseSystemRecordStore;
 import io.etcdhbase.server.observability.RequestMetrics;
@@ -93,6 +94,7 @@ class EventTailerCycleTest {
     when(stores.manifests()).thenReturn(manifests);
     when(stores.decisions()).thenReturn(mock(HBaseCommitDecisionRepository.class));
     when(stores.manifestRepository()).thenReturn(mock(HBaseManifestRepository.class));
+    when(stores.eventIndexes()).thenReturn(new HBaseEventRevisionIndexRepository(records));
 
     var eventPins = mock(EventHistoryPinManager.class);
     when(eventPins.namespace()).thenReturn(Optional.of(NAMESPACE));

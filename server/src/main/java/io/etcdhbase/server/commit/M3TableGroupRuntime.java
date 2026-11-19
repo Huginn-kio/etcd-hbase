@@ -46,7 +46,6 @@ import io.etcdhbase.hbase.codec.LeaseBindingMessages;
 import io.etcdhbase.hbase.connection.HBaseRequestContext;
 import io.etcdhbase.hbase.error.HBaseFailures;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
-import io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepository;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.observability.RequestMetrics;
@@ -788,9 +787,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       var history = new EventHistoryCycle(backfill, tailer, business.metrics());
       pending.installEventHistoryWorker(new EventHistoryWorker(
           pending.leaseTimers, owner::currentToken, history::run, business.metrics()));
-      var eventIndexes = new HBaseEventRevisionIndexRepository(stores.records());
       var selectedEvents = new SelectedSequenceReader(pending.eventPins, stores.control(),
-          stores.decisions(), stores.manifestRepository(), eventIndexes);
+          stores.decisions(), stores.manifestRepository(), stores.eventIndexes());
       var watchGateway = new WatchGateway(plan.source().tableGroupId(), pending,
           stores.control(), budgets, pending.worker, pending.leaseTimers,
           stores.clusterId(), activation.memberIdBits(), limits.maxRpcBytes(), pending.eventPins,

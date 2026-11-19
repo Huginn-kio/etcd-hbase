@@ -47,6 +47,7 @@ public final class TableGroupStores {
   private final HBaseResultRepository resultRepository;
   private final ResultCatalog results;
   private final HBaseCommitDecisionRepository decisions;
+  private final HBaseEventRevisionIndexRepository eventIndexes;
   private final CommitOutcomeResolver outcomes;
   private final HBaseMaterializationStore materialization;
   private final AuxiliaryMaterializationStore auxiliaryMaterialization;
@@ -59,7 +60,8 @@ public final class TableGroupStores {
   private TableGroupStores(HBaseSystemRecordStore records, HBaseCommitControlStore control,
       HBaseInvocationRepository invocations, HBaseManifestRepository manifestRepository,
       ManifestCatalog manifests, HBaseResultRepository resultRepository, ResultCatalog results,
-      HBaseCommitDecisionRepository decisions, CommitOutcomeResolver outcomes,
+      HBaseCommitDecisionRepository decisions, HBaseEventRevisionIndexRepository eventIndexes,
+      CommitOutcomeResolver outcomes,
       HBaseMaterializationStore materialization,
       AuxiliaryMaterializationStore auxiliaryMaterialization,
       CommitFinalizationService finalizer,
@@ -74,6 +76,7 @@ public final class TableGroupStores {
     this.resultRepository = resultRepository;
     this.results = results;
     this.decisions = decisions;
+    this.eventIndexes = eventIndexes;
     this.outcomes = outcomes;
     this.materialization = materialization;
     this.auxiliaryMaterialization = auxiliaryMaterialization;
@@ -92,6 +95,7 @@ public final class TableGroupStores {
   public HBaseResultRepository resultRepository() { return resultRepository; }
   public ResultCatalog results() { return results; }
   public HBaseCommitDecisionRepository decisions() { return decisions; }
+  HBaseEventRevisionIndexRepository eventIndexes() { return eventIndexes; }
   public CommitOutcomeResolver outcomes() { return outcomes; }
   public HBaseMaterializationStore materialization() { return materialization; }
   public AuxiliaryMaterializationStore auxiliaryMaterialization() { return auxiliaryMaterialization; }
@@ -218,7 +222,7 @@ public final class TableGroupStores {
     var views = new ReadViewService(control, manifests, pins, system.profileFingerprint());
     var invocationResults = new InvocationResultResolver(invocations, outcomes, manifests, results);
     return new TableGroupStores(records, control, invocations, manifestRepository, manifests,
-        resultRepository, results, decisions, outcomes, materialization, auxiliaryMaterialization,
+        resultRepository, results, decisions, eventIndexes, outcomes, materialization, auxiliaryMaterialization,
         finalizer, pins, views, invocationResults, clusterId);
   }
 }
