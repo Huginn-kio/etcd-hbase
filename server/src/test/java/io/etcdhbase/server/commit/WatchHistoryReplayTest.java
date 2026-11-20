@@ -51,8 +51,9 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -150,6 +151,27 @@ class WatchHistoryReplayTest {
           new Position(6, 4, 0), new Position(6, 4, 1)), actual);
       assertTrue(replay.complete());
       verify(fixture.pin).close();
+      replay.close();
+      watchAccount.close();
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
+
+  @Test
+  void clearingWakeupKeepsReplayReadableWithoutCallingTheClosedWatcher() throws Exception {
+    var fixture = new ReplayFixture();
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      WatchHistoryReplay replay = fixture.openReplay(watchAccount, KeyRange.all(), 3);
+      var wakeups = new AtomicInteger();
+
+      replay.setWakeup(wakeups::incrementAndGet);
+      replay.setWakeup(null);
+
+      assertEquals(List.of(
+          new Position(4, 3, 0), new Position(4, 3, 1),
+          new Position(6, 4, 0), new Position(6, 4, 1)), drainReplay(replay));
+      assertEquals(0, wakeups.get(), "clearing the listener prevents callbacks after Watch close");
       replay.close();
       watchAccount.close();
       assertNoBudgetLeaks(fixture.budgets);

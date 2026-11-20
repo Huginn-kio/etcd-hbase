@@ -25,6 +25,8 @@ import java.util.concurrent.CompletionStage;
 
 /** Bounded, inclusive replay of selected Watch revisions behind one durable history pin. */
 final class WatchHistoryReplay implements AutoCloseable {
+  private static final Runnable NO_WAKEUP = () -> {};
+
   record OpenResult(long revision, long sequence, long compactRevision,
       Optional<WatchHistoryReplay> replay,
       Optional<RequestScope.ScopedCleanup> cleanup) {
@@ -82,7 +84,7 @@ final class WatchHistoryReplay implements AutoCloseable {
   private boolean closed;
   private WatchTermination termination;
   private CompletableFuture<Void> pinRelease;
-  private Runnable wakeup = () -> {};
+  private Runnable wakeup = NO_WAKEUP;
   private CompletableFuture<?> inFlight;
   private RequestScope activeReadScope;
 
@@ -433,7 +435,7 @@ final class WatchHistoryReplay implements AutoCloseable {
   }
 
   synchronized void setWakeup(Runnable wakeup) {
-    this.wakeup = Objects.requireNonNull(wakeup, "wakeup");
+    this.wakeup = wakeup == null ? NO_WAKEUP : wakeup;
   }
 
   synchronized Optional<WatchStream.Delivery> poll() {
