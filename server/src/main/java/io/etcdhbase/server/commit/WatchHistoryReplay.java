@@ -195,6 +195,9 @@ final class WatchHistoryReplay implements AutoCloseable {
     }
     if (readRevisions >= MAX_TOTAL_REVISIONS || readPages >= MAX_TOTAL_PAGES
         || readBytes >= MAX_TOTAL_PROOF_BYTES) {
+      // Keep resource-limit cancellation watcher-local only when cleanup succeeds. If releasing
+      // the replay pin fails, surface it so WatchStream fails visibly instead of reporting a
+      // cancellation while the replay's resource ownership is uncertain.
       WatchCleanup.throwIfPresent(terminate(RESOURCE_LIMIT_REASON));
       return;
     }

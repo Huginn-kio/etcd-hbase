@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -77,6 +78,43 @@ class WatchHistoryReplayTest {
       assertSame(secondFailure, actual.getSuppressed()[0]);
       assertTrue(thirdReleased.get(), "later delivery release must run after an Error");
       assertTrue(pending.isEmpty(), "pending deliveries must be cleared after release attempts");
+      verify(fixture.pin).close();
+      watchAccount.close();
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
+
+  @Test
+  void resourceLimitCancelsOnlyReplayWhenCleanupSucceeds() throws Exception {
+    var fixture = new ReplayFixture();
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      WatchHistoryReplay replay = fixture.openReplay(watchAccount, KeyRange.all(), 3);
+      exceedReplayPageLimit(replay);
+
+      assertTrue(replay.poll().isEmpty());
+      assertEquals(Optional.of("etcd-hbase: Watch history replay resource limit exceeded"),
+          replay.terminationReason());
+      verify(fixture.pin).close();
+      watchAccount.close();
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
+
+  @Test
+  void resourceLimitCleanupFailurePropagatesThroughReplayPoll() throws Exception {
+    var fixture = new ReplayFixture();
+    var cleanupFailure = new IllegalStateException("history pin release failed");
+    doThrow(cleanupFailure).when(fixture.pin).close();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      WatchHistoryReplay replay = fixture.openReplay(watchAccount, KeyRange.all(), 3);
+      exceedReplayPageLimit(replay);
+
+      assertSame(cleanupFailure, assertThrows(IllegalStateException.class, replay::poll));
+      assertEquals(Optional.of("etcd-hbase: Watch history replay resource limit exceeded"),
+          replay.terminationReason());
       verify(fixture.pin).close();
       watchAccount.close();
       assertNoBudgetLeaks(fixture.budgets);
@@ -212,6 +250,13 @@ class WatchHistoryReplayTest {
   private static WatchStream.Delivery delivery(Runnable release) {
     PreparedEvent event = event(2, 1, 0, 61);
     return new WatchStream.Delivery(1, 2, event, release);
+  }
+
+  private static void exceedReplayPageLimit(WatchHistoryReplay replay)
+      throws ReflectiveOperationException {
+    Field readPagesField = WatchHistoryReplay.class.getDeclaredField("readPages");
+    readPagesField.setAccessible(true);
+    readPagesField.setInt(replay, Integer.MAX_VALUE);
   }
 
   @SuppressWarnings("unchecked")

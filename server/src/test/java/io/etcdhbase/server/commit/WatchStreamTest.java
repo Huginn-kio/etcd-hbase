@@ -3,6 +3,7 @@ package io.etcdhbase.server.commit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -1532,6 +1533,27 @@ class WatchStreamTest {
   }
 
   @Test
+  void subscriptionPollFailureFailsTheWatchStreamInsteadOfReportingWatcherCancellation() {
+    var subscription = new RecordingSubscription();
+    subscription.pollFailure = new IllegalStateException("replay cleanup failed");
+    var session = new RecordingSession(8, subscription);
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(),
+          () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(23, new byte[] {1}, new byte[0], 0, false));
+
+      assertNotNull(observer.failure, "a subscription poll failure must fail the RPC stream");
+      assertEquals(1, subscription.closeCount.get());
+      assertTrue(observer.responses.stream().noneMatch(Rpc.WatchResponse::getCanceled),
+          "a cleanup failure must not be presented as watcher-local resource cancellation");
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
   void watcherCloseStillClosesSubscriptionWhenPendingDeliveryCleanupThrowsError() {
     var subscription = new RecordingSubscription();
     var subscriptionFailure = new IllegalStateException("subscription cleanup failed");
@@ -1855,6 +1877,7 @@ class WatchStreamTest {
     private final AtomicInteger releases = new AtomicInteger();
     private final AtomicInteger closeCount = new AtomicInteger();
     private RuntimeException closeFailure;
+    private RuntimeException pollFailure;
     private Runnable afterPoll;
     private Runnable wakeup;
     private String terminationReason;
@@ -1877,6 +1900,7 @@ class WatchStreamTest {
 
     @Override public Optional<WatchStream.Delivery> poll() {
       if (closed || terminationReason != null) return Optional.empty();
+      if (pollFailure != null) throw pollFailure;
       WatchStream.Delivery delivery = deliveries.pollFirst();
       Runnable hook = afterPoll;
       afterPoll = null;
