@@ -1033,7 +1033,7 @@
           "assembledWatchServiceDelegatesTheResponseObserverAndReturnsItsRequestHandler"
         ]},
         {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchGatewayTest", "tests": [
-          "mapsEveryTailerTerminationToItsWatchCancellationReason",
+          "mapsEveryTailerTerminationToItsTypedWatchTermination",
           "gatewayChargesRetainedRangeBytesAndReleasesThemOnClose",
           "subscriptionCloseErrorStillReleasesBudgetsAndIsPropagated",
           "tailerShutdownRacePreservesUnavailableAndReleasesWatchReservation",

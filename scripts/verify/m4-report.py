@@ -174,7 +174,7 @@ J45_CRITICAL_JAVA_TESTS = {
         "assembledWatchServiceDelegatesTheResponseObserverAndReturnsItsRequestHandler",
     },
     "io.etcdhbase.server.commit.WatchGatewayTest": {
-        "mapsEveryTailerTerminationToItsWatchCancellationReason",
+        "mapsEveryTailerTerminationToItsTypedWatchTermination",
         "gatewayChargesRetainedRangeBytesAndReleasesThemOnClose",
         "tailerShutdownRacePreservesUnavailableAndReleasesWatchReservation",
         "passesNegativeStartRevisionAndCompactBoundaryAndReleasesBudgetsOnClose",
