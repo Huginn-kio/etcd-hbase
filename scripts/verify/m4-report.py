@@ -353,6 +353,7 @@ J47_GO_TESTS = {
     "internal/scenario": {
         "TestM4WatchHalfCloseMatchesPinnedNativeOracle",
         "TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages",
+        "TestM4CombinedWatchResourceLimitErrorRecognizesRequestAndSubscriptionReasons",
     },
 }
 J46_CRITICAL_JAVA_TESTS = {

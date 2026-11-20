@@ -243,7 +243,7 @@ elif [[ "$task" == J46 ]]; then
 elif [[ "$task" == J47 ]]; then
   run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \
     -tags=m4watchintegration \
-    -run '^(TestM4WatchHalfCloseMatchesPinnedNativeOracle|TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages)$' ./internal/scenario
+    -run '^(TestM4WatchHalfCloseMatchesPinnedNativeOracle|TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages|TestM4CombinedWatchResourceLimitErrorRecognizesRequestAndSubscriptionReasons)$' ./internal/scenario
 elif [[ "$task" != J44 ]]; then
   run_logged go-module-lock go-module-lock.log go-module-lock.stderr python3 scripts/verify/go-module-lock.py
   run_logged go-tests go-test.jsonl go-test.stderr scripts/dev/go-m0.sh test -json -count=1 \

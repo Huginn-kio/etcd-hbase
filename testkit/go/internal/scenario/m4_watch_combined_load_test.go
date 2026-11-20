@@ -30,16 +30,17 @@ const (
 	m4CombinedLoadWatchCreateAttempts = 12
 	// The runtime exposes nine regular request slots at the combined-load profile; two are held by
 	// the live consumers, so the bounded probe must try beyond that remainder to observe rejection.
-	m4CombinedLoadSaturationWatchers  = 16
-	m4CombinedLoadSlowWatchDrainLimit = m4CombinedLoadWrites + 8
-	m4CombinedLoadWatchRetryBase      = 50 * time.Millisecond
-	m4CombinedLoadWatchRetryMaximum   = time.Second
-	m4CombinedLoadWatchResourceLimit  = "etcd-hbase: Watch resource limit exceeded"
-	m4CombinedWatchDiagnosticLimit    = 256
-	m4CombinedWatchDiagnosticBytes    = 4 << 10
+	m4CombinedLoadSaturationWatchers              = 16
+	m4CombinedLoadSlowWatchDrainLimit             = m4CombinedLoadWrites + 8
+	m4CombinedLoadWatchRetryBase                  = 50 * time.Millisecond
+	m4CombinedLoadWatchRetryMaximum               = time.Second
+	m4CombinedLoadRequestResourceLimitReason      = "etcd-hbase: Watch resource limit exceeded"
+	m4CombinedLoadSubscriptionResourceLimitReason = "etcd-hbase: Watch subscription resource limit exceeded"
+	m4CombinedWatchDiagnosticLimit                = 256
+	m4CombinedWatchDiagnosticBytes                = 4 << 10
 )
 
-var errM4CombinedWatchResourceLimit = errors.New(m4CombinedLoadWatchResourceLimit)
+var errM4CombinedWatchResourceLimit = errors.New(m4CombinedLoadRequestResourceLimitReason)
 
 type m4CombinedWatchDiagnosticContextKey struct{}
 
@@ -570,7 +571,32 @@ func awaitM4CombinedWatchCreated(ctx context.Context, watch clientv3.WatchChan) 
 }
 
 func isM4CombinedWatchResourceLimitError(err error) bool {
-	return errors.Is(err, errM4CombinedWatchResourceLimit)
+	if errors.Is(err, errM4CombinedWatchResourceLimit) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	reason := err.Error()
+	if rpcStatus, ok := status.FromError(err); ok {
+		switch rpcStatus.Code() {
+		case codes.Unknown, codes.Canceled, codes.FailedPrecondition:
+		default:
+			return false
+		}
+		reason = rpcStatus.Message()
+	}
+	return isM4CombinedWatchResourceLimitReason(reason)
+}
+
+func isM4CombinedWatchResourceLimitReason(reason string) bool {
+	switch reason {
+	case m4CombinedLoadRequestResourceLimitReason,
+		m4CombinedLoadSubscriptionResourceLimitReason:
+		return true
+	default:
+		return false
+	}
 }
 
 func describeM4CombinedWatchError(operation string, response clientv3.WatchResponse,
@@ -581,14 +607,59 @@ func describeM4CombinedWatchError(operation string, response clientv3.WatchRespo
 }
 
 func isM4CombinedWatchResourceLimitResponse(response clientv3.WatchResponse) bool {
-	// clientv3 v3.5.23 consumes the server's Created+Canceled rejection while
-	// creating its substream, then reports it as a Canceled response with closeErr.
+	// clientv3 v3.5.23 exposes both pre-Created request rejections and post-Created
+	// subscription-limit cancellations as canceled responses with an error.
 	if !response.Canceled || response.CompactRevision != 0 {
 		return false
 	}
-	err := response.Err()
-	return err != nil && status.Code(err) == codes.Unknown &&
-		err.Error() == m4CombinedLoadWatchResourceLimit
+	return isM4CombinedWatchResourceLimitError(response.Err())
+}
+
+func TestM4CombinedWatchResourceLimitErrorRecognizesRequestAndSubscriptionReasons(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "request admission rejection",
+			err:  status.Error(codes.Unknown, m4CombinedLoadRequestResourceLimitReason),
+			want: true,
+		},
+		{
+			name: "subscription cancellation",
+			err:  status.Error(codes.Canceled, m4CombinedLoadSubscriptionResourceLimitReason),
+			want: true,
+		},
+		{
+			name: "subscription failed precondition",
+			err:  status.Error(codes.FailedPrecondition, m4CombinedLoadSubscriptionResourceLimitReason),
+			want: true,
+		},
+		{
+			name: "etcd client error text",
+			err:  errors.New(m4CombinedLoadSubscriptionResourceLimitReason),
+			want: true,
+		},
+		{
+			name: "similar but unsupported reason",
+			err:  status.Error(codes.Canceled, "etcd-hbase: Watch backend unavailable"),
+			want: false,
+		},
+		{
+			name: "resource reason with unrelated status",
+			err:  status.Error(codes.Internal, m4CombinedLoadSubscriptionResourceLimitReason),
+			want: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isM4CombinedWatchResourceLimitError(test.err); got != test.want {
+				t.Fatalf("isM4CombinedWatchResourceLimitError(%v) = %t, want %t",
+					test.err, got, test.want)
+			}
+		})
+	}
 }
 
 func combinedWatchRetryDelay(rejectedCreates int) time.Duration {

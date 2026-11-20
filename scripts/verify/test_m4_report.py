@@ -507,7 +507,7 @@ class M4ReportTest(unittest.TestCase):
 
             self.assertEqual("J47", summary["task"])
             self.assertEqual("public-local-minicluster", summary["scope"])
-            self.assertEqual(2, summary["go_test_count"])
+            self.assertEqual(3, summary["go_test_count"])
             self.assertEqual(
                 sum(len(methods) for methods in m4_report.J47_CRITICAL_JAVA_TESTS.values()),
                 summary["java_test_count"],
@@ -1137,7 +1137,8 @@ class M4ReportTest(unittest.TestCase):
         if task_id == "J47":
             go_test_pattern = (
                 "^(TestM4WatchHalfCloseMatchesPinnedNativeOracle|"
-                "TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages)$"
+                "TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages|"
+                "TestM4CombinedWatchResourceLimitErrorRecognizesRequestAndSubscriptionReasons)$"
             )
             argv_by_name = {
                 "registry-check": ["python3", "scripts/verify/m4-report.py", "--validate-registry"],

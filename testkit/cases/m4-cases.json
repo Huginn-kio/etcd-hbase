@@ -1135,7 +1135,8 @@
       "go_tests": [
         {"package": "internal/scenario", "tests": [
           "TestM4WatchHalfCloseMatchesPinnedNativeOracle",
-          "TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages"
+          "TestM4CombinedWatchErrorDiagnosticsOmitRawStatusMessages",
+          "TestM4CombinedWatchResourceLimitErrorRecognizesRequestAndSubscriptionReasons"
         ]}
       ],
       "maven_tests": [
