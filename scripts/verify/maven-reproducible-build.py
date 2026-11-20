@@ -10,12 +10,17 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from evidence import M0_JAVA_MODULES as MODULES, M0_REQUIRED_SUITES as REQUIRED, java_reports, require_unchanged_source
 from build_process import run_logged
 
 ROOT = Path(__file__).resolve().parents[2]
+MAVEN_WRAPPER_STARTUP_ATTEMPTS = 4
+TRANSIENT_WRAPPER_HTTP_FAILURE = re.compile(
+    r"Server returned HTTP response code: (?:408|425|429|500|502|503|504)\b"
+)
 
 
 def packaged_jars(root=ROOT):
@@ -35,6 +40,30 @@ def packaged_jars(root=ROOT):
 def compare_jars(first, second):
     if not first or first != second:
         raise ValueError("clean build JAR inventories or SHA-256 values differ")
+
+
+def prepare_maven_wrapper(output):
+    """Warm the pinned Maven distribution, retrying only transient wrapper downloads."""
+    command = [str(ROOT / "scripts/dev/mvn21.sh"), "--version"]
+    for attempt in range(1, MAVEN_WRAPPER_STARTUP_ATTEMPTS + 1):
+        log = output / f"maven-wrapper-startup-{attempt}.log"
+        code = run_logged(command, log, ROOT, timeout=180)
+        if code == 0:
+            print(f"pinned Maven Wrapper ready after {attempt} attempt(s)", flush=True)
+            return
+
+        details = log.read_text(errors="replace")
+        if attempt == MAVEN_WRAPPER_STARTUP_ATTEMPTS or not TRANSIENT_WRAPPER_HTTP_FAILURE.search(details):
+            print(details, file=sys.stderr, end="" if details.endswith("\n") else "\n")
+            raise ValueError(f"pinned Maven Wrapper startup failed on attempt {attempt}")
+
+        delay = min(2 ** attempt, 8)
+        print(
+            f"transient HTTP failure while downloading pinned Maven; "
+            f"retrying Wrapper startup in {delay}s ({attempt}/{MAVEN_WRAPPER_STARTUP_ATTEMPTS})",
+            flush=True,
+        )
+        time.sleep(delay)
 
 
 def build_once(output, run, command, source):
@@ -76,6 +105,7 @@ def main():
     # m0-public explicitly includes J03 and J07 ITs. No skip flag is used.
     profiles = args.profile or ["m0-public"]
     command = [str(ROOT / "scripts/dev/mvn21.sh"), "-B", "-ntp", "-P" + ",".join(profiles), "clean", args.phase]
+    prepare_maven_wrapper(output)
     first, second = [build_once(output, run, command, source) for run in (1, 2)]
     compare_jars(first["jars"], second["jars"])
     source.update(phase="J09-reproducible", command=command[1:], jars=second["jars"],
