@@ -71,13 +71,32 @@ class WatchGatewayTest {
   private static final int RESPONSE_BYTES = 64 * 1024;
 
   @Test
-  void mapsEveryTailerTerminationToItsWatchCancellationReason() {
-    assertEquals("etcd-hbase: Watch subscription was cancelled",
-        WatchGateway.cancelReason(SharedEventTailer.Termination.CANCELLED));
-    assertEquals("etcd-hbase: Watch subscription resource limit exceeded",
-        WatchGateway.cancelReason(SharedEventTailer.Termination.RESOURCE_LIMIT));
-    assertEquals("etcd-hbase: Watch event source is unavailable",
-        WatchGateway.cancelReason(SharedEventTailer.Termination.TAILER_CLOSED));
+  void mapsEveryTailerTerminationToItsTypedWatchTermination() throws Exception {
+    assertTailerTermination(SharedEventTailer.Termination.CANCELLED,
+        WatchTermination.cancelled("etcd-hbase: Watch subscription was cancelled"));
+    assertTailerTermination(SharedEventTailer.Termination.RESOURCE_LIMIT,
+        WatchTermination.resourceLimit("etcd-hbase: Watch subscription resource limit exceeded"));
+    assertTailerTermination(SharedEventTailer.Termination.TAILER_CLOSED,
+        WatchTermination.unavailable("etcd-hbase: Watch event source is unavailable"));
+  }
+
+  private static void assertTailerTermination(SharedEventTailer.Termination tailerTermination,
+      WatchTermination expected) throws Exception {
+    try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
+      var tailer = openTailer();
+      var subscription = mock(SharedEventTailer.Subscription.class);
+      when(subscription.termination()).thenReturn(Optional.of(tailerTermination));
+      when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
+          anyInt(), anyLong(), anyLong()))
+          .thenReturn(new SharedEventTailer.SubscriptionStart(subscription, 0, 0));
+      var budgets = budgets();
+      var opened = subscribe(gateway(startup, budgets), tailer, scope);
+
+      assertEquals(Optional.of(expected), opened.subscription().termination());
+
+      opened.subscription().close();
+      assertReleased(budgets);
+    }
   }
 
   @Test

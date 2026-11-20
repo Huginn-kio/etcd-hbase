@@ -463,43 +463,22 @@ final class WatchGateway {
     @Override
     public synchronized void close() {
       if (closed) return;
-      RuntimeException failure = null;
-      try {
-        closeLiveDelivery();
-      } catch (RuntimeException cleanup) {
-        failure = cleanup;
-      }
-      try {
-        subscriptionCleanup.close();
-      } catch (Exception cleanup) {
-        RuntimeException wrapped = new IllegalStateException(
-            "Watch subscription cleanup registration failed", cleanup);
-        if (failure == null) failure = wrapped;
-        else if (cleanup != failure) failure.addSuppressed(wrapped);
-      }
+      Throwable failure = WatchCleanup.closeAndCollect(this::closeLiveDelivery, null);
+      failure = WatchCleanup.closeAndCollect(
+          () -> closeScopedCleanup(subscriptionCleanup,
+              "Watch subscription cleanup registration failed"), failure);
       closed = true;
-      try {
-        if (historyCleanup != null) historyCleanup.close();
-        else if (history != null) history.close();
-      } catch (Exception cleanup) {
-        RuntimeException wrapped = new IllegalStateException(
-            "Watch history cleanup registration failed", cleanup);
-        if (failure == null) failure = wrapped;
-        else if (cleanup != failure) failure.addSuppressed(wrapped);
-      }
-      try {
-        closeScopedCleanup(stateMemoryCleanup, "Watch state memory cleanup failed");
-      } catch (RuntimeException cleanup) {
-        if (failure == null) failure = cleanup;
-        else if (cleanup != failure) failure.addSuppressed(cleanup);
-      }
-      try {
-        account.close();
-      } catch (RuntimeException cleanup) {
-        if (failure == null) failure = cleanup;
-        else if (cleanup != failure) failure.addSuppressed(cleanup);
-      }
-      if (failure != null) throw failure;
+      failure = WatchCleanup.closeAndCollect(() -> {
+        if (historyCleanup != null) {
+          closeScopedCleanup(historyCleanup, "Watch history cleanup registration failed");
+        } else if (history != null) {
+          history.close();
+        }
+      }, failure);
+      failure = WatchCleanup.closeAndCollect(
+          () -> closeScopedCleanup(stateMemoryCleanup, "Watch state memory cleanup failed"), failure);
+      failure = WatchCleanup.closeAndCollect(account::close, failure);
+      WatchCleanup.throwIfPresent(failure);
     }
   }
 }

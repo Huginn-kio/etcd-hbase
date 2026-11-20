@@ -115,7 +115,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     }
   }
 
-  private enum DrainKind { STOP, SEND_FAILURE, COMPLETE, SEND_RESPONSE, PROCESS_REQUEST, PUMP }
+  private enum DrainKind { STOP, SEND_FAILURE, SEND_RESPONSE, PROCESS_REQUEST, PUMP }
 
   private record DrainAction(
       DrainKind kind, PendingResponse response, Rpc.WatchRequest request, Throwable failure) {}
@@ -370,10 +370,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
           sendTerminalFailure(action.failure());
           return;
         }
-        case COMPLETE -> {
-          completeInboundStream();
-          return;
-        }
         case SEND_RESPONSE -> {
           sendResponse(action.response());
           continue;
@@ -438,9 +434,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         processingRequest = true;
         return new DrainAction(DrainKind.PROCESS_REQUEST, null, request, null);
       }
-      if (inboundClosed && pendingRequest == null && !processingRequest) {
-        return new DrainAction(DrainKind.COMPLETE, null, null, null);
-      }
       if (!isReady()) return new DrainAction(DrainKind.STOP, null, null, null);
       return new DrainAction(DrainKind.PUMP, null, null, null);
     }
@@ -454,23 +447,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     } finally {
       streamScope.cancel();
     }
-  }
-
-  private void completeInboundStream() {
-    try {
-      closeWatchers();
-    } catch (RuntimeException | Error failure) {
-      fail(failure);
-      if (failure instanceof Error fatal) throw fatal;
-      return;
-    }
-    synchronized (lock) {
-      if (terminal || peerCancelled) return;
-      terminal = true;
-    }
-    cancelDrainYield();
-    cancelProgressNotifyTimer();
-    responseObserver.onCompleted();
   }
 
   private void sendResponse(PendingResponse response) {
@@ -1302,8 +1278,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       if (activeFragment != null) {
         return isReady() || isCancelRequest(pendingRequest) && !processingRequest;
       }
-      return pendingRequest != null && !processingRequest || !responses.isEmpty() && isReady()
-          || inboundClosed && pendingRequest == null && !processingRequest && responses.isEmpty();
+      return pendingRequest != null && !processingRequest || !responses.isEmpty() && isReady();
     }
   }
 
@@ -1501,18 +1476,6 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       closing = watchRegistry.detachAll();
     }
     return closeWatchersCollecting(closing);
-  }
-
-  private void closeWatchers() {
-    Throwable failure = closeWatchersCollecting();
-    if (failure instanceof Error fatal) throw fatal;
-    if (failure instanceof RuntimeException cleanup) throw cleanup;
-  }
-
-  private static void closeWatchers(List<WatchRegistry.Watcher> closing) {
-    Throwable failure = closeWatchersCollecting(closing);
-    if (failure instanceof Error fatal) throw fatal;
-    if (failure instanceof RuntimeException cleanup) throw cleanup;
   }
 
   private static Throwable closeWatchersCollecting(List<WatchRegistry.Watcher> closing) {
