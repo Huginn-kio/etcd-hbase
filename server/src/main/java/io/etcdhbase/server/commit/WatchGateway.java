@@ -281,7 +281,8 @@ final class WatchGateway {
         try {
           replayOpen = WatchHistoryReplay.open(tableGroup, range, request.getStartRevision(),
               barrierSnapshot, state.publishedSequence(), authorization, historyPins, selectedEvents,
-              budgets, account, streamScope, metrics::recordWatchReplayOpenResourceFailure);
+              budgets, account, streamScope, metrics::recordWatchReplayOpenResourceFailure,
+              metrics::recordWatchReplayLookupAdmissionFailure);
         } catch (RuntimeException | Error failure) {
           recordResourceFailure(
               RequestMetrics.WatchCreateResourceFailureStage.HISTORY_REPLAY_OPEN, failure);

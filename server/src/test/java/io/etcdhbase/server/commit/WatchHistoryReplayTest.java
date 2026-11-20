@@ -2,6 +2,7 @@ package io.etcdhbase.server.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -50,6 +51,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -129,9 +131,7 @@ class WatchHistoryReplayTest {
           "etcd-hbase: Watch history replay resource limit exceeded")), replay.termination());
       CompletionException settledFailure = assertThrows(CompletionException.class,
           () -> replay.settled().toCompletableFuture().join());
-      assertTrue(settledFailure.getCause() instanceof BackendFailure backendFailure
-          && backendFailure.getSuppressed().length == 1
-          && backendFailure.getSuppressed()[0] == cleanupFailure);
+      assertSame(cleanupFailure, settledFailure.getCause());
       verify(fixture.pin).close();
       watchAccount.close();
       assertNoBudgetLeaks(fixture.budgets);
@@ -298,6 +298,7 @@ class WatchHistoryReplayTest {
     var fixture = new ReplayFixture();
     var reservedScopes = new ArrayList<RequestScope>();
     var stages = new ArrayList<RequestMetrics.WatchReplayOpenResourceFailureStage>();
+    var metrics = new RequestMetrics();
     try (var scope = RequestScope.withoutDeadline()) {
       BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
       try {
@@ -310,13 +311,24 @@ class WatchHistoryReplayTest {
 
         CompletableFuture<WatchHistoryReplay.OpenResult> opening = WatchHistoryReplay.open(
             TABLE_GROUP, KeyRange.all(), 3, fixture.snapshot, 6, AUTHORIZATION, fixture.pins,
-            fixture.selected, fixture.budgets, watchAccount, null, stages::add);
+            fixture.selected, fixture.budgets, watchAccount, null, stages::add,
+            metrics::recordWatchReplayLookupAdmissionFailure);
         CompletionException failure = assertThrows(CompletionException.class, opening::join);
 
         assertTrue(failure.getCause() instanceof BackendFailure backendFailure
             && backendFailure.category() == BackendFailure.Category.RESOURCE_LIMIT);
         assertEquals(List.of(RequestMetrics.WatchReplayOpenResourceFailureStage.LOOKUP_ACCOUNT_ADMISSION),
             stages);
+        var admission = metrics.watchReplayLookupAdmissionFailure().orElseThrow();
+        assertEquals(4, admission.globalReservedRequests());
+        assertEquals(8, admission.globalReservedBytes());
+        assertEquals(4, admission.globalRequestCapacity());
+        assertEquals(80L << 20, admission.globalReservedByteCapacity());
+        assertEquals(4, admission.groupReservedRequests());
+        assertEquals(8, admission.groupReservedBytes());
+        assertEquals(4, admission.groupRequestCapacity());
+        assertEquals(80L << 20, admission.groupReservedByteCapacity());
+        assertTrue(admission.attemptedBytes() > 0);
       } finally {
         watchAccount.close();
         reservedScopes.forEach(RequestScope::close);
@@ -634,11 +646,7 @@ class WatchHistoryReplayTest {
         assertTrue(replay.poll().isEmpty(), "the next revision is rejected before its events are read");
         assertTrue(wakeups.poll(5, TimeUnit.SECONDS) != null);
         assertEquals(Optional.of(WatchTermination.compacted(5)), replay.termination());
-        var settledFailure = org.junit.jupiter.api.Assertions.assertThrows(
-            java.util.concurrent.ExecutionException.class,
-            () -> replay.settled().toCompletableFuture().get(5, TimeUnit.SECONDS));
-        assertTrue(settledFailure.getCause() instanceof BackendFailure backendFailure
-            && backendFailure.category() == BackendFailure.Category.UNAVAILABLE);
+        replay.settled().toCompletableFuture().get(5, TimeUnit.SECONDS);
       } finally {
         replay.close();
         watchAccount.close();
@@ -755,6 +763,83 @@ class WatchHistoryReplayTest {
       org.mockito.Mockito.verify(fixture.pins,
           org.mockito.Mockito.never()).registerProtection(any(), any());
       verify(fixture.selected, org.mockito.Mockito.never()).readPublishedState(any(), any());
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
+
+  @Test
+  void clientCancelDuringReplayReadReturnsPerWatchCanceledWhenReadBecomesUnavailable()
+      throws Exception {
+    var fixture = new ReplayFixture();
+    var selectedOpen = new CompletableFuture<Optional<SelectedSequenceReader.Selected>>();
+    var replayReadStarted = new CompletableFuture<Void>();
+    var physicalProducer = new CompletableFuture<Void>();
+    when(fixture.selected.openUnderProtection(anyLong(), anyLong(), any(ByteKey.class),
+        any(EventHistoryPinManager.Protection.class), any(RequestScope.class),
+        any(ManifestCatalog.ProofReadBudget.class))).thenAnswer(invocation -> {
+          RequestScope readScope = invocation.getArgument(4);
+          readScope.trackPhysicalProducer(physicalProducer);
+          replayReadStarted.complete(null);
+          return selectedOpen;
+        });
+
+    try (var startup = RequestScope.withoutDeadline();
+         var streamScope = RequestScope.withoutDeadline()) {
+      var control = mock(CommitControlStore.class);
+      when(control.read(any(RequestScope.class))).thenReturn(
+          CompletableFuture.completedFuture(Optional.of(fixture.snapshot)));
+      var pending = new M3TableGroupRuntime.Pending(startup, null, true);
+      var gateway = new WatchGateway(TABLE_GROUP, pending, control, fixture.budgets,
+          Runnable::run, mock(ScheduledExecutorService.class), 11, 12, RESPONSE_BYTES,
+          fixture.pins, fixture.selected, AUTHORIZATION);
+      SharedEventTailer tailer = mock(SharedEventTailer.class);
+      SharedEventTailer.Subscription live = mock(SharedEventTailer.Subscription.class);
+      when(tailer.isClosed()).thenReturn(false);
+      when(tailer.completedRevision()).thenReturn(fixture.state.publishedRevision());
+      when(tailer.completedSequence()).thenReturn(fixture.state.publishedSequence());
+      when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
+          anyInt(), anyLong(), anyLong()))
+          .thenReturn(new SharedEventTailer.SubscriptionStart(live, 0, 1));
+      when(live.poll()).thenReturn(Optional.empty());
+      when(live.termination()).thenReturn(Optional.empty());
+      doAnswer(invocation -> {
+        selectedOpen.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+        physicalProducer.complete(null);
+        return null;
+      }).when(live).close();
+
+      var responses = new ArrayList<Rpc.WatchResponse>();
+      var transportFailure = new AtomicReference<Throwable>();
+      var observer = new io.grpc.stub.StreamObserver<Rpc.WatchResponse>() {
+        @Override public void onNext(Rpc.WatchResponse response) { responses.add(response); }
+        @Override public void onError(Throwable failure) { transportFailure.set(failure); }
+        @Override public void onCompleted() { }
+      };
+      var worker = new QueuedExecutor();
+      WatchStream.Session session = tailerSession(gateway, tailer, streamScope);
+      var stream = new WatchStream(observer, streamScope, worker,
+          mock(ScheduledExecutorService.class),
+          () -> CompletableFuture.completedFuture(session), 11, 12, RESPONSE_BYTES);
+      Rpc.WatchCreateRequest create = Rpc.WatchCreateRequest.newBuilder()
+          .setWatchId(17).setKey(com.google.protobuf.ByteString.copyFrom(new byte[] {1}))
+          .setStartRevision(3).build();
+      stream.onNext(Rpc.WatchRequest.newBuilder().setCreateRequest(create).build());
+      worker.runUntilIdle();
+
+      assertEquals(1, responses.size());
+      assertTrue(responses.getFirst().getCreated());
+      replayReadStarted.get(5, TimeUnit.SECONDS);
+
+      stream.onNext(Rpc.WatchRequest.newBuilder().setCancelRequest(
+          Rpc.WatchCancelRequest.newBuilder().setWatchId(17)).build());
+      worker.runUntilIdle();
+
+      assertEquals(2, responses.size());
+      assertTrue(responses.getLast().getCanceled());
+      assertEquals(17, responses.getLast().getWatchId());
+      assertNull(transportFailure.get(), "canceling one Watch must not fail the stream");
+      verify(live).close();
+      stream.close();
       assertNoBudgetLeaks(fixture.budgets);
     }
   }
@@ -965,6 +1050,24 @@ class WatchHistoryReplayTest {
         current.publishedRevision(), current.finalizedSequence(), current.finalizedRevision(),
         current.publication(), compactRevision, current.eventRegistryNamespace(),
         current.pendingEventRegistryNamespace(), current.eventRegistryAttempts());
+  }
+
+  private static final class QueuedExecutor implements Executor {
+    private final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
+
+    @Override
+    public synchronized void execute(Runnable task) {
+      tasks.addLast(task);
+    }
+
+    private void runUntilIdle() {
+      while (true) {
+        Runnable task;
+        synchronized (this) { task = tasks.pollFirst(); }
+        if (task == null) return;
+        task.run();
+      }
+    }
   }
 
   private record Position(long sequence, long revision, long ordinal) {}

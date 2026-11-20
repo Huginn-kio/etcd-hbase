@@ -9,6 +9,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.function.Consumer;
 
 /** Single ledger for global/group/request admission, work and reserved memory lanes. */
 public final class BudgetManager {
@@ -103,6 +104,12 @@ public final class BudgetManager {
       long cleanup, long queuedBytes, long reservedBytes, long allocatedBytes, long retiredScanners,
       long peakScanners, long peakAllocatedBytes) {}
 
+  /** Bounded diagnostics captured under the admission lock when a reserved request is rejected. */
+  public record ReservedAdmissionFailureSnapshot(long globalReservedRequests,
+      long globalReservedBytes, int globalRequestCapacity, long globalReservedByteCapacity,
+      long groupReservedRequests, long groupReservedBytes, int groupRequestCapacity,
+      long groupReservedByteCapacity, long attemptedBytes) {}
+
   /** Per-request read work; cellBytes includes returned cells and fetched manifest candidates. */
   public record ReadLimits(long physicalRows, long cellBytes, long scanRpcCalls, long pages, long pointOperations) {
     public ReadLimits {
@@ -187,15 +194,33 @@ public final class BudgetManager {
 
   public Account admitReserved(String groupId, RequestScope scope, Reservation reservation,
       ReadLimits readLimits) throws BackendFailure {
-    return admit(groupId, scope, reservation, readLimits, true);
+    return admit(groupId, scope, reservation, readLimits, true, null);
+  }
+
+  /**
+   * Admits reserved work and reports a bounded snapshot if capacity rejects it. The snapshot is
+   * captured while the admission lock is held and deliberately excludes the group identifier.
+   */
+  public Account admitReserved(String groupId, RequestScope scope, Reservation reservation,
+      ReadLimits readLimits, Consumer<ReservedAdmissionFailureSnapshot> failureObserver)
+      throws BackendFailure {
+    return admit(groupId, scope, reservation, readLimits, true,
+        Objects.requireNonNull(failureObserver, "failureObserver"));
   }
 
   private Account admit(String groupId, RequestScope scope, Reservation reservation,
       ReadLimits readLimits, boolean reserved) throws BackendFailure {
+    return admit(groupId, scope, reservation, readLimits, reserved, null);
+  }
+
+  private Account admit(String groupId, RequestScope scope, Reservation reservation,
+      ReadLimits readLimits, boolean reserved,
+      Consumer<ReservedAdmissionFailureSnapshot> failureObserver) throws BackendFailure {
     Objects.requireNonNull(scope, "scope");
     Objects.requireNonNull(reservation, "reservation");
     Objects.requireNonNull(readLimits, "readLimits");
-    Account account;
+    Account account = null;
+    ReservedAdmissionFailureSnapshot rejectedSnapshot = null;
     synchronized (this) {
       Group group = groups.get(groupId);
       if (group == null) throw new IllegalArgumentException("unconfigured group ID");
@@ -210,15 +235,27 @@ public final class BudgetManager {
               && group.usage.canAdmitRegular(group.limits, group.reservedCapacity,
                   group.reservedUsage, reservation.total());
       if (!canAdmit) {
-        throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+        if (reserved && failureObserver != null) {
+          rejectedSnapshot = new ReservedAdmissionFailureSnapshot(
+              globalReservedUsage.requests, globalReservedUsage.reservedBytes,
+              globalReservedCapacity.requests(), globalReservedCapacity.memoryBytes(),
+              group.reservedUsage.requests, group.reservedUsage.reservedBytes,
+              group.reservedCapacity.requests(), group.reservedCapacity.memoryBytes(),
+              reservation.total());
+        }
+      } else {
+        global.admit(reservation.total());
+        group.usage.admit(reservation.total());
+        if (reserved) {
+          globalReservedUsage.admit(reservation.total());
+          group.reservedUsage.admit(reservation.total());
+        }
+        account = new Account(groupId, group, scope, reservation, readLimits, reserved);
       }
-      global.admit(reservation.total());
-      group.usage.admit(reservation.total());
-      if (reserved) {
-        globalReservedUsage.admit(reservation.total());
-        group.reservedUsage.admit(reservation.total());
-      }
-      account = new Account(groupId, group, scope, reservation, readLimits, reserved);
+    }
+    if (account == null) {
+      if (rejectedSnapshot != null) failureObserver.accept(rejectedSnapshot);
+      throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
     }
     account.registration = scope.registerScopedCleanup(account);
     return account;

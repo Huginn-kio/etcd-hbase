@@ -173,9 +173,21 @@ final class WatchHistoryReplay implements AutoCloseable {
       BudgetManager budgets,
       BudgetManager.Account watchAccount, RequestScope streamScope,
       Consumer<RequestMetrics.WatchReplayOpenResourceFailureStage> resourceFailureObserver) {
+    return open(tableGroup, range, startRevision, barrier, barrierSequence, authorization,
+        pins, selected, budgets, watchAccount, streamScope, resourceFailureObserver, ignored -> {});
+  }
+
+  static CompletableFuture<OpenResult> open(String tableGroup, KeyRange range,
+      long startRevision, ControlSnapshot barrier, long barrierSequence, ByteKey authorization,
+      EventHistoryPinManager pins, SelectedSequenceReader selected,
+      BudgetManager budgets,
+      BudgetManager.Account watchAccount, RequestScope streamScope,
+      Consumer<RequestMetrics.WatchReplayOpenResourceFailureStage> resourceFailureObserver,
+      Consumer<BudgetManager.ReservedAdmissionFailureSnapshot> admissionFailureObserver) {
     Objects.requireNonNull(barrier, "barrier");
     Objects.requireNonNull(authorization, "authorization");
     Objects.requireNonNull(resourceFailureObserver, "resourceFailureObserver");
+    Objects.requireNonNull(admissionFailureObserver, "admissionFailureObserver");
     if (startRevision <= 0 || barrier.state().publishedRevision() < startRevision
         || barrierSequence != barrier.state().publishedSequence()
         || authorization.length() != 32) {
@@ -198,7 +210,8 @@ final class WatchHistoryReplay implements AutoCloseable {
     BudgetManager.Account lookupAccount;
     try {
       lookupAccount = budgets.admitReserved(tableGroup, lookupScope,
-          LeaseBudgetProfile.EVENT_TAILER_READ_MEMORY, LeaseBudgetProfile.EVENT_TAILER_READ_LIMITS);
+          LeaseBudgetProfile.EVENT_TAILER_READ_MEMORY, LeaseBudgetProfile.EVENT_TAILER_READ_LIMITS,
+          admissionFailureObserver);
     } catch (BackendFailure failure) {
       lookupScope.close();
       recordResourceFailure(resourceFailureObserver,
@@ -233,7 +246,8 @@ final class WatchHistoryReplay implements AutoCloseable {
         Throwable cause = unwrap(lookupFailure);
         recordResourceFailure(resourceFailureObserver,
             RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_LOOKUP, cause);
-        return replay.openIfCompactedOrFail(startRevision, cause, cleanup);
+        return replay.openIfCompactedOrFail(startRevision, cause, cleanup,
+            resourceFailureObserver, admissionFailureObserver);
       }
       var requirement = new EventHistoryPinManager.Requirement(firstEventRevision, sequence,
           authorization, Optional.empty(), Optional.empty());
@@ -242,10 +256,11 @@ final class WatchHistoryReplay implements AutoCloseable {
           Throwable cause = unwrap(registrationFailure);
           recordResourceFailure(resourceFailureObserver,
               RequestMetrics.WatchReplayOpenResourceFailureStage.PIN_REGISTRATION, cause);
-          return replay.openIfCompactedOrFail(startRevision, cause, cleanup);
+          return replay.openIfCompactedOrFail(startRevision, cause, cleanup,
+              resourceFailureObserver, admissionFailureObserver);
         }
         return replay.finishOpen(registered, barrier, startRevision, sequence, barrierSequence,
-            cleanup, resourceFailureObserver);
+            cleanup, resourceFailureObserver, admissionFailureObserver);
       }).thenCompose(java.util.function.Function.identity());
     }).thenCompose(java.util.function.Function.identity());
     var result = new CompletableFuture<OpenResult>();
@@ -294,7 +309,8 @@ final class WatchHistoryReplay implements AutoCloseable {
   private CompletableFuture<OpenResult> finishOpen(EventHistoryPinManager.Protection registered,
       ControlSnapshot barrier, long startRevision, long sequence, long barrierSequence,
       Optional<RequestScope.ScopedCleanup> cleanup,
-      Consumer<RequestMetrics.WatchReplayOpenResourceFailureStage> resourceFailureObserver) {
+      Consumer<RequestMetrics.WatchReplayOpenResourceFailureStage> resourceFailureObserver,
+      Consumer<BudgetManager.ReservedAdmissionFailureSnapshot> admissionFailureObserver) {
     return installPin(registered)
         .thenCompose(ignored -> observeResourceFailure(() -> registered.renew(pinScope),
             resourceFailureObserver,
@@ -302,7 +318,8 @@ final class WatchHistoryReplay implements AutoCloseable {
         .thenCompose(ignored -> withReadScope(
             (scope, budget) -> readControl(scope, budget), resourceFailureObserver,
             RequestMetrics.WatchReplayOpenResourceFailureStage.CONTROL_REVALIDATION_ACCOUNT_ADMISSION,
-            RequestMetrics.WatchReplayOpenResourceFailureStage.CONTROL_REVALIDATION_READ))
+            RequestMetrics.WatchReplayOpenResourceFailureStage.CONTROL_REVALIDATION_READ,
+            admissionFailureObserver))
         .thenCompose(current -> {
           if (current.publishedRevision() < barrier.state().publishedRevision()) {
             return CompletableFuture.failedFuture(
@@ -316,7 +333,8 @@ final class WatchHistoryReplay implements AutoCloseable {
           return withReadScope((scope, budget) -> readSequence(
               Math.max(2, startRevision), current, scope, budget), resourceFailureObserver,
               RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_REVALIDATION_ACCOUNT_ADMISSION,
-              RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_REVALIDATION_READ)
+              RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_REVALIDATION_READ,
+              admissionFailureObserver)
               .thenApply(verified -> {
                 if (verified.longValue() != sequence || verified > barrierSequence) {
                   throw new CompletionException(new IllegalStateException(
@@ -334,7 +352,9 @@ final class WatchHistoryReplay implements AutoCloseable {
    * committed compact boundary turns that failure into the protocol's Created + Canceled result.
    */
   private CompletableFuture<OpenResult> openIfCompactedOrFail(long startRevision,
-      Throwable openingFailure, Optional<RequestScope.ScopedCleanup> cleanup) {
+      Throwable openingFailure, Optional<RequestScope.ScopedCleanup> cleanup,
+      Consumer<RequestMetrics.WatchReplayOpenResourceFailureStage> resourceFailureObserver,
+      Consumer<BudgetManager.ReservedAdmissionFailureSnapshot> admissionFailureObserver) {
     if (!(openingFailure instanceof SelectedSequenceReader.MissingFinalizedRevisionIndex)
         && !(openingFailure instanceof SnapshotPinManager.RegistrationFloorExceeded)) {
       return CompletableFuture.failedFuture(openingFailure);
@@ -344,7 +364,10 @@ final class WatchHistoryReplay implements AutoCloseable {
         return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.CANCELLED));
       }
     }
-    return withReadScope((scope, budget) -> readControl(scope, budget))
+    return withReadScope((scope, budget) -> readControl(scope, budget), resourceFailureObserver,
+        RequestMetrics.WatchReplayOpenResourceFailureStage.CONTROL_REVALIDATION_ACCOUNT_ADMISSION,
+        RequestMetrics.WatchReplayOpenResourceFailureStage.CONTROL_REVALIDATION_READ,
+        admissionFailureObserver)
         .handle((current, stateFailure) -> {
           if (stateFailure != null) {
             Throwable checkFailure = unwrap(stateFailure);
@@ -678,7 +701,7 @@ final class WatchHistoryReplay implements AutoCloseable {
   private <T> CompletableFuture<T> withReadScope(
       java.util.function.BiFunction<RequestScope, ManifestCatalog.ProofReadBudget,
           CompletableFuture<T>> operation) {
-    return withReadScope(operation, null, null, null);
+    return withReadScope(operation, null, null, null, null);
   }
 
   private <T> CompletableFuture<T> withReadScope(
@@ -686,12 +709,16 @@ final class WatchHistoryReplay implements AutoCloseable {
           CompletableFuture<T>> operation,
       Consumer<RequestMetrics.WatchReplayOpenResourceFailureStage> resourceFailureObserver,
       RequestMetrics.WatchReplayOpenResourceFailureStage admissionFailureStage,
-      RequestMetrics.WatchReplayOpenResourceFailureStage operationFailureStage) {
+      RequestMetrics.WatchReplayOpenResourceFailureStage operationFailureStage,
+      Consumer<BudgetManager.ReservedAdmissionFailureSnapshot> admissionFailureObserver) {
     RequestScope scope = RequestScope.withoutDeadline();
     BudgetManager.Account account;
     try {
-      account = budgets.admitReserved(tableGroup, scope,
-          LeaseBudgetProfile.EVENT_TAILER_READ_MEMORY, LeaseBudgetProfile.EVENT_TAILER_READ_LIMITS);
+      account = admissionFailureObserver == null
+          ? budgets.admitReserved(tableGroup, scope, LeaseBudgetProfile.EVENT_TAILER_READ_MEMORY,
+              LeaseBudgetProfile.EVENT_TAILER_READ_LIMITS)
+          : budgets.admitReserved(tableGroup, scope, LeaseBudgetProfile.EVENT_TAILER_READ_MEMORY,
+              LeaseBudgetProfile.EVENT_TAILER_READ_LIMITS, admissionFailureObserver);
     } catch (BackendFailure failure) {
       scope.close();
       recordResourceFailure(resourceFailureObserver, admissionFailureStage, failure);
@@ -753,11 +780,7 @@ final class WatchHistoryReplay implements AutoCloseable {
     termination = reason;
     Throwable cleanupFailure = collectDeliveryCloseFailures(pending, null);
     pending.clear();
-    Throwable terminalFailure = new BackendFailure(BackendFailure.Category.UNAVAILABLE);
-    if (cleanupFailure != null && cleanupFailure != terminalFailure) {
-      terminalFailure.addSuppressed(cleanupFailure);
-    }
-    settleAfterPinRelease(terminalFailure);
+    settleAfterPinRelease(cleanupFailure);
   }
 
   private synchronized CompletionStage<Void> releasePin() {
@@ -817,7 +840,8 @@ final class WatchHistoryReplay implements AutoCloseable {
       return switch (backendFailure.category()) {
         case RESOURCE_LIMIT -> WatchTermination.resourceLimit(RESOURCE_LIMIT_REASON);
         case CANCELLED -> WatchTermination.cancelled(backendFailure.safeMessage());
-        case AUTHENTICATION, PERMISSION, UNAVAILABLE, TIMEOUT, UNKNOWN ->
+        case UNAVAILABLE -> WatchTermination.unavailable(backendFailure.safeMessage());
+        case AUTHENTICATION, PERMISSION, TIMEOUT, UNKNOWN ->
             WatchTermination.failure(backendFailure);
       };
     }

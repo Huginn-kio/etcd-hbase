@@ -5,13 +5,16 @@ import static io.etcdhbase.grpc.RequestCompletionRecorder.Outcome;
 
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.RequestCompletionRecorder;
 import java.time.Duration;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
@@ -32,6 +35,8 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   private final Map<LeaseRevocationStage, StageCounter> leaseRevocationStages;
   private final Map<WatchCreateResourceFailureStage, LongAdder> watchCreateResourceFailures;
   private final Map<WatchReplayOpenResourceFailureStage, LongAdder> watchReplayOpenResourceFailures;
+  private final AtomicReference<BudgetManager.ReservedAdmissionFailureSnapshot>
+      watchReplayLookupAdmissionFailure = new AtomicReference<>();
   private final LongAdder putOutputBytes = new LongAdder();
   private final LongAdder txnOutputBytes = new LongAdder();
   private final LongAdder leaseRenewalRequests = new LongAdder();
@@ -182,6 +187,17 @@ public final class RequestMetrics implements RequestCompletionRecorder {
         new EnumMap<>(WatchReplayOpenResourceFailureStage.class);
     watchReplayOpenResourceFailures.forEach((stage, count) -> snapshot.put(stage, count.sum()));
     return Map.copyOf(snapshot);
+  }
+
+  /** Retains only the latest bounded lookup-admission rejection; no group or request identity. */
+  public void recordWatchReplayLookupAdmissionFailure(
+      BudgetManager.ReservedAdmissionFailureSnapshot snapshot) {
+    watchReplayLookupAdmissionFailure.set(Objects.requireNonNull(snapshot, "snapshot"));
+  }
+
+  public Optional<BudgetManager.ReservedAdmissionFailureSnapshot>
+      watchReplayLookupAdmissionFailure() {
+    return Optional.ofNullable(watchReplayLookupAdmissionFailure.get());
   }
 
   public void recordTxnStage(TxnStage stage, long elapsedNanos) {

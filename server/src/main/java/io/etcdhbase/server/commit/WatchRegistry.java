@@ -131,7 +131,6 @@ final class WatchRegistry {
       Throwable failure = null;
       if (delivery != null) failure = WatchCleanup.closeAndCollect(delivery::close, failure);
       failure = WatchCleanup.closeAndCollect(() -> subscription.setWakeup(null), failure);
-      failure = WatchCleanup.closeAndCollect(subscription::closeLiveDelivery, failure);
       failure = WatchCleanup.closeAndCollect(subscription::close, failure);
       WatchCleanup.throwIfPresent(failure);
     }
