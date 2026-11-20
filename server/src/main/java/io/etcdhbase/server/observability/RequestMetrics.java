@@ -31,6 +31,7 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   private final Map<LeaseRenewalStage, StageCounter> leaseRenewalStages;
   private final Map<LeaseRevocationStage, StageCounter> leaseRevocationStages;
   private final Map<WatchCreateResourceFailureStage, LongAdder> watchCreateResourceFailures;
+  private final Map<WatchReplayOpenResourceFailureStage, LongAdder> watchReplayOpenResourceFailures;
   private final LongAdder putOutputBytes = new LongAdder();
   private final LongAdder txnOutputBytes = new LongAdder();
   private final LongAdder leaseRenewalRequests = new LongAdder();
@@ -113,6 +114,12 @@ public final class RequestMetrics implements RequestCompletionRecorder {
       watchFailures.put(stage, new LongAdder());
     }
     watchCreateResourceFailures = Map.copyOf(watchFailures);
+    Map<WatchReplayOpenResourceFailureStage, LongAdder> replayFailures =
+        new EnumMap<>(WatchReplayOpenResourceFailureStage.class);
+    for (WatchReplayOpenResourceFailureStage stage : WatchReplayOpenResourceFailureStage.values()) {
+      replayFailures.put(stage, new LongAdder());
+    }
+    watchReplayOpenResourceFailures = Map.copyOf(replayFailures);
   }
 
   /** Bounded stages that J30 actually observes; publication includes M2 finalization. */
@@ -141,6 +148,18 @@ public final class RequestMetrics implements RequestCompletionRecorder {
     HISTORY_REPLAY_OPEN
   }
 
+  /** Bounded inner phases for a resource failure while opening historical Watch replay. */
+  public enum WatchReplayOpenResourceFailureStage {
+    LOOKUP_ACCOUNT_ADMISSION,
+    SEQUENCE_LOOKUP,
+    PIN_REGISTRATION,
+    PIN_RENEWAL,
+    CONTROL_REVALIDATION_ACCOUNT_ADMISSION,
+    CONTROL_REVALIDATION_READ,
+    SEQUENCE_REVALIDATION_ACCOUNT_ADMISSION,
+    SEQUENCE_REVALIDATION_READ
+  }
+
   public void recordWatchCreateResourceFailure(WatchCreateResourceFailureStage stage) {
     Objects.requireNonNull(stage, "stage");
     watchCreateResourceFailures.get(stage).increment();
@@ -150,6 +169,18 @@ public final class RequestMetrics implements RequestCompletionRecorder {
     Map<WatchCreateResourceFailureStage, Long> snapshot =
         new EnumMap<>(WatchCreateResourceFailureStage.class);
     watchCreateResourceFailures.forEach((stage, count) -> snapshot.put(stage, count.sum()));
+    return Map.copyOf(snapshot);
+  }
+
+  public void recordWatchReplayOpenResourceFailure(WatchReplayOpenResourceFailureStage stage) {
+    Objects.requireNonNull(stage, "stage");
+    watchReplayOpenResourceFailures.get(stage).increment();
+  }
+
+  public Map<WatchReplayOpenResourceFailureStage, Long> watchReplayOpenResourceFailures() {
+    Map<WatchReplayOpenResourceFailureStage, Long> snapshot =
+        new EnumMap<>(WatchReplayOpenResourceFailureStage.class);
+    watchReplayOpenResourceFailures.forEach((stage, count) -> snapshot.put(stage, count.sum()));
     return Map.copyOf(snapshot);
   }
 

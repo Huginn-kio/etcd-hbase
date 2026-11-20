@@ -37,6 +37,7 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.storage.StorageMetadata;
 import io.etcdhbase.core.storage.StoredRecord;
+import io.etcdhbase.server.observability.RequestMetrics;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -288,6 +289,161 @@ class WatchHistoryReplayTest {
       assertTrue(result.replay().isEmpty(), "compacted history has no replay cursor");
       verify(fixture.pins, org.mockito.Mockito.never()).registerProtection(any(), any());
       watchAccount.close();
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
+
+  @Test
+  void reportsLookupAccountAdmissionResourceLimitWithoutChangingWatchFailure() throws Exception {
+    var fixture = new ReplayFixture();
+    var reservedScopes = new ArrayList<RequestScope>();
+    var stages = new ArrayList<RequestMetrics.WatchReplayOpenResourceFailureStage>();
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      try {
+        for (int index = 0; index < 4; index++) {
+          RequestScope reservedScope = RequestScope.withoutDeadline();
+          reservedScopes.add(reservedScope);
+          fixture.budgets.admitReserved(TABLE_GROUP, reservedScope,
+              new BudgetManager.Reservation(0, 1, 1, 0, 0));
+        }
+
+        CompletableFuture<WatchHistoryReplay.OpenResult> opening = WatchHistoryReplay.open(
+            TABLE_GROUP, KeyRange.all(), 3, fixture.snapshot, 6, AUTHORIZATION, fixture.pins,
+            fixture.selected, fixture.budgets, watchAccount, null, stages::add);
+        CompletionException failure = assertThrows(CompletionException.class, opening::join);
+
+        assertTrue(failure.getCause() instanceof BackendFailure backendFailure
+            && backendFailure.category() == BackendFailure.Category.RESOURCE_LIMIT);
+        assertEquals(List.of(RequestMetrics.WatchReplayOpenResourceFailureStage.LOOKUP_ACCOUNT_ADMISSION),
+            stages);
+      } finally {
+        watchAccount.close();
+        reservedScopes.forEach(RequestScope::close);
+      }
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
+
+  @Test
+  void reportsSequenceLookupResourceLimitWithoutChangingWatchFailure() throws Exception {
+    var fixture = new ReplayFixture();
+    var stages = new ArrayList<RequestMetrics.WatchReplayOpenResourceFailureStage>();
+    BackendFailure resourceLimit = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    when(fixture.selected.sequenceForRevision(anyLong(), any(CommitState.class),
+        any(RequestScope.class), any(ManifestCatalog.ProofReadBudget.class)))
+        .thenReturn(CompletableFuture.failedFuture(resourceLimit));
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      CompletableFuture<WatchHistoryReplay.OpenResult> opening = WatchHistoryReplay.open(
+          TABLE_GROUP, KeyRange.all(), 3, fixture.snapshot, 6, AUTHORIZATION, fixture.pins,
+          fixture.selected, fixture.budgets, watchAccount, null, stages::add);
+      CompletionException failure = assertThrows(CompletionException.class, opening::join);
+
+      assertSame(resourceLimit, failure.getCause());
+      assertEquals(List.of(RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_LOOKUP),
+          stages);
+      watchAccount.close();
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
+
+  @Test
+  void reportsSynchronousSequenceLookupResourceLimitWithoutChangingWatchFailure() throws Exception {
+    var fixture = new ReplayFixture();
+    var stages = new ArrayList<RequestMetrics.WatchReplayOpenResourceFailureStage>();
+    BackendFailure resourceLimit = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    doThrow(new CompletionException(resourceLimit)).when(fixture.selected).sequenceForRevision(anyLong(),
+        any(CommitState.class), any(RequestScope.class),
+        any(ManifestCatalog.ProofReadBudget.class));
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      CompletableFuture<WatchHistoryReplay.OpenResult> opening = WatchHistoryReplay.open(
+          TABLE_GROUP, KeyRange.all(), 3, fixture.snapshot, 6, AUTHORIZATION, fixture.pins,
+          fixture.selected, fixture.budgets, watchAccount, null, stages::add);
+      CompletionException failure = assertThrows(CompletionException.class, opening::join);
+
+      assertSame(resourceLimit, failure.getCause());
+      assertEquals(List.of(RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_LOOKUP),
+          stages);
+      watchAccount.close();
+      assertNoBudgetLeaks(fixture.budgets);
+    }
+  }
+
+  @Test
+  void reportsPinRenewalResourceLimitWithoutChangingWatchFailure() throws Exception {
+    var fixture = new ReplayFixture();
+    var stages = new ArrayList<RequestMetrics.WatchReplayOpenResourceFailureStage>();
+    BackendFailure resourceLimit = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    when(fixture.protection.renew(any(RequestScope.class)))
+        .thenReturn(CompletableFuture.failedFuture(resourceLimit));
+
+    assertOpenResourceFailure(fixture, resourceLimit,
+        RequestMetrics.WatchReplayOpenResourceFailureStage.PIN_RENEWAL, stages);
+  }
+
+  @Test
+  void reportsControlRevalidationResourceLimitWithoutChangingWatchFailure() throws Exception {
+    var fixture = new ReplayFixture();
+    var stages = new ArrayList<RequestMetrics.WatchReplayOpenResourceFailureStage>();
+    BackendFailure resourceLimit = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    when(fixture.selected.readPublishedState(any(RequestScope.class),
+        any(ManifestCatalog.ProofReadBudget.class)))
+        .thenReturn(CompletableFuture.failedFuture(resourceLimit));
+
+    assertOpenResourceFailure(fixture, resourceLimit,
+        RequestMetrics.WatchReplayOpenResourceFailureStage.CONTROL_REVALIDATION_READ, stages);
+  }
+
+  @Test
+  void reportsSequenceRevalidationResourceLimitWithoutChangingWatchFailure() throws Exception {
+    var fixture = new ReplayFixture();
+    var stages = new ArrayList<RequestMetrics.WatchReplayOpenResourceFailureStage>();
+    BackendFailure resourceLimit = new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    when(fixture.selected.sequenceForRevision(anyLong(), any(CommitState.class),
+        any(RequestScope.class), any(ManifestCatalog.ProofReadBudget.class)))
+        .thenReturn(CompletableFuture.completedFuture(4L), CompletableFuture.failedFuture(resourceLimit));
+
+    assertOpenResourceFailure(fixture, resourceLimit,
+        RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_REVALIDATION_READ, stages);
+  }
+
+  @Test
+  void reportsControlReadAdmissionResourceLimitSeparatelyFromReadFailure() throws Exception {
+    var fixture = new ReplayFixture();
+    var stages = new ArrayList<RequestMetrics.WatchReplayOpenResourceFailureStage>();
+    var reservedScopes = new ArrayList<RequestScope>();
+    when(fixture.pins.registerProtection(any(EventHistoryPinManager.Requirement.class),
+        any(RequestScope.class))).thenAnswer(invocation -> {
+          for (int index = 0; index < 4; index++) {
+            RequestScope reservedScope = RequestScope.withoutDeadline();
+            reservedScopes.add(reservedScope);
+            fixture.budgets.admitReserved(TABLE_GROUP, reservedScope,
+                new BudgetManager.Reservation(0, 1, 1, 0, 0));
+          }
+          return CompletableFuture.completedFuture(fixture.protection);
+        });
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      try {
+        CompletableFuture<WatchHistoryReplay.OpenResult> opening = WatchHistoryReplay.open(
+            TABLE_GROUP, KeyRange.all(), 3, fixture.snapshot, 6, AUTHORIZATION, fixture.pins,
+            fixture.selected, fixture.budgets, watchAccount, null, stages::add);
+        CompletionException failure = assertThrows(CompletionException.class, opening::join);
+
+        assertTrue(failure.getCause() instanceof BackendFailure backendFailure
+            && backendFailure.category() == BackendFailure.Category.RESOURCE_LIMIT);
+        assertEquals(List.of(
+            RequestMetrics.WatchReplayOpenResourceFailureStage.CONTROL_REVALIDATION_ACCOUNT_ADMISSION),
+            stages);
+      } finally {
+        watchAccount.close();
+        reservedScopes.forEach(RequestScope::close);
+      }
       assertNoBudgetLeaks(fixture.budgets);
     }
   }
@@ -780,6 +936,26 @@ class WatchHistoryReplayTest {
     assertEquals(0, snapshot.requests());
     assertEquals(0, snapshot.reservedBytes());
     assertEquals(0, snapshot.allocatedBytes());
+  }
+
+  private static void assertOpenResourceFailure(ReplayFixture fixture, BackendFailure expectedFailure,
+      RequestMetrics.WatchReplayOpenResourceFailureStage expectedStage,
+      List<RequestMetrics.WatchReplayOpenResourceFailureStage> stages) throws Exception {
+    try (var scope = RequestScope.withoutDeadline()) {
+      BudgetManager.Account watchAccount = fixture.admitWatchAccount(scope);
+      try {
+        CompletableFuture<WatchHistoryReplay.OpenResult> opening = WatchHistoryReplay.open(
+            TABLE_GROUP, KeyRange.all(), 3, fixture.snapshot, 6, AUTHORIZATION, fixture.pins,
+            fixture.selected, fixture.budgets, watchAccount, null, stages::add);
+        CompletionException failure = assertThrows(CompletionException.class, opening::join);
+
+        assertSame(expectedFailure, failure.getCause());
+        assertEquals(List.of(expectedStage), stages);
+      } finally {
+        watchAccount.close();
+      }
+      assertNoBudgetLeaks(fixture.budgets);
+    }
   }
 
   private static CommitState compactedState(CommitState current, long compactRevision) {

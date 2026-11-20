@@ -95,6 +95,34 @@ class RequestMetricsTest {
   }
 
   @Test
+  void countsWatchReplayOpenResourceFailuresByBoundedInnerStage() {
+    var metrics = new RequestMetrics();
+    metrics.recordWatchReplayOpenResourceFailure(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.LOOKUP_ACCOUNT_ADMISSION);
+    metrics.recordWatchReplayOpenResourceFailure(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_LOOKUP);
+
+    var snapshot = metrics.watchReplayOpenResourceFailures();
+    assertEquals(8, snapshot.size());
+    assertEquals(1, snapshot.get(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.LOOKUP_ACCOUNT_ADMISSION));
+    assertEquals(1, snapshot.get(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_LOOKUP));
+    assertEquals(0, snapshot.get(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.PIN_REGISTRATION));
+    assertEquals(0, snapshot.get(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.PIN_RENEWAL));
+    assertEquals(0, snapshot.get(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.CONTROL_REVALIDATION_ACCOUNT_ADMISSION));
+    assertEquals(0, snapshot.get(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.CONTROL_REVALIDATION_READ));
+    assertEquals(0, snapshot.get(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_REVALIDATION_ACCOUNT_ADMISSION));
+    assertEquals(0, snapshot.get(
+        RequestMetrics.WatchReplayOpenResourceFailureStage.SEQUENCE_REVALIDATION_READ));
+  }
+
+  @Test
   void countsCommittedExpiryWithoutInventingAnUnavailableDelaySample() {
     var metrics = new RequestMetrics();
     metrics.recordLeaseExpiryRevocation(250);

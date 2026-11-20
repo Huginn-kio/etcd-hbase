@@ -169,7 +169,9 @@ class M4WatchRpcIT {
           throw new AssertionError(failure.getMessage() + "\nserver request metrics: "
               + metrics.snapshot() + "\nPut stages: " + metrics.putStages()
               + "\nWatch create resource failure stages: "
-              + metrics.watchCreateResourceFailures(), failure);
+              + metrics.watchCreateResourceFailures()
+              + "\nWatch replay open resource failure stages: "
+              + metrics.watchReplayOpenResourceFailures(), failure);
         }
       }
     }
