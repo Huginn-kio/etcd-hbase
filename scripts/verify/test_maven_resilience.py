@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise the pinned Resolver against transient and permanent HTTP failures."""
+"""Exercise Maven Resolver and Wrapper resilience to transient and permanent HTTP failures."""
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,8 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
@@ -25,6 +28,10 @@ PREP_SPEC = importlib.util.spec_from_file_location(
     "maven_preparation", ROOT / "scripts/dev/prepare-maven-dependencies.py")
 PREPARATION = importlib.util.module_from_spec(PREP_SPEC)
 PREP_SPEC.loader.exec_module(PREPARATION)
+REPRO_SPEC = importlib.util.spec_from_file_location(
+    "maven_reproducible_build", ROOT / "scripts/verify/maven-reproducible-build.py")
+REPRO = importlib.util.module_from_spec(REPRO_SPEC)
+REPRO_SPEC.loader.exec_module(REPRO)
 
 PARENT = b"""<project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion><groupId>resilience.fixture</groupId>
@@ -34,7 +41,22 @@ PARENT = b"""<project xmlns="http://maven.apache.org/POM/4.0.0">
 
 class MavenCachePolicyTest(unittest.TestCase):
     def test_actual_workflows_keep_public_pins_and_cache_barriers(self):
-        self.assertTrue(POLICY.static_policy()["public_maven_only"])
+        result = POLICY.static_policy()
+        self.assertTrue(result["public_maven_only"])
+        self.assertEqual(4, result["immutable_action_pins"])
+
+    def test_j09_wrapper_cache_and_failure_diagnostics_are_locked(self):
+        workflow = (ROOT / ".github/workflows/j09.yml").read_text()
+        pins = POLICY.approved_action_pins(ROOT, json.loads((ROOT / "build/dependency-lock.json").read_text()))
+        self.assertIn("actions/cache", pins)
+        self.assertIn("actions/upload-artifact", pins)
+        POLICY.workflow_actions(workflow, ROOT, pins)
+        self.assertIn("path: ~/.m2/wrapper/dists", workflow)
+        self.assertIn("hashFiles('.mvn/wrapper/maven-wrapper.properties')", workflow)
+        self.assertIn("if: failure()", workflow)
+        self.assertIn("maven-wrapper-startup-*.log", workflow)
+        self.assertIn("retention-days: 7", workflow)
+        self.assertNotIn("build/ci-action-lock.json", POLICY.MAVEN_CACHE_INPUTS)
 
     def test_consumer_rejects_incomplete_keys_and_failed_preparation_bypass(self):
         workflow = ROOT / ".github/workflows/m3.yml"
@@ -90,6 +112,86 @@ class MavenOfflineCacheRepairTest(unittest.TestCase):
                 self.assertEqual(3, fetch.call_count)
                 fetch.assert_called_with("-N", PREPARATION.GOAL + "get",
                                          "-Dartifact=net.bytebuddy:byte-buddy:1.18.3:jar")
+
+
+class MavenWrapperStartupRetryTest(unittest.TestCase):
+    def run_wrapper_startup(self, status):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        wrapper = root / ".mvn/wrapper"
+        wrapper.mkdir(parents=True)
+        shutil.copyfile(ROOT / "mvnw", root / "mvnw")
+        (root / "mvnw").chmod(0o755)
+        shutil.copyfile(ROOT / ".mvn/wrapper/maven-wrapper.jar", wrapper / "maven-wrapper.jar")
+
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                payload = b"fixture rate limit" if status == 429 else b"fixture missing"
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_arguments):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def close_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(close_server)
+        (wrapper / "maven-wrapper.properties").write_text(
+            "wrapperVersion=3.3.4\n"
+            "distributionType=bin\n"
+            f"distributionUrl=http://127.0.0.1:{server.server_port}/apache-maven-3.9.16-bin.zip\n"
+            "distributionSha256Sum=5af3b743dd8b876b5c45da33b676251e5f1687712644abb4ee519ca56e1d89ce\n"
+        )
+        runner = root / "scripts/dev/mvn21.sh"
+        runner.parent.mkdir(parents=True)
+        runner.write_text(
+            '#!/usr/bin/env bash\n'
+            'set -euo pipefail\n'
+            'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"\n'
+            'exec "$ROOT/mvnw" "$@"\n'
+        )
+        runner.chmod(0o755)
+
+        output = root / "output"
+        output.mkdir()
+        delays = []
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.object(REPRO, "ROOT", root), \
+             patch.object(REPRO, "time", SimpleNamespace(sleep=delays.append)), \
+             redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaisesRegex(ValueError, "pinned Maven Wrapper startup failed"):
+                REPRO.prepare_maven_wrapper(output)
+        return requests, delays, stdout.getvalue(), stderr.getvalue(), output
+
+    def test_real_wrapper_retries_local_http_429_only_to_its_bound(self):
+        requests, delays, stdout, stderr, output = self.run_wrapper_startup(429)
+        self.assertEqual(4, len(requests))
+        self.assertEqual([2, 4, 8], delays)
+        self.assertEqual(3, stdout.count("retrying Wrapper startup"))
+        self.assertIn("HTTP response code: 429", stderr)
+        for attempt in range(1, 5):
+            self.assertIn("HTTP response code: 429",
+                          (output / f"maven-wrapper-startup-{attempt}.log").read_text(errors="replace"))
+
+    def test_real_wrapper_does_not_retry_local_http_404(self):
+        requests, delays, _stdout, stderr, _output = self.run_wrapper_startup(404)
+        self.assertEqual(1, len(requests))
+        self.assertEqual([], delays)
+        self.assertIn("FileNotFoundException:", stderr)
 
 
 class MavenHttpResilienceTest(unittest.TestCase):

@@ -17,6 +17,23 @@ MAVEN_CACHE_INPUTS = (
     "build/dependency-lock.json", "build/maven-settings-public.xml", "scripts/dev/mvn21.sh",
     "scripts/dev/maven-repository.sh", "scripts/dev/prepare-maven-dependencies.py", MAVEN_PREPARATION,
 )
+# Keep CI Action pins outside the Maven dependency lock so they do not invalidate its cache key.
+
+
+def approved_action_pins(root, dependency_lock):
+    ci_lock = json.loads((root / "build/ci-action-lock.json").read_text())
+    if ci_lock.get("schemaVersion") != 1 or not isinstance(ci_lock.get("actions"), dict):
+        raise ValueError("CI Action lock has an unsupported schema")
+    dependency_actions = dependency_lock["actions"]
+    ci_actions = ci_lock["actions"]
+    if set(dependency_actions).intersection(ci_actions):
+        raise ValueError("CI Action pins must not be duplicated across lock files")
+    pins = {**dependency_actions, **ci_actions}
+    if not pins or any(not isinstance(name, str) or not isinstance(revision, str)
+                       or not re.fullmatch(r"[0-9a-f]{40}", revision)
+                       for name, revision in pins.items()):
+        raise ValueError("CI Actions must use complete immutable SHA pins")
+    return pins
 
 
 def workflow_actions(content, root, pins):
@@ -56,6 +73,7 @@ def maven_cache_policy(workflow, content):
 
 def static_policy(root=ROOT):
     lock = json.loads((root / "build/dependency-lock.json").read_text())
+    action_pins = approved_action_pins(root, lock)
     settings = ET.parse(root / "build/maven-settings-public.xml").getroot()
     namespace = {"m": "http://maven.apache.org/SETTINGS/1.2.0"}
     mirrors = settings.findall("m:mirrors/m:mirror", namespace)
@@ -73,11 +91,11 @@ def static_policy(root=ROOT):
         content = workflow.read_text()
         if "pull_request_target" in content or re.search(r"secrets\s*[.\[]", content) or re.search(r"permissions\s*:\s*(?:write-all|[\s\S]*?contents\s*:\s*write)", content):
             raise ValueError("M0 public CI must not request target secrets or write access")
-        workflow_actions(content, root, lock["actions"])
+        workflow_actions(content, root, action_pins)
         maven_cache_policy(workflow, content)
         if "persist-credentials: false" not in content:
             raise ValueError("checkout credentials must not persist")
-    return {"workflows": len(workflows), "immutable_action_pins": len(lock["actions"]),
+    return {"workflows": len(workflows), "immutable_action_pins": len(action_pins),
             "runtime_base": runtime["reference"], "public_maven_only": True}
 
 

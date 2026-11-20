@@ -34,7 +34,9 @@ Maven SNAPSHOT 依赖安装到本工作树专用的 `.artifacts/m0/j09/maven-rep
 
 `.mvn/maven.config` 将普通制品下载并发降为 2；缓存准备进一步降为 1。Resolver 对 429/503 等传输失败最多重试 4 次，无服务端等待提示时从 15 秒开始递增等待，间隔上限 60 秒，并保留其 `Retry-After` 处理。不会重新执行失败的测试来制造通过。跨工作流的冷缓存准备仍可能并发，GitHub 托管 runner 的出口及 Central 的服务端策略也不受本项目控制，因此这些措施不承诺永久消除 429。
 
-`python3 scripts/verify/test_maven_resilience.py` 使用锁定 Maven 和本地 HTTP 制品仓库验证连续 429 后恢复、持续 429 的终止边界及 404 不重试，并检查缓存键和准备失败门禁。它需要 `ETCD_HBASE_JDK21_HOME` 或 `JAVA_HOME` 指向锁定 JDK，不访问真实业务数据。
+J09 另将 Maven Wrapper 发行包缓存到 `~/.m2/wrapper/dists`，缓存键绑定 runner OS 和 `.mvn/wrapper/maven-wrapper.properties` 摘要；这与 Maven 制品仓库缓存分开，且 CI Action pin 放在 `build/ci-action-lock.json`，不改变 Maven 依赖缓存键。Wrapper 启动最多尝试 4 次，仅对明确记录的 HTTP 408、425、429、500、502、503、504 退避重试 2/4/8 秒；依赖解析、构建和测试失败仍立即按原流程失败。J09 job 失败时上传有限诊断文件，保留 7 天。
+
+`python3 scripts/verify/test_maven_resilience.py` 使用锁定 Maven 和本地 HTTP 制品仓库验证 Maven Resolver 连续 429 后恢复、持续 429 的终止边界及 404 不重试；还通过实际 Maven Wrapper 和本地 HTTP 429/404 响应验证 Wrapper 的有界重试、硬错误快速失败与启动日志留存，并检查 Action pin、缓存键和准备失败门禁。它需要 `ETCD_HBASE_JDK21_HOME` 或 `JAVA_HOME` 指向锁定 JDK，不访问真实业务数据。
 
 若后续接入 Nexus/Artifactory，需要先提供 GitHub CI 可访问的实际 HTTPS 代理服务，并明确访问方式和凭据 secret 名称。当前公开验证仍强制 Central 且不使用私有凭据；代理服务尚未配置或部署，接入时需同步维护对应构建路径和策略校验。
 

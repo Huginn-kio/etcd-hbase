@@ -25,6 +25,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: 缓存 Maven Wrapper 发行包
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ~/.m2/wrapper/dists
+          key: j09-maven-wrapper-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
       - name: 下载固定 Temurin JDK
         run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/j09-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
@@ -38,3 +43,18 @@ jobs:
         run: |
           scripts/verify/m0.sh --scope public --artifact-root .artifacts/m0/public/ci
           python3 scripts/verify/report-index.py --phase M0 --artifact-root .artifacts/m0/public/ci
+      - name: 上传 J09 失败诊断
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: j09-failure-diagnostics-${{ github.run_id }}
+          path: |
+            .artifacts/m0/public/ci/INDEX.json
+            .artifacts/m0/public/ci/steps.json
+            .artifacts/m0/public/ci/summary.json
+            .artifacts/m0/public/ci/reproducible.log
+            .artifacts/m0/public/ci/go-race.jsonl
+            .artifacts/m0/public/ci/reproducible/maven-wrapper-startup-*.log
+            .artifacts/m0/public/ci/reproducible/run-*/maven.log
+          if-no-files-found: warn
+          retention-days: 7
